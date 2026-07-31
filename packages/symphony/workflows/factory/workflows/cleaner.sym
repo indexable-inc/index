@@ -1,0 +1,12 @@
+# Continuous feeder: scans ix for slop / flaky tests / CI failures / latent
+# bugs and files ONE cleanup issue per run, labelled `factory:scope-needed`.
+# Runs every 4 hours, off the :00 mark. Dedups against existing issues.
+workflow "cleaner" on cron "23 */4 * * *" tz "UTC" {
+  sweep <- agent {
+    engine: codex
+    model: "gpt-5.3-codex"
+    effort: medium
+    permissions: read_only
+    prompt: skill "cleaner"
+  }
+}

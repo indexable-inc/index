@@ -1,0 +1,93 @@
+# Per-issue pipeline: scope -> implement -> bounded review/fix cascade -> merge.
+# Triggered when a factory issue is ready (Idea generator / Cleaner / a human
+# apply the `factory:scope-needed` label). The whole loop runs in ONE Symphony
+# run.
+#
+# Symphony is acyclic and a `when` body holds exactly ONE statement, so the
+# Worker<->Reviewer correction loop is UNROLLED as a FLAT chain of individually
+# gated steps. Ordering is enforced by data dependencies (each step reads the
+# previous step's output), not by nesting. MAX_ROUNDS = 3 (review1/2/3) is the
+# hard convergence cap: there is no review4, so it cannot run away.
+workflow "task-pipeline" on linear label "factory:scope-needed" {
+  # Researcher: deep research + scope, or reject.
+  scope <- agent {
+    engine: codex
+    model: "gpt-5.3-codex"
+    effort: high
+    permissions: read_only
+    prompt: skill "researcher"
+  }
+
+  # Worker: implement the scoped plan on a branch and open a PR (only if scoped).
+  impl <- when ${scope.scoped} {
+    agent {
+      engine: codex
+      model: "gpt-5.3-codex"
+      effort: high
+      permissions: workspace_write
+      prompt: skill "worker" { plan: ${scope.plan}, affected: ${scope.affected_crates} }
+    }
+  }
+
+  # Review round 1 (only if the Worker completed and opened a PR).
+  review1 <- when ${impl.completed} {
+    agent {
+      engine: codex
+      model: "gpt-5.3-codex"
+      effort: high
+      permissions: workspace_write
+      prompt: skill "reviewer" { pr: ${impl.pr}, round: "1" }
+    }
+  }
+
+  # Round 2: fix + re-review, only if round 1 asked for changes.
+  fix1 <- when ${review1.needs_changes} {
+    agent {
+      engine: codex
+      model: "gpt-5.3-codex"
+      effort: high
+      permissions: workspace_write
+      prompt: skill "worker-fix" { pr: ${impl.pr}, findings: ${review1.findings} }
+    }
+  }
+  review2 <- when ${review1.needs_changes} {
+    agent {
+      engine: codex
+      model: "gpt-5.3-codex"
+      effort: high
+      permissions: workspace_write
+      prompt: skill "reviewer" { pr: ${fix1.pr}, round: "2" }
+    }
+  }
+
+  # Round 3 (final): fix + re-review, only if round 2 still wants changes.
+  fix2 <- when ${review2.needs_changes} {
+    agent {
+      engine: codex
+      model: "gpt-5.3-codex"
+      effort: high
+      permissions: workspace_write
+      prompt: skill "worker-fix" { pr: ${impl.pr}, findings: ${review2.findings} }
+    }
+  }
+  review3 <- when ${review2.needs_changes} {
+    agent {
+      engine: codex
+      model: "gpt-5.3-codex"
+      effort: high
+      permissions: workspace_write
+      prompt: skill "reviewer" { pr: ${fix2.pr}, round: "3" }
+    }
+  }
+
+  # MAX_ROUNDS hit and still not green -> hand to a human.
+  escalate <- when ${review3.needs_changes} {
+    agent {
+      engine: codex
+      model: "gpt-5.3-codex"
+      effort: medium
+      permissions: read_only
+      prompt: skill "escalate" { reason: "max-review-rounds" }
+    }
+  }
+}

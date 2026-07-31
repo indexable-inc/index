@@ -1,0 +1,12 @@
+# Continuous feeder: proposes ONE improvement/feature idea per run and files it
+# as a Linear issue labelled `factory:scope-needed` (which triggers
+# task-pipeline). Daily, off the :00 mark. Dedups against existing issues.
+workflow "idea-generator" on cron "17 9 * * *" tz "UTC" {
+  idea <- agent {
+    engine: codex
+    model: "gpt-5.3-codex"
+    effort: high
+    permissions: read_only
+    prompt: skill "idea-generator"
+  }
+}

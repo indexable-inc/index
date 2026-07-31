@@ -1,0 +1,5 @@
+repositories:
+  - name: ix
+    owner_repo: indexable-inc/ix
+    default_branch: main
+    primary: true
