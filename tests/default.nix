@@ -27,6 +27,14 @@
       home-manager
       ;
   };
+  nixBuilderTest = import ./nix-builder.nix {
+    inherit
+      lib
+      nixpkgs
+      paths
+      pkgs
+      ;
+  };
   # VM boot smoke test for the minecraft-blocks Paper plugin (ENG-2186). Not
   # part of the `eval` aggregate: it boots a qemu VM, so it is its own check
   # (`checks.<system>.minecraft-blocks-vm`).
@@ -7283,6 +7291,7 @@ in {
   sdkRustPrebuilt = sdkRust.artifactCheck;
   portableServices = portableServicesTest;
   provenance = provenanceTest;
+  nixBuilder = nixBuilderTest;
   minecraftBlocksVm = minecraftBlocksVmTest;
   minestomSpleefVm = minestomSpleefVmTest;
   switchStopsAMountVm = switchStopsAMountVmTest;
@@ -7300,6 +7309,7 @@ in {
       helperTest
       portableServicesTest
       provenanceTest
+      nixBuilderTest
       cargoUnitPrebuiltTest
       devProfileFortifyTest.wiringReachesUnits
     ]
