@@ -193,6 +193,11 @@
   filters for `testChecksByTarget`. Callers should pass policy data, not
   runner-specific argv.
 
+  `nextestNoTestsByTarget.<target>` accepts "pass" or "fail"; omitted
+  targets explicitly default to "pass". Required suites should select "fail".
+  `wrapNextestTarget` is a target-name -> derivation -> derivation function
+  applied once before runner aliases and the aggregate capture the map.
+
   `rust.resolveArgs` resolves the shared bundle (context, policy, linker,
   effects, checks) once; the two IFD stages and the unit import below read the
   once-resolved values (configScript, toolchainId, cargoLockPath, render flags,
@@ -863,6 +868,14 @@
       NEXTEST_NO_INPUT_HANDLER = "true";
       NEXTEST_SHOW_PROGRESS = "none";
     };
+    nextestNoTestsByTarget =
+      lib.mapAttrs (
+        targetName: value:
+          assert lib.assertMsg (elem value ["pass" "fail"])
+          "cargoUnit.buildWorkspace nextestNoTestsByTarget.${targetName} must be pass or fail"; value
+      )
+      (rawArgs.nextestNoTestsByTarget or {});
+    wrapNextestTarget = rawArgs.wrapNextestTarget or (_targetName: drv: drv);
     mkNextestForTarget = targetName: entry: let
       inherit (entry) packageName;
       packageEnv = packageTestEnvForPackage packageName;
@@ -925,7 +938,7 @@
           --binaries-metadata "$workspace_root/binaries-metadata.json" \
           --workspace-remap "$workspace_root" \
           --no-fail-fast \
-          --no-tests=pass \
+          --no-tests=${nextestNoTestsByTarget.${targetName} or "pass"} \
           --test-threads ${
           if packagePolicy.testThreads != null
           then packagePolicy.testThreads
@@ -936,7 +949,11 @@
         mkdir -p "$out"
         echo "ran ${targetName} test target" > "$out/result"
       '';
-    nextestByTarget = lib.mapAttrs mkNextestForTarget (units.tests or {});
+    nextestByTarget =
+      lib.mapAttrs (
+        targetName: entry: wrapNextestTarget targetName (mkNextestForTarget targetName entry)
+      )
+      (units.tests or {});
     # Whole-workspace nextest metadata for running the prebuilt test binaries
     # OUTSIDE nix, on a machine that never compiled them:
     #   cargo nextest run \
