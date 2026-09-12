@@ -2,13 +2,29 @@
   ix,
   lib,
   updateScriptWriter ? null,
-  # Link the in-tree Rust evaluator into the `nix` CLI, so `eval-backend =
-  # rust` and `eval-backend = shadow` have a backend to route to. Off by
-  # default because it adds a Rust toolchain and a vendored cargo registry to
-  # every host that builds this package; hydra turns it on to dogfood the
-  # evaluator under `shadow`, which serves the C++ answer and only records
-  # what the Rust arm got wrong.
-  withRustEval ? false,
+  # The prebuilt jj tree ABI: a prefix holding `lib/libjj_tree.a` and
+  # `include/jj_tree.h`, built from the ix crate `jj-tree-abi`. The fork's
+  # libfetchers links its jj fetcher against it
+  # (`src/libfetchers/meson.options`, option `jj-tree-prefix`), so a nix
+  # built without it has no jj fetcher at all.
+  #
+  # `null` by DEFAULT AND FATAL WHEN FORCED, rather than a required formal.
+  # The crate lives in the ix repository, outside this flake's source root
+  # (`index.url = "path:./index"`), so nothing here can build it and only a
+  # consumer can supply it. A required formal would throw during the
+  # registry's package-set evaluation, which would also destroy the
+  # `.override` seam that consumer needs -- the override re-calls this
+  # function, and you cannot call `.override` on a value that throws. So it
+  # is accepted as null and refused at the point of use, which leaves the
+  # attribute evaluable, the override usable, and a build without it loud.
+  jjTree ? null,
+  # The ix jj client, on PATH as `jj` for the fork's functional tests
+  # (`tests/functional/common/functions.sh`, `requireJj`, which fails rather
+  # than skips). Same null-and-fatal contract, for the same reason: it is
+  # `packages/jj-ix` in the ix repository, and that package name is what the
+  # argument below is spelled after. It reaches the suite through
+  # `nativeBuildInputs` below, not through a package.nix argument: see there.
+  jjIx ? null,
 }:
 # The Nix view is surfaced as `ix.nixSrc` and built through nixpkgs' own
 # modular nix packaging so the result is a protocol-compatible drop-in for the
@@ -32,14 +48,15 @@
 # store builds [--json]`; the lazy trees backport (NixOS/nix#15711 and its
 # post-merge fixes) behind an off-by-default `lazy-trees` eval setting
 # (indexable-inc/index#3645, and see indexable-inc/index#4297 for why no host
-# sets it); `builtins.wasm` from the open upstream PR NixOS/nix#15380 behind
-# `wasm-builtin`, with deterministic execution forced so eval stays
-# bit-identical across the mixed fleet (indexable-inc/index#3997); lazy git ref
+# sets it); `builtins.wasm` behind `wasm-builtin`, implemented by the Rust
+# evaluator (rust/nix-eval-rs/src/wasm.rs; the C++ side registers the name and
+# refuses the call) with deterministic execution so eval stays bit-identical
+# across the mixed fleet (indexable-inc/index#3997); lazy git ref
 # resolution so rev-pinned `builtins.fetchGit` inputs evaluate without network
-# once cached (indexable-inc/index#4028); a jj working-copy fetcher; and an
-# in-process parallel evaluator behind an off-by-default `eval-cores`, which
-# also moved where an infinite recursion is reported (see the fork's release
-# notes). The fork's `codex/flake-check-eval-cache` branch (draft PR
+# once cached (indexable-inc/index#4028); a jj working-copy fetcher; and a
+# Rust evaluator with incremental evaluation and a shared runtime. The C++
+# evaluator and its parallel executor have been removed. The fork's
+# `codex/flake-check-eval-cache` branch (draft PR
 # indexable-inc/nix#1) is deliberately excluded: self-declared WIP, untested,
 # incomplete.
 let
@@ -47,6 +64,35 @@ let
   # formal is fragile against `callPackage` auto-binding, and the rest of the
   # nix/* packages read `pkgs` off their argument the same way.
   inherit (ix) pkgs;
+
+  # An argument this flake cannot supply for itself. Deferred rather than
+  # asserted at eval time: see the `jjTree` formal above for why the
+  # difference matters to the consumer's `.override`.
+  fromIx = name: value:
+    if value != null
+    then value
+    else
+      throw ''
+        packages/nix: `${name}` was not supplied.
+
+        This nix links the jj tree ABI out of the ix repository, which is
+        outside this flake's source root, so it has to be handed in. This
+        package is not a flake output (`flake = false` in package.nix): it is
+        reached through index.lib's `packageSetFor`, and the one consumer
+        that supplies both arguments is ix's `nixPackageBySystem`
+        (nix/flake/outputs/workspace.nix), which overrides this package with
+
+            jjTree = <ix>.packages.<system>.jj-tree-abi;
+            jjIx   = <ix>.packages.<system>.jj-ix;
+
+        Every ix consumer of the fork reads that binding; nothing evaluates
+        this package un-overridden on purpose. Standalone (index without
+        ix), supply `jjTree` and `jjIx` when calling `packageSetFor`.
+
+        There is deliberately no fallback. A nix built without the ABI has
+        no jj fetcher, and shipping one silently would turn a configure-time
+        error into a runtime "unsupported input type".
+      '';
 
   # Cross lane (RFC 0009, #3585): when the registry cross lane instantiates
   # this package (`cross = true` in package.nix), swap the component scope to
@@ -153,25 +199,128 @@ let
   # changes on top of upstream 2.34.7, so the only remaining build-time
   # patches are nixpkgs' own (`patchesCommon`).
   #
-  # Identify a patched daemon by version: `nix --version` (and
-  # `builtins.nixVersion`) report the version each *component* was compiled
-  # with -- the modular build's preConfigure writes the component derivation's
-  # `version` into the tree's `.version` on every build, so a `.version` source
-  # patch in our series would be clobbered and a version override on the
-  # `nix-everything` aggregate would only rename the store path. Set it through
-  # `overrideAllMesonComponents`, the last layer in the component builder
-  # stack. The marker is semver build metadata (`+ix.g<rev12>.h<hash>`), not
-  # `-ix`: meson feeds the version to darwin ld's -current_version, which
-  # rejects a `-` suffix as a "malformed 32-bit x.y.z version number" but
-  # tolerates `+`.
+  # Components report a stable fork version. Exact source provenance belongs
+  # to the aggregate artifact and its installed ix-provenance.json, so a Rust
+  # edit does not rename and rebuild every unrelated C++ component.
   patchedNix = let
+    cppSource = builtins.path {
+      path = ix.nixSrc;
+      name = "nix-source";
+      filter = path: _type: let
+        relative = lib.removePrefix "${ix.nixSrc}/" path;
+      in
+        relative != "rust" && !lib.hasPrefix "rust/" relative;
+    };
     # nixpkgs' modular components derive sourceRoot from `patchedSrc.name`.
-    # The checked view is a path whose unpacked directory is `nix-source`, so
-    # wrap that path with the one field the nixpkgs boundary requires.
+    # Keep all C++ headers, build support and embedded data. The Rust runtime
+    # is supplied independently by prefix and never built from this source.
+    # overrideSource otherwise includes the complete tree in every component,
+    # defeating the runtime's separate source boundary even with stable versions.
     patchedSrc = {
       name = "nix-source";
-      outPath = ix.nixSrc;
+      outPath = cppSource;
     };
+    # nixpkgs deliberately omits filesets from its vendored component recipes.
+    # Keep those recipes and their dependency scope, but snapshot each complete
+    # fork component directory so additions and deletions enter its own source.
+    # Cross-directory inputs are explicit; component .version/build-support
+    # symlinks keep their original relative targets inside each snapshot.
+    componentExtraRoots =
+      (lib.genAttrs [
+        "src/libutil"
+        "src/libutil-c"
+        "src/libutil-test-support"
+        "src/libutil-tests"
+        "src/libstore"
+        "src/libstore-c"
+        "src/libstore-test-support"
+        "src/libstore-tests"
+        "src/libfetchers"
+        "src/libfetchers-c"
+        "src/libfetchers-tests"
+        "src/libexpr"
+        "src/libexpr-c"
+        "src/libexpr-test-support"
+        "src/libexpr-tests"
+        "src/libflake"
+        "src/libflake-c"
+        "src/libflake-tests"
+        "src/libmain"
+        "src/libmain-c"
+        "src/libcmd"
+        "src/nswrapper"
+        "src/perl"
+      ] (_: []))
+      // {
+        "src/nix" = [
+          "scripts"
+          "misc"
+          "doc/manual/generate-manpage.nix"
+          "doc/manual/generate-settings.nix"
+          "doc/manual/generate-store-info.nix"
+          "doc/manual/utils.nix"
+          "doc/manual/source/store/types/index.md.in"
+          "doc/manual/source/command-ref/files/profiles.md"
+        ];
+        "src/libstore-tests" = ["tests/functional/derivation"];
+        "tests/functional" = ["scripts/nix-profile.sh.in"];
+        "doc/manual" = manualFixtureRoots;
+        "src/internal-api-docs" = ["src"];
+        "src/external-api-docs" = [
+          "src/libutil-c"
+          "src/libexpr-c"
+          "src/libflake-c"
+          "src/libstore-c"
+        ];
+        "src/json-schema-checks" = manualFixtureRoots ++ ["doc/manual/source/protocols/json/schema"];
+      };
+    manualFixtureRoots = [
+      "src/libutil-tests/data/memory-source-accessor"
+      "src/libutil-tests/data/hash"
+      "src/libstore-tests/data/content-address"
+      "src/libstore-tests/data/store-path"
+      "src/libstore-tests/data/realisation"
+      "src/libstore-tests/data/derivation"
+      "src/libstore-tests/data/derived-path"
+      "src/libstore-tests/data/path-info"
+      "src/libstore-tests/data/nar-info"
+      "src/libstore-tests/data/build-result"
+      "src/libstore-tests/data/dummy-store"
+      "tests/functional/derivation"
+    ];
+    componentSource = relative: let
+      roots = [relative ".version" "nix-meson-build-support"] ++ componentExtraRoots.${relative};
+    in
+      assert lib.assertMsg (builtins.hasAttr relative componentExtraRoots)
+      "packages/nix: no source boundary declared for component ${relative}";
+      assert lib.assertMsg (builtins.pathExists (ix.nixSrc + "/${relative}/meson.build"))
+      "packages/nix: component ${relative} has no Meson source root";
+      assert lib.assertMsg (builtins.all (entry: builtins.pathExists (ix.nixSrc + "/${entry}")) roots)
+      "packages/nix: component ${relative} has a missing source dependency"; {
+        name = "nix-source";
+        outPath = builtins.path {
+          path = ix.nixSrc;
+          name = "nix-source";
+          filter = path: _type: let
+            part = lib.removePrefix "${ix.nixSrc}/" path;
+          in
+            path
+            == toString ix.nixSrc
+            || builtins.any
+            (entry: part == entry || lib.hasPrefix "${entry}/" part || lib.hasPrefix "${part}/" entry)
+            roots;
+        };
+      };
+    withComponentSource = _: previous: let
+      prefix = "${patchedSrc.name}/";
+      relative = lib.removePrefix "./" (lib.removePrefix prefix previous.sourceRoot);
+    in
+      assert lib.assertMsg (lib.hasPrefix prefix previous.sourceRoot)
+      "packages/nix: unexpected component sourceRoot ${previous.sourceRoot}"; {
+        version = componentVersion;
+        src = componentSource relative;
+        sourceRoot = "nix-source/${relative}";
+      };
     source = {
       version = upstreamVersion;
       storePath = builtins.unsafeDiscardStringContext (toString ix.nixSrc);
@@ -183,6 +332,7 @@ let
     });
     shortHash = builtins.substring 0 20 sourceDigest;
     version = "${upstreamVersion}+ix.h${builtins.substring 0 8 sourceDigest}";
+    componentVersion = "${upstreamVersion}+ix";
     provenance = {
       schema = 3;
       algorithm = "sha256";
@@ -190,144 +340,136 @@ let
     };
     provenanceJson = (pkgs.formats.json {}).generate "nix-ix-provenance.json" provenance;
 
-    # The Rust evaluator, compiled in its own derivation and handed to the CLI
-    # as a prebuilt archive rather than built from inside the nix-cli build.
-    #
-    # It has to be done this way here. nixpkgs' modular packaging vendors its
-    # OWN src/nix/package.nix, so the fileset in the fork's copy -- the thing
-    # that would carry ../../rust and the derivation.nix that build.rs
-    # fingerprints -- never applies on this path. Same trap as the `wasm`
-    # feature above, whose in-tree dependency declaration is likewise ignored.
-    # Here the fileset is ours, so both inputs are easy to include.
-    #
-    # `nix build path:./views/nix#nix-cli --arg withRustEval true` still takes
-    # the in-tree cargo path; this prefix only overrides it for this build.
-    nixEvalRs = componentPkgs.stdenv.mkDerivation {
-      pname = "nix-eval-rs";
-      inherit version;
-
-      # The whole patched tree, not a fileset over it. `ix.nixSrc` is a
-      # string-like store path rather than a path, which `lib.fileset` rejects
-      # outright -- and narrowing would buy nothing anyway: this derivation is
-      # keyed on `ix.nixSrc`, so it already rebuilds exactly when the fork
-      # moves. Taking the tree whole also keeps
-      # src/libexpr/primops/derivation.nix in reach, which build.rs hashes to
-      # key the evaluator's compiler fingerprint
-      # (rust/nix-eval-rs/compiler-fingerprint.rs) and without which the crate
-      # fails in the build script before compiling anything.
-      src = ix.nixSrc;
-
-      nativeBuildInputs = [
-        componentPkgs.cargo
-        componentPkgs.rustc
-        componentPkgs.rustPlatform.cargoSetupHook
-        # Do the cargo invocation through nixpkgs' hook rather than by hand.
-        # `componentPkgs` is a CROSS set -- built on x86_64-linux, hosted on
-        # aarch64-apple-darwin -- and a bare `cargo build` targets the
-        # *builder*, so cargo compiles for x86_64-linux while stdenv's CC is
-        # the darwin cross compiler. That combination fed `--target
-        # x86_64-unknown-linux-gnu` to a darwin clang wrapper and died on a
-        # missing wchar.h; had it linked, it would have produced a Linux
-        # archive for a Darwin binary. The hook sets the six things that must
-        # agree: --target, CARGO_BUILD_TARGET, CC_<TRIPLE>, CXX_<TRIPLE>,
-        # CARGO_TARGET_<TRIPLE>_LINKER, and HOST_CC/HOST_CXX (build-platform
-        # compilers, kept distinct from the host-platform ones).
-        componentPkgs.rustPlatform.cargoBuildHook
-      ];
-
-      # Vendored so cargo never reaches the network. The lock pins rnix to a
-      # git rev (a fork adding 1_000-style digit separators), which
-      # importCargoLock cannot hash on its own.
-      cargoDeps = componentPkgs.rustPlatform.importCargoLock {
-        lockFile = ix.nixSrc + "/rust/Cargo.lock";
-        outputHashes = {
-          "rnix-0.12.0" = "sha256-CEBnghY4vr+FTR0d7tUkdjrgXgPtws+EA+Ig8aOM904=";
-        };
-      };
-      cargoRoot = "rust";
-      # The hook installs itself as buildPhase only when buildPhase is unset,
-      # so there is deliberately no buildPhase here. It cds into this subdir
-      # and pins CARGO_TARGET_DIR to <sourceRoot>/target.
-      buildAndTestSubdir = "rust";
-      cargoBuildFlags = ["-p" "nix-eval-rs"];
-      # buildRustPackage would default this; plain mkDerivation does not, and
-      # the hook interpolates it unguarded -- `--profile ""` and a
-      # CARGO_PROFILE__STRIP with an empty infix. Must be set explicitly.
-      cargoBuildType = "release";
-
-      installPhase = ''
-        # shell
-        runHook preInstall
-        mkdir -p "$out/lib" "$out/include"
-        # Cargo emits into <target-dir>/<triple>/release whenever --target is
-        # passed, which the hook always does. Take the triple from nix rather
-        # than from $CARGO_BUILD_TARGET: the hook exports that only for the
-        # cargo process itself, so it is not in scope here.
-        cp "target/${componentPkgs.stdenv.hostPlatform.rust.cargoShortTarget}/release/libnix_eval_rs.a" "$out/lib/"
-        cp rust/nix-eval-rs/include/*.h "$out/include/"
-        runHook postInstall
-      '';
+    nixHostRs = import ./rust-host-runtime.nix {
+      inherit ix lib componentPkgs;
     };
-    # The Rust evaluator's meson flags, in one place: the conditional in
-    # `patchedComponents` below and the always-on `rustEvalComponents` scope must
-    # apply exactly the same pair, or the parity lane stops testing the build
-    # everyone else would get with `withRustEval = true`.
-    rustEvalCli = nixCli:
-      nixCli.overrideAttrs (old: {
+    nixEvalRs = import ./rust-runtime.nix {
+      inherit ix lib componentPkgs;
+    };
+    # The Rust evaluator's meson flags, in one place. Every `nix-ix` links the
+    # Rust evaluator: `builtins.wasm` (the `.ix` converter) exists only there,
+    # so a nix-ix without it cannot import `.ix` at all. The cost is one crate
+    # derivation (`nixEvalRs` above), shared by both C++ consumers.
+    withRustEval = component:
+      component.overrideAttrs (old: {
         mesonFlags =
           (old.mesonFlags or [])
-          ++ [
-            "-Drust-eval=enabled"
-            "-Drust-eval-prefix=${nixEvalRs}"
-          ];
+          ++ ["-Drust-eval-prefix=${nixEvalRs}"];
       });
     patchedComponents = ((base.overrideSource patchedSrc).overrideAllMesonComponents
-      (_: _: {inherit version;}))
-      .overrideScope (_: prev: {
-      # Patch 0038 (builtins.wasm, NixOS/nix#15380) adds a `wasm` meson
-      # feature to libexpr and declares its wasmtime dependency in the
-      # in-tree src/libexpr/package.nix; the nixpkgs modular scope builds
-      # from its own vendored component packaging, so that declaration
-      # never reaches this build. Worse, nixpkgs' meson hook passes
-      # --auto-features=enabled, which flips the feature on with nobody
-      # supplying the library (wasm.cc fails on #include <wasmtime.hh>).
-      # Wire the dependency here, at the same seam that swaps the source,
-      # and pin the feature explicitly so a missing wasmtime fails at
-      # configure time instead of mid-compile. nixpkgs' wasmtime ships the
-      # C API + C++ headers in its dev output and libwasmtime via the
-      # dev->out propagation of the multiple-outputs hook.
-      nix-expr = prev.nix-expr.overrideAttrs (old: {
-        buildInputs = (old.buildInputs or []) ++ [componentPkgs.wasmtime];
-        mesonFlags = (old.mesonFlags or []) ++ ["-Dwasm=enabled"];
-      });
+      withComponentSource)
+      .overrideScope (final: prev: {
       # See `curlForNixStore` above: libstore owns the file-transfer
       # worker the curl regression stalls, and it is the only component that
       # takes Curl, so the source view is scoped to it instead of `pkgs.curl`.
-      nix-store = prev.nix-store.override {curl = curlForNixStore;};
-      # The Rust evaluator links into the CLI only -- `src/nix/meson.build`
-      # owns the cargo target, and nothing in libexpr/libstore/libfetchers
-      # depends on it -- so this is the one component that needs the flag.
-      #
-      # The meson option defaults to `disabled` rather than `auto` on purpose:
-      # nixpkgs' meson hook passes `--auto-features=enabled` (see the wasm note
-      # above), which would otherwise switch the Rust build on for every
-      # consumer of this package with no cargo in scope.
-      nix-cli =
-        if !withRustEval
-        then prev.nix-cli
-        else rustEvalCli prev.nix-cli;
-    });
+      nix-store = (prev.nix-store.override {curl = curlForNixStore;}).overrideAttrs (old: {
+        mesonFlags = (old.mesonFlags or []) ++ ["-Drust-host-prefix=${nixHostRs}"];
+      });
+      # Stable component versions do not identify host behavior. The immutable
+      # CLI output captures its complete host dependency closure for cache keys.
+      nix-cli = prev.nix-cli.overrideAttrs (old: {
+        mesonFlags = (old.mesonFlags or []) ++ ["-Dhost-build-identity=${builtins.placeholder "out"}"];
+      });
+      # Both consumers use exactly the same runtime path and allocator/state.
+      nix-flake = withRustEval prev.nix-flake;
+      # The remaining flake C API exposes settings and reference parsing. Its
+      # inherited recipe still propagates the deleted expression C API.
+      nix-flake-c = prev.nix-flake-c.overrideAttrs (old: {
+        propagatedBuildInputs =
+          lib.filter
+          (input: !(builtins.elem (lib.getName input) ["nix-expr" "nix-expr-c"]))
+          old.propagatedBuildInputs;
+      });
+      nix-flake-tests = prev.nix-flake-tests.overrideAttrs (old: {
+        buildInputs =
+          lib.filter (input: lib.getName input != "nix-expr-test-support") old.buildInputs
+          ++ [final.nix-store-test-support];
+      });
+      # nixpkgs owns these component recipes; source overrides do not remove
+      # its parser generators, old TOML parser, or deleted REPL dependencies.
+      nix-expr = prev.nix-expr.overrideAttrs (old: {
+        nativeBuildInputs =
+          lib.filter
+          (input: !(builtins.elem (lib.getName input) ["bison" "flex" "cmake"]))
+          old.nativeBuildInputs;
+        buildInputs = lib.filter (input: lib.getName input != "toml11") old.buildInputs;
+      });
+      nix-cmd = withRustEval (prev.nix-cmd.overrideAttrs (old: {
+        buildInputs =
+          lib.filter
+          (input: !(builtins.elem (lib.getName input) ["editline" "readline"]))
+          old.buildInputs;
+        mesonFlags = lib.filter (flag: !lib.hasPrefix "-Dreadline-flavor=" flag) old.mesonFlags;
+      }));
 
-    # The rust/C++ parity tests are the only thing in the tree that executes the
-    # Rust evaluator, and `nix-cli` links it only under `-Drust-eval=enabled` --
-    # off by default at the meson option, at `withRustEval` here, and therefore in
-    # every binary CI builds. Run them against their own scope rather than turning
-    # the flag on for the shared one: the parity claim gets a live instrument and
-    # no other consumer grows a cargo dependency. The crate is a separate
-    # derivation (`nixEvalRs`), so this costs one extra CLI relink, not a rebuild
-    # of the component chain.
-    rustEvalComponents = patchedComponents.overrideScope (_: prev: {
-      nix-cli = rustEvalCli prev.nix-cli;
+      # The jj fetcher lives in libfetchers, so this is the component that
+      # links the jj archive. The Rust evaluator is a separate shared runtime
+      # (above). Everything above libfetchers (libexpr, libflake, the CLI,
+      # the daemon) picks it up transitively, which is why there is exactly
+      # one seam here.
+      #
+      # `overrideAttrs`, not `override`, and this is the ONLY author of the
+      # flag. nixpkgs' modular packaging owns the component lambdas: it
+      # vendors its own copy of every `package.nix` under
+      # `pkgs/tools/package-management/nix/modular/`, and `overrideSource`
+      # swaps `src` alone. The libfetchers lambda actually called here is
+      # nixpkgs' (formals: lib, mkMesonLibrary, nix-util, nix-store,
+      # nlohmann_json, libgit2, version), so `.override { jjTree = ...; }`
+      # died at eval with "function 'anonymous lambda' called with unexpected
+      # argument 'jjTree'". What does cross the `overrideSource` boundary is
+      # the SOURCE, and the source's meson is what reads the flag
+      # (`src/libfetchers/meson.options`, `meson.build`, which errors when the
+      # prefix is empty) -- the same seam `-Drust-eval-prefix` uses above. The
+      # fork's own `src/libfetchers/package.nix` therefore declares no
+      # `jjTree` and builds no flag: one option, one author, here.
+      #
+      # The archive needs no `buildInputs` entry. Interpolating the store path
+      # into `mesonFlags` carries its string context, which is what makes it
+      # an input of this derivation, and meson reads
+      # `<prefix>/lib/libjj_tree.a` and `<prefix>/include` by absolute path.
+      # `buildInputs` would additionally splice it, which is wrong under
+      # `isCross`: the consumer hands in an archive already built for the host
+      # platform.
+      nix-fetchers = prev.nix-fetchers.overrideAttrs (old: {
+        mesonFlags =
+          (old.mesonFlags or [])
+          ++ ["-Djj-tree-prefix=${fromIx "jjTree" jjTree}"];
+      });
+
+      # The fork's functional suite drives a real jj client: `requireJj`
+      # (`tests/functional/common/functions.sh`) fails rather than skips, and
+      # the three jj tree-identity tests in `passthru.tests` below run through
+      # this derivation. nixpkgs owns this lambda too and its formals have no
+      # `jj-ix`, so the client is appended to the input list nixpkgs' copy
+      # does declare rather than passed as an argument.
+      #
+      # `old.nativeBuildInputs` with no `or []` on purpose: nixpkgs' copy
+      # always sets it -- that is where `git` and `mercurial` come from -- so a
+      # nixpkgs refactor that renames the attribute fails here loudly instead
+      # of quietly building a test closure with neither git nor jj.
+      #
+      # `packages/jj-ix` installs `bin/jj` (`lib/jj-client-satellite.nix`,
+      # `installedName = "jj"`), which is the name `requireJj` probes. It has
+      # to be the ix client: the tests exercise ix-local stores that upstream
+      # jujutsu cannot open.
+      #
+      # `unixtools.script` and `zstd` for the same reason: the fork's own
+      # tests/functional/package.nix declares them (binary-cache.sh rewrites
+      # a NAR with the compressor the cache used, zstd by default), but that
+      # lambda is not the one this path calls, and nixpkgs' copy has neither.
+      # Without them binary-cache.sh dies with exit 127 (`zstd: command not
+      # found`) rather than skipping: the tool is a declared dependency of
+      # the suite, not an optional one.
+      nix-functional-tests = prev.nix-functional-tests.overrideAttrs (old: {
+        nativeBuildInputs =
+          old.nativeBuildInputs
+          ++ [
+            (fromIx "jjIx" jjIx)
+            pkgs.unixtools.script
+            pkgs.python3
+            pkgs.zstd
+          ];
+      });
     });
 
     # The aggregate `nix` package (daemon + client + libs), the same attribute
@@ -345,12 +487,12 @@ let
           # same language the client does, underscore digit separators
           # included).
           components = patchedComponents;
-          # The same scope with the Rust evaluator linked into the CLI, for the
-          # parity lane (`passthru.tests.rustEvalShadow*`). Exposed for the same
-          # reason `components` is: it is bound inside this `let` and the tests
-          # are assembled outside it.
-          componentsRustEval = rustEvalComponents;
-          inherit provenance;
+          # The crate derivation itself, for `nixEvalRsClippy` below (which is
+          # this derivation with its build phase swapped) and for building the
+          # evaluator alone.
+          # The aggregate inherits a component version in passthru, which
+          # otherwise shadows its own derivation version for consumers.
+          inherit nixEvalRs nixHostRs provenance componentVersion version;
         };
       # The aggregate's `doCheck = true` gates the build on `checkInputs`: the
       # five component unit-test runners plus the entire upstream functional
@@ -417,20 +559,24 @@ let
       strictDeps = true;
     }
     ''
-      expected=${lib.escapeShellArg "nix (Nix) ${package.version}"}
+      expected=${lib.escapeShellArg "nix (Nix) ${package.componentVersion}"}
       actual=$(nix --version)
       if [[ "$actual" != "$expected" ]]; then
-        echo "nix --version disagrees with the package version" >&2
+        echo "nix --version disagrees with the compiled component version" >&2
         printf 'expected: %s\nactual:   %s\n' "$expected" "$actual" >&2
         exit 1
       fi
 
-      jq -e \
+      if ! jq -e \
         --arg version ${lib.escapeShellArg package.version} \
         --arg sourceDigest ${lib.escapeShellArg package.provenance.sourceDigest} \
         --arg sourceStorePath ${lib.escapeShellArg package.provenance.source.storePath} \
         '.schema == 3 and .algorithm == "sha256" and .version == $version and .sourceDigest == $sourceDigest and .source.storePath == $sourceStorePath' \
-        ${package}/share/nix/ix-provenance.json >/dev/null
+        ${package}/share/nix/ix-provenance.json >/dev/null; then
+        echo "installed provenance disagrees with the package identity" >&2
+        cat ${package}/share/nix/ix-provenance.json >&2
+        exit 1
+      fi
 
       mkdir -p "$out"
     '';
@@ -439,6 +585,9 @@ let
     name,
     testDaemon ? null,
   }: let
+    # One component scope; every build links the Rust evaluator, so a test
+    # whose claims include a Rust arm runs that arm here with nothing to skip
+    # on.
     tests = package.components.nix-functional-tests.override (
       lib.optionalAttrs (testDaemon != null) {test-daemon = testDaemon;}
     );
@@ -447,78 +596,136 @@ let
       mesonCheckFlags = (old.mesonCheckFlags or []) ++ [name];
     });
 
-  # `focusedFunctionalTest` leaves the derivation named `nix-functional-tests`,
-  # which every other focused check also carries. Tooling that addresses a
-  # check by derivation name therefore cannot tell the eight focused tests
-  # apart, and a per-check decision recorded against the shared name silently
-  # applies to all eight. Its own pname makes this lane addressable on its own.
-  rustEvalFunctionalTest = {name}:
-    package.componentsRustEval.nix-functional-tests.overrideAttrs (old: {
-      pname = "nix-rust-eval-parity-tests";
-      mesonCheckFlags = (old.mesonCheckFlags or []) ++ [name];
+  # These protocol regressions create their own disposable stores. Their
+  # focused owner needs the real CLI and Python, not the unrelated jj client
+  # required by the full Meson suite that also registers the same scripts.
+  focusedPythonTest = {
+    name,
+    script,
+  }:
+    pkgs.runCommand name {
+      NIX_CONFIG = "experimental-features = nix-command ca-derivations\nmin-free = 0\nmax-free = 0";
+      NIX_USER_CONF_FILES = "/dev/null";
+    } ''
+      # shell
+      export NIX_CONF_DIR="$TMPDIR/empty-nix-conf"
+      ${lib.getExe pkgs.python3} ${ix.nixSrc + "/tests/functional/${script}"} ${package.components.nix-cli}/bin/nix
+      mkdir "$out"
+    '';
 
-      # Pinned, not inherited. `postCheck` runs only inside `checkPhase`, and
-      # stdenv skips `checkPhase` when `doCheck` is unset -- so a future
-      # build-budget trim setting `doCheck = false` (as another derivation in
-      # this file already does) would make the guard below unreachable and
-      # take this lane green having compared nothing.
-      doCheck = true;
+  remoteRetainedFixture =
+    pkgs.runCommandCC "nix-remote-retained-fixture" {
+      nativeBuildInputs = [pkgs.pkg-config];
+      buildInputs = [package.components.nix-store];
+    } ''
+      # shell
+      mkdir -p "$out/bin"
+      $CXX -std=c++23 ${ix.nixSrc + "/tests/functional/remote-retained-fixture.cc"} \
+        $(pkg-config --cflags --libs nix-store) -o "$out/bin/remote-retained-fixture"
+    '';
+  remoteRetainedMapping = pkgs.runCommand "nix-remote-retained-mapping" {} ''
+    # shell
+    ${lib.getExe pkgs.python3} ${ix.nixSrc + "/tests/functional/remote-retained-mapping.py"} \
+      ${package.components.nix-cli}/bin/nix ${remoteRetainedFixture}/bin/remote-retained-fixture
+    mkdir "$out"
+  '';
 
-      # A SKIPPED test leaves this derivation GREEN. `skipTest` exits 77,
-      # meson's default exitcode protocol reads 77 as SKIP, and `meson test`
-      # still exits 0 -- so if `-Drust-eval=enabled` ever stops reaching this
-      # build, the capability guard in both parity scripts skips, the check
-      # goes green, and the lane measures nothing for ever. That is exactly
-      # the failure class this lane exists to kill, one level up. So assert
-      # the outcome the lane is promoted on: this test RAN, and it said OK.
-      #
-      # Read meson's STRUCTURED log, not the human one. `testlog.txt` embeds
-      # the whole build environment, and that includes this postCheck's own
-      # source, so a text pattern there can match itself and pass vacuously.
-      # `testlog.json` is one JSON object per test and is selected on fields.
-      #
-      # Fails closed: a missing log, an absent entry, or any result other
-      # than OK is a failure rather than a pass.
-      # Parse the last component because meson's display name changes by version.
-      postCheck = ''
-        testlogs=()
-        while IFS= read -r tl; do testlogs+=("$tl"); done < <(
-          find . -path '*meson-logs/testlog.json' -print | sort)
-        if [[ ''${#testlogs[@]} -eq 0 ]]; then
-          echo "parity lane: no meson testlog.json; cannot prove ${name} ran" >&2
+  # The whole `rust-eval` meson suite as ONE check: every `rust-eval-*.sh`
+  # functional test, which tests/functional/meson.build puts in that suite by
+  # name. One derivation and no roster, because the roster was the defect: three
+  # tests were registered here by hand while a dozen others were meson tests no
+  # CI job ran, which is the E1 finding again -- a control that exists and never
+  # executes reads as coverage. `focusedFunctionalTest` leaves the derivation
+  # named `nix-functional-tests`, which every other focused check also carries,
+  # so this one has its own pname and is addressable on its own.
+  #
+  # Direct result, filesystem, and persistent-cache contracts.
+  rustEvalTests = package.components.nix-functional-tests.overrideAttrs (old: {
+    pname = "nix-rust-eval-tests";
+    mesonCheckFlags = (old.mesonCheckFlags or []) ++ ["--suite" "rust-eval"];
+
+    # Pinned, not inherited. `postCheck` runs only inside `checkPhase`, and
+    # stdenv skips `checkPhase` when `doCheck` is unset -- so a future
+    # build-budget trim setting `doCheck = false` (as another derivation in
+    # this file already does) would make the guard below unreachable and
+    # take this lane green without running the required tests.
+    doCheck = true;
+
+    # A SKIPPED test leaves this derivation GREEN. `skipTest` exits 77,
+    # meson's default exitcode protocol reads 77 as SKIP, and `meson test`
+    # still exits 0 -- so if any test in the suite ever starts skipping,
+    # the check goes green and the lane measures nothing for ever. That is exactly the failure class
+    # this lane exists to kill, one level up. So assert the outcome the lane
+    # is promoted on: every test in the suite RAN, and every one said OK.
+    #
+    # Read meson's STRUCTURED log, not the human one. `testlog.txt` embeds
+    # the whole build environment, and that includes this postCheck's own
+    # source, so a text pattern there can match itself and pass vacuously.
+    # `testlog.json` is one JSON object per test and is selected on fields.
+    # The expected count comes from meson's own listing of the suite, never
+    # from a number kept by hand here.
+    #
+    # Fails closed: a missing log, a count that disagrees with the listing,
+    # or any result other than OK is a failure rather than a pass.
+    postCheck = ''
+      # shell
+      testlogs=()
+      while IFS= read -r tl; do testlogs+=("$tl"); done < <(
+        find . -path '*meson-logs/testlog.json' -print | sort)
+      if [[ ''${#testlogs[@]} -ne 1 ]]; then
+        echo "Rust evaluator tests: expected exactly one meson testlog.json, found ''${#testlogs[@]}" >&2
+        exit 1
+      fi
+      builddir=$(dirname "$(dirname "''${testlogs[0]}")")
+      registered=$(meson test -C "$builddir" --suite rust-eval --list | grep -c .)
+      if [[ "$registered" -lt 1 ]]; then
+        echo "Rust evaluator tests: meson lists no tests in the rust-eval suite" >&2
+        exit 1
+      fi
+      ran=$(jq -r '.name' "''${testlogs[0]}" | grep -c .)
+      notOk=$(jq -r 'select(.result != "OK") | "\(.name): \(.result)"' "''${testlogs[0]}")
+      if [[ "$ran" -ne "$registered" ]]; then
+        echo "Rust evaluator tests: the rust-eval suite lists $registered tests but $ran ran:" >&2
+        jq -r '.name' "''${testlogs[0]}" >&2
+        exit 1
+      fi
+      if [[ -n "$notOk" ]]; then
+        echo "Rust evaluator tests: tests that did not report OK:" >&2
+        echo "$notOk" >&2
+        echo "A SKIP here means this build lost the rust evaluator, and without" >&2
+        echo "this check the derivation would have succeeded without running the required tests." >&2
+        exit 1
+      fi
+      # These migrations require their live command boundary fixtures even
+      # if a future Meson edit accidentally drops a registration.
+      for required in rust-eval-registry rust-eval-build-scheduler rust-eval-import-cache; do
+        if ! jq -s -e --arg required "$required" \
+          '[.[] | select((.name | split(" - ") | last | sub("^nix-functional-tests:"; "")) == $required)] | length == 1 and .[0].result == "OK"' \
+          "''${testlogs[0]}" >/dev/null; then
+          echo "Rust evaluator tests: mandatory test $required did not run exactly once successfully" >&2
           exit 1
         fi
-        # meson renders this field for humans and has changed the rendering at
-        # least twice: "<test>", "<prj>:<suites> / <test>", and (1.10.x)
-        # "<suites> - <prj>:<test>". Take the last component under either
-        # separator rather than hard-coding one of them.
-        results=()
-        while IFS= read -r r; do
-          [[ -n "$r" ]] && results+=("$r")
-        done < <(jq -r --arg n "${name}" \
-          'select((.name | split(" / ") | last | split(":") | last) == $n) | .result' \
-          "''${testlogs[@]}")
-        if [[ ''${#results[@]} -ne 1 ]]; then
-          echo "parity lane: expected exactly one testlog entry for ${name}, found ''${#results[@]}." >&2
-          echo "meson most likely changed its test-name rendering. Names present:" >&2
-          jq -r '.name' "''${testlogs[@]}" >&2
-          exit 1
-        fi
-        if [[ "''${results[0]}" != OK ]]; then
-          echo "parity lane: ${name} reported result [''${results[0]}], not OK." >&2
-          echo "A SKIP here means this build lost the rust evaluator, and without" >&2
-          echo "this check the derivation would have succeeded having compared nothing." >&2
-          exit 1
-        fi
-      '';
-    });
+      done
+      echo "Rust evaluator tests: $ran of $registered rust-eval tests OK"
+    '';
+  });
 
-  # ENG-12874: the shadow census must survive a divergence whose text the JSON
-  # writer dislikes, rather than serialising the whole document to zero bytes.
-  rustEvalShadowCensus = rustEvalFunctionalTest {name = "rust-eval-shadow-census";};
-  # Flake installables reach the shadow census, agree on both arms, and account
-  # for every skip and verdict in the vocabulary.
-  rustEvalShadowFlake = rustEvalFunctionalTest {name = "rust-eval-shadow-flake";};
+  hostValueTests = package.components.nix-expr-tests.tests.run;
+
+  contentAddressBoundaries = focusedFunctionalTest {name = "blake3";};
+  deferredStoreWrites = focusedPythonTest {
+    name = "nix-deferred-store-writes";
+    script = "deferred-store-writes.py";
+  };
+  remoteAdmissionProgress = focusedPythonTest {
+    name = "nix-remote-admission-progress";
+    script = "remote-admission-progress.py";
+  };
+  legacySshGc = focusedPythonTest {
+    name = "nix-legacy-ssh-gc";
+    script = "legacy-ssh-gc.py";
+  };
+  realisationSignatures = focusedFunctionalTest {name = "signatures";};
 
   autoGcInterrupt = focusedFunctionalTest {name = "gc-auto";};
   # `libfetchers: resolve git refs lazily and refresh the cached HEAD`
@@ -535,6 +742,30 @@ let
   # test now asserts sparse child-lock semantics (stale copied nodes refresh
   # from the child's own flake.lock; in-sync locks stay byte-identical).
   sparseLocks = focusedFunctionalTest {name = "relative-paths-lockfile";};
+  # The lock-file WRITE path (`InputScheme::putFile`) per source kind. jj
+  # needs no commit step, because a snapshot gives every working-copy state a
+  # revision; a git working tree needs one, and since the fetchers stopped
+  # serving mutable trees that difference decides whether `nix flake update`
+  # can write at all.
+  lockFileWrites = focusedFunctionalTest {name = "lock-file-writes";};
+  # The jj tree-identity suite (`tests/functional/jj-tree/`), the coverage for
+  # the fetcher that links `libjj_tree.a`: `identity` that a store path is
+  # derived from the blake3 tree id with no file reads, `lock` that a jj input
+  # locks as `treeHash` and never `narHash`, `relative` that `path:./sub`
+  # inside a jj parent resolves to the parent's SUBTREE object rather than
+  # acquiring an identity of its own, and `filtered` that `builtins.path` on
+  # a jj-served directory is addressed by the FILTERED tree's id (no file
+  # read, lazily mounted, unmoved by edits outside the kept files). Meson
+  # names a test after its script (`fs.replace_suffix`), and each of these
+  # four basenames is registered exactly once across the whole functional
+  # suite, so the bare name selects one test.
+  jjTreeIdentity = focusedFunctionalTest {name = "identity";};
+  jjTreeLock = focusedFunctionalTest {name = "lock";};
+  jjTreeRelative = focusedFunctionalTest {name = "relative";};
+  # `filtered` also asserts that the Rust evaluator's road lands on the same
+  # store paths, and refuses to run without that evaluator (every nix-ix links
+  # it, so a refusal here is a broken build, not a missing option).
+  jjTreeFiltered = focusedFunctionalTest {name = "filtered";};
   # `fix(libstore): don't abort when an output path becomes valid mid-build`
   # regression coverage: a local-overlay store whose LOWER store gains an
   # input-addressed output while the overlay is still building that very
@@ -558,6 +789,17 @@ let
   # than being re-signed. The test expects `--check` itself to fail (LC_UUID is
   # still a stale content hash, index#4336) and inspects the `.check` binary.
   machoRewrite = focusedFunctionalTest {name = "macho-rewrite";};
+  # Separate per-unit checks cover the default workspace and runtime-only
+  # no-default-features configuration without unifying `perf` back on.
+  nixEvalRsClippy = package.nixEvalRs.checks.clippy;
+  nixEvalRsTests = package.nixEvalRs.checks.tests;
+  nixEvalRsDocs = package.nixEvalRs.checks.docs;
+  nixHostRsTests = package.nixHostRs.checks.tests;
+  nixHostRsDocs = package.nixHostRs.checks.docs;
+  nixHostRsClippy = package.nixHostRs.checks.clippy;
+  rustRuntimeOwnership = package.nixHostRs.checks.ownership;
+  rustRuntimeSourceIsolation = package.nixHostRs.checks.sourceIsolation;
+  rustRuntimeUnitIsolation = package.nixHostRs.checks.unitIsolation;
 in
   package.overrideAttrs (old: {
     passthru =
@@ -571,7 +813,7 @@ in
         tests =
           (old.passthru.tests or old.tests or {})
           // lib.optionalAttrs (!isCross) {
-            inherit autoGcInterrupt buildLogFastExit buildStatus curlMultiWakeup daemonSignal fetchGitHeadCache machoRewrite overlayLowerGainsOutput rustEvalShadowCensus rustEvalShadowFlake smoke sparseLocks;
+            inherit deferredStoreWrites remoteRetainedMapping contentAddressBoundaries remoteAdmissionProgress legacySshGc realisationSignatures autoGcInterrupt buildLogFastExit buildStatus curlMultiWakeup daemonSignal fetchGitHeadCache jjTreeFiltered jjTreeIdentity jjTreeLock jjTreeRelative lockFileWrites machoRewrite hostValueTests nixEvalRsClippy nixEvalRsTests nixEvalRsDocs nixHostRsTests nixHostRsDocs nixHostRsClippy rustRuntimeOwnership rustRuntimeSourceIsolation rustRuntimeUnitIsolation overlayLowerGainsOutput rustEvalTests smoke sparseLocks;
           };
       }
       // lib.optionalAttrs (updateScriptWriter != null) {

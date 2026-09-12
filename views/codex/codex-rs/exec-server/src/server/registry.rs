@@ -1,11 +1,17 @@
+use opentelemetry::trace::TraceContextExt;
 use std::sync::Arc;
 
+use crate::protocol::CAPABILITY_ROOTS_DISCOVER_METHOD;
+use crate::protocol::CapabilityRootsDiscoverParams;
+use crate::protocol::ENVIRONMENT_CONFIG_READ_METHOD;
 use crate::protocol::ENVIRONMENT_INFO_METHOD;
+use crate::protocol::ENVIRONMENT_STATUS_METHOD;
 use crate::protocol::EXEC_METHOD;
 use crate::protocol::EXEC_READ_METHOD;
 use crate::protocol::EXEC_SIGNAL_METHOD;
 use crate::protocol::EXEC_TERMINATE_METHOD;
 use crate::protocol::EXEC_WRITE_METHOD;
+use crate::protocol::EnvironmentConfigReadParams;
 use crate::protocol::ExecParams;
 use crate::protocol::FS_CANONICALIZE_METHOD;
 use crate::protocol::FS_CLOSE_METHOD;
@@ -63,13 +69,35 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
             handler.http_request(request_id, params).await
         },
     );
-    router.request(
+    router.request_with_trace(
         EXEC_METHOD,
-        |handler: Arc<ExecServerHandler>, params: ExecParams| async move { handler.exec(params).await },
+        |handler: Arc<ExecServerHandler>, params: ExecParams, trace| async move {
+            let launch_context = trace
+                .as_ref()
+                .and_then(codex_otel::context_from_w3c_trace_context)
+                .map(|context| context.span().span_context().clone());
+            handler.exec(params, launch_context).await
+        },
     );
     router.request(
         ENVIRONMENT_INFO_METHOD,
         |handler: Arc<ExecServerHandler>, _params: ()| async move { handler.environment_info() },
+    );
+    router.request(
+        ENVIRONMENT_CONFIG_READ_METHOD,
+        |handler: Arc<ExecServerHandler>, params: EnvironmentConfigReadParams| async move {
+            handler.environment_config_read(params).await
+        },
+    );
+    router.request(
+        ENVIRONMENT_STATUS_METHOD,
+        |handler: Arc<ExecServerHandler>, _params: ()| async move { handler.environment_status() },
+    );
+    router.request(
+        CAPABILITY_ROOTS_DISCOVER_METHOD,
+        |handler: Arc<ExecServerHandler>, params: CapabilityRootsDiscoverParams| async move {
+            handler.discover_capability_roots(params).await
+        },
     );
     router.request(
         EXEC_READ_METHOD,

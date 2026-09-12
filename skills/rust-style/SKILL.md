@@ -54,6 +54,8 @@ the crate's `Cargo.toml`, not the directory and not a `rust-` prefix:
 nix build .#legacyPackages.x86_64-linux.rustClippyChecksByPackage.<cargo-package-name>
 ```
 
+Before choosing ix Clippy work, read `lib/rust-clippy-gate-packages.nix`: available checks include both `gated` and `knownRed` packages. Compile affected dependencies and run required checks; historical known-red cleanup needs its own task scope. A new package must be classified after measuring its check. In the 2026-09-08 storage integration, selecting CAS-disk Clippy unnecessarily expanded into 1,519 diagnostics; that draft was parked and the required segstore checks resumed.
+
 The CLI lives at `crates/ix/cli` and its package is `ix`, so its check is
 `rustClippyChecksByPackage.ix`. It sits under `legacyPackages` rather than
 `checks` because the names come from a planner IFD and the values are nested
@@ -64,6 +66,14 @@ attrsets, and it evaluates only on Linux systems
 nix eval --json .#legacyPackages.x86_64-linux.rustClippyChecksByPackage \
   --apply builtins.attrNames
 ```
+
+After integrating Cargo manifest changes, reconcile each affected workspace's
+lock with the pinned Cargo and its actual offline vendor configuration in a
+private writable planner copy. Run the original `--frozen --offline` unit-graph
+commands afterward and verify the lock stays unchanged. Parsing or byte-matching
+a manually edited lock does not prove dependency consistency. Inspect every
+changed package, dependency edge, source, version and checksum; keep the
+production frozen check enabled.
 
 Prefer names that preserve the concept's path. Local aliases may shorten noisy
 source paths only when the shape remains visible at the call site. Keep singular

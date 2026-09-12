@@ -38,6 +38,74 @@ static UnkeyedValidPathInfo makeEmpty()
     };
 }
 
+/* ----------------------------------------------------------------------------
+ * Jujutsu tree objects: addressed by an id Nix cannot recompute
+ * --------------------------------------------------------------------------*/
+
+class JjTreePathInfoTest : public LibStoreTest
+{
+protected:
+    Hash treeId = Hash::parseSRI("blake3-TAPbLczl0EP0I9SGuLfWmVPhgmOEd9ABjIzodWGd+aA=", nativeIdXpSettings());
+};
+
+/* The whole read path: name plus id gives the store path, no bytes involved,
+   and it is the `output:out` scheme over `fixed:out:jj-tree:blake3:<hex>:`
+   (the algorithm is part of the payload, `store-dir-config.cc`) as the store
+   path specification says. */
+TEST_F(JjTreePathInfoTest, storePathFromIdAlone)
+{
+    auto path = store->makeFixedOutputPath(
+        "source", FixedOutputInfo{.method = FileIngestionMethod::JjTree, .hash = treeId, .references = {}});
+    auto expected = store->makeStorePath(
+        "output:out",
+        hashString(HashAlgorithm::SHA256, "fixed:out:jj-tree:" + treeId.to_string(HashFormat::Base16, true) + ":"),
+        "source");
+    EXPECT_EQ(path, expected);
+    EXPECT_EQ(
+        store->makeFixedOutputPathFromCA(
+            "source", ContentAddressWithReferences::fromParts(ContentAddressMethod::Raw::JjTree, treeId, {})),
+        expected);
+}
+
+TEST_F(JjTreePathInfoTest, storePathRefusesNonBlake3)
+{
+    EXPECT_THAT(
+        [&]() {
+            store->makeFixedOutputPath(
+                "source",
+                FixedOutputInfo{
+                    .method = FileIngestionMethod::JjTree,
+                    .hash = hashString(HashAlgorithm::SHA256, "not a tree id"),
+                    .references = {}});
+        },
+        testing::ThrowsMessage<Error>(testing::HasSubstr("BLAKE3")));
+}
+
+/* Content-addressed, yes: the path is the one the ca derives. Self-certifying,
+   no: nothing in Nix can check the id against the bytes, so without a
+   signature the object counts zero signatures, like an input-addressed path. */
+TEST_F(JjTreePathInfoTest, notSelfCertifying)
+{
+    auto info = ValidPathInfo::makeFromCA(
+        *store,
+        "source",
+        ContentAddressWithReferences::fromParts(ContentAddressMethod::Raw::JjTree, treeId, {}),
+        Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc="));
+    EXPECT_TRUE(info.isContentAddressed(*store));
+    EXPECT_FALSE(info.isSelfCertifying(*store));
+    EXPECT_EQ(info.checkSignatures(*store, PublicKeys{}), 0u);
+
+    /* Control: the same shape under NAR addressing is self-certifying. */
+    auto narInfo = ValidPathInfo::makeFromCA(
+        *store,
+        "source",
+        ContentAddressWithReferences::fromParts(
+            ContentAddressMethod::Raw::NixArchive, hashString(HashAlgorithm::SHA256, "bytes"), {}),
+        hashString(HashAlgorithm::SHA256, "bytes"));
+    EXPECT_TRUE(narInfo.isSelfCertifying(*store));
+    EXPECT_EQ(narInfo.checkSignatures(*store, PublicKeys{}), ValidPathInfo::maxSigs);
+}
+
 static ValidPathInfo makeFullKeyed(const Store & store, bool includeImpureInfo)
 {
     auto info = ValidPathInfo::makeFromCA(

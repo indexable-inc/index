@@ -25,7 +25,7 @@ struct ExperimentalFeatureDetails
  * feature, we either have no issue at all if few features are not added
  * at the end of the list, or a proper merge conflict if they are.
  */
-constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::RustEval);
+constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::ParallelEval);
 
 constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails = {{
     {
@@ -338,17 +338,6 @@ constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails
         .description = R"(
             Enable built-in functions for parallel evaluation, and let the
             `eval-cores` setting raise the evaluator's thread count above one.
-        )",
-        .trackingUrl = "",
-    },
-    {
-        .tag = Xp::RustEval,
-        .name = "rust-eval",
-        .description = R"(
-            Allow `eval-backend = rust`, which routes expression evaluation
-            through the in-tree Rust evaluator (`rust/nix-eval-rs`) instead of
-            the C++ tree-walking interpreter. Constructs the Rust evaluator
-            does not implement yet fail with `rust-eval unimplemented`.
         )",
         .trackingUrl = "",
     },

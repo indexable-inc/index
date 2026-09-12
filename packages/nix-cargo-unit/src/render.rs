@@ -298,6 +298,7 @@ struct SourceEntry {
     root: PathBuf,
     relative: String,
     include_relatives: Vec<String>,
+    excluded_relatives: Vec<String>,
     source_key: String,
     /// Placeholder this source's store path is rewritten to, see
     /// [`source_remap_prefix`].
@@ -372,6 +373,18 @@ impl SourceEntry {
 
     fn nix_expr(&self) -> String {
         match self.base {
+            SourceBase::Workspace if !self.excluded_relatives.is_empty() => format!(
+                "scopedWorkspaceSourceExcluding {} {} {}",
+                nix_attr(&self.name),
+                nix_attr(&self.relative),
+                nix_string_list(&self.excluded_relatives)
+            ),
+            SourceBase::WorkspaceClosure if !self.excluded_relatives.is_empty() => format!(
+                "scopedWorkspaceClosureSourceExcluding {} {} {}",
+                nix_attr(&self.name),
+                nix_string_list(&self.include_relatives),
+                nix_string_list(&self.excluded_relatives)
+            ),
             SourceBase::Workspace => format!(
                 "scopedWorkspaceSource {} {}",
                 nix_attr(&self.name),
@@ -455,10 +468,7 @@ pub fn render_units_nix(graph: &UnitGraph, options: &RenderOptions) -> Result<St
             "test_name_unit_entries",
             render_test_name_unit_entries(graph, options, &prepared)?,
         ),
-        (
-            "rmeta_stability_args",
-            render_rmeta_stability_args(options),
-        ),
+        ("rmeta_stability_args", render_rmeta_stability_args(options)),
         (
             "doctest_target_entries",
             render_doctest_target_entries(graph, &prepared, options)?,
@@ -716,9 +726,17 @@ fn render_source_entries(prepared: &PreparedGraph) -> String {
 fn render_source_audit_entries(prepared: &PreparedGraph) -> String {
     let mut entries = String::new();
     for (key, source) in &prepared.source_entries {
+        let exclusions = if source.excluded_relatives.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " excludedRelatives = {};",
+                nix_string_list(&source.excluded_relatives)
+            )
+        };
         let _ = writeln!(
             entries,
-            "    {} = {{ base = {}; scope = {}; relative = {}; includeRelatives = {}; sourceKey = {}; remapPrefix = {}; }};",
+            "    {} = {{ base = {}; scope = {}; relative = {}; includeRelatives = {}; sourceKey = {}; remapPrefix = {};{} }};",
             nix_attr(key),
             nix_attr(source.base.audit_label()),
             nix_attr(source.base.scope().audit_label()),
@@ -726,6 +744,7 @@ fn render_source_audit_entries(prepared: &PreparedGraph) -> String {
             nix_string_list(&source.include_relatives),
             nix_attr(&source.source_key),
             nix_attr(&source.remap_prefix),
+            exclusions,
         );
     }
     entries
@@ -768,6 +787,74 @@ impl PreparedGraph {
     }
 }
 
+fn workspace_package_roots(graph: &UnitGraph) -> BTreeSet<PathBuf> {
+    graph
+        .units
+        .iter()
+        .filter(|unit| !unit.is_external())
+        .filter_map(|unit| local_package_root_from_pkg_id(&unit.pkg_id))
+        .collect()
+}
+
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct LocalSourceCacheKey {
+    package_id: String,
+    package_name: String,
+    package_version: String,
+    root: PathBuf,
+    has_build_script: bool,
+    input_class: SourceInputClass,
+}
+
+/// Cache only within this render: the next invocation re-reads source inputs.
+/// Production and test sources may differ only under an explicit package
+/// contract. Include that class in both this cache and the emitted source key.
+fn prepare_sources(
+    graph: &UnitGraph,
+    options: &RenderOptions,
+) -> Result<(Vec<String>, BTreeMap<String, SourceEntry>)> {
+    let workspace_packages = workspace_package_roots(graph);
+    // A build script may read arbitrary package-relative files. Keep its
+    // package intact instead of inferring those inputs from Rust includes.
+    let build_script_packages: BTreeSet<&str> = graph
+        .units
+        .iter()
+        .filter(|unit| unit.is_custom_build_compile())
+        .map(|unit| unit.pkg_id.as_str())
+        .collect();
+    let mut source_refs = Vec::with_capacity(graph.units.len());
+    let mut source_entries = BTreeMap::new();
+    let mut local_cache: BTreeMap<LocalSourceCacheKey, SourceEntry> =
+        BTreeMap::new();
+    for unit in &graph.units {
+        let has_build_script = build_script_packages.contains(unit.pkg_id.as_str());
+        let local_key = (!unit.is_external()).then(|| LocalSourceCacheKey {
+            package_id: unit.pkg_id.clone(),
+            package_name: unit.package_name().into_owned(),
+            package_version: unit.package_version().to_owned(),
+            root: local_package_root_from_pkg_id(&unit.pkg_id)
+                .unwrap_or_else(|| crate_root_for_unit(unit)),
+            has_build_script,
+            input_class: source_input_class(unit),
+        });
+        let source = if let Some(cached) = local_key.as_ref().and_then(|key| local_cache.get(key)) {
+            cached.clone()
+        } else {
+            let source =
+                source_entry_for_unit(unit, options, &workspace_packages, has_build_script)?;
+            if let Some(key) = local_key {
+                local_cache.insert(key, source.clone());
+            }
+            source
+        };
+        let key = source.name.clone();
+        source_refs.push(key.clone());
+        source_entries.entry(key).or_insert(source);
+    }
+
+    Ok((source_refs, source_entries))
+}
+
 fn prepare_graph(graph: &UnitGraph, options: &RenderOptions) -> Result<PreparedGraph> {
     let mut hashes = vec![None; graph.units.len()];
     for index in 0..graph.units.len() {
@@ -806,14 +893,7 @@ fn prepare_graph(graph: &UnitGraph, options: &RenderOptions) -> Result<PreparedG
         })
         .collect();
 
-    let mut source_refs = Vec::with_capacity(graph.units.len());
-    let mut source_entries = BTreeMap::new();
-    for unit in &graph.units {
-        let source = source_entry_for_unit(unit, options)?;
-        let key = source.name.clone();
-        source_refs.push(key.clone());
-        source_entries.entry(key).or_insert(source);
-    }
+    let (source_refs, source_entries) = prepare_sources(graph, options)?;
 
     let mut build_script_runs = BTreeMap::new();
     for (index, unit) in graph.units.iter().enumerate() {
@@ -994,9 +1074,9 @@ struct UnitDerivation<'a> {
     install_phase: String,
     // `Some` only for a unit that compiles the package's own code, so
     // `packageBuildEnv.<package>` can be merged onto its env in the template.
-    // `None` for the clippy and panic-object check units: build env is for
-    // producing the artifact, not for lints, and tagging them would needlessly
-    // invalidate them when the env changes.
+    // Clippy compiles the same source, including env! expressions, and needs
+    // the same package-scoped environment and lint configuration.
+    // Panic-object checks currently have no package tag.
     package_name: Option<String>,
 }
 
@@ -1107,7 +1187,7 @@ fn render_clippy_unit(
             native_build_inputs: "[ rustToolchain ] ++ extraNativeBuildInputs ++ extraClippyNativeBuildInputs",
             driver: Driver::Clippy,
             install_phase: "mkdir -p $out\n".to_string(),
-            package_name: None,
+            package_name: Some(graph.units[index].package_name().into_owned()),
         },
     )
 }
@@ -2267,9 +2347,16 @@ fn render_build_script_run_phase(
         shell::quote(source.package_root())
     )?;
     script.push_str("mkdir -p \"$build_script_manifest_dir\"\n");
-    script.push_str(
-        "cp -RL \"$build_script_manifest_dir_source\"/. \"$build_script_manifest_dir\"/\n",
-    );
+    // Includes and symlinks can declare inputs outside the package directory.
+    // Preserve their workspace-relative layout when the build script reads
+    // those same inputs at runtime through CARGO_MANIFEST_DIR.
+    if source.base.scope() == SourceScope::Closure {
+        script.push_str("cp -RL \"$src\"/. \"$out\"/\n");
+    } else {
+        script.push_str(
+            "cp -RL \"$build_script_manifest_dir_source\"/. \"$build_script_manifest_dir\"/\n",
+        );
+    }
     script.push_str("chmod -R u+w \"$build_script_manifest_dir\"\n");
     // Cargo nests OUT_DIR several levels deep
     // (`target/<profile>/build/<pkg>-<hash>/out`), so a build script can write
@@ -2895,7 +2982,122 @@ fn nearest_manifest_root(source: &Path) -> Option<PathBuf> {
     }
 }
 
-fn source_entry_for_unit(unit: &Unit, options: &RenderOptions) -> Result<SourceEntry> {
+/// A test-only input contract is never inferred from a filename or Rust text.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum SourceInputClass {
+    Complete,
+    Production,
+}
+
+fn source_input_class(unit: &Unit) -> SourceInputClass {
+    // Check-mode library units do not set cfg(test); test harness units do.
+    // Unknown modes and user flags that can enable test compilation keep all
+    // inputs. Build-script packages are handled separately at the boundary.
+    let opaque_test_flags = unit
+        .profile
+        .rustflags
+        .iter()
+        .chain(&unit.lint_rustflags)
+        .chain(&unit.check_cfg_args)
+        .any(|flag| {
+            flag == "test"
+                || flag.starts_with("--test")
+                || flag.starts_with("--cfg")
+                || flag.starts_with('@')
+        });
+    if unit.is_library()
+        && !unit.is_test()
+        && !unit.is_benchmark()
+        && matches!(unit.mode, UnitMode::Build | UnitMode::Check)
+        && !opaque_test_flags
+    {
+        SourceInputClass::Production
+    } else {
+        SourceInputClass::Complete
+    }
+}
+
+/// Opt-in contract: these paths are read only by test targets or cfg(test) modules.
+/// Package owners must audit procedural macros and other implicit file reads.
+/// Known includes, path attributes and uncertain source syntax still retain
+/// inputs through the existing conservative source-closure scanner.
+fn test_source_exclusions(
+    unit: &Unit,
+    package_root: &Path,
+    has_build_script: bool,
+) -> Result<BTreeSet<PathBuf>> {
+    let manifest_path = package_root.join("Cargo.toml");
+    if !manifest_path.is_file() {
+        return Ok(BTreeSet::new());
+    }
+    let manifest: toml::Value = toml::from_str(&fs::read_to_string(manifest_path)?)?;
+    let setting = ["package", "metadata", "ix", "inputs", "test-only"]
+        .iter()
+        .try_fold(&manifest, |value, key| value.get(*key));
+    let Some(setting) = setting else {
+        return Ok(BTreeSet::new());
+    };
+    let paths = setting.as_array().ok_or_else(|| {
+        eyre!("package.metadata.ix.inputs.test-only must be an array of relative paths")
+    })?;
+    let mut excluded = BTreeSet::new();
+    for value in paths {
+        let relative = Path::new(value.as_str().ok_or_else(|| {
+            eyre!("package.metadata.ix.inputs.test-only entries must be strings")
+        })?);
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(eyre!(
+                "test-only input must be a package-relative path: {}",
+                relative.display()
+            ));
+        }
+        let path = package_root.join(relative);
+        let mut ancestor = path.as_path();
+        while ancestor != package_root {
+            if fs::symlink_metadata(ancestor)?.file_type().is_symlink() {
+                return Err(eyre!(
+                    "test-only input cannot traverse a symlink: {}",
+                    path.display()
+                ));
+            }
+            ancestor = ancestor
+                .parent()
+                .ok_or_else(|| eyre!("test-only input has no parent"))?;
+        }
+        if !(path.is_file() || path.is_dir()) || !excluded.insert(path) {
+            return Err(eyre!(
+                "test-only inputs must be unique regular files or directories"
+            ));
+        }
+    }
+    // Explicit/custom and implicit build scripts can read arbitrary files.
+    let package_build = manifest
+        .get("package")
+        .and_then(|package| package.get("build"));
+    let manifest_build_script = match package_build {
+        Some(toml::Value::Boolean(false)) => false,
+        Some(_) => true,
+        None => package_root.join("build.rs").exists(),
+    };
+    if has_build_script
+        || manifest_build_script
+        || source_input_class(unit) == SourceInputClass::Complete
+    {
+        excluded.clear();
+    }
+    Ok(excluded)
+}
+
+fn source_entry_for_unit(
+    unit: &Unit,
+    options: &RenderOptions,
+    workspace_packages: &BTreeSet<PathBuf>,
+    has_build_script: bool,
+) -> Result<SourceEntry> {
     if unit.is_external() {
         let vendor_root = options.vendor_root.as_ref().ok_or_else(|| {
             eyre!(
@@ -2918,14 +3120,25 @@ fn source_entry_for_unit(unit: &Unit, options: &RenderOptions) -> Result<SourceE
             root: scoped.root,
             relative: scoped.relative,
             include_relatives: scoped.include_relatives,
+            excluded_relatives: Vec::new(),
             source_key,
             remap_prefix: source_remap_prefix(unit),
         });
     }
 
-    let scoped = local_source_root_for_unit(unit, &options.workspace_root)?;
+    let (scoped, excluded_relatives) = local_source_root_for_unit(
+        unit,
+        &options.workspace_root,
+        workspace_packages,
+        has_build_script,
+    )?;
 
-    let source_key = local_source_key(unit);
+    let mut source_key = local_source_key(unit);
+    let package_root =
+        local_package_root_from_pkg_id(&unit.pkg_id).unwrap_or_else(|| crate_root_for_unit(unit));
+    if !test_source_exclusions(unit, &package_root, has_build_script)?.is_empty() {
+        source_key.push_str("#production");
+    }
 
     Ok(SourceEntry {
         name: source_name(SourceBase::Workspace, unit, &source_key, &scoped.relative),
@@ -2936,12 +3149,114 @@ fn source_entry_for_unit(unit: &Unit, options: &RenderOptions) -> Result<SourceE
         root: scoped.root,
         relative: scoped.relative,
         include_relatives: scoped.include_relatives,
+        excluded_relatives,
         source_key,
         remap_prefix: source_remap_prefix(unit),
     })
 }
 
-fn local_source_root_for_unit(unit: &Unit, workspace_root: &Path) -> Result<ScopedSourceRoot> {
+fn nested_manifest_roots(package_root: &Path) -> Result<BTreeSet<PathBuf>> {
+    let mut roots = BTreeSet::new();
+    let mut pending = vec![package_root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        if !directory.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let relative = path.strip_prefix(package_root)?;
+            if relative.components().next().is_some_and(|part| {
+                matches!(
+                    part.as_os_str().to_str(),
+                    Some("src" | "tests" | "examples" | "benches")
+                )
+            }) {
+                continue;
+            }
+            if path.join("Cargo.toml").is_file() {
+                roots.insert(path);
+            } else {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(roots)
+}
+
+/// Opt-in boundary: callers must audit build tools and procedural macros for
+/// reads into nested packages before declaring this source split. Textual
+/// include detection preserves known references; it is not such an audit.
+fn nested_package_filter_enabled(package_root: &Path) -> Result<bool> {
+    let path = package_root.join("Cargo.toml");
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let manifest: toml::Value = toml::from_str(&fs::read_to_string(path)?)?;
+    let setting = [
+        "package",
+        "metadata",
+        "ix",
+        "inputs",
+        "exclude-nested-packages",
+    ]
+    .iter()
+    .try_fold(&manifest, |value, key| value.get(*key));
+    match setting {
+        None => Ok(false),
+        Some(toml::Value::Boolean(enabled)) => Ok(*enabled),
+        Some(_) => Err(eyre!(
+            "package.metadata.ix.inputs.exclude-nested-packages must be a boolean"
+        )),
+    }
+}
+
+fn manifest_needs_nested_inputs(package_root: &Path, excluded: &BTreeSet<PathBuf>) -> Result<bool> {
+    if excluded.is_empty() {
+        return Ok(false);
+    }
+    let manifest_path = package_root.join("Cargo.toml");
+    if !manifest_path.is_file() {
+        return Ok(true);
+    }
+    let manifest: toml::Value = toml::from_str(&fs::read_to_string(manifest_path)?)?;
+    match manifest
+        .get("package")
+        .and_then(|package| package.get("build"))
+    {
+        Some(toml::Value::Boolean(false)) => {}
+        Some(_) => return Ok(true),
+        None if package_root.join("build.rs").exists() => return Ok(true),
+        None => {}
+    }
+    for name in ["lib", "bin", "example", "test", "bench"] {
+        let Some(value) = manifest.get(name) else {
+            continue;
+        };
+        let targets = value
+            .as_array()
+            .map_or_else(|| std::slice::from_ref(value), Vec::as_slice);
+        for target in targets {
+            if let Some(path) = target.get("path").and_then(toml::Value::as_str) {
+                let path = normalize_path(&package_root.join(path));
+                if excluded.iter().any(|boundary| path.starts_with(boundary)) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn local_source_root_for_unit(
+    unit: &Unit,
+    workspace_root: &Path,
+    workspace_packages: &BTreeSet<PathBuf>,
+    has_build_script: bool,
+) -> Result<(ScopedSourceRoot, Vec<String>)> {
     let package_root =
         local_package_root_from_pkg_id(&unit.pkg_id).unwrap_or_else(|| crate_root_for_unit(unit));
     relative_path_string(&package_root, workspace_root).map_err(|_| {
@@ -2955,23 +3270,80 @@ fn local_source_root_for_unit(unit: &Unit, workspace_root: &Path) -> Result<Scop
     })?;
 
     let package_relative = relative_path_string(&package_root, workspace_root)?;
-    let include_relatives = source_closure_relatives(&package_root, workspace_root)?;
+    // Manifest boundaries make the source identity independent of which
+    // nested packages happen to be selected in this unit graph.
+    let mut known_packages = BTreeSet::new();
+    if nested_package_filter_enabled(&package_root)? {
+        known_packages = nested_manifest_roots(&package_root)?;
+        known_packages.extend(workspace_packages.iter().cloned());
+    }
+    let mut excluded: BTreeSet<PathBuf> = known_packages
+        .iter()
+        .filter(|path| {
+            !has_build_script && *path != &package_root && path.starts_with(&package_root)
+        })
+        .filter(|path| {
+            // Nested fixture/module packages in a conventional Rust target
+            // directory remain inputs of that target.
+            let first = path
+                .strip_prefix(&package_root)
+                .unwrap()
+                .components()
+                .next();
+            !first.is_some_and(|part| {
+                matches!(
+                    part.as_os_str().to_str(),
+                    Some("src" | "tests" | "examples" | "benches")
+                )
+            })
+        })
+        .cloned()
+        .collect();
+    // Only outermost boundaries matter. A selected grandchild must not
+    // change the filter of a parent whose child is already excluded.
+    let boundaries = excluded.clone();
+    excluded.retain(|path| {
+        !path
+            .ancestors()
+            .skip(1)
+            .any(|parent| boundaries.contains(parent))
+    });
+    if manifest_needs_nested_inputs(&package_root, &excluded)? {
+        excluded.clear();
+    }
+    excluded.extend(test_source_exclusions(
+        unit,
+        &package_root,
+        has_build_script,
+    )?);
+    let include_relatives =
+        source_closure_with_exclusions(&package_root, workspace_root, &mut excluded)?;
+    let excluded_relatives: Vec<String> = excluded
+        .iter()
+        .map(|path| relative_path_string(path, workspace_root))
+        .collect::<Result<_>>()?;
 
     if include_relatives.len() > 1 || include_relatives.first() != Some(&package_relative) {
-        return Ok(ScopedSourceRoot {
-            root: workspace_root.to_path_buf(),
-            scope: SourceScope::Closure,
-            relative: package_relative,
-            include_relatives,
-        });
+        return Ok((
+            ScopedSourceRoot {
+                root: workspace_root.to_path_buf(),
+                scope: SourceScope::Closure,
+                relative: package_relative,
+                include_relatives,
+            },
+            excluded_relatives,
+        ));
     }
 
-    Ok(ScopedSourceRoot {
-        root: package_root,
-        scope: SourceScope::Package,
-        relative: package_relative.clone(),
-        include_relatives: vec![package_relative],
-    })
+    Ok((
+        ScopedSourceRoot {
+            root: package_root,
+            scope: SourceScope::Package,
+            relative: package_relative.clone(),
+            include_relatives: vec![package_relative],
+        },
+        excluded_relatives,
+    ))
 }
 
 fn vendored_source_root_for_unit(unit: &Unit, vendor_root: &Path) -> Result<ScopedSourceRoot> {
@@ -3136,6 +3508,14 @@ fn file_url_path(path: &str) -> Option<PathBuf> {
 }
 
 fn source_closure_relatives(root: &Path, source_boundary: &Path) -> Result<Vec<String>> {
+    source_closure_with_exclusions(root, source_boundary, &mut BTreeSet::new())
+}
+
+fn source_closure_with_exclusions(
+    root: &Path,
+    source_boundary: &Path,
+    excluded: &mut BTreeSet<PathBuf>,
+) -> Result<Vec<String>> {
     let source_boundary = normalize_path(source_boundary);
     let mut included_roots = BTreeSet::from([normalize_path(root)]);
     let mut queue = VecDeque::from([normalize_path(root)]);
@@ -3146,6 +3526,7 @@ fn source_closure_relatives(root: &Path, source_boundary: &Path) -> Result<Vec<S
             &source_boundary,
             &mut included_roots,
             &mut queue,
+            excluded,
         )?;
     }
 
@@ -3160,14 +3541,18 @@ fn collect_source_closure_roots(
     source_boundary: &Path,
     included_roots: &mut BTreeSet<PathBuf>,
     queue: &mut VecDeque<PathBuf>,
+    excluded: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
-    if !root.exists() || !root.is_dir() {
+    if excluded.contains(root) || !root.exists() || !root.is_dir() {
         return Ok(());
     }
 
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
+        if excluded.contains(&path) {
+            continue;
+        }
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             let target = fs::read_link(&path)?;
@@ -3187,6 +3572,7 @@ fn collect_source_closure_roots(
                 ));
             }
 
+            retain_referenced_packages(&target, excluded, queue);
             if !path_is_covered_by_roots(&target, included_roots) {
                 if target.is_dir() {
                     queue.push_back(target.clone());
@@ -3194,13 +3580,92 @@ fn collect_source_closure_roots(
                 included_roots.insert(target);
             }
         } else if file_type.is_dir() {
-            collect_source_closure_roots(&path, source_boundary, included_roots, queue)?;
+            collect_source_closure_roots(&path, source_boundary, included_roots, queue, excluded)?;
         } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
-            scan_rust_includes_into_closure(&path, source_boundary, included_roots, queue);
+            scan_rust_includes_into_closure(
+                &path,
+                source_boundary,
+                included_roots,
+                queue,
+                excluded,
+            )?;
         }
     }
 
     Ok(())
+}
+
+#[derive(Default)]
+struct SourceScopeSyntax {
+    preserve_nested: bool,
+    includes: Vec<ScannedIncludePath>,
+}
+
+fn contains_path_token(stream: proc_macro2::TokenStream) -> bool {
+    stream.into_iter().any(|token| match token {
+        proc_macro2::TokenTree::Ident(name) => name.to_string().trim_start_matches("r#") == "path",
+        proc_macro2::TokenTree::Group(group) => contains_path_token(group.stream()),
+        _ => false,
+    })
+}
+
+/// Read macro and attribute token boundaries without interpreting Rust expressions.
+/// Comments and literal contents cannot masquerade as a module-path attribute.
+fn source_scope_syntax(source: &str) -> Option<SourceScopeSyntax> {
+    use proc_macro2::{Delimiter, TokenTree};
+    let mut pending = vec![source.parse::<proc_macro2::TokenStream>().ok()?];
+    let mut result = SourceScopeSyntax::default();
+    while let Some(stream) = pending.pop() {
+        let tokens: Vec<_> = stream.into_iter().collect();
+        for (index, token) in tokens.iter().enumerate() {
+            if let TokenTree::Group(group) = token {
+                pending.push(group.stream());
+            }
+            if matches!(token, TokenTree::Punct(mark) if mark.as_char() == '#') {
+                let next = index
+                    + 1
+                    + usize::from(
+                        matches!(tokens.get(index + 1), Some(TokenTree::Punct(mark)) if mark.as_char() == '!'),
+                    );
+                match tokens.get(next) {
+                    Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Bracket => {
+                        result.preserve_nested |= contains_path_token(group.stream());
+                    }
+                    _ => result.preserve_nested = true,
+                }
+            }
+            let TokenTree::Ident(name) = token else {
+                continue;
+            };
+            if !matches!(
+                name.to_string().trim_start_matches("r#"),
+                "include" | "include_str" | "include_bytes"
+            ) || !matches!(tokens.get(index + 1), Some(TokenTree::Punct(mark)) if mark.as_char() == '!')
+            {
+                continue;
+            }
+            let Some(TokenTree::Group(group)) = tokens.get(index + 2) else {
+                result.preserve_nested = true;
+                continue;
+            };
+            let args: Vec<_> = group.stream().into_iter().collect();
+            let literal = match args.as_slice() {
+                [TokenTree::Literal(value)] => Some(value),
+                [TokenTree::Literal(value), TokenTree::Punct(comma)] if comma.as_char() == ',' => {
+                    Some(value)
+                }
+                _ => None,
+            };
+            match literal.and_then(|value| parse_rust_string_literal(&value.to_string())) {
+                Some(path) if !path.is_empty() => result.includes.push(ScannedIncludePath {
+                    path,
+                    require_existing_file: false,
+                }),
+                _ => result.preserve_nested = true,
+            }
+        }
+    }
+    Some(result)
 }
 
 /// Extend `included_roots` / `queue` with any directories reached through
@@ -3218,13 +3683,29 @@ fn scan_rust_includes_into_closure(
     source_boundary: &Path,
     included_roots: &mut BTreeSet<PathBuf>,
     queue: &mut VecDeque<PathBuf>,
-) {
-    let Ok(source) = fs::read_to_string(file) else {
-        return;
+    excluded: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let source = match fs::read_to_string(file) {
+        Ok(source) => source,
+        Err(_) if excluded.is_empty() => return Ok(()),
+        Err(error) => return Err(error.into()),
     };
+    let mut candidates = extract_include_macro_paths(&source);
+    if !excluded.is_empty() {
+        match source_scope_syntax(&source) {
+            Some(syntax) => {
+                candidates.extend(syntax.includes);
+                if syntax.preserve_nested || source.contains("CARGO_MANIFEST_DIR") {
+                    queue.extend(std::mem::take(excluded));
+                }
+            }
+            // Tokenization uncertainty cannot justify omitting an input.
+            None => queue.extend(std::mem::take(excluded)),
+        }
+    }
 
     let file_dir = file.parent().unwrap_or(file);
-    for candidate in extract_include_macro_paths(&source) {
+    for candidate in candidates {
         let resolved = normalize_path(&file_dir.join(&candidate.path));
         if !resolved.starts_with(source_boundary) {
             continue;
@@ -3237,10 +3718,30 @@ fn scan_rust_includes_into_closure(
         let Some(include_root) = include_closure_root(&resolved, source_boundary) else {
             continue;
         };
+        // Closure widening uses the parent directory, but only the actual
+        // referenced path can require a previously excluded input.
+        retain_referenced_packages(&resolved, excluded, queue);
         if !path_is_covered_by_roots(&include_root, included_roots) {
             queue.push_back(include_root.clone());
             included_roots.insert(include_root);
         }
+    }
+    Ok(())
+}
+
+/// A read into a nested package preserves the original package tree. Keeping
+/// all nested inputs in this case also avoids changing its identity when a
+/// different target selection exposes additional descendant packages.
+fn retain_referenced_packages(
+    target: &Path,
+    excluded: &mut BTreeSet<PathBuf>,
+    queue: &mut VecDeque<PathBuf>,
+) {
+    if excluded
+        .iter()
+        .any(|path| target.starts_with(path) || path.starts_with(target))
+    {
+        queue.extend(std::mem::take(excluded));
     }
 }
 
@@ -3395,8 +3896,8 @@ fn parse_rust_string_literal(source: &str) -> Option<String> {
                 Some('"') => literal.push('"'),
                 Some('\'') => literal.push('\''),
                 Some('\\') => literal.push('\\'),
-                Some(other) => literal.push(other),
-                None => break,
+                // Unsupported Rust escapes cannot justify omitting a source input.
+                _ => return None,
             }
         } else {
             literal.push(c);
@@ -3764,7 +4265,10 @@ fn append_doctest_link_args(script: &mut String, unit: &Unit, mode: DoctestComma
     if let Some(platform) = &unit.platform {
         let env_name = cargo_target_linker_env_name(platform);
         let _ = writeln!(script, "if [ \"''${{{env_name}+x}}\" = x ]; then");
-        let _ = writeln!(script, "  rustdoc_args+=( -C \"linker=''${{{env_name}}}\" )");
+        let _ = writeln!(
+            script,
+            "  rustdoc_args+=( -C \"linker=''${{{env_name}}}\" )"
+        );
         script.push_str("fi\n");
     }
 }
@@ -4967,7 +5471,7 @@ mod tests {
             deny_unused_crate_dependencies: false,
             deny_panics,
             embed_metadata: true,
-                rmeta_stability_flags: vec![],
+            rmeta_stability_flags: vec![],
         };
 
         let rendered = render_units_nix(&graph, &options(true)).unwrap();
@@ -5742,7 +6246,7 @@ version = "0.1.0"
             deny_unused_crate_dependencies: false,
             deny_panics: false,
             embed_metadata: true,
-                rmeta_stability_flags: vec![],
+            rmeta_stability_flags: vec![],
         };
         let rendered = render_units_nix(&graph, &options).unwrap();
         let prepared = prepare_graph(&graph, &options).unwrap();
@@ -5905,6 +6409,594 @@ version = "0.1.0"
             1
         );
         assert!(rendered.contains("$out/nix-support/unused-crate-dependencies"));
+    }
+
+    fn nested_package_fixture() -> (tempfile::TempDir, UnitGraph, BTreeSet<PathBuf>) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("parent");
+        for relative in ["src", "child/src", "tests/fixture/src"] {
+            fs::create_dir_all(root.join(relative)).unwrap();
+        }
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"parent\"\nversion = \"0.1.0\"\n[package.metadata.ix.inputs]\nexclude-nested-packages = true\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("child/Cargo.toml"),
+            "[package]\nname = \"child\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn parent() {}\n").unwrap();
+        fs::write(root.join("child/src/lib.rs"), "pub fn child() {}\n").unwrap();
+        let graph = single_library_graph(
+            &format!("path+file://{}#parent@0.1.0", root.display()),
+            "parent",
+            &root.join("src/lib.rs").to_string_lossy(),
+            "2024",
+        );
+        let packages =
+            BTreeSet::from([root.clone(), root.join("child"), root.join("tests/fixture")]);
+        (temp, graph, packages)
+    }
+
+    struct TestInputFixture {
+        temp: tempfile::TempDir,
+        graph: UnitGraph,
+        options: RenderOptions,
+    }
+
+    fn test_input_fixture() -> TestInputFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("fixture");
+        fs::create_dir_all(root.join("src/tests")).unwrap();
+        fs::create_dir_all(root.join("migrations")).unwrap();
+        fs::write(root.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[package.metadata.ix.inputs]\ntest-only = [\"src/tests.rs\", \"src/tests/data.rs\"]\n").unwrap();
+        fs::write(root.join("src/lib.rs"),
+            "#[cfg(test)] mod tests;\npub const SQL: &str = include_str!(\"../migrations/one.sql\");\n").unwrap();
+        fs::write(
+            root.join("src/tests.rs"),
+            "mod data;\n#[test] fn database() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/tests/data.rs"), "pub const ROW: u8 = 1;\n").unwrap();
+        fs::write(root.join("migrations/one.sql"), "SELECT 1;\n").unwrap();
+        let mut graph = single_library_graph(
+            &format!("path+file://{}#fixture@0.1.0", root.display()),
+            "fixture",
+            &root.join("src/lib.rs").to_string_lossy(),
+            "2024",
+        );
+        let mut test = graph.units[0].clone();
+        test.mode = UnitMode::Test;
+        graph.units.push(test);
+        let options = RenderOptions {
+            workspace_root: temp.path().to_path_buf(),
+            vendor_root: None,
+            cargo_lock_sources: CargoLockSources::default(),
+            content_addressed: true,
+            toolchain_id: None,
+            deny_unused_crate_dependencies: false,
+            deny_panics: false,
+            embed_metadata: true,
+            rmeta_stability_flags: vec![],
+        };
+        TestInputFixture {
+            temp,
+            graph,
+            options,
+        }
+    }
+
+    // Observe the bytes selected by the emitted source boundary, rather than
+    // treating equal source-entry names as evidence of equal file contents.
+    fn selected_source_bytes(entry: &SourceEntry, workspace: &Path) -> BTreeMap<String, Vec<u8>> {
+        let mut pending = vec![entry.root.clone()];
+        let mut files = BTreeMap::new();
+        while let Some(path) = pending.pop() {
+            let relative = relative_path_string(&path, workspace).unwrap();
+            if entry.excluded_relatives.iter().any(|excluded| {
+                relative == *excluded || relative.starts_with(&format!("{excluded}/"))
+            }) {
+                continue;
+            }
+            if path.is_dir() {
+                pending.extend(
+                    fs::read_dir(path)
+                        .unwrap()
+                        .map(|child| child.unwrap().path()),
+                );
+            } else {
+                files.insert(relative, fs::read(path).unwrap());
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn test_only_edits_preserve_production_inputs_but_change_test_inputs() {
+        let TestInputFixture {
+            temp,
+            graph,
+            options,
+        } = test_input_fixture();
+        let (refs, entries) = prepare_sources(&graph, &options).unwrap();
+        assert_ne!(refs[0], refs[1]);
+        assert_eq!(entries.len(), 2);
+        let production = selected_source_bytes(&entries[&refs[0]], temp.path());
+        let tests = selected_source_bytes(&entries[&refs[1]], temp.path());
+        assert_eq!(
+            entries[&refs[0]].excluded_relatives,
+            ["fixture/src/tests/data.rs", "fixture/src/tests.rs"]
+        );
+        assert!(entries[&refs[1]].excluded_relatives.is_empty());
+        let rendered = render_units_nix(&graph, &options).unwrap();
+        assert!(rendered.contains("scopedWorkspaceSourceExcluding"));
+        fs::write(
+            temp.path().join("fixture/src/tests/data.rs"),
+            "pub const ROW: u8 = 2;\n",
+        )
+        .unwrap();
+        let (after_refs, after) = prepare_sources(&graph, &options).unwrap();
+        assert_eq!(refs, after_refs);
+        assert_eq!(
+            production,
+            selected_source_bytes(&after[&refs[0]], temp.path())
+        );
+        assert_ne!(tests, selected_source_bytes(&after[&refs[1]], temp.path()));
+        fs::write(
+            temp.path().join("fixture/migrations/one.sql"),
+            "SELECT 2;\n",
+        )
+        .unwrap();
+        let (sql_refs, sql_entries) = prepare_sources(&graph, &options).unwrap();
+        assert_ne!(
+            production,
+            selected_source_bytes(&sql_entries[&sql_refs[0]], temp.path())
+        );
+        fs::write(
+            temp.path().join("fixture/migrations/one.sql"),
+            "SELECT 1;\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("fixture/src/lib.rs"),
+            "pub fn changed() {}\n",
+        )
+        .unwrap();
+        let (code_refs, code_entries) = prepare_sources(&graph, &options).unwrap();
+        assert_ne!(
+            production,
+            selected_source_bytes(&code_entries[&code_refs[0]], temp.path())
+        );
+    }
+
+    #[test]
+    fn test_source_classes_are_independent_of_unit_order_and_render_history() {
+        let TestInputFixture {
+            temp,
+            mut graph,
+            options,
+        } = test_input_fixture();
+        let (refs, entries) = prepare_sources(&graph, &options).unwrap();
+        graph.units.reverse();
+        let (reversed, reversed_entries) = prepare_sources(&graph, &options).unwrap();
+        assert_eq!(refs, reversed.into_iter().rev().collect::<Vec<_>>());
+        assert_eq!(entries, reversed_entries);
+        fs::write(
+            temp.path().join("fixture/src/lib.rs"),
+            "include!(\"tests/data.rs\");\n",
+        )
+        .unwrap();
+        let (_, changed) = prepare_sources(&graph, &options).unwrap();
+        assert!(
+            changed
+                .values()
+                .all(|source| source.excluded_relatives.is_empty())
+        );
+    }
+
+    #[test]
+    fn test_input_contract_retains_build_script_and_uncertain_compile_inputs() {
+        let TestInputFixture {
+            temp,
+            graph,
+            options,
+        } = test_input_fixture();
+        let packages = workspace_package_roots(&graph);
+        for source in [
+            "include!(concat!(\"tests/\", \"data.rs\"));\n",
+            "#[path = \"tests/data.rs\"] mod fixture;\n",
+            "const ROOT: &str = env!(\"CARGO_MANIFEST_DIR\");\n",
+        ] {
+            fs::write(temp.path().join("fixture/src/lib.rs"), source).unwrap();
+            let entry = source_entry_for_unit(&graph.units[0], &options, &packages, false).unwrap();
+            assert!(entry.excluded_relatives.is_empty(), "{source}");
+        }
+        fs::write(
+            temp.path().join("fixture/src/lib.rs"),
+            "#[cfg(test)] mod tests;\n",
+        )
+        .unwrap();
+        assert!(
+            !source_entry_for_unit(&graph.units[0], &options, &packages, false)
+                .unwrap()
+                .excluded_relatives
+                .is_empty()
+        );
+        let entry = source_entry_for_unit(&graph.units[0], &options, &packages, true).unwrap();
+        assert!(entry.excluded_relatives.is_empty());
+        fs::write(temp.path().join("fixture/build.rs"), "fn main() {}\n").unwrap();
+        assert!(
+            source_entry_for_unit(&graph.units[0], &options, &packages, false)
+                .unwrap()
+                .excluded_relatives
+                .is_empty()
+        );
+        for mode in [
+            UnitMode::Test,
+            UnitMode::Doc,
+            UnitMode::Other("future".into()),
+        ] {
+            let mut unit = graph.units[0].clone();
+            unit.mode = mode;
+            assert_eq!(source_input_class(&unit), SourceInputClass::Complete);
+        }
+        let mut flagged = graph.units[0].clone();
+        flagged.profile.rustflags = vec!["--cfg=test".into()];
+        assert_eq!(source_input_class(&flagged), SourceInputClass::Complete);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_input_contract_retains_referenced_symlinks_and_rejects_symlink_declarations() {
+        let TestInputFixture {
+            temp,
+            graph,
+            options,
+        } = test_input_fixture();
+        let root = temp.path().join("fixture");
+        std::os::unix::fs::symlink("tests/data.rs", root.join("src/alias.rs")).unwrap();
+        let (_, entries) = prepare_sources(&graph, &options).unwrap();
+        assert!(
+            entries
+                .values()
+                .all(|entry| entry.excluded_relatives.is_empty())
+        );
+        fs::remove_file(root.join("src/tests/data.rs")).unwrap();
+        std::os::unix::fs::symlink("../lib.rs", root.join("src/tests/data.rs")).unwrap();
+        assert!(test_source_exclusions(&graph.units[0], &root, false).is_err());
+    }
+
+    #[test]
+    fn test_directory_reference_restores_unrelated_sibling_inputs() {
+        let TestInputFixture {
+            temp,
+            graph,
+            options,
+        } = test_input_fixture();
+        let root = temp.path().join("fixture");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package.metadata.ix.inputs]\ntest-only = [\"src/tests\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/tests/sibling.rs"),
+            "pub const SIBLING: u8 = 2;\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/constant.rs"), "pub const VALUE: u8 = 1;\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "include!(\"constant.rs\");\n").unwrap();
+        let (refs, entries) = prepare_sources(&graph, &options).unwrap();
+        assert_eq!(entries[&refs[0]].excluded_relatives, ["fixture/src/tests"]);
+        assert!(entries[&refs[1]].excluded_relatives.is_empty());
+        fs::write(root.join("src/lib.rs"), "include!(\"tests/data.rs\");\n").unwrap();
+        let (refs, entries) = prepare_sources(&graph, &options).unwrap();
+        assert!(entries[&refs[0]].excluded_relatives.is_empty());
+        let selected = selected_source_bytes(&entries[&refs[0]], temp.path());
+        assert!(selected.contains_key("fixture/src/tests/sibling.rs"));
+        assert!(selected.contains_key("fixture/src/tests/data.rs"));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                "/outside-source-boundary",
+                root.join("src/tests/escape.rs"),
+            )
+            .unwrap();
+            assert!(prepare_sources(&graph, &options).is_err());
+        }
+    }
+
+    #[test]
+    fn test_input_contract_rejects_untyped_missing_or_escaping_paths() {
+        let TestInputFixture { temp, graph, .. } = test_input_fixture();
+        let root = temp.path().join("fixture");
+        for setting in [
+            "true",
+            "[42]",
+            "[\"../outside\"]",
+            "[\"/absolute\"]",
+            "[\"src/missing.rs\"]",
+            "[\".\"]",
+            "[\"src/tests.rs\", \"src/tests.rs\"]",
+        ] {
+            fs::write(
+                root.join("Cargo.toml"),
+                format!("[package.metadata.ix.inputs]\ntest-only = {setting}\n"),
+            )
+            .unwrap();
+            assert!(
+                test_source_exclusions(&graph.units[0], &root, false).is_err(),
+                "{setting}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_package_edits_leave_parent_scope_and_target_fixtures_unchanged() {
+        let (temp, graph, packages) = nested_package_fixture();
+        let (before, excluded) =
+            local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).unwrap();
+        assert_eq!(excluded, ["parent/child"]);
+        assert_eq!(before.scope, SourceScope::Package);
+        fs::write(
+            temp.path().join("parent/child/src/lib.rs"),
+            "pub fn changed_child() {}\n",
+        )
+        .unwrap();
+        let (after, after_excluded) =
+            local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).unwrap();
+        assert_eq!(before.root, after.root);
+        assert_eq!(before.include_relatives, after.include_relatives);
+        assert_eq!(excluded, after_excluded);
+    }
+
+    #[test]
+    fn nested_package_boundary_requires_a_typed_explicit_declaration() {
+        let (temp, graph, packages) = nested_package_fixture();
+        let manifest = temp.path().join("parent/Cargo.toml");
+        for extra in [
+            "",
+            "\n[package.metadata.ix.inputs]\nexclude-nested-packages = false\n",
+        ] {
+            fs::write(&manifest, format!("[package]\nname = \"parent\"\n{extra}")).unwrap();
+            let (_, excluded) =
+                local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).unwrap();
+            assert!(excluded.is_empty());
+        }
+        fs::write(
+            &manifest,
+            "[package.metadata.ix.inputs]\nexclude-nested-packages = \"true\"\n",
+        )
+        .unwrap();
+        assert!(
+            local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).is_err()
+        );
+    }
+
+    #[test]
+    fn repeated_package_targets_share_scope_without_caching_across_renders() {
+        let (temp, mut graph, _) = nested_package_fixture();
+        let mut test = graph.units[0].clone();
+        test.target.kind = vec!["test".to_owned()];
+        graph.units.push(test);
+        let options = RenderOptions {
+            workspace_root: temp.path().to_path_buf(),
+            vendor_root: None,
+            cargo_lock_sources: CargoLockSources::default(),
+            content_addressed: true,
+            toolchain_id: None,
+            deny_unused_crate_dependencies: false,
+            deny_panics: false,
+            embed_metadata: true,
+            rmeta_stability_flags: vec![],
+        };
+        let (refs, entries) = prepare_sources(&graph, &options).unwrap();
+        assert_eq!(refs[0], refs[1]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[&refs[0]].excluded_relatives, ["parent/child"]);
+        let packages = workspace_package_roots(&graph);
+        for unit in &graph.units {
+            let uncached = source_entry_for_unit(unit, &options, &packages, false).unwrap();
+            assert_eq!(entries[&uncached.name], uncached);
+        }
+        fs::write(
+            temp.path().join("parent/src/lib.rs"),
+            "include!(\"../child/src/lib.rs\");\n",
+        )
+        .unwrap();
+        let (_, after) = prepare_sources(&graph, &options).unwrap();
+        assert!(after[&refs[0]].excluded_relatives.is_empty());
+
+        // An unparseable package id uses each target's name as its package
+        // identity, even when both targets share the same manifest root.
+        graph.units[0].pkg_id = "unparseable".to_owned();
+        graph.units[1].pkg_id = "unparseable".to_owned();
+        graph.units[1].target.name = "other_target".to_owned();
+        let (fallback_refs, fallback_entries) = prepare_sources(&graph, &options).unwrap();
+        assert_ne!(fallback_refs[0], fallback_refs[1]);
+        for unit in &graph.units {
+            let uncached = source_entry_for_unit(unit, &options, &packages, false).unwrap();
+            assert_eq!(fallback_entries[&uncached.name], uncached);
+        }
+    }
+
+    #[test]
+    fn ordinary_path_fields_and_comments_do_not_declare_module_inputs() {
+        let (temp, graph, packages) = nested_package_fixture();
+        fs::write(
+            temp.path().join("parent/src/lib.rs"),
+            r#"// A path is ordinary data, not a module attribute.
+#[doc = "path and include_str ! are documentation"]
+struct Entry { path: String }
+const DATA: &str = include_str /* whitespace */ ! ("lib.rs");
+"#,
+        )
+        .unwrap();
+        let (_, excluded) =
+            local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).unwrap();
+        assert_eq!(excluded, ["parent/child"]);
+    }
+
+    #[test]
+    fn uncertain_tokens_or_commented_module_attributes_keep_nested_inputs() {
+        for source in [
+            "#[path /* comment */ = \"../child/src/lib.rs\"] mod child;",
+            "#[cfg_attr(feature = \"child\", path /* ] */ = \"../child/src/lib.rs\")] mod child;",
+            "#[r#path = \"../child/src/lib.rs\"] mod child;",
+            "const DATA: &str = r#include_str ! (concat!(\"../child/\", NAME));",
+            "fn incomplete(",
+            "// include_str!(\"lib.rs\")\nconst DATA: &str = include_str ! (concat!(\"../child/\", NAME));",
+        ] {
+            let (temp, graph, packages) = nested_package_fixture();
+            fs::write(temp.path().join("parent/src/lib.rs"), source).unwrap();
+            let (_, excluded) =
+                local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).unwrap();
+            assert!(excluded.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn unsupported_string_escapes_keep_nested_inputs() {
+        for source in [
+            r#"const DATA: &str = include_str!("\x2e\x2e/child/src/lib.rs");"#,
+            r#"const DATA: &str = include_str!("\u{2e}\u{2e}/child/src/lib.rs");"#,
+            r#"const DATA: &str = include_str!("..\
+                /child/src/lib.rs");"#,
+        ] {
+            let (temp, graph, packages) = nested_package_fixture();
+            fs::write(temp.path().join("parent/src/lib.rs"), source).unwrap();
+            let (_, excluded) =
+                local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).unwrap();
+            assert!(excluded.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn nested_package_selection_does_not_change_parent_source_scope() {
+        let (temp, graph, mut packages) = nested_package_fixture();
+        let grandchild = temp.path().join("parent/child/grandchild");
+        fs::create_dir_all(&grandchild).unwrap();
+        fs::write(grandchild.join("Cargo.toml"), "[package]\n").unwrap();
+        packages.insert(grandchild);
+        let (selected, excluded) =
+            local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).unwrap();
+        let (unselected, unselected_excluded) =
+            local_source_root_for_unit(&graph.units[0], temp.path(), &BTreeSet::new(), false)
+                .unwrap();
+        assert_eq!(selected.root, unselected.root);
+        assert_eq!(selected.include_relatives, unselected.include_relatives);
+        assert_eq!(excluded, unselected_excluded);
+        assert_eq!(excluded, ["parent/child"]);
+    }
+
+    #[test]
+    fn explicit_nested_include_retains_package_and_its_external_inputs() {
+        let (temp, graph, packages) = nested_package_fixture();
+        let parent = temp.path().join("parent");
+        fs::create_dir_all(temp.path().join("shared")).unwrap();
+        fs::write(temp.path().join("shared/data.txt"), "data").unwrap();
+        fs::write(
+            parent.join("src/lib.rs"),
+            "include!(\"../child/src/lib.rs\");\n",
+        )
+        .unwrap();
+        fs::write(
+            parent.join("child/src/lib.rs"),
+            "const DATA: &str = include_str!(\"../../../shared/data.txt\");\n",
+        )
+        .unwrap();
+        let (scope, excluded) =
+            local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).unwrap();
+        assert!(excluded.is_empty());
+        assert_eq!(scope.scope, SourceScope::Closure);
+        assert!(scope.include_relatives.contains(&"shared".to_owned()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_nested_symlink_retains_its_target_package() {
+        let (temp, graph, packages) = nested_package_fixture();
+        std::os::unix::fs::symlink(
+            "../child/src/lib.rs",
+            temp.path().join("parent/src/linked.rs"),
+        )
+        .unwrap();
+        let (_, excluded) =
+            local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).unwrap();
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn manifest_targets_and_unselected_build_scripts_preserve_nested_inputs() {
+        let (temp, graph, packages) = nested_package_fixture();
+        let root = temp.path().join("parent");
+        for manifest in [
+            "[package]\nname = \"parent\"\n[lib]\npath = \"child/src/lib.rs\"\n",
+            "[package]\nname = \"parent\"\n[[bin]]\nname = \"child\"\npath = \"child/src/lib.rs\"\n",
+            "[package]\nname = \"parent\"\nbuild = \"scripts/generate.rs\"\n",
+        ] {
+            fs::write(
+                root.join("Cargo.toml"),
+                format!(
+                    "{manifest}\n[package.metadata.ix.inputs]\nexclude-nested-packages = true\n"
+                ),
+            )
+            .unwrap();
+            let (_, excluded) =
+                local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).unwrap();
+            assert!(excluded.is_empty(), "{manifest}: {excluded:?}");
+        }
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"parent\"\n[package.metadata.ix.inputs]\nexclude-nested-packages = true\n").unwrap();
+        fs::write(root.join("build.rs"), "fn main() {}\n").unwrap();
+        let (_, excluded) =
+            local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).unwrap();
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn unresolved_builtin_include_syntax_preserves_nested_inputs() {
+        let (temp, graph, packages) = nested_package_fixture();
+        for source in [
+            r#"const DATA: &str = include_str ! ("../child/data");"#,
+            r#"const DATA: &str = include_str /* input */ ! ("../child/data");"#,
+            r#"const DATA: &str = include_str!["../child/data"];"#,
+            r#"const DATA: &str = include_str!{"../child/data"};"#,
+            r#"const DATA: &str = include_str!(concat!("../child/", "data"));"#,
+            r#"#[path /* input */ = "../child/src/lib.rs"] mod child;"#,
+            r#"#[cfg_attr(test, path /* input */ = "../child/src/lib.rs")] mod child;"#,
+        ] {
+            fs::write(temp.path().join("parent/src/lib.rs"), source).unwrap();
+            let (_, excluded) =
+                local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).unwrap();
+            assert!(excluded.is_empty(), "{source}: {excluded:?}");
+        }
+    }
+
+    #[test]
+    fn dynamic_manifest_paths_and_build_scripts_preserve_nested_inputs() {
+        let (temp, graph, packages) = nested_package_fixture();
+        let (_, excluded) =
+            local_source_root_for_unit(&graph.units[0], temp.path(), &packages, true).unwrap();
+        assert!(excluded.is_empty());
+        fs::write(
+            temp.path().join("parent/src/lib.rs"),
+            "const ROOT: &str = env!(\"CARGO_MANIFEST_DIR\");\n",
+        )
+        .unwrap();
+        let (_, excluded) =
+            local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).unwrap();
+        assert!(excluded.is_empty());
+        fs::write(
+            temp.path().join("parent/src/lib.rs"),
+            "#[path = \"../child/src/lib.rs\"] mod child;\n",
+        )
+        .unwrap();
+        let (_, excluded) =
+            local_source_root_for_unit(&graph.units[0], temp.path(), &packages, false).unwrap();
+        assert!(excluded.is_empty());
     }
 
     #[test]
@@ -6158,7 +7250,7 @@ version = "0.1.0"
             deny_unused_crate_dependencies: false,
             deny_panics: false,
             embed_metadata,
-                rmeta_stability_flags: vec![],
+            rmeta_stability_flags: vec![],
         };
 
         let thinned = render_units_nix(&graph, &options(false)).unwrap();

@@ -123,7 +123,7 @@ fn truncates_across_multiple_under_limit_texts_and_reports_omitted() {
     ];
 
     let output =
-        truncate_function_output_items_with_policy(&items, TruncationPolicy::Tokens(limit));
+        truncate_function_output_items_with_policy(&items, TruncationPolicy::Tokens(limit), |_| 0);
 
     assert_eq!(output.len(), 5);
 
@@ -161,6 +161,45 @@ fn truncates_across_multiple_under_limit_texts_and_reports_omitted() {
         other => panic!("unexpected summary item: {other:?}"),
     };
     assert!(summary_text.contains("omitted 2 text items"));
+}
+
+#[test]
+fn truncate_function_output_items_with_policy_discards_empty_text() {
+    let mut items = vec![
+        FunctionCallOutputContentItem::InputText {
+            text: String::new(),
+        };
+        16_384
+    ];
+    for policy in [TruncationPolicy::Bytes(0), TruncationPolicy::Tokens(1)] {
+        assert_eq!(
+            truncate_function_output_items_with_policy(&items, policy, |_| 0),
+            Vec::new()
+        );
+    }
+
+    let content = vec![
+        FunctionCallOutputContentItem::InputText {
+            text: "caption".to_string(),
+        },
+        FunctionCallOutputContentItem::InputImage {
+            image_url: "img:one".to_string(),
+            detail: Some(DEFAULT_IMAGE_DETAIL),
+        },
+        FunctionCallOutputContentItem::InputAudio {
+            audio_url: "audio:one".to_string(),
+        },
+        FunctionCallOutputContentItem::EncryptedContent {
+            encrypted_content: "enc_opaque".to_string(),
+        },
+    ];
+    items.extend(content.clone());
+    for policy in [TruncationPolicy::Bytes(16), TruncationPolicy::Tokens(4)] {
+        assert_eq!(
+            truncate_function_output_items_with_policy(&items, policy, |_| 1),
+            content
+        );
+    }
 }
 
 #[test]
@@ -208,7 +247,7 @@ fn formatted_truncate_text_content_items_with_policy_preserves_empty_leading_tex
 }
 
 #[test]
-fn formatted_truncate_text_content_items_with_policy_merges_text_and_appends_images() {
+fn formatted_truncate_text_content_items_with_policy_merges_text_and_appends_media() {
     let items = vec![
         FunctionCallOutputContentItem::InputText {
             text: "abcd".to_string(),
@@ -219,6 +258,9 @@ fn formatted_truncate_text_content_items_with_policy_merges_text_and_appends_ima
         },
         FunctionCallOutputContentItem::InputText {
             text: "efgh".to_string(),
+        },
+        FunctionCallOutputContentItem::InputAudio {
+            audio_url: "audio:one".to_string(),
         },
         FunctionCallOutputContentItem::InputText {
             text: "ijkl".to_string(),
@@ -241,6 +283,9 @@ fn formatted_truncate_text_content_items_with_policy_merges_text_and_appends_ima
             FunctionCallOutputContentItem::InputImage {
                 image_url: "img:one".to_string(),
                 detail: Some(DEFAULT_IMAGE_DETAIL),
+            },
+            FunctionCallOutputContentItem::InputAudio {
+                audio_url: "audio:one".to_string(),
             },
             FunctionCallOutputContentItem::InputImage {
                 image_url: "img:two".to_string(),
@@ -280,7 +325,7 @@ fn formatted_truncate_text_content_items_with_policy_preserves_encrypted_content
 }
 
 #[test]
-fn truncate_function_output_items_with_policy_preserves_encrypted_content() {
+fn truncate_function_output_items_with_policy_omits_audio_over_budget() {
     let items = vec![
         FunctionCallOutputContentItem::InputText {
             text: "abcdefgh".to_string(),
@@ -288,9 +333,13 @@ fn truncate_function_output_items_with_policy_preserves_encrypted_content() {
         FunctionCallOutputContentItem::EncryptedContent {
             encrypted_content: "enc_opaque".to_string(),
         },
+        FunctionCallOutputContentItem::InputAudio {
+            audio_url: "audio:one".to_string(),
+        },
     ];
 
-    let output = truncate_function_output_items_with_policy(&items, TruncationPolicy::Bytes(2));
+    let output =
+        truncate_function_output_items_with_policy(&items, TruncationPolicy::Bytes(2), |_| 1);
 
     assert_eq!(
         output,
@@ -300,6 +349,35 @@ fn truncate_function_output_items_with_policy_preserves_encrypted_content() {
             },
             FunctionCallOutputContentItem::EncryptedContent {
                 encrypted_content: "enc_opaque".to_string(),
+            },
+            FunctionCallOutputContentItem::InputText {
+                text: "[omitted 1 audio items ...]".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn truncate_function_output_items_with_policy_charges_audio_against_byte_budget() {
+    let audio = FunctionCallOutputContentItem::InputAudio {
+        audio_url: "audio:one".to_string(),
+    };
+    let items = vec![
+        audio.clone(),
+        FunctionCallOutputContentItem::InputText {
+            text: "abcdefgh".to_string(),
+        },
+    ];
+
+    let output =
+        truncate_function_output_items_with_policy(&items, TruncationPolicy::Bytes(5), |_| 1);
+
+    assert_eq!(
+        output,
+        vec![
+            audio,
+            FunctionCallOutputContentItem::InputText {
+                text: truncate_text("abcdefgh", TruncationPolicy::Bytes(1)),
             },
         ]
     );

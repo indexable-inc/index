@@ -187,6 +187,27 @@ Goal::Co DerivationBuildingGoal::gaveUpOnSubstitution(bool storeDerivation)
               return "'" + worker.store.printStorePath(p) + "'";
           }));
 
+    /* Registration of a direct input does not prove that every object in
+       its closure is still available. Realise missing members before either
+       the local sandbox or the remote build hook consumes the closure. */
+    Goals closureGoals;
+    for (auto & path : inputPaths) {
+        worker.store.addTempRoot(path);
+        if (worker.store.isValidPath(path))
+            continue;
+        if (!worker.settings.useSubstitutes)
+            throw Error(
+                "dependency '%s' of '%s' does not exist, and substitution is disabled",
+                worker.store.printStorePath(path),
+                worker.store.printStorePath(drvPath));
+        closureGoals.insert(upcast_goal(worker.makePathSubstitutionGoal(path)));
+    }
+    co_await await(std::move(closureGoals));
+    if (nrFailed != 0)
+        co_return doneFailure(BuildError(
+            BuildResult::Failure::DependencyFailed,
+            fmt("Cannot build '%s': input closure could not be realised", worker.store.printStorePath(drvPath))));
+
     /* Okay, try to build.  Note that here we don't wait for a build
        slot to become available, since we don't need one if there is a
        build hook. */
@@ -456,6 +477,13 @@ Goal::Co DerivationBuildingGoal::tryToBuild(StorePathSet inputPaths)
                 if (!status.known || status.known->isValid())
                     continue;
                 auto storePath = status.known->path;
+                if (!drv->type().hasKnownOutputPaths() && worker.store.isValidPath(storePath)
+                    && worker.checkPathContents(storePath) == PathContentStatus::InvalidContentAddress) {
+                    // A floating CA build produces a new canonical path. Retain
+                    // the historical object so registration can verify and
+                    // atomically replace only its invalid realisation mapping.
+                    continue;
+                }
                 debug("removing invalid path '%s'", worker.store.printStorePath(status.known->path));
                 deletePath(localStore->toRealPath(storePath));
             }
@@ -603,7 +631,7 @@ Goal::Co DerivationBuildingGoal::buildWithHook(
 
     /* Set up callback so childTerminated is called if the hook is
        destroyed (e.g., during failure cascades). */
-    hook->onKillChild = [this]() { worker.childTerminated(this, JobCategory::Build); };
+    hook->onKillChild = [this]() { worker.childTerminated(this); };
 
     try {
         hook->machineName = readLine(hook->fromHook.readSide.get());
@@ -723,7 +751,6 @@ Goal::Co DerivationBuildingGoal::buildWithHook(
                         currentHookLine += c;
             }
         } else if (std::get_if<ChildEOF>(&event)) {
-            buildLog->flush();
             break;
         } else if (auto * timeout = std::get_if<TimedOut>(&event)) {
             hook.reset();
@@ -747,12 +774,29 @@ Goal::Co DerivationBuildingGoal::buildWithHook(
     /* So the child is gone now. */
     worker.childTerminated(this);
 
+    /* The hook's logger can reach EOF while the separate builder-output
+       pipe still contains bytes. Its parent-owned write end stays open, so
+       drain only bytes already available after the hook has terminated. */
+    LambdaSink remainingLog([&](std::string_view data) {
+        logSize += data.size();
+        if (worker.settings.maxLogSize && logSize > worker.settings.maxLogSize)
+            return;
+        (*buildLog)(data);
+        if (logFile->sink)
+            (*logFile->sink)(data);
+    });
+    drainFD(hook->builderOut.readSide.get(), remainingLog, {.block = false});
+    buildLog->flush();
+
     /* Close the read side of the logger pipe. */
     hook->builderOut.readSide.close();
     hook->fromHook.readSide.close();
 
     /* Close the log file. */
     logFile.reset();
+
+    if (worker.settings.maxLogSize && logSize > worker.settings.maxLogSize)
+        co_return doneFailureLogTooLong(*buildLog);
 
     /* Check the exit status. */
     if (!statusOk(status)) {
@@ -849,8 +893,7 @@ Goal::Co DerivationBuildingGoal::buildLocally(
     // Will continue here while waiting for a build user below
     while (true) {
 
-        unsigned int curBuilds = worker.getNrLocalBuilds();
-        if (curBuilds >= worker.settings.maxBuildJobs) {
+        if (!worker.buildSlotAvailable(JobCategory::Build)) {
             outputLocks.unlock();
             co_await waitForBuildSlot();
             co_return tryToBuild(std::move(inputPaths));
@@ -879,7 +922,7 @@ Goal::Co DerivationBuildingGoal::buildLocally(
 
                 void childTerminated() override
                 {
-                    goal.worker.childTerminated(&goal, JobCategory::Build);
+                    goal.worker.childTerminated(&goal);
                 }
 
                 void openLogFile() override
@@ -1192,9 +1235,8 @@ HookReply DerivationBuildingGoal::tryBuildHook(const DerivationOptions<StorePath
     try {
 
         /* Send the request to the hook. */
-        worker.hook->sink << "try" << (worker.getNrLocalBuilds() < worker.settings.maxBuildJobs ? 1 : 0)
-                          << drv->platform << worker.store.printStorePath(drvPath)
-                          << drvOptions.getRequiredSystemFeatures(*drv);
+        worker.hook->sink << "try" << (worker.buildSlotAvailable(JobCategory::Build) ? 1 : 0) << drv->platform
+                          << worker.store.printStorePath(drvPath) << drvOptions.getRequiredSystemFeatures(*drv);
         worker.hook->sink.flush();
 
         /* Read the first line of input, which should be a word indicating
@@ -1326,6 +1368,10 @@ DerivationBuildingGoal::checkPathValidity(std::map<std::string, InitialOutput> &
         return {false, {}};
 
     bool checkHash = buildMode == bmRepair;
+    auto reusableContents = [&](const StorePath & path) {
+        return (!checkHash && !worker.store.queryPathInfo(path)->ca.has_value())
+               || worker.checkPathContents(path) == PathContentStatus::Valid;
+    };
     SingleDrvOutputs validOutputs;
 
     for (auto & i : queryPartialDerivationOutputMap()) {
@@ -1338,9 +1384,9 @@ DerivationBuildingGoal::checkPathValidity(std::map<std::string, InitialOutput> &
             auto outputPath = *i.second;
             info.known = {
                 .path = outputPath,
-                .status = !worker.store.isValidPath(outputPath)               ? PathStatus::Absent
-                          : !checkHash || worker.pathContentsGood(outputPath) ? PathStatus::Valid
-                                                                              : PathStatus::Corrupt,
+                .status = !worker.store.isValidPath(outputPath) ? PathStatus::Absent
+                          : reusableContents(outputPath)        ? PathStatus::Valid
+                                                                : PathStatus::Corrupt,
             };
         }
         auto drvOutput = DrvOutput{info.outputHash, i.first};
@@ -1356,9 +1402,9 @@ DerivationBuildingGoal::checkPathValidity(std::map<std::string, InitialOutput> &
                 worker.store.addTempRoot(real->outPath);
                 info.known = {
                     .path = real->outPath,
-                    .status = !worker.store.isValidPath(real->outPath)               ? PathStatus::Absent
-                              : !checkHash || worker.pathContentsGood(real->outPath) ? PathStatus::Valid
-                                                                                     : PathStatus::Corrupt,
+                    .status = !worker.store.isValidPath(real->outPath) ? PathStatus::Absent
+                              : reusableContents(real->outPath)        ? PathStatus::Valid
+                                                                       : PathStatus::Corrupt,
                 };
             } else if (info.known && info.known->isValid()) {
                 // We know the output because it's a static output of the

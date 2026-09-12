@@ -70,6 +70,27 @@ struct ContentAddressMethod
          * manual.
          */
         Text,
+
+        /**
+         * Calculate a store path from the `FileIngestionMethod::JjTree`
+         * id of the file system objects: the BLAKE3 tree id jj's native
+         * object store already assigned them. No references.
+         *
+         * The id is never computed by Nix (`hashPath` refuses), so
+         * `makeFixedOutputPathFromCA` is the whole read path: a fetcher
+         * that knows the id (`SourceAccessor::knownTreeRoot`) gets the
+         * store path with zero file reads, and the
+         * object is written only when something forces it
+         * (`Store::addToStoreWithKnownCA`). Not gated on an experimental
+         * feature: the algorithm is the method's, not a user's choice.
+         *
+         * Rendered `jj-tree`; in a `ValidPathInfo::ca` string,
+         * `fixed:jj-tree:blake3:<nix32>`.
+         *
+         * See `store-object/content-address.md#method-jj-tree` in the
+         * manual.
+         */
+        JjTree,
     };
 
     Raw raw;
@@ -177,6 +198,24 @@ struct ContentAddress
 
     std::string printMethodAlgo() const;
 };
+
+/** Inputs to the canonical store-object content hash. */
+struct ContentAddressHashRequest
+{
+    ContentAddressMethod method;
+    HashAlgorithm algorithm;
+    std::string selfReference;
+};
+
+/** The NAR digest is available when the content method already serializes a NAR. */
+struct ContentAddressHashResult
+{
+    Hash hash;
+    std::optional<HashResult> narHashAndSize;
+};
+
+/** Shared by output production, import, and verification of retained objects. */
+ContentAddressHashResult hashContentAddress(const SourcePath & path, const ContentAddressHashRequest & request);
 
 /**
  * Render the `ContentAddress` if it exists to a string, return empty

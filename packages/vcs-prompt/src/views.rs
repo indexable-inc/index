@@ -1,190 +1,192 @@
-//! Which configured jj view owns the prompt directory, and where it stands.
+//! Which declared jj view owns the prompt directory, and whether its
+//! subtree is the imported tree.
 //!
-//! `jj views prompt` is the seam: it maps the directory to the repository's
-//! `views` config table and reads the survey record the last `jj views fetch`
-//! or `jj views status` left. The counts are therefore as fresh as the last
-//! survey and cost a config read plus a file read, where computing them fresh
-//! is a derive over the view's whole history -- seconds, which no prompt can
-//! pay.
+//! `jj view prompt` is the seam: it maps the directory to the repo's
+//! `views.toml` and compares the subtree's tree id with the import the
+//! manifest records. Both are ids read off the working-copy commit, so the
+//! answer is exact and current, and it costs no network and no cache. The
+//! old segment carried behind/ahead counts from a survey record whose
+//! vintage was routinely hours stale (the `ix⇣241` reading here was 7h41m
+//! old and already wrong low); a state has no vintage to get wrong.
 //!
-//! Because they are a cache, they need a vintage. `jj views prompt` prints
-//! the counts alone, and a count without the time it was taken is the kind of
-//! number a reader restates wrongly: the record behind `ix⇣241` here was
-//! 7h41m old, and its surveyed upstream had itself moved 33 commits on, so
-//! 241 was already wrong low. The record file's mtime is the cheapest honest
-//! vintage available -- one `stat`, no jj -- so the segment carries it.
+//! The protocol is one line of stdout: `name<TAB>state` inside a view, the
+//! literal `-` outside every view. Anything else, including a non-zero exit
+//! and an empty stdout, is a failure the prompt SHOWS (`view:ERR`). The
+//! first version mapped every failure to "no view", so the segment went
+//! quietly missing on every fleet host, where `jj` is the plain fork binary
+//! without a `view` verb, and nothing distinguished that from a directory
+//! outside every view.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+
+use color_eyre::eyre::{Result, WrapErr, eyre};
+
+/// The binary that carries `view`. There is one jj: the fleet and the
+/// workstation both install ix's native client (`packages/jj-ix`) under this
+/// name, and it is the vendored fork's CLI plus the ix store factories and
+/// the native verbs, so every stock verb and `view` come out of the same
+/// binary. Still a constant rather than a literal at the call site: it names
+/// a spawn dependency of this crate, and a reader asking "what does the
+/// prompt shell out to" should find one answer.
+pub const JJ_CLIENT: &str = "jj";
+
+/// What `jj view prompt` prints outside every view.
+const OUTSIDE: &str = "-";
+
+/// `jj view`'s local state, parsed at the protocol boundary so that an
+/// unknown word is a failure the prompt SHOWS (`view:ERR`), never a value
+/// that renders flagless and reads as pristine. The vocabulary's one
+/// emitter is the view CLI (crates/jj/client/cli/src/view/status.rs,
+/// `LocalState::as_str`); these six variants are that list, and the test
+/// below walks it word by word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewState {
+    Pristine,
+    Patched,
+    Unanchored,
+    Conflicted,
+    Missing,
+    NotADirectory,
+}
+
+impl ViewState {
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "pristine" => Some(Self::Pristine),
+            "patched" => Some(Self::Patched),
+            "unanchored" => Some(Self::Unanchored),
+            "conflicted" => Some(Self::Conflicted),
+            "missing" => Some(Self::Missing),
+            "not-a-directory" => Some(Self::NotADirectory),
+            _ => None,
+        }
+    }
+}
 
 /// The view the prompt directory sits inside.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct View {
     pub name: String,
-    /// Counts from the last survey; `None` for a view never surveyed.
-    pub counts: Option<Counts>,
-    /// Age of the survey record, `None` when it cannot be read.
-    pub age: Option<Duration>,
+    pub state: ViewState,
 }
 
-/// How the view stood against its published repository at the last survey.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Counts {
-    /// Published commits that had not arrived here.
-    pub behind: usize,
-    /// View commits here the published repository did not have.
-    pub ahead: usize,
+/// What the prompt renders for views: nothing, a view, or a failure it
+/// must not hide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Segment {
+    Outside,
+    Inside(View),
+    Failed,
 }
 
-/// The view owning `cwd` in the workspace at `root`, or `None` outside every
-/// view.
-///
-/// Every failure is also `None`: stock jj exits nonzero on the unknown
-/// subcommand, and a segment that goes missing beats one that renders an
-/// error. The working-copy state still renders either way, so a missing view
-/// segment stays visible as exactly that.
-pub fn at(root: &Path, cwd: &Path) -> Option<View> {
-    let output = Command::new("jj")
-        .args(["views", "prompt", "--repository"])
+/// The view owning `cwd` in the workspace at `root`: `Ok(None)` outside
+/// every view, `Err` for any failure to ask (missing binary, non-zero exit,
+/// output off protocol).
+pub fn at(root: &Path, cwd: &Path) -> Result<Option<View>> {
+    let output = Command::new(JJ_CLIENT)
+        .args(["view", "prompt", "--repository"])
         .arg(root)
         .args(["--ignore-working-copy", "--color=never", "--quiet"])
         .current_dir(cwd)
         .output()
-        .ok()?;
+        .wrap_err_with(|| format!("failed to run `{JJ_CLIENT} view prompt`"))?;
     if !output.status.success() {
-        return None;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre!(
+            "`{JJ_CLIENT} view prompt` failed ({}): {}",
+            output.status,
+            stderr.trim()
+        ));
     }
-    let mut view = parse(&String::from_utf8(output.stdout).ok()?)?;
-    view.age = record_age(root, &view.name);
-    Some(view)
+    let stdout = String::from_utf8(output.stdout)
+        .wrap_err_with(|| format!("`{JJ_CLIENT} view prompt` wrote non-UTF-8 output"))?;
+    parse(&stdout)
 }
 
-/// One `name<TAB>behind<TAB>ahead` line, or bare `name` for a view never
-/// surveyed, or nothing at all outside every view.
-fn parse(stdout: &str) -> Option<View> {
-    let line = stdout.lines().next()?;
-    let mut columns = line.split('\t');
-    let name = columns.next().filter(|name| !name.is_empty())?.to_owned();
-    let counts = match (columns.next(), columns.next()) {
-        (Some(behind), Some(ahead)) => Some(Counts {
-            behind: behind.parse().ok()?,
-            ahead: ahead.parse().ok()?,
-        }),
-        _ => None,
+/// One `name<TAB>state` line, or the outside token; anything else is a
+/// protocol failure, so an empty stdout can never read as "no view".
+fn parse(stdout: &str) -> Result<Option<View>> {
+    let line = stdout.lines().next().unwrap_or_default();
+    if line == OUTSIDE {
+        return Ok(None);
+    }
+    let Some((name, word)) = line
+        .split_once('\t')
+        .filter(|(name, word)| !name.is_empty() && !word.is_empty())
+    else {
+        return Err(eyre!(
+            "`{JJ_CLIENT} view prompt` printed {stdout:?}, neither `{OUTSIDE}` nor `name<TAB>state`"
+        ));
     };
-    Some(View {
-        name,
-        counts,
-        age: None,
-    })
-}
-
-/// How long ago the last survey of `name` wrote its record.
-fn record_age(root: &Path, name: &str) -> Option<Duration> {
-    let modified = fs::metadata(record_path(root, name)?).ok()?.modified().ok()?;
-    SystemTime::now().duration_since(modified).ok()
-}
-
-/// `<repo>/views/<name>.json`, where the repository directory is `.jj/repo`
-/// for the default workspace and the path *named by* that file for every
-/// other one -- a secondary workspace's `.jj/repo` is a pointer, not the
-/// store, so reading it as a directory finds nothing and would report every
-/// record as missing.
-fn record_path(root: &Path, name: &str) -> Option<PathBuf> {
-    let repo = root.join(".jj").join("repo");
-    let repo = if repo.is_dir() {
-        repo
-    } else {
-        PathBuf::from(fs::read_to_string(&repo).ok()?.trim())
+    let Some(state) = ViewState::parse(word) else {
+        return Err(eyre!(
+            "`{JJ_CLIENT} view prompt` printed unknown state {word:?} for view {name:?}; the \
+             vocabulary is emitted by `jj view` (view/status.rs) and an unrecognised word is a \
+             failure to show, never a flagless rendering that reads as pristine"
+        ));
     };
-    Some(repo.join("views").join(format!("{name}.json")))
+    Ok(Some(View {
+        name: name.to_owned(),
+        state,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::time::Duration;
-
-    use super::{Counts, View, parse, record_path};
+    use super::{View, ViewState, parse};
 
     #[test]
-    fn a_surveyed_view_carries_its_counts() {
+    fn a_view_line_carries_name_and_state() {
         assert_eq!(
-            parse("ix\t25\t1\n"),
+            parse("ix\tpatched\n").expect("a view line parses"),
             Some(View {
                 name: "ix".to_owned(),
-                counts: Some(Counts {
-                    behind: 25,
-                    ahead: 1,
+                state: ViewState::Patched,
+            })
+        );
+    }
+
+    /// The emitter's whole vocabulary (view/status.rs, `LocalState::as_str`),
+    /// word by word: a new word over there must land here deliberately.
+    #[test]
+    fn the_state_vocabulary_is_exactly_the_emitters() {
+        for (word, state) in [
+            ("pristine", ViewState::Pristine),
+            ("patched", ViewState::Patched),
+            ("unanchored", ViewState::Unanchored),
+            ("conflicted", ViewState::Conflicted),
+            ("missing", ViewState::Missing),
+            ("not-a-directory", ViewState::NotADirectory),
+        ] {
+            assert_eq!(
+                parse(&format!("ix\t{word}\n")).expect("a vocabulary word parses"),
+                Some(View {
+                    name: "ix".to_owned(),
+                    state,
                 }),
-                age: None,
-            })
-        );
+                "word {word}"
+            );
+        }
     }
 
     #[test]
-    fn a_view_never_surveyed_is_a_bare_name() {
-        assert_eq!(
-            parse("ix\n"),
-            Some(View {
-                name: "ix".to_owned(),
-                counts: None,
-                age: None,
-            })
-        );
+    fn an_unknown_state_word_is_a_failure_not_pristine() {
+        assert!(parse("ix\tresplendent\n").is_err());
     }
 
     #[test]
-    fn outside_every_view_there_is_nothing_to_parse() {
-        assert_eq!(parse(""), None);
+    fn the_outside_token_is_no_view() {
+        assert_eq!(parse("-\n").expect("the outside token parses"), None);
     }
 
     #[test]
-    fn the_default_workspace_keeps_its_record_under_dot_jj_repo() {
-        let root = tempfile::tempdir().expect("tempdir");
-        fs::create_dir_all(root.path().join(".jj/repo")).expect("create repo dir");
-
-        assert_eq!(
-            record_path(root.path(), "ix"),
-            Some(root.path().join(".jj/repo/views/ix.json"))
-        );
-    }
-
-    /// A secondary workspace's `.jj/repo` is a file naming the real store.
-    #[test]
-    fn a_secondary_workspace_follows_its_repo_pointer() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let store = tempfile::tempdir().expect("store tempdir");
-        fs::create_dir_all(root.path().join(".jj")).expect("create .jj");
-        fs::write(
-            root.path().join(".jj/repo"),
-            format!("{}\n", store.path().display()),
-        )
-        .expect("write pointer");
-
-        assert_eq!(
-            record_path(root.path(), "ix"),
-            Some(store.path().join("views/ix.json"))
-        );
+    fn a_line_without_a_state_is_a_protocol_failure() {
+        assert!(parse("ix\n").is_err());
     }
 
     #[test]
-    fn a_record_that_is_not_there_has_no_age() {
-        let root = tempfile::tempdir().expect("tempdir");
-        fs::create_dir_all(root.path().join(".jj/repo")).expect("create repo dir");
-
-        assert_eq!(super::record_age(root.path(), "ix"), None);
-    }
-
-    #[test]
-    fn a_record_just_written_is_fresh() {
-        let root = tempfile::tempdir().expect("tempdir");
-        fs::create_dir_all(root.path().join(".jj/repo/views")).expect("create views dir");
-        fs::write(root.path().join(".jj/repo/views/ix.json"), "{}").expect("write record");
-
-        let age = super::record_age(root.path(), "ix").expect("an age");
-        assert!(age < Duration::from_mins(1), "fresh record read as {age:?}");
+    fn an_empty_stdout_is_a_protocol_failure_not_silence() {
+        assert!(parse("").is_err());
     }
 }

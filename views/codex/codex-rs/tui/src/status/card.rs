@@ -4,9 +4,11 @@ use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::plain_lines;
 use crate::history_cell::with_border_with_inner_width;
 use crate::legacy_core::config::Config;
+use crate::line_truncation::line_width;
 use crate::token_usage::TokenUsage;
 use crate::token_usage::TokenUsageInfo;
 use crate::version::CODEX_CLI_VERSION;
+use crate::width::display_width;
 use chrono::DateTime;
 use chrono::Local;
 use codex_app_server_protocol::AskForApproval;
@@ -26,12 +28,10 @@ use ratatui::prelude::*;
 use ratatui::style::Stylize;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use unicode_width::UnicodeWidthStr;
 use url::Url;
 
 use super::account::StatusAccountDisplay;
 use super::format::FieldFormatter;
-use super::format::line_display_width;
 use super::format::push_label;
 use super::format::truncate_line_to_width;
 use super::helpers::compose_account_display;
@@ -47,6 +47,7 @@ use super::rate_limits::compose_rate_limit_data_many;
 use super::rate_limits::format_status_limit_summary;
 use super::rate_limits::render_status_limit_progress_bar;
 use super::remote_connection::RemoteConnectionStatus;
+use super::thread_usage::StatusThreadUsage;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_lines;
 use crate::wrapping::word_wrap_lines;
@@ -79,9 +80,14 @@ struct StatusRateLimitState {
 #[derive(Debug, Clone)]
 pub(crate) struct StatusHistoryHandle {
     rate_limit_state: Arc<RwLock<StatusRateLimitState>>,
+    thread_usage: StatusThreadUsage,
 }
 
 impl StatusHistoryHandle {
+    pub(crate) fn reserve_thread_usage_label_width(&self) {
+        self.thread_usage.reserve_label_width();
+    }
+
     pub(crate) fn finish_rate_limit_refresh(
         &self,
         rate_limits: &[RateLimitSnapshotDisplay],
@@ -99,6 +105,13 @@ impl StatusHistoryHandle {
             .expect("status history rate-limit state poisoned");
         state.rate_limits = rate_limits;
         state.refreshing_rate_limits = false;
+    }
+
+    pub(crate) fn set_thread_usage(
+        &self,
+        estimate: Option<codex_app_server_protocol::ThreadUsage>,
+    ) {
+        self.thread_usage.set_estimate(estimate);
     }
 }
 
@@ -119,6 +132,7 @@ struct StatusHistoryCell {
     forked_from: Option<String>,
     token_usage: StatusTokenUsageData,
     rate_limit_state: Arc<RwLock<StatusRateLimitState>>,
+    thread_usage: StatusThreadUsage,
 }
 
 #[cfg(test)]
@@ -177,6 +191,7 @@ pub(crate) fn new_status_output_with_rate_limits(
 ) -> CompositeHistoryCell {
     new_status_output_with_rate_limits_handle(
         config,
+        config.model_provider.requires_openai_auth,
         /*runtime_model_provider_base_url*/ None,
         /*remote_connection*/ None,
         account_display,
@@ -200,6 +215,7 @@ pub(crate) fn new_status_output_with_rate_limits(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn new_status_output_with_rate_limits_handle(
     config: &Config,
+    requires_openai_auth: bool,
     runtime_model_provider_base_url: Option<&str>,
     remote_connection: Option<&RemoteConnectionStatus>,
     account_display: Option<&StatusAccountDisplay>,
@@ -220,6 +236,7 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
     let command = PlainHistoryCell::new(vec!["/status".magenta().into()]);
     let (card, handle) = StatusHistoryCell::new(
         config,
+        requires_openai_auth,
         runtime_model_provider_base_url,
         remote_connection,
         account_display,
@@ -248,6 +265,7 @@ impl StatusHistoryCell {
     #[allow(clippy::too_many_arguments)]
     fn new(
         config: &Config,
+        requires_openai_auth: bool,
         runtime_model_provider_base_url: Option<&str>,
         remote_connection: Option<&RemoteConnectionStatus>,
         account_display: Option<&StatusAccountDisplay>,
@@ -319,7 +337,7 @@ impl StatusHistoryCell {
             workspace_root_suffix.as_deref(),
         );
         let model_provider = format_model_provider(config, runtime_model_provider_base_url);
-        let show_chatgpt_usage_link = config.model_provider.requires_openai_auth;
+        let show_chatgpt_usage_link = requires_openai_auth;
         let account = compose_account_display(account_display);
         let session_id = session_id.as_ref().map(std::string::ToString::to_string);
         let forked_from = forked_from.map(|id| id.to_string());
@@ -350,6 +368,7 @@ impl StatusHistoryCell {
             refreshing_rate_limits,
         }));
         let agents_summary = Arc::new(RwLock::new(agents_summary));
+        let thread_usage = StatusThreadUsage::default();
 
         (
             Self {
@@ -368,8 +387,12 @@ impl StatusHistoryCell {
                 token_usage,
                 agents_summary,
                 rate_limit_state: rate_limit_state.clone(),
+                thread_usage: thread_usage.clone(),
             },
-            StatusHistoryHandle { rate_limit_state },
+            StatusHistoryHandle {
+                rate_limit_state,
+                thread_usage,
+            },
         )
     }
 
@@ -482,7 +505,7 @@ impl StatusHistoryCell {
                     ];
                     // On narrow terminals, keep the percentage visible rather than
                     // letting the fixed-width progress bar crowd out the reset time.
-                    let value_spans = if line_display_width(&Line::from(full_value_spans.clone()))
+                    let value_spans = if line_width(&Line::from(full_value_spans.clone()))
                         <= formatter.value_width(available_inner_width)
                     {
                         full_value_spans
@@ -498,9 +521,7 @@ impl StatusHistoryCell {
                         inline_spans.push(Span::from(" ").dim());
                         inline_spans.push(resets_span.clone());
 
-                        if line_display_width(&Line::from(inline_spans.clone()))
-                            <= available_inner_width
-                        {
+                        if line_width(&Line::from(inline_spans.clone())) <= available_inner_width {
                             lines.push(Line::from(inline_spans));
                         } else {
                             lines.push(base_line);
@@ -772,8 +793,8 @@ impl HistoryCell for StatusHistoryCell {
         if self.token_usage.context_window.is_some() {
             push_label(&mut labels, &mut seen, "Context window");
         }
-
         self.collect_rate_limit_labels(&rate_limit_state, &mut seen, &mut labels);
+        self.thread_usage.push_labels(&mut labels, &mut seen);
 
         let formatter = FieldFormatter::from_labels(labels.iter().map(String::as_str));
         let value_width = formatter.value_width(available_inner_width);
@@ -862,8 +883,13 @@ impl HistoryCell for StatusHistoryCell {
         }
 
         lines.extend(self.rate_limit_lines(&rate_limit_state, available_inner_width, &formatter));
+        let thread_usage_lines = self.thread_usage.lines(&formatter, value_width);
+        if !thread_usage_lines.is_empty() {
+            lines.push(Line::from(Vec::<Span<'static>>::new()));
+            lines.extend(thread_usage_lines);
+        }
 
-        let content_width = lines.iter().map(line_display_width).max().unwrap_or(0);
+        let content_width = lines.iter().map(line_width).max().unwrap_or(0);
         let inner_width = content_width.min(available_inner_width);
         let truncated_lines: Vec<Line<'static>> = lines
             .into_iter()
@@ -891,12 +917,12 @@ impl HistoryCell for StatusHistoryCell {
                 .map(|span| span.content.as_ref())
                 .collect::<String>();
             if let Some(start_byte) = visible.find(CHATGPT_USAGE_URL) {
-                let start = visible[..start_byte].width();
+                let start = display_width(&visible[..start_byte]);
                 line.hyperlinks
-                    .push(crate::terminal_hyperlinks::TerminalHyperlink {
-                        columns: start..start + CHATGPT_USAGE_URL.width(),
-                        destination: CHATGPT_USAGE_URL.to_string(),
-                    });
+                    .push(crate::terminal_hyperlinks::TerminalHyperlink::web(
+                        start..start + display_width(CHATGPT_USAGE_URL),
+                        CHATGPT_USAGE_URL.to_string(),
+                    ));
             }
         }
         lines

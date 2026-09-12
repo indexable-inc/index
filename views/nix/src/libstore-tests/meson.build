@@ -71,6 +71,7 @@ sources = files(
   'local-binary-cache-store.cc',
   'local-overlay-store.cc',
   'local-store.cc',
+  'retained-content-address.cc',
   'machines.cc',
   'main.cc',
   'nar-info-disk-cache.cc',

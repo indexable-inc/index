@@ -417,10 +417,7 @@ public:
          * If an exception is thrown inside a coroutine,
          * we re-throw it in the context of the "resumer" of the continuation.
          */
-        void unhandled_exception()
-        {
-            throw;
-        };
+        void unhandled_exception();
 
         /**
          * Allows awaiting a @ref Co.

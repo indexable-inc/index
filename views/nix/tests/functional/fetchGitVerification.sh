@@ -35,10 +35,11 @@ out=$(nix eval --impure --raw --expr "builtins.fetchGit { url = \"file://$repo\"
 
 echo 'hello world' > "$repo"/text
 
-# Verification on a dirty repo should fail.
+# A repo with uncommitted changes has no commit to verify, and is refused
+# before verification is even attempted.
 out=$(nix eval --impure --raw --expr "builtins.fetchGit { url = \"file://$repo\"; keytype = \"ssh-rsa\"; publicKey = \"$publicKey2\"; }" 2>&1) || status=$?
 [[ $status == 1 ]]
-[[ $out =~ 'dirty' ]]
+[[ $out =~ 'uncommitted changes' ]]
 
 git -C "$repo" add text
 git -C "$repo" -c "user.signingkey=$key2File" commit -S -m 'second commit'

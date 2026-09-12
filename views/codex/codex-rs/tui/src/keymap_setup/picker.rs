@@ -21,8 +21,7 @@ use crate::style::accent_style;
 use super::actions::KEYMAP_ACTIONS;
 use super::actions::KeymapActionFilter;
 use super::actions::action_label;
-use super::actions::bindings_for_action;
-use super::actions::format_binding_summary;
+use super::actions::format_action_binding_summary;
 use super::has_custom_binding;
 
 pub(crate) const KEYMAP_PICKER_VIEW_ID: &str = "keymap-picker";
@@ -105,13 +104,24 @@ const KEYMAP_CONTEXT_TABS: &[KeymapContextTab] = &[
         id: "vim-shortcuts",
         label: "Vim",
         description: "Vim normal-mode and operator shortcuts.",
-        contexts: &["vim_normal", "vim_operator", "vim_text_object"],
+        contexts: &[
+            "vim_normal",
+            "vim_operator",
+            "vim_search",
+            "vim_text_object",
+        ],
     },
     KeymapContextTab {
         id: "navigation-shortcuts",
         label: "Navigation",
         description: "Pager and selection-list navigation shortcuts.",
         contexts: &["pager", "list"],
+    },
+    KeymapContextTab {
+        id: "agents-shortcuts",
+        label: "Agents",
+        description: "Shared agents dashboard shortcuts.",
+        contexts: &["agents"],
     },
     KeymapContextTab {
         id: "approval-shortcuts",
@@ -335,24 +345,23 @@ fn build_keymap_rows(
         .iter()
         .copied()
         .filter(|descriptor| descriptor.is_visible(action_filter))
-        .map(|descriptor| {
-            let bindings =
-                bindings_for_action(runtime_keymap, descriptor.context, descriptor.action)
-                    .unwrap_or(&[]);
-            KeymapActionRow {
-                context: descriptor.context,
-                context_label: descriptor.context_label,
-                action: descriptor.action,
-                label: action_label(descriptor.action),
-                description: descriptor.description,
-                binding_summary: format_binding_summary(bindings),
-                custom_binding: has_custom_binding(
-                    keymap_config,
-                    descriptor.context,
-                    descriptor.action,
-                )
-                .unwrap_or(false),
-            }
+        .map(|descriptor| KeymapActionRow {
+            context: descriptor.context,
+            context_label: descriptor.context_label,
+            action: descriptor.action,
+            label: action_label(descriptor.action),
+            description: descriptor.description,
+            binding_summary: format_action_binding_summary(
+                runtime_keymap,
+                descriptor.context,
+                descriptor.action,
+            ),
+            custom_binding: has_custom_binding(
+                keymap_config,
+                descriptor.context,
+                descriptor.action,
+            )
+            .unwrap_or(/*default*/ false),
         })
         .collect()
 }

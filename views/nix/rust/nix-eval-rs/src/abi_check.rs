@@ -1,5 +1,6 @@
 #![cfg(test)]
-//! `include/ixe.h` against `capi.rs`, read as text at test time.
+//! All C ABI headers against the exported Rust ABI modules, read as text.
+//! Includes the evaluator, command, and lock-graph interfaces.
 //!
 //! The header is hand-written on purpose: it carries the prose that explains
 //! what each hook must do, which a generator would delete. The price of
@@ -309,7 +310,19 @@ fn canon_c(text: &str) -> String {
     if is_const {
         out.push_str("const ");
     }
-    out.push_str(&words.join(" "));
+    // On supported x86-64/AArch64 Linux and Darwin ABIs, stdint.h uses
+    // unsigned char for uint8_t and unsigned int for uint32_t. This is
+    // typedef identity, not merely equal width: signedness, other integer
+    // types and pointer qualifiers remain distinct. Unknown ABIs fail closed.
+    let known_integer_abi = cfg!(all(
+        any(target_os = "linux", target_os = "macos"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ));
+    match words.as_slice() {
+        ["uint8_t"] if known_integer_abi => out.push_str("unsigned char"),
+        ["uint32_t"] if known_integer_abi => out.push_str("unsigned int"),
+        _ => out.push_str(&words.join(" ")),
+    }
     if stars > 0 {
         out.push(' ');
         for _ in 0..stars {
@@ -317,6 +330,42 @@ fn canon_c(text: &str) -> String {
         }
     }
     out
+}
+
+#[test]
+fn fixed_width_aliases_preserve_qualifiers_and_integer_types() {
+    let aliases = BTreeMap::new();
+    if cfg!(all(
+        any(target_os = "linux", target_os = "macos"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )) {
+        for (c, rust) in [
+            ("uint8_t", "u8"),
+            ("uint8_t *", "*mut u8"),
+            ("const uint8_t *", "*const u8"),
+            ("const uint8_t **", "*mut *const u8"),
+            ("uint32_t", "u32"),
+            ("uint32_t *", "*mut u32"),
+            ("const uint32_t *", "*const u32"),
+            ("const uint32_t **", "*mut *const u32"),
+        ] {
+            assert_eq!(canon_c(c), canon_rust(rust, &aliases));
+        }
+    } else {
+        assert_eq!(canon_c("uint8_t"), "uint8_t");
+        assert_eq!(canon_c("uint32_t"), "uint32_t");
+    }
+    assert_ne!(canon_c("unsigned char"), canon_c("char"));
+    assert_ne!(canon_c("unsigned char"), canon_c("signed char"));
+    assert_ne!(canon_c("unsigned char"), canon_c("uint16_t"));
+    assert_ne!(canon_c("uint8_t *"), canon_c("const uint8_t *"));
+    assert_ne!(canon_c("uint8_t *"), canon_c("uint8_t **"));
+    assert_ne!(canon_c("uint32_t"), canon_c("int"));
+    assert_ne!(canon_c("uint32_t"), canon_c("unsigned long"));
+    assert_ne!(canon_c("uint32_t"), canon_c("uint64_t"));
+    assert_ne!(canon_c("uint32_t"), canon_c("uint8_t"));
+    assert_ne!(canon_c("uint32_t *"), canon_c("const uint32_t *"));
+    assert_ne!(canon_c("uint32_t *"), canon_c("uint32_t **"));
 }
 
 /// Resolve a canonical C type through the header's own typedefs.
@@ -496,12 +545,23 @@ fn header_statements(src: &str) -> (Vec<String>, Vec<String>) {
     (statements, problems)
 }
 
-/// Parse `include/ixe.h`.
+/// Parse the evaluator, command, flake-show, and lock-graph headers as one ABI surface.
 fn parse_header() -> Surface {
-    let src = read_source(HEADER_PATH);
     let mut surface = Surface::default();
-    let (statements, tail_problems) = header_statements(&src);
-    surface.problems.extend(tail_problems);
+    let mut statements = Vec::new();
+    for path in [
+        HEADER_PATH,
+        "include/ixe-command.h",
+        "include/ixe-flake-show.h",
+        "include/ixe-search.h",
+        "include/ixe-flake-check.h",
+        "include/ixe-source-position.h",
+        "include/ixe-lock-graph.h",
+    ] {
+        let (parsed, problems) = header_statements(&read_source(path));
+        statements.extend(parsed);
+        surface.problems.extend(problems);
+    }
 
     // Two passes: typedefs first, so a declaration mentioning `IxeHandle` or
     // `ixe_warn_fn` can be resolved whatever order the file puts them in.
@@ -541,6 +601,13 @@ fn parse_header() -> Surface {
                     .push(format!("ixe.h typedef names nothing: `typedef {rest};`"));
                 continue;
             };
+            // `typedef ixe_read_file_fn ixe_import_fn;` is a function-pointer
+            // typedef under a second name, like capi.rs's `pub type ImportFn
+            // = ReadFileFn;`, and is counted and resolved as one.
+            if let Some(text) = surface.fn_pointers.get(ty.trim()).cloned() {
+                surface.fn_pointers.insert(name, text);
+                continue;
+            }
             value_aliases.insert(name, canon_c(&ty));
             continue;
         }
@@ -742,13 +809,29 @@ fn gather_item(lines: &[&str], index: usize) -> Option<String> {
         if opened && depth == 0 {
             return Some(collapse(&text));
         }
+        // An item with no parentheses at all -- `pub type ImportFn =
+        // ReadFileFn;` -- ends at its semicolon. Reading on would glue the
+        // next item onto it and count an alias as a function pointer with
+        // its neighbour's signature.
+        if !opened && line.trim_end().ends_with(';') {
+            return Some(collapse(&text));
+        }
     }
     None
 }
 
-/// Parse `src/capi.rs`.
+/// Parse every module exporting the C ABI as one surface.
 fn parse_capi() -> Surface {
-    let src = read_source(CAPI_PATH);
+    let src = [
+        read_source(CAPI_PATH),
+        read_source("src/capi/command.rs"),
+        read_source("src/capi/flake_show.rs"),
+        read_source("src/capi/search.rs"),
+        read_source("src/capi/flake_check.rs"),
+        read_source("src/capi/source_position.rs"),
+        read_source("src/lock_graph/ffi.rs"),
+    ]
+    .join("\n");
     let mut surface = Surface {
         no_mangle_attributes: count_lines_equal(&src, "#[unsafe(no_mangle)]"),
         repr_c_attributes: count_lines_equal(&src, "#[repr(C)]"),
@@ -767,6 +850,23 @@ fn parse_capi() -> Surface {
             continue;
         };
         if !item.contains("extern \"C\" fn") {
+            // `pub type ImportFn = ReadFileFn;`: the same shape under a second
+            // name, registered once its target is known so a vtable field
+            // spelled with the alias resolves exactly as one spelled with the
+            // target. ixe.h's `typedef ixe_read_file_fn ixe_import_fn;` is
+            // read the same way below, which is what keeps the two counts
+            // comparable.
+            if let Some((name, target)) = item
+                .trim_start()
+                .trim_start_matches("pub type ")
+                .split_once('=')
+                && let Some(text) = surface
+                    .fn_pointers
+                    .get(target.trim().trim_end_matches(';').trim())
+                    .cloned()
+            {
+                surface.fn_pointers.insert(name.trim().to_owned(), text);
+            }
             continue;
         }
         let Some((name, after)) = item
@@ -951,19 +1051,19 @@ fn count_lines_equal(src: &str, needle: &str) -> usize {
 fn refuse_empty(header: &Surface, capi: &Surface) {
     assert!(
         header.problems.is_empty(),
-        "the ixe.h parser did not understand part of the header, so that part \
+        "the C ABI headers parser did not understand part of the header, so that part \
          is compared against nothing: {:#?}",
         header.problems
     );
     assert!(
         capi.problems.is_empty(),
-        "the capi.rs parser did not understand part of the file, so that part \
+        "the Rust ABI modules parser did not understand part of the file, so that part \
          is compared against nothing: {:#?}",
         capi.problems
     );
     assert!(
         capi.no_mangle_attributes > 0 && capi.repr_c_attributes > 0,
-        "capi.rs read as {} #[unsafe(no_mangle)] attributes and {} #[repr(C)] \
+        "Rust ABI modules read as {} #[unsafe(no_mangle)] attributes and {} #[repr(C)] \
          attributes. Zero of either means the file was not read at all, and \
          every comparison would then pass vacuously.",
         capi.no_mangle_attributes,
@@ -972,7 +1072,7 @@ fn refuse_empty(header: &Surface, capi: &Surface) {
     assert_eq!(
         capi.functions.len(),
         capi.no_mangle_attributes,
-        "parsed {} exported functions out of capi.rs but the file carries {} \
+        "parsed {} exported functions out of Rust ABI modules but those modules carry {} \
          #[unsafe(no_mangle)] attributes. The parser is missing entry points, \
          and the ones it misses are compared against nothing.",
         capi.functions.len(),
@@ -981,7 +1081,7 @@ fn refuse_empty(header: &Surface, capi: &Surface) {
     assert_eq!(
         capi.structs.len(),
         capi.repr_c_attributes,
-        "parsed {} #[repr(C)] structs out of capi.rs but the file carries {} \
+        "parsed {} #[repr(C)] structs out of Rust ABI modules but those modules carry {} \
          #[repr(C)] attributes. Either the parser is missing a struct or the \
          attribute is on something that is not one; both leave a layout \
          uncompared.",
@@ -993,7 +1093,7 @@ fn refuse_empty(header: &Surface, capi: &Surface) {
             && !header.structs.is_empty()
             && !header.fn_pointers.is_empty(),
         "parsed {} functions, {} structs and {} function-pointer typedefs out \
-         of ixe.h. A zero here is a parser that read nothing, which looks \
+         of C ABI headers. A zero here is a parser that read nothing, which looks \
          exactly like a header that agrees with everything.",
         header.functions.len(),
         header.structs.len(),
@@ -1010,7 +1110,7 @@ fn both_files_parse_whole() {
     assert_eq!(
         header.fn_pointers.len(),
         capi.fn_pointers.len(),
-        "ixe.h declares {} function-pointer typedefs and capi.rs declares {}. \
+        "C ABI headers declares {} function-pointer typedefs and Rust ABI modules declares {}. \
          They are compared through the vtable fields that use them, so an \
          unequal count means one side has a hook shape the other does not.",
         header.fn_pointers.len(),
@@ -1037,10 +1137,34 @@ fn both_files_parse_whole() {
         .collect();
     assert!(
         unreferenced.is_empty(),
-        "these ixe.h function-pointer typedefs are the type of no struct \
+        "these C ABI headers function-pointer typedefs are the type of no struct \
          field, so nothing in this module compares their signatures against \
-         capi.rs: {unreferenced:#?}"
+         Rust ABI modules: {unreferenced:#?}"
     );
+}
+
+/// The function-pointer shape cannot catch a documentation-only ABI break.
+/// Keep the success payload and both root meanings beside the declaration so
+/// an external embedder is not told to return the obsolete plain path.
+#[test]
+fn find_file_header_documents_the_rooted_wire_answer() {
+    let header = read_source(HEADER_PATH);
+    let Some((before, _)) = header.split_once("typedef int (*ixe_find_file_fn)") else {
+        panic!("C ABI headers no longer declares ixe_find_file_fn")
+    };
+    let Some((_, comment)) = before.rsplit_once("/*") else {
+        panic!("ixe_find_file_fn has no preceding contract comment")
+    };
+    for required in [
+        "root NUL accessor-relative-path",
+        "ambient rootFS accessor",
+        "storeFS mount table",
+    ] {
+        assert!(
+            comment.contains(required),
+            "ixe_find_file_fn's contract omits {required:?}: {comment}"
+        );
+    }
 }
 
 #[test]
@@ -1056,20 +1180,20 @@ fn every_export_matches_its_header_declaration() {
                 continue;
             }
             faults.push(format!(
-                "{name}: exported from capi.rs and declared nowhere in ixe.h, \
+                "{name}: exported from Rust ABI modules and declared nowhere in C ABI headers, \
                  so the bridge cannot call it and nothing checks its shape"
             ));
             continue;
         };
         if c.ret.canon != rust.ret.canon {
             faults.push(format!(
-                "{name}: returns `{}` in ixe.h and `{}` in capi.rs (written `{}`)",
+                "{name}: returns `{}` in C ABI headers and `{}` in Rust ABI modules (written `{}`)",
                 c.ret.canon, rust.ret.canon, rust.ret.written
             ));
         }
         if c.params.len() != rust.params.len() {
             faults.push(format!(
-                "{name}: takes {} parameters in ixe.h and {} in capi.rs",
+                "{name}: takes {} parameters in C ABI headers and {} in Rust ABI modules",
                 c.params.len(),
                 rust.params.len()
             ));
@@ -1079,8 +1203,8 @@ fn every_export_matches_its_header_declaration() {
             if cp.canon != rp.canon {
                 let position = i.saturating_add(1);
                 faults.push(format!(
-                    "{name}: parameter {position} is `{}` in ixe.h (written \
-                     `{}`) and `{}` in capi.rs (written `{}`)",
+                    "{name}: parameter {position} is `{}` in C ABI headers (written \
+                     `{}`) and `{}` in Rust ABI modules (written `{}`)",
                     cp.canon, cp.written, rp.canon, rp.written
                 ));
             }
@@ -1090,8 +1214,8 @@ fn every_export_matches_its_header_declaration() {
     for name in header.functions.keys() {
         if !capi.functions.contains_key(name) {
             faults.push(format!(
-                "{name}: declared in ixe.h and exported by no \
-                 #[unsafe(no_mangle)] function in capi.rs. A caller that \
+                "{name}: declared in C ABI headers and exported by no \
+                 #[unsafe(no_mangle)] function in Rust ABI modules. A caller that \
                  believes the header gets an undefined symbol at link time."
             ));
         }
@@ -1102,20 +1226,20 @@ fn every_export_matches_its_header_declaration() {
     for (name, why) in UNDECLARED_EXPORTS {
         assert!(
             capi.functions.contains_key(*name),
-            "UNDECLARED_EXPORTS excuses `{name}`, which capi.rs no longer \
+            "UNDECLARED_EXPORTS excuses `{name}`, which Rust ABI modules no longer \
              exports. Delete the row. The reason it carried was: {why}"
         );
         assert!(
             !header.functions.contains_key(*name),
             "UNDECLARED_EXPORTS excuses `{name}` from having a declaration, \
-             and ixe.h now declares it. Delete the row so the declaration is \
+             and C ABI headers now declares it. Delete the row so the declaration is \
              compared. The reason it carried was: {why}"
         );
     }
 
     let mut message = format!(
-        "compared {} exported functions in capi.rs against {} declarations in \
-         ixe.h and found {} disagreement(s). The C++ compile catches only the \
+        "compared {} exported functions in Rust ABI modules against {} declarations in \
+         C ABI headers and found {} disagreement(s). The C++ compile catches only the \
          subset that is also a type error; the rest is a call through the \
          wrong signature.\n",
         capi.functions.len(),
@@ -1138,13 +1262,13 @@ fn every_repr_c_struct_matches_its_header_definition() {
     for (name, rust) in &capi.structs {
         let Some(c) = header.structs.get(name) else {
             faults.push(format!(
-                "{name}: #[repr(C)] in capi.rs and defined nowhere in ixe.h"
+                "{name}: #[repr(C)] in Rust ABI modules and defined nowhere in C ABI headers"
             ));
             continue;
         };
         if c.len() != rust.len() {
             faults.push(format!(
-                "{name}: has {} fields in ixe.h and {} in capi.rs",
+                "{name}: has {} fields in C ABI headers and {} in Rust ABI modules",
                 c.len(),
                 rust.len()
             ));
@@ -1154,8 +1278,8 @@ fn every_repr_c_struct_matches_its_header_definition() {
             let position = i.saturating_add(1);
             if cf.name != rf.name {
                 faults.push(format!(
-                    "{name}: field {position} is named `{}` in ixe.h and `{}` \
-                     in capi.rs. Field order is the ABI here -- two fields of \
+                    "{name}: field {position} is named `{}` in C ABI headers and `{}` \
+                     in Rust ABI modules. Field order is the ABI here -- two fields of \
                      the same type swapped is a call through the wrong \
                      function pointer, which compiles on both sides.",
                     cf.name, rf.name
@@ -1163,8 +1287,8 @@ fn every_repr_c_struct_matches_its_header_definition() {
             }
             if cf.ty.canon != rf.ty.canon {
                 faults.push(format!(
-                    "{name}: field {position} (`{}`) is `{}` in ixe.h and \
-                     `{}` in capi.rs (written `{}`)",
+                    "{name}: field {position} (`{}`) is `{}` in C ABI headers and \
+                     `{}` in Rust ABI modules (written `{}`)",
                     cf.name, cf.ty.canon, rf.ty.canon, rf.ty.written
                 ));
             }
@@ -1174,16 +1298,16 @@ fn every_repr_c_struct_matches_its_header_definition() {
     for name in header.structs.keys() {
         if !capi.structs.contains_key(name) {
             faults.push(format!(
-                "{name}: defined in ixe.h and matched by no #[repr(C)] struct \
-                 in capi.rs, so its layout is whatever the C side imagines"
+                "{name}: defined in C ABI headers and matched by no #[repr(C)] struct \
+                 in Rust ABI modules, so its layout is whatever the C side imagines"
             ));
         }
     }
 
     let compared: usize = capi.structs.values().map(Vec::len).sum();
     let mut message = format!(
-        "compared {} #[repr(C)] structs ({compared} fields) in capi.rs against \
-         {} struct definitions in ixe.h and found {} disagreement(s).\n",
+        "compared {} #[repr(C)] structs ({compared} fields) in Rust ABI modules against \
+         {} struct definitions in C ABI headers and found {} disagreement(s).\n",
         capi.structs.len(),
         header.structs.len(),
         faults.len()
@@ -1192,4 +1316,149 @@ fn every_repr_c_struct_matches_its_header_definition() {
         let _ = writeln!(message, "  - {fault}");
     }
     assert!(faults.is_empty(), "{message}");
+}
+
+/// Every `NAME = value,` enumerator and `#define NAME value` in the header
+/// whose name starts with `prefix`, in header order. Comment lines are
+/// skipped, so prose that quotes a constant is not read as declaring it.
+fn header_constants(header: &str, prefix: &str) -> Vec<(String, i32)> {
+    let mut found = Vec::new();
+    for raw in header.lines() {
+        let line = raw.trim().trim_end_matches(',');
+        if line.starts_with('*') || line.starts_with('/') {
+            continue;
+        }
+        let (name, value) = if let Some(rest) = line.strip_prefix("#define ") {
+            let mut words = rest.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some(name), Some(value)) => (name, value),
+                _ => continue,
+            }
+        } else if let Some((name, value)) = line.split_once('=') {
+            (name.trim(), value.trim())
+        } else {
+            continue;
+        };
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let value = value
+            .parse()
+            .unwrap_or_else(|e| panic!("{name} has a non-integer value in ixe.h: {e}"));
+        found.push((name.to_owned(), value));
+    }
+    found
+}
+
+/// The header's constants under `prefix` are exactly `expected`, value for
+/// value. The struct parser above compares declarations, not values: a
+/// header that renumbers a constant while the Rust side keeps its number
+/// would pass every other check and misread every answer that carries it.
+/// The count is pinned too, so a constant added on one side only cannot
+/// hide.
+fn assert_header_constants_agree(prefix: &str, expected: &[(&str, i32)]) {
+    let header = read_source(HEADER_PATH);
+    let found = header_constants(&header, prefix);
+    for (name, value) in &found {
+        let rust = expected
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("{name} is declared in ixe.h but has no Rust constant"))
+            .1;
+        assert_eq!(
+            *value, rust,
+            "{name}: ixe.h says {value}, capi.rs says {rust}"
+        );
+    }
+    assert_eq!(
+        found.len(),
+        expected.len(),
+        "ixe.h declares {} {prefix}* constants, capi.rs has {}",
+        found.len(),
+        expected.len()
+    );
+}
+
+/// The realise error class crosses by value: `IFDError` stays its own
+/// exception class through it, and a misnumbering would misclassify every
+/// disabled-IFD failure.
+#[test]
+fn realise_error_class_discriminants_agree_with_the_header() {
+    use crate::capi::IxeRealiseErrorClass as C;
+    assert_header_constants_agree(
+        "IXE_REALISE_ERROR_",
+        &[
+            ("IXE_REALISE_ERROR_OTHER", C::Other as i32),
+            (
+                "IXE_REALISE_ERROR_IMPORT_FROM_DERIVATION",
+                C::ImportFromDerivation as i32,
+            ),
+        ],
+    );
+}
+
+/// The realise check status crosses by value: it is what decides whether a
+/// build is spawned, skipped, or refused.
+#[test]
+fn realise_check_statuses_agree_with_the_header() {
+    use crate::capi::IxeRealiseCheck as C;
+    assert_header_constants_agree(
+        "IXE_REALISE_CHECK_",
+        &[
+            ("IXE_REALISE_CHECK_BUILD", C::Build as i32),
+            ("IXE_REALISE_CHECK_FAILED", C::Failed as i32),
+            ("IXE_REALISE_CHECK_NOTHING", C::Nothing as i32),
+        ],
+    );
+}
+
+/// The question kinds cross by value too, as `#define`s in the header and
+/// `const`s in capi.rs: a served question of the wrong kind would decode
+/// the wrong payload.
+#[test]
+fn question_kinds_agree_with_the_header() {
+    use crate::capi as c;
+    assert_header_constants_agree(
+        "IXE_QUESTION_",
+        &[
+            ("IXE_QUESTION_SELECT", c::IXE_QUESTION_SELECT),
+            ("IXE_QUESTION_DERIVATION", c::IXE_QUESTION_DERIVATION),
+            ("IXE_QUESTION_APP", c::IXE_QUESTION_APP),
+            ("IXE_QUESTION_FLAKE_SHOW", c::IXE_QUESTION_FLAKE_SHOW),
+            (
+                "IXE_QUESTION_DERIVATION_PATH",
+                c::IXE_QUESTION_DERIVATION_PATH,
+            ),
+            (
+                "IXE_QUESTION_DERIVATION_SET",
+                c::IXE_QUESTION_DERIVATION_SET,
+            ),
+            (
+                "IXE_QUESTION_FLAKE_DOCUMENT",
+                c::IXE_QUESTION_FLAKE_DOCUMENT,
+            ),
+            (
+                "IXE_QUESTION_SOURCE_POSITION",
+                c::IXE_QUESTION_SOURCE_POSITION,
+            ),
+            (
+                "IXE_QUESTION_SEARCH_PACKAGES",
+                c::IXE_QUESTION_SEARCH_PACKAGES,
+            ),
+            ("IXE_QUESTION_FLAKE_CHECK", c::IXE_QUESTION_FLAKE_CHECK),
+        ],
+    );
+}
+
+/// The two auto-argument kinds, which cross as integers.
+#[test]
+fn auto_argument_kinds_agree_with_the_header() {
+    use crate::capi as c;
+    assert_header_constants_agree(
+        "IXE_AUTO_ARG_",
+        &[
+            ("IXE_AUTO_ARG_EXPR", c::IXE_AUTO_ARG_EXPR),
+            ("IXE_AUTO_ARG_STRING", c::IXE_AUTO_ARG_STRING),
+        ],
+    );
 }

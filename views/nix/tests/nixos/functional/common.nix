@@ -1,4 +1,20 @@
-{ lib, nixComponents, ... }:
+{
+  lib,
+  nixComponents,
+  # The jj client the functional suite drives (`requireJj` in
+  # common/functions.sh fails rather than skips, and the fixtures use the ix
+  # client's `init --repo` surface, which upstream jujutsu does not have and
+  # whose ix-local stores upstream cannot open). Nothing in this tree can
+  # build that client, and TODAY NOTHING SETS THIS ARGUMENT: the ix package
+  # scope wires `packages/jj-ix` into the suite's nativeBuildInputs
+  # (index/packages/nix/default.nix) but does not instantiate these VM tests
+  # at all. When it adopts them it passes the client here (NixOS module
+  # args / specialArgs); until then the jj-driving tests fail on this
+  # runner, loudly and by design, in requireJj, whose NixOS message names
+  # this argument.
+  jjClient ? null,
+  ...
+}:
 
 {
   # We rarely change the script in a way that benefits from type checking, so
@@ -30,7 +46,8 @@
               # want a store path. Likewise for coreutils.
               pkgs.bash
               pkgs.coreutils
-            ];
+            ]
+            ++ lib.optional (jjClient != null) jjClient;
             text = ''
               set -x
 

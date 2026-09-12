@@ -4,6 +4,7 @@ source common.sh
 
 cp ../simple.nix ../simple.builder.sh "${config_nix}" "$TEST_HOME"
 
+jjFlakeDir "$TEST_HOME"
 cd "$TEST_HOME"
 
 rm -f post-hook-ran

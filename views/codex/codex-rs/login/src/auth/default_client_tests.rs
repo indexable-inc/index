@@ -67,6 +67,54 @@ fn is_first_party_chat_originator_matches_known_values() {
     assert_eq!(is_first_party_chat_originator("codex_vscode"), false);
 }
 
+#[test]
+fn add_originator_header_inserts_non_default_originator() {
+    let default_originator = originator();
+    let thread_originator = if default_originator.value == "chatgpt_cca" {
+        "codex_work_cca"
+    } else {
+        "chatgpt_cca"
+    };
+    let mut headers = HeaderMap::new();
+
+    add_originator_header(&mut headers, thread_originator);
+
+    assert_eq!(
+        headers
+            .get("originator")
+            .and_then(|value| value.to_str().ok()),
+        Some(thread_originator)
+    );
+}
+
+#[test]
+fn add_originator_header_preserves_provider_default() {
+    let default_originator = originator();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "originator",
+        HeaderValue::from_static("provider-originator"),
+    );
+
+    add_originator_header(&mut headers, &default_originator.value);
+
+    assert_eq!(
+        headers
+            .get("originator")
+            .and_then(|value| value.to_str().ok()),
+        Some("provider-originator")
+    );
+}
+
+#[test]
+fn add_originator_header_omits_invalid_originator() {
+    let mut headers = HeaderMap::new();
+
+    add_originator_header(&mut headers, "invalid\noriginator");
+
+    assert!(headers.is_empty());
+}
+
 #[tokio::test]
 async fn test_create_client_sets_default_headers() {
     skip_if_no_network!();
@@ -150,8 +198,11 @@ async fn raw_auth_client_does_not_log_sensitive_request_or_response_data() {
     let endpoint = format!(
         "http://auth-user:password-secret-value@{authority}/token?client_secret=query-secret-value"
     );
-    let client = create_raw_auth_client(&endpoint, /*auth_route_config*/ None)
-        .expect("raw auth client should build");
+    let client = create_raw_auth_client(
+        &endpoint,
+        &crate::test_support::transport_default_auth_route_config(),
+    )
+    .expect("raw auth client should build");
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
@@ -180,9 +231,11 @@ async fn raw_auth_client_does_not_log_sensitive_request_or_response_data() {
     let unresponsive_endpoint = format!(
         "http://auth-user:failure-password-secret-value@{unresponsive_addr}/token?client_secret=failure-query-secret-value"
     );
-    let unresponsive_client =
-        create_raw_auth_client(&unresponsive_endpoint, /*auth_route_config*/ None)
-            .expect("raw auth client should build");
+    let unresponsive_client = create_raw_auth_client(
+        &unresponsive_endpoint,
+        &crate::test_support::transport_default_auth_route_config(),
+    )
+    .expect("raw auth client should build");
     let error = unresponsive_client
         .post(&unresponsive_endpoint)
         .header("x-sensitive-request", "failure-request-header-secret-value")

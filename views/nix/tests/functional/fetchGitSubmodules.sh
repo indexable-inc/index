@@ -190,6 +190,32 @@ pathWithSubmodules=$(nix eval --impure --raw --expr "(builtins.fetchGit { url = 
 [[ -e $pathWithoutExportIgnore/exclude-from-root ]]
 [[ -e $pathWithoutExportIgnore/sub/exclude-from-sub ]]
 
+# A bare checkout is served as the commit it has checked out, and its
+# submodules are read from their own checkouts' repositories (the commit made
+# in `sub` above was never pushed to $subRepo: only that checkout's
+# repository has it), pinned to the gitlink the superproject's commit
+# records. The served bytes are determined by that commit alone, so a
+# submodule checkout sitting on some OTHER commit changes nothing: same
+# store path. The fetcher cache is dropped around each arm (as at :125/:135)
+# so every equality below is a fresh fetch, not a cache echo.
+subHeadRecorded=$(git -C "$rootRepo" rev-parse HEAD:sub)
+echo drifted > "$rootRepo"/sub/drift-file
+git -C "$rootRepo"/sub add drift-file
+git -C "$rootRepo"/sub commit -qm "drift"
+subHeadDrifted=$(git -C "$rootRepo"/sub rev-parse HEAD)
+[[ $subHeadDrifted != "$subHeadRecorded" ]]
+# Negative control: the drifted commit is real, different content that
+# fetches to a different path, so the equality below cannot pass vacuously.
+rm -f "$TEST_HOME"/.cache/nix/fetcher-cache*
+[[ $(nix eval --impure --raw --expr "(builtins.fetchGit { url = \"file://$rootRepo/sub\"; rev = \"$subHeadDrifted\"; }).outPath") != $(nix eval --impure --raw --expr "(builtins.fetchGit { url = \"file://$rootRepo/sub\"; rev = \"$subHeadRecorded\"; }).outPath") ]]
+rm -f "$TEST_HOME"/.cache/nix/fetcher-cache*
+[[ $(nix eval --impure --raw --expr "(builtins.fetchGit { url = \"file://$rootRepo\"; submodules = true; }).outPath") = "$pathWithSubmodules" ]]
+# Back at the recorded commit: still the same input.
+git -C "$rootRepo" submodule update
+[[ $(git -C "$rootRepo"/sub rev-parse HEAD) = "$subHeadRecorded" ]]
+rm -f "$TEST_HOME"/.cache/nix/fetcher-cache*
+[[ $(nix eval --impure --raw --expr "(builtins.fetchGit { url = \"file://$rootRepo\"; submodules = true; }).outPath") = "$pathWithSubmodules" ]]
+
 test_submodule_nested() {
   local repoA=$TEST_ROOT/submodule_nested/a
   local repoB=$TEST_ROOT/submodule_nested/b
@@ -223,8 +249,11 @@ test_submodule_nested() {
   test -e "$out"/b/c/content
   local nonWorktree=$out
 
-  # Check worktree based fetch
-  # TODO: make it work without git submodule update
+  # A clean checkout is fetched as the commit it has checked out, so the bare
+  # spelling and the `rev =` spelling above are the same fetch and must land on
+  # one store path. Submodules come from the revisions the commit records, so
+  # they no longer have to be checked out at all; the update below only keeps
+  # the fixture in a state a developer would recognise.
   git -C "$repoA" submodule update --init --recursive
   out=$(nix eval --impure --raw --expr "(builtins.fetchGit { url = \"file://$repoA\"; submodules = true; }).outPath")
   find "$out"
@@ -232,3 +261,33 @@ test_submodule_nested() {
 
 }
 test_submodule_nested
+
+# Which repository serves a submodule on the checkout road is a probe, not a
+# promise: the submodule's own checkout serves the gitlink when it has the
+# object, and the URL `.gitmodules` names serves it otherwise -- same rev,
+# same bytes, so the outPath cannot tell them apart. The debug log can
+# ("served from its checkout"), and both arms are asserted through it.
+probeSub=$TEST_ROOT/probeSub
+createGitRepo "$probeSub"
+addGitContent "$probeSub"
+probeRoot=$TEST_ROOT/probeRoot
+createGitRepo "$probeRoot"
+git -C "$probeRoot" submodule add "$probeSub" sub
+git -C "$probeRoot" commit -m "Add submodule"
+probeRev=$(git -C "$probeRoot" rev-parse HEAD)
+# Baseline: the explicit-rev road, which always resolves the .gitmodules URL.
+expectedProbe=$(nix eval --impure --raw --expr "(builtins.fetchGit { url = \"file://$probeRoot\"; rev = \"$probeRev\"; submodules = true; }).outPath")
+# (a) The checkout has the object: served from it.
+rm -f "$TEST_HOME"/.cache/nix/fetcher-cache*
+gotCheckoutArm=$(nix eval --impure --raw -vvvvv --expr "(builtins.fetchGit { url = \"file://$probeRoot\"; submodules = true; }).outPath" 2> "$TEST_ROOT/subarm-checkout.err")
+grepQuiet -F "served from its checkout" "$TEST_ROOT/subarm-checkout.err"
+[[ $gotCheckoutArm = "$expectedProbe" ]]
+# (b) The checkout exists as a repository but LACKS the object (an empty
+# repository stands in for a shallow or stale one): the probe misses and the
+# URL arm serves the same bytes.
+rm -rf "$probeRoot/sub/.git"
+git -C "$probeRoot/sub" init -q
+rm -f "$TEST_HOME"/.cache/nix/fetcher-cache*
+gotUrlArm=$(nix eval --impure --raw -vvvvv --expr "(builtins.fetchGit { url = \"file://$probeRoot\"; submodules = true; }).outPath" 2> "$TEST_ROOT/subarm-url.err")
+grepQuietInverse -F "served from its checkout" "$TEST_ROOT/subarm-url.err"
+[[ $gotUrlArm = "$expectedProbe" ]]

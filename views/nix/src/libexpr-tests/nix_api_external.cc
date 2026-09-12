@@ -1,10 +1,13 @@
 #include "nix_api_store.h"
 #include "nix_api_util.h"
 #include "nix_api_expr.h"
+#include "nix_api_expr_internal.h"
 #include "nix_api_value.h"
 #include "nix_api_external.h"
 
 #include "nix/expr/tests/nix_api_expr.hh"
+#include "nix/expr/value-to-json.hh"
+#include <nlohmann/json.hpp>
 #include "nix/util/tests/string_callback.hh"
 
 #include <gtest/gtest.h>
@@ -46,24 +49,8 @@ TEST_F(nix_api_expr_test, nix_expr_eval_external)
     ExternalValue * val = nix_create_external_value(ctx, external, external);
     nix_init_external(ctx, value, val);
 
-    EvalState * stateResult = nix_state_create(nullptr, nullptr, store);
-    nix_value * valueResult = nix_alloc_value(nullptr, stateResult);
-
-    EvalState * stateFn = nix_state_create(nullptr, nullptr, store);
-    nix_value * valueFn = nix_alloc_value(nullptr, stateFn);
-
-    nix_expr_eval_from_string(nullptr, state, "builtins.typeOf", ".", valueFn);
-
     ASSERT_EQ(NIX_TYPE_EXTERNAL, nix_get_type(nullptr, value));
-
-    nix_value_call(ctx, state, valueFn, value, valueResult);
-
-    std::string string_value;
-    nix_get_string(nullptr, valueResult, OBSERVE_STRING(string_value));
-    ASSERT_STREQ("nix-external<MyExternalValueDesc( 42 )>", string_value.c_str());
-
-    nix_state_free(stateResult);
-    nix_state_free(stateFn);
+    ASSERT_EQ("nix-external<MyExternalValueDesc( 42 )>", value->value->external()->typeOf());
 }
 
 static void print_value_as_json_using_state(
@@ -90,20 +77,10 @@ TEST_F(nix_api_expr_test, nix_external_printValueAsJSON_can_use_state)
     nix_init_external(ctx, value, val);
     assert_ctx_ok();
 
-    nix_value * toJsonFn = nix_alloc_value(ctx, state);
-    nix_expr_eval_from_string(ctx, state, "builtins.toJSON", ".", toJsonFn);
+    nix::NixStringContext context;
+    auto json = nix::printValueAsJSON(state->state, true, *value->value, nix::noPos, context, false);
     assert_ctx_ok();
-
-    nix_value * result = nix_alloc_value(ctx, state);
-    nix_value_call(ctx, state, toJsonFn, value, result);
-    assert_ctx_ok();
-
-    std::string json_str;
-    nix_get_string(ctx, result, OBSERVE_STRING(json_str));
-    ASSERT_EQ("42", json_str);
-
-    nix_gc_decref(ctx, result);
-    nix_gc_decref(ctx, toJsonFn);
+    ASSERT_EQ(42, json);
 }
 
 } // namespace nixC

@@ -431,7 +431,7 @@ impl DrvStrict {
                 let idx = crate::builtins::global_index("toJSON").ok_or_else(|| {
                     VmError::eval("internal: no toJSON builtin to render a structured attribute")
                 })?;
-                Ok(Yield::Sub(Task::builtin(idx, vec![Slot::value(value)])))
+                Ok(Yield::sub(Task::builtin(idx, vec![Slot::value(value)])))
             }
             _ => {
                 self.stage = Stage::AttrCoerced;
@@ -441,7 +441,7 @@ impl DrvStrict {
                 // the attribute becomes the store path. `toString` is the
                 // other setting of the same function and must not be
                 // substituted for it.
-                Ok(Yield::Sub(Task::coerce_copying(Slot::value(value))))
+                Ok(Yield::sub(Task::coerce_copying(Slot::value(value))))
             }
         }
     }
@@ -451,7 +451,7 @@ impl DrvStrict {
         match self.arg_slots.get(self.arg_index) {
             Some(slot) => {
                 self.stage = Stage::ArgElement;
-                Ok(Yield::Sub(Task::coerce_copying(slot.clone())))
+                Ok(Yield::sub(Task::coerce_copying(slot.clone())))
             }
             None => {
                 self.arg_slots = Rc::new(Vec::new());
@@ -470,7 +470,9 @@ impl DrvStrict {
             // fixed-output branch (`primops.cc:1853`), which is why this is
             // recorded rather than inspected here.
             attr::OUTPUT_HASH => self.output_hash = Some(text.clone()),
-            attr::OUTPUT_HASH_ALGO => self.output_hash_algo = parse_algo(&text)?,
+            attr::OUTPUT_HASH_ALGO => {
+                self.output_hash_algo = parse_algo(&text, vm.settings().blake3_hashes)?;
+            }
             attr::OUTPUT_HASH_MODE => self.set_ingestion_method(&text)?,
             attr::JSON => return Err(unimplemented("__json (deprecated structured attributes)")),
             attr::OUTPUTS => self.set_outputs(&text)?,
@@ -550,7 +552,8 @@ impl DrvStrict {
             attr::SYSTEM => self.platform = want_text_no_ctx(value)?,
             attr::OUTPUT_HASH => self.output_hash = Some(want_text_no_ctx(value)?),
             attr::OUTPUT_HASH_ALGO => {
-                self.output_hash_algo = parse_algo(&want_text_no_ctx(value)?)?;
+                self.output_hash_algo =
+                    parse_algo(&want_text_no_ctx(value)?, vm.settings().blake3_hashes)?;
             }
             attr::OUTPUT_HASH_MODE => {
                 let mode = want_text_no_ctx(value)?;
@@ -659,8 +662,12 @@ impl DrvStrict {
         // doing nothing: inverting it changed no observable behaviour because
         // the other one refuses the same inputs with the same words
         // (ENG-13020).
-        let (hash, warning) =
-            new_hash_allow_empty(hash_text, self.output_hash_algo).map_err(hash_parse_error)?;
+        let (hash, warning) = new_hash_allow_empty(
+            hash_text,
+            self.output_hash_algo,
+            vm.settings().blake3_hashes,
+        )
+        .map_err(hash_parse_error)?;
         let method = self.ingestion_method.unwrap_or(CaMethod::Flat);
 
         let built = build_fixed_output(store_dir, inputs, method, &hash).map_err(build_error)?;
@@ -685,7 +692,7 @@ impl DrvStrict {
         // structuredAttrs warnings are, and held past the write because the
         // answer has to be ready to hand back when the warning returns.
         self.empty_hash_warning = warning;
-        self.write_drv(built)
+        self.write_drv(vm, built)
     }
 
     /// Everything after the walk: the context becomes inputs, the required
@@ -838,7 +845,7 @@ impl DrvStrict {
             )
             .map_err(hash_error)?;
             vm.drv_hashes_mut().insert(built.drv_path.clone(), modulo);
-            return self.write_drv(built);
+            return self.write_drv(vm, built);
         }
 
         let built = build_input_addressed(&store_dir, &inputs, &InProcess, vm.drv_hashes_mut())
@@ -861,7 +868,7 @@ impl DrvStrict {
         .map_err(hash_error)?;
         vm.drv_hashes_mut().insert(built.drv_path.clone(), modulo);
 
-        self.write_drv(built)
+        self.write_drv(vm, built)
     }
 
     /// Hand the finished `.drv` to the embedder to put in the store.
@@ -873,22 +880,27 @@ impl DrvStrict {
     /// them all. Under `readOnlyMode` -- and under no store at all -- nothing
     /// is written and the path this already computed stands, which is the
     /// same branch cppnix takes. ENG-12799.
-    fn write_drv(&mut self, built: BuiltDerivation) -> Result<Yield> {
-        // `writeDerivation`'s reference set: the input sources plus every
-        // input derivation (`derivations.cc:172`). Sorted and deduplicated
-        // because the two sources are separate containers and the embedder
-        // hashes the set, not the sequence.
-        let mut references: Vec<String> = built.drv.input_srcs.clone();
-        references.extend(built.drv.input_drvs.iter().map(|d| d.drv_path.clone()));
-        references.sort();
-        references.dedup();
+    ///
+    /// Once per derivation per evaluation, where cppnix asks its store once
+    /// per `derivationStrict` call and nixpkgs makes the same call for the
+    /// same derivation several times over: the repeat has the same bytes and
+    /// so the same path, and the first ask is what wrote it
+    /// ([`Vm::note_drv_written`]). The repeat takes the `Null` branch of
+    /// [`Self::after_drv_written`], which is the "nothing to compare" case
+    /// it already is. Under `--repair` every ask reaches the store: repair
+    /// rewrites a damaged object, and the repeat could be the ask that
+    /// would have rewritten it.
+    fn write_drv(&mut self, vm: &mut Vm, built: BuiltDerivation) -> Result<Yield> {
         self.built_drv_path = built.drv_path;
         self.built_outputs = built.outputs;
+        if !vm.settings().repair && !vm.note_drv_written(&self.built_drv_path) {
+            crate::perf::note_drv_write_skipped();
+            return self.after_drv_written(vm, &Value::Null);
+        }
         self.stage = Stage::DrvWritten;
         Ok(Yield::Need(NeedPath::WriteDrv {
             name: self.name.clone(),
             aterm: built.aterm,
-            references,
             expected: self.built_drv_path.clone(),
         }))
     }
@@ -1005,11 +1017,16 @@ fn build_error(e: BuildError) -> VmError {
     }
 }
 
-/// `parseHashAlgoOpt` for the `outputHashAlgo` attribute. Only the
-/// experimentally-gated `blake3` fails; every other unrecognised name is
-/// `None`, which is cppnix's behaviour and not a shrug.
-fn parse_algo(s: &str) -> Result<Option<HashAlgo>> {
-    parse_algo_opt(s).map_err(hash_parse_error)
+/// `parseHashAlgoOpt` for the `outputHashAlgo` attribute. Blake3 is recognised
+/// before its feature is required; every other unrecognised name is `None`,
+/// which is cppnix's behaviour and not a shrug (`libutil/hash.cc:468-481`).
+fn parse_algo(s: &str, blake3_hashes: bool) -> Result<Option<HashAlgo>> {
+    parse_algo_opt(s)
+        .and_then(|algo| {
+            algo.map(|parsed| parsed.require_enabled(blake3_hashes))
+                .transpose()
+        })
+        .map_err(hash_parse_error)
 }
 
 /// A hash the derivation declared could not be read. An experimentally-gated
@@ -1075,8 +1092,11 @@ fn check_derivation_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InProcess, check_derivation_name};
+    use super::{InProcess, check_derivation_name, parse_algo};
     use crate::drvpath::DrvSource;
+    use crate::nixhash::HashAlgo;
+    use crate::refusal::{Refusal, RefusalToken};
+    use crate::vm::VmError;
 
     /// Evaluate under `/nix/store`, which is the value cppnix used on the
     /// machines the golden paths below were recorded on.
@@ -1427,8 +1447,9 @@ mod tests {
     struct Warns(std::cell::RefCell<Vec<String>>);
 
     impl crate::host::Host for Warns {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -1450,21 +1471,31 @@ mod tests {
             nix_path,
             trace
         );
-        fn read_file(&self, _p: &str) -> std::result::Result<String, String> {
+        fn read_file(&self, _p: &crate::value2::PathValue) -> std::result::Result<String, String> {
             Ok(String::new())
         }
         fn read_dir(
             &self,
-            _p: &str,
+            _p: &crate::value2::PathValue,
         ) -> std::result::Result<Vec<(String, crate::host::FileType)>, String> {
             Ok(Vec::new())
         }
-        fn path_exists(&self, _p: &str) -> bool {
-            true
+        fn path_exists_checked(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(true)
+        }
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
         }
         fn file_type(
             &self,
-            _p: &str,
+            _p: &crate::value2::PathValue,
         ) -> std::result::Result<Option<crate::host::FileType>, String> {
             Ok(Some(crate::host::FileType::Regular))
         }
@@ -1477,7 +1508,7 @@ mod tests {
     /// asked to write and answers with the path it was told to expect, or
     /// with a path of its own when the test wants the guard to fire.
     struct WritesDrvs {
-        written: std::cell::RefCell<Vec<(String, String, Vec<String>)>>,
+        written: std::cell::RefCell<Vec<(String, String)>>,
         /// What to answer instead of the store path. `None` answers
         /// correctly, by recomputing the same text path the evaluator did.
         lie: Option<String>,
@@ -1493,8 +1524,9 @@ mod tests {
     }
 
     impl crate::host::Host for WritesDrvs {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -1515,21 +1547,31 @@ mod tests {
             nix_path,
             trace
         );
-        fn read_file(&self, _p: &str) -> std::result::Result<String, String> {
+        fn read_file(&self, _p: &crate::value2::PathValue) -> std::result::Result<String, String> {
             Ok(String::new())
         }
         fn read_dir(
             &self,
-            _p: &str,
+            _p: &crate::value2::PathValue,
         ) -> std::result::Result<Vec<(String, crate::host::FileType)>, String> {
             Ok(Vec::new())
         }
-        fn path_exists(&self, _p: &str) -> bool {
-            true
+        fn path_exists_checked(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(true)
+        }
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
         }
         fn file_type(
             &self,
-            _p: &str,
+            _p: &crate::value2::PathValue,
         ) -> std::result::Result<Option<crate::host::FileType>, String> {
             Ok(Some(crate::host::FileType::Regular))
         }
@@ -1538,39 +1580,44 @@ mod tests {
             &self,
             name: &str,
             aterm: &str,
-            references: &[String],
         ) -> std::result::Result<String, crate::host::StoreError> {
-            self.written.borrow_mut().push((
-                name.to_owned(),
-                aterm.to_owned(),
-                references.to_vec(),
-            ));
+            self.written
+                .borrow_mut()
+                .push((name.to_owned(), aterm.to_owned()));
             if let Some(lie) = &self.lie {
                 return Ok(lie.clone());
             }
             // The same rule cppnix's `writeDerivation` uses under
-            // `readOnlyMode`: the text path of these bytes under this name.
-            // Computed with the crate's own hashing rather than echoed back
-            // from the request, so the assertion in the test below is a real
-            // comparison of two computations.
+            // `readOnlyMode`: the text path of these bytes under this name,
+            // with the reference set derived from the parsed derivation, as
+            // that writer derives it. Computed with the crate's own hashing
+            // rather than echoed back from the request, so the assertion in
+            // the test below is a real comparison of two computations.
+            let drv = crate::drv::parse(aterm).map_err(|e| {
+                crate::host::StoreError::Failed(format!("unparseable ATerm: {e:?}"))
+            })?;
             Ok(crate::drvpath::text_store_path(
                 "/nix/store",
                 &format!("{name}.drv"),
                 aterm,
-                references,
+                &drv.references(),
             ))
         }
     }
 
     fn drive_with(host: &dyn crate::host::Host, src: &str) -> std::result::Result<String, String> {
-        let module = crate::compile::compile_source(
-            src,
-            "/m",
-            crate::compile::Origin::String,
-            &crate::eval::settings_with_store(),
-        )
-        .map_err(|e| format!("{e:?}"))?;
-        let mut vm = crate::vm::Vm::with_settings(crate::eval::settings_with_store());
+        drive_with_settings(host, src, crate::eval::settings_with_store())
+    }
+
+    fn drive_with_settings(
+        host: &dyn crate::host::Host,
+        src: &str,
+        settings: crate::eval::Settings,
+    ) -> std::result::Result<String, String> {
+        let module =
+            crate::compile::compile_source(src, "/m", crate::compile::Origin::String, &settings)
+                .map_err(|e| format!("{e:?}"))?;
+        let mut vm = crate::vm::Vm::with_settings(settings);
         vm.start_module(&std::rc::Rc::new(module));
         let value = crate::eval::drive(&mut vm, host).map_err(|e| format!("{e:?}"))?;
         vm.start_print(value);
@@ -1600,7 +1647,7 @@ mod tests {
         )
         .unwrap_or_else(|e| unreachable!("evaluation: {e}"));
         let written = host.written.borrow();
-        let names: Vec<&str> = written.iter().map(|(n, _, _)| n.as_str()).collect();
+        let names: Vec<&str> = written.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
             vec!["a", "b"],
@@ -1618,15 +1665,72 @@ mod tests {
         assert!(b.1.starts_with("Derive(["), "b's ATerm: {}", b.1);
         // `b` names `a`'s `.drv` as a reference, which is what makes the
         // store keep the input closure alive.
+        let b_refs = crate::drv::parse(&b.1)
+            .unwrap_or_else(|e| unreachable!("b's ATerm parses: {e:?}"))
+            .references();
         assert!(
-            b.2.iter().any(|r| r.ends_with("-a.drv")),
-            "b's references: {:?}",
-            b.2
+            b_refs.iter().any(|r| r.ends_with("-a.drv")),
+            "b's references: {b_refs:?}"
         );
         // And the path the evaluation reports is the one the store answered,
         // recomputed from the bytes rather than echoed back.
-        let expected = crate::drvpath::text_store_path("/nix/store", "b.drv", &b.1, &b.2);
+        let expected = crate::drvpath::text_store_path("/nix/store", "b.drv", &b.1, &b_refs);
         assert_eq!(out.trim_matches('"'), expected);
+    }
+
+    /// The same derivation built twice in one evaluation is handed to the
+    /// store once: the second `derivationStrict` has the same bytes, so the
+    /// same path, and the first ask wrote it. nixpkgs does this constantly
+    /// (73k asks for 23k distinct derivations on one home-manager closure),
+    /// and each repeat used to be a store round trip answered "already
+    /// valid". Both values still carry the path.
+    #[test]
+    fn a_repeated_derivation_is_handed_to_the_store_once() {
+        let host = WritesDrvs::honest();
+        let out = drive_with(
+            &host,
+            r#"let mk = derivation { name = "a"; system = "x86_64-linux"; builder = "/bin/sh"; };
+                   x = mk.drvPath; y = (derivation { name = "a"; system = "x86_64-linux"; builder = "/bin/sh"; }).drvPath;
+               in if x == y then x else throw "two paths for one derivation""#,
+        )
+        .unwrap_or_else(|e| unreachable!("evaluation: {e}"));
+        let written = host.written.borrow();
+        let names: Vec<&str> = written.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a"],
+            "one write for two builds of one derivation"
+        );
+        assert!(out.trim_matches('"').ends_with("-a.drv"), "{out}");
+    }
+
+    /// Under `--repair` the repeat is asked again: repair rewrites a damaged
+    /// object, and a skipped repeat could be the ask that would have
+    /// rewritten it (cppnix calls `writeDerivation(.., Repair)` per
+    /// `derivationStrict`).
+    #[test]
+    fn under_repair_every_build_of_a_derivation_reaches_the_store() {
+        let host = WritesDrvs::honest();
+        let settings = crate::eval::Settings {
+            repair: true,
+            ..crate::eval::settings_with_store()
+        };
+        let out = drive_with_settings(
+            &host,
+            r#"let mk = derivation { name = "a"; system = "x86_64-linux"; builder = "/bin/sh"; };
+                   x = mk.drvPath; y = (derivation { name = "a"; system = "x86_64-linux"; builder = "/bin/sh"; }).drvPath;
+               in if x == y then x else throw "two paths for one derivation""#,
+            settings,
+        )
+        .unwrap_or_else(|e| unreachable!("evaluation: {e}"));
+        let written = host.written.borrow();
+        let names: Vec<&str> = written.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a", "a"],
+            "repair hands every build to the store"
+        );
+        assert!(out.trim_matches('"').ends_with("-a.drv"), "{out}");
     }
 
     /// A store that answers with a different path is a hard failure, not a
@@ -2249,6 +2353,49 @@ mod tests {
         );
     }
 
+    /// cppnix recognises Blake3 in `parseHashAlgoOpt`, then requires
+    /// `blake3-hashes` (`libutil/hash.cc:468-473`). The disabled case keeps
+    /// the refusal token and prose emitted before Blake3 support; the enabled
+    /// case must reach fixed-output path construction. The exact recursive
+    /// path is pinned because it fails before the Blake3 `source`-scheme fix
+    /// and passes after it; a shape-only assertion cannot distinguish that
+    /// branch from the well-formed but wrong `output:out` branch.
+    #[test]
+    fn blake3_hashes_off_keeps_the_refusal_and_on_builds_the_derivation() {
+        let refusal = match parse_algo("blake3", false) {
+            Err(VmError::Unimplemented(refusal)) => Some(refusal),
+            _ => None,
+        };
+        assert_eq!(
+            refusal,
+            Some(Refusal::new(
+                RefusalToken::DerivationStrict,
+                "builtins.derivationStrict with blake3 hashes (cppnix gates these behind the blake3-hashes experimental feature)",
+            ))
+        );
+
+        assert!(matches!(
+            parse_algo("blake3", true),
+            Ok(Some(HashAlgo::Blake3))
+        ));
+        let settings = crate::eval::Settings {
+            blake3_hashes: true,
+            ..crate::eval::settings_with_store()
+        };
+        let path = crate::eval::render_str_with(
+            &settings,
+            r#"(builtins.derivationStrict {
+                name = "x"; system = "x86_64-linux"; builder = "/bin/sh";
+                outputHash = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85";
+                outputHashAlgo = "blake3"; outputHashMode = "recursive";
+            }).out"#,
+        );
+        assert_eq!(
+            path, "\"/nix/store/yn6wzl5kf2iajdq4m3srq4hgy77i14d5-x\"",
+            "enabled blake3-hashes should use cppnix's recursive source scheme"
+        );
+    }
+
     /// The content-addressed branch, against cppnix goldens: every string
     /// below is what this fork's `nix-instantiate` printed on the cpp
     /// backend with `extra-experimental-features = ca-derivations` and store
@@ -2399,8 +2546,9 @@ mod tests {
 
         struct Store;
         impl Host for Store {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -2422,27 +2570,49 @@ mod tests {
                 nix_path,
                 trace
             );
-            fn read_file(&self, path: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 match path {
-                    "/m/f" => Ok("hi".to_owned()),
+                    p if p.path.as_ref() == "/m/f" => Ok("hi".to_owned()),
                     _ => Err(format!("path '{path}' does not exist")),
                 }
             }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, path: &str) -> bool {
-                self.read_file(path).is_ok()
+            fn path_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(self.read_file(path).is_ok())
             }
-            fn file_type(&self, path: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 match path {
-                    p if self.path_exists(p) => Ok(Some(FileType::Regular)),
+                    p if self.path_exists_checked(p)? => Ok(Some(FileType::Regular)),
                     p => Err(format!("path '{p}' does not exist")),
                 }
             }
-            fn copy_to_store(&self, path: &str) -> std::result::Result<String, StoreError> {
+            fn copy_to_store(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<String, StoreError> {
                 match path {
-                    "/m/f" => Ok(STORE_PATH.to_owned()),
+                    p if p.path.as_ref() == "/m/f" => Ok(STORE_PATH.to_owned()),
                     p => Err(StoreError::Failed(format!("path '{p}' does not exist"))),
                 }
             }

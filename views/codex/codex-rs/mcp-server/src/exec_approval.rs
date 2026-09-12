@@ -86,9 +86,7 @@ pub(crate) async fn handle_exec_approval_request(
             let message = format!("Failed to serialize ExecApprovalElicitRequestParams: {err}");
             error!("{message}");
 
-            outgoing
-                .send_error(request_id.clone(), ErrorData::invalid_params(message, None))
-                .await;
+            outgoing.send_error(request_id.clone(), ErrorData::invalid_params(message, None));
 
             return;
         }
@@ -130,7 +128,7 @@ async fn on_exec_approval_response(
         // If we cannot deserialize the response, we deny the request to be
         // conservative.
         ExecApprovalResponse {
-            decision: ReviewDecision::Denied,
+            decision: ReviewDecision::denied("approval request failed"),
         }
     });
 

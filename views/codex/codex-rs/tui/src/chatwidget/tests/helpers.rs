@@ -1,6 +1,7 @@
 use super::*;
 use codex_app_server_protocol::ImageGenerationItem;
 use codex_app_server_protocol::PluginAvailability;
+use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 
 pub(super) async fn test_config() -> Config {
@@ -14,8 +15,10 @@ pub(super) async fn test_config() -> Config {
         Config::load_default_with_cli_overrides_for_codex_home(codex_home.clone(), Vec::new())
             .await
             .expect("config");
+    // Keep generic UI snapshots stable when the bundled catalog default changes.
+    config.model = Some("gpt-5.6-sol".to_string());
     config.codex_home = codex_home.abs();
-    config.sqlite_home = codex_home.clone();
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.as_path().abs());
     config.log_dir = codex_home.join("log");
     config.cwd = PathBuf::from(test_path_display("/tmp/project")).abs();
     config.config_layer_stack = ConfigLayerStack::default();
@@ -34,7 +37,7 @@ pub(super) fn truncated_path_variants(path: &str) -> Vec<String> {
         .collect()
 }
 
-pub(super) fn normalize_snapshot_paths(text: impl Into<String>) -> String {
+pub(crate) fn normalize_snapshot_paths(text: impl Into<String>) -> String {
     let mut text = text.into();
 
     for unix_path in ["/tmp/project", "/tmp/hooks.json"] {
@@ -43,6 +46,7 @@ pub(super) fn normalize_snapshot_paths(text: impl Into<String>) -> String {
             text = text.replace(&platform_path, unix_path);
         }
     }
+    text = text.replace("/tmp/project\\", "/tmp/project/");
 
     let platform_test_cwd = test_path_display("/tmp/project");
     if platform_test_cwd == "/tmp/project" {
@@ -105,6 +109,7 @@ pub(super) fn snapshot(percent: f64) -> RateLimitSnapshot {
     RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: percent.round() as i32,
             window_duration_mins: Some(60),
@@ -113,6 +118,7 @@ pub(super) fn snapshot(percent: f64) -> RateLimitSnapshot {
         secondary: None,
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }
@@ -136,9 +142,12 @@ pub(super) fn test_session_telemetry(config: &Config, model: &str) -> SessionTel
 }
 
 pub(super) fn test_model_catalog(_config: &Config) -> Arc<ModelCatalog> {
-    Arc::new(ModelCatalog::new(
-        crate::test_support::TEST_MODEL_PRESETS.clone(),
-    ))
+    Arc::new(
+        ModelCatalog::new(crate::test_support::TEST_MODEL_PRESETS.clone())
+            .with_collaboration_modes(
+            codex_models_manager::collaboration_mode_presets::builtin_collaboration_mode_presets(),
+        ),
+    )
 }
 
 // --- Helpers for tests that need direct construction and event draining ---
@@ -153,6 +162,7 @@ pub(super) async fn make_chatwidget_manual(
         model_override,
         /*has_chatgpt_account*/ false,
         /*has_codex_backend_auth*/ false,
+        FrameRequester::test_dummy(),
     )
     .await
 }
@@ -161,6 +171,7 @@ pub(super) async fn make_chatwidget_manual_with_auth(
     model_override: Option<&str>,
     has_chatgpt_account: bool,
     has_codex_backend_auth: bool,
+    frame_requester: FrameRequester,
 ) -> (
     ChatWidget,
     tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
@@ -179,8 +190,10 @@ pub(super) async fn make_chatwidget_manual_with_auth(
     let session_telemetry = test_session_telemetry(&cfg, resolved_model.as_str());
     let model_catalog = test_model_catalog(&cfg);
     let common = ChatWidgetInit {
+        requires_openai_auth: cfg.model_provider.requires_openai_auth,
+        local_settings: crate::local_settings::LocalSettings::from(&cfg),
         config: cfg,
-        frame_requester: FrameRequester::test_dummy(),
+        frame_requester,
         app_event_tx,
         workspace_command_runner: None,
         initial_user_message: None,
@@ -202,14 +215,12 @@ pub(super) async fn make_chatwidget_manual_with_auth(
     let mut widget = ChatWidget::new_with_op_target(common, super::CodexOpTarget::Direct(op_tx));
     widget.transcript.active_cell = None;
     widget.transcript.active_cell_revision = 0;
-    widget.normal_placeholder_text = "Ask Codex to do anything".to_string();
-    widget.side_placeholder_text =
-        "Check recently modified functions for compatibility".to_string();
-    widget
-        .bottom_pane
-        .set_placeholder_text(widget.normal_placeholder_text.clone());
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)
+}
+
+pub(crate) fn set_active_cell(chat: &mut ChatWidget, cell: Box<dyn HistoryCell>) {
+    chat.transcript.active_cell = Some(cell);
 }
 
 // ChatWidget may emit other `Op`s (e.g. history/logging updates) on the same channel; this helper
@@ -228,7 +239,7 @@ pub(super) fn next_submit_op(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op
 pub(super) fn next_interrupt_op(op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>) {
     loop {
         match op_rx.try_recv() {
-            Ok(Op::Interrupt { .. }) => return,
+            Ok(Op::Interrupt) => return,
             Ok(_) => continue,
             Err(TryRecvError::Empty) => panic!("expected interrupt op but queue was empty"),
             Err(TryRecvError::Disconnected) => panic!("expected interrupt op but channel closed"),
@@ -275,14 +286,11 @@ fn test_model_info(slug: &str, priority: i32, supports_fast_mode: bool) -> Model
         "default_service_tier": null,
         "availability_nux": null,
         "upgrade": null,
-        "base_instructions": "base instructions",
-        "supports_reasoning_summaries": false,
         "default_reasoning_summary": "none",
         "support_verbosity": false,
         "default_verbosity": null,
         "apply_patch_tool_type": null,
         "truncation_policy": {"mode": "bytes", "limit": 10_000},
-        "supports_parallel_tool_calls": false,
         "supports_image_detail_original": false,
         "context_window": 272_000,
         "experimental_supported_tools": [],
@@ -306,7 +314,7 @@ pub(crate) fn set_fast_mode_test_catalog(chat: &mut ChatWidget) {
     .map(Into::into)
     .collect();
 
-    chat.model_catalog = Arc::new(ModelCatalog::new(models));
+    Arc::make_mut(&mut chat.model_catalog).models = models;
 }
 
 pub(crate) async fn make_chatwidget_manual_with_sender() -> (
@@ -323,10 +331,23 @@ pub(crate) async fn make_chatwidget_manual_with_sender() -> (
 pub(super) fn drain_insert_history(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
 ) -> Vec<Vec<ratatui::text::Line<'static>>> {
+    drain_insert_history_with(rx, |cell| cell.display_lines(/*width*/ 80))
+}
+
+pub(super) fn drain_insert_history_transcript(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> Vec<Vec<ratatui::text::Line<'static>>> {
+    drain_insert_history_with(rx, |cell| cell.transcript_lines(/*width*/ 80))
+}
+
+fn drain_insert_history_with(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    render: impl Fn(&dyn HistoryCell) -> Vec<ratatui::text::Line<'static>>,
+) -> Vec<Vec<ratatui::text::Line<'static>>> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.try_recv() {
         if let AppEvent::InsertHistoryCell(cell) = ev {
-            let mut lines = cell.display_lines(/*width*/ 80);
+            let mut lines = render(cell.as_ref());
             if !cell.is_stream_continuation() && !out.is_empty() && !lines.is_empty() {
                 lines.insert(0, "".into());
             }
@@ -375,6 +396,7 @@ fn token_usage_breakdown(usage: TokenUsage) -> codex_app_server_protocol::TokenU
         total_tokens: usage.total_tokens,
         input_tokens: usage.input_tokens,
         cached_input_tokens: usage.cached_input_tokens,
+        cache_write_input_tokens: 0,
         output_tokens: usage.output_tokens,
         reasoning_output_tokens: usage.reasoning_output_tokens,
     }
@@ -414,6 +436,7 @@ pub(super) fn handle_error(
     chat.handle_server_notification(
         ServerNotification::Error(ErrorNotification {
             error: AppServerTurnError {
+                misalignment: None,
                 message: message.into(),
                 codex_error_info,
                 additional_details: None,
@@ -447,6 +470,7 @@ pub(super) fn handle_stream_error_with_replay(
     chat.handle_server_notification(
         ServerNotification::Error(ErrorNotification {
             error: AppServerTurnError {
+                misalignment: None,
                 message: message.into(),
                 codex_error_info: None,
                 additional_details,
@@ -711,7 +735,10 @@ pub(super) fn handle_image_generation_end(
                 status: status.into(),
                 revised_prompt,
                 result: String::new(),
+                transparent_background: None,
+                failure: None,
                 saved_path,
+                imagegen_request_id: None,
             }),
         }),
         /*replay_kind*/ None,
@@ -764,6 +791,8 @@ pub(super) fn replay_agent_message(
             text: text.into(),
             phase: Some(MessagePhase::FinalAnswer),
             memory_citation: None,
+            delivery: None,
+            questions: None,
         },
         "turn-1".to_string(),
         replay_kind,
@@ -822,6 +851,8 @@ pub(super) fn begin_exec_with_source(
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
         process_id: None,
+        plugin_id: None,
+        script_path: None,
         source,
         status: AppServerCommandExecutionStatus::InProgress,
         command_actions,
@@ -845,6 +876,8 @@ pub(super) fn begin_unified_exec_startup(
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
         process_id: Some(process_id.to_string()),
+        plugin_id: None,
+        script_path: None,
         source: ExecCommandSource::UnifiedExecStartup,
         status: AppServerCommandExecutionStatus::InProgress,
         command_actions: Vec::new(),
@@ -912,6 +945,8 @@ pub(super) fn complete_assistant_message(
                 text: text.to_string(),
                 phase,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             },
         }),
         /*replay_kind*/ None,
@@ -920,6 +955,7 @@ pub(super) fn complete_assistant_message(
 
 pub(super) fn pending_steer(text: &str) -> PendingSteer {
     PendingSteer {
+        client_id: "test-submission".to_string(),
         user_message: UserMessage::from(text),
         history_record: UserMessageHistoryRecord::UserMessageText,
         compare_key: PendingSteerCompareKey {
@@ -1057,6 +1093,8 @@ pub(super) fn end_exec(
         command,
         cwd,
         process_id,
+        plugin_id,
+        script_path,
         source,
         command_actions,
         ..
@@ -1071,6 +1109,8 @@ pub(super) fn end_exec(
             command,
             cwd,
             process_id,
+            plugin_id,
+            script_path,
             source,
             status: if exit_code == 0 {
                 AppServerCommandExecutionStatus::Completed
@@ -1108,14 +1148,6 @@ pub(super) fn active_blob(chat: &ChatWidget) -> String {
         .as_ref()
         .expect("active cell present")
         .display_lines(/*width*/ 80);
-    lines_to_single_string(&lines)
-}
-
-pub(super) fn active_hook_blob(chat: &ChatWidget) -> String {
-    let Some(cell) = chat.active_hook_cell.as_ref() else {
-        return "<empty>\n".to_string();
-    };
-    let lines = cell.display_lines(/*width*/ 80);
     lines_to_single_string(&lines)
 }
 
@@ -1157,7 +1189,7 @@ pub(super) async fn assert_shift_left_edits_most_recent_queued_message_for_termi
 ) {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.queued_message_edit_hint_binding =
-        Some(queued_message_edit_binding_for_terminal(terminal_info));
+        Some(queued_message_edit_binding_for_terminal(terminal_info).into());
     chat.bottom_pane
         .set_queued_message_edit_binding(chat.queued_message_edit_hint_binding);
 
@@ -1338,11 +1370,15 @@ pub(super) fn plugins_test_summary(
             path: plugins_test_absolute_path(&format!("plugins/{name}")),
         },
         installed,
+        installed_at: None,
         enabled,
         install_policy,
         install_policy_source: None,
+        must_show_installation_interstitial: None,
         auth_policy: PluginAuthPolicy::OnInstall,
         availability: PluginAvailability::Available,
+        disabled_reason: None,
+        eligible_plan_types: None,
         interface: Some(plugins_test_interface(
             display_name,
             description,
@@ -1368,11 +1404,15 @@ pub(super) fn plugins_test_remote_summary(
         share_context: None,
         source: PluginSource::Remote,
         installed,
+        installed_at: None,
         enabled: true,
         install_policy: PluginInstallPolicy::Available,
         install_policy_source: None,
+        must_show_installation_interstitial: None,
         auth_policy: PluginAuthPolicy::OnInstall,
         availability: PluginAvailability::Available,
+        disabled_reason: None,
+        eligible_plan_types: None,
         interface: Some(plugins_test_interface(
             display_name,
             description,
@@ -1504,6 +1544,7 @@ pub(super) fn plugins_test_detail(
             .collect(),
         app_templates: Vec::new(),
         mcp_servers: mcp_servers.iter().map(|name| (*name).to_string()).collect(),
+        scheduled_tasks: None,
     }
 }
 
@@ -1523,6 +1564,7 @@ pub(super) fn plugins_test_remote_detail(
         apps: Vec::new(),
         app_templates: Vec::new(),
         mcp_servers: Vec::new(),
+        scheduled_tasks: None,
     }
 }
 
@@ -1623,6 +1665,7 @@ pub(super) async fn assert_hook_events_snapshot(
     snapshot_name: &str,
 ) {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.on_task_started();
 
     handle_hook_started(
         &mut chat,
@@ -1639,14 +1682,31 @@ pub(super) async fn assert_hook_events_snapshot(
         "hook start should update the live hook cell instead of writing history"
     );
     reveal_running_hooks(&mut chat);
+    let width = 100;
+    let height = chat.desired_height(width);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("create terminal");
+    terminal
+        .draw(|frame| chat.render(frame.area(), frame.buffer_mut()))
+        .expect("render hook activity status");
+    let running = normalized_backend_snapshot(terminal.backend());
     assert!(
-        active_hook_blob(&chat).contains(&format!(
-            "Running {} hook: {status_message}",
-            hook_event_label(event_name)
-        )),
-        "hook start should render in the live hook cell"
+        running
+            .lines()
+            .any(|line| line.contains("Working") && line.contains(status_message)),
+        "hook start should render its status in the activity row: {running}"
     );
 
+    let mut entries = vec![codex_app_server_protocol::HookOutputEntry {
+        kind: codex_app_server_protocol::HookOutputEntryKind::Warning,
+        text: "Heads up from the hook".to_string(),
+    }];
+    if event_name != codex_app_server_protocol::HookEventName::Interrupt {
+        entries.push(codex_app_server_protocol::HookOutputEntry {
+            kind: codex_app_server_protocol::HookOutputEntryKind::Context,
+            text: "Remember the startup checklist.".to_string(),
+        });
+    }
     handle_hook_completed(
         &mut chat,
         hook_run(
@@ -1654,16 +1714,7 @@ pub(super) async fn assert_hook_events_snapshot(
             event_name,
             codex_app_server_protocol::HookRunStatus::Completed,
             status_message,
-            vec![
-                codex_app_server_protocol::HookOutputEntry {
-                    kind: codex_app_server_protocol::HookOutputEntryKind::Warning,
-                    text: "Heads up from the hook".to_string(),
-                },
-                codex_app_server_protocol::HookOutputEntry {
-                    kind: codex_app_server_protocol::HookOutputEntryKind::Context,
-                    text: "Remember the startup checklist.".to_string(),
-                },
-            ],
+            entries,
         ),
     );
 
@@ -1673,19 +1724,4 @@ pub(super) async fn assert_hook_events_snapshot(
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
     assert_chatwidget_snapshot!(snapshot_name, combined);
-}
-
-fn hook_event_label(event_name: codex_app_server_protocol::HookEventName) -> &'static str {
-    match event_name {
-        codex_app_server_protocol::HookEventName::PreToolUse => "PreToolUse",
-        codex_app_server_protocol::HookEventName::PermissionRequest => "PermissionRequest",
-        codex_app_server_protocol::HookEventName::PostToolUse => "PostToolUse",
-        codex_app_server_protocol::HookEventName::PreCompact => "PreCompact",
-        codex_app_server_protocol::HookEventName::PostCompact => "PostCompact",
-        codex_app_server_protocol::HookEventName::SessionStart => "SessionStart",
-        codex_app_server_protocol::HookEventName::UserPromptSubmit => "UserPromptSubmit",
-        codex_app_server_protocol::HookEventName::SubagentStart => "SubagentStart",
-        codex_app_server_protocol::HookEventName::SubagentStop => "SubagentStop",
-        codex_app_server_protocol::HookEventName::Stop => "Stop",
-    }
 }

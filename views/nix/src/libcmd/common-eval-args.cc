@@ -159,15 +159,7 @@ Bindings * MixEvalArgs::getAutoArgs(EvalState & state)
         auto v = state.allocValue();
         std::visit(
             overloaded{
-                [&](const AutoArgExpr & arg) {
-                    state.mkThunk_(
-                        *v,
-                        state.parseExprFromString(
-                            arg.expr,
-                            compatibilitySettings.nixShellShebangArgumentsRelativeToScript
-                                ? state.rootPath(absPath(getCommandBaseDir()).string())
-                                : state.rootPath(".")));
-                },
+                [&](const AutoArgExpr & arg) { state.requireBackendCanServe(); },
                 [&](const AutoArgString & arg) { v->mkString(arg.s, state.mem); },
                 [&](const AutoArgFile & arg) { v->mkString(readFile(arg.path.string()), state.mem); },
                 [&](const AutoArgStdin & arg) { v->mkString(readFile(STDIN_FILENO), state.mem); }},

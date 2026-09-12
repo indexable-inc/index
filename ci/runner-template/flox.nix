@@ -58,23 +58,23 @@
     # Deliberately short. flox is a nix-first repository: the only things
     # listed here are what a step needs BEFORE or AROUND `nix develop`,
     # which cannot come from the devshell it is about to enter.
-    extraPackages = with pkgs; [
+    extraPackages = [
       # `just` is the entry point of every build/test step
       # (`nix develop --command just build-cli`). It comes from the devshell
       # in practice; kept here so a step that shells out to `just` before
       # entering the devshell still resolves, and so `ix shell` debugging of
       # a stuck lane can drive the same recipes.
-      just
+      pkgs.just
       # `git describe` in the nix-build lane needs annotated tags, and the
       # bats suites shell out to git constantly. git itself is in
       # module.nix's baseUserland; git-lfs is in platform.nix. `openssh` is
       # neither, and `nix` reaches for `ssh` whenever a flake input or a
       # store URI is ssh-shaped.
-      openssh
+      pkgs.openssh
       # `ps`/`pstree` parity: the activation suites inspect process trees.
       # flox-cli-tests carries its own copies, but an operator debugging a
       # hung lane over `ix shell` has no PATH but this one.
-      procps
+      pkgs.procps
       # EVIDENCE-DRIVEN, not a guess. GitHub's ubuntu images ship util-linux;
       # neither module.nix's base userland nor platform.nix does. The
       # cli-unit lane's `manifest_builds_can_depend_on_nef` runs a generated
@@ -87,7 +87,7 @@
       # when its pool ran the platform default template and could not use
       # this file. This entry is the proper fix; once the pool pins the
       # `flox` attr the shim is redundant and should be deleted.
-      util-linux
+      pkgs.util-linux
     ];
 
     # Delta over platform.nix's pins. platform.nix targets baml-class

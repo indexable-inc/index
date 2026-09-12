@@ -138,10 +138,6 @@ struct GitArchiveInputScheme : InputScheme
                 {},
             },
             {
-                "treeHash",
-                {},
-            },
-            {
                 "submodules",
                 {
                     .type = "Bool",
@@ -247,26 +243,6 @@ struct GitArchiveInputScheme : InputScheme
         if (host)
             url.query.insert_or_assign("host", *host);
         return url;
-    }
-
-    Input applyOverrides(const Input & _input, std::optional<std::string> ref, std::optional<Hash> rev) const override
-    {
-        auto input(_input);
-        if (rev && ref)
-            throw BadURL(
-                "cannot apply both a commit hash (%s) and a branch/tag name ('%s') to input '%s'",
-                rev->gitRev(),
-                *ref,
-                input.to_string());
-        if (rev) {
-            input.attrs.insert_or_assign("rev", rev->gitRev());
-            input.attrs.erase("ref");
-        }
-        if (ref) {
-            input.attrs.insert_or_assign("ref", *ref);
-            input.attrs.erase("rev");
-        }
-        return input;
     }
 
     // Search for the longest possible match starting from the beginning and ending at either the end or a path segment.
@@ -378,8 +354,7 @@ struct GitArchiveInputScheme : InputScheme
            `lastModified` the commit time (forge archives set file
            mtimes to the commit time, which is also what the git scheme
            reports). The rest (owner/repo/host are folded into the URL,
-           `treeHash` is archive-specific, `__final` is owned by the
-           lock layer) must not be forwarded. */
+           `__final` is owned by the lock layer) must not be forwarded. */
         if (auto narHash = maybeGetStrAttr(attrs, "narHash"))
             res.insert_or_assign("narHash", *narHash);
         if (auto lastModified = maybeGetIntAttr(attrs, "lastModified"))
@@ -552,9 +527,6 @@ struct GitArchiveInputScheme : InputScheme
 
         auto [input, tarballInfo] = downloadArchive(settings, store, _input);
 
-#if 0
-        input.attrs.insert_or_assign("treeHash", tarballInfo.treeHash.gitRev());
-#endif
         input.attrs.insert_or_assign("lastModified", uint64_t(tarballInfo.lastModified));
 
         auto accessor =

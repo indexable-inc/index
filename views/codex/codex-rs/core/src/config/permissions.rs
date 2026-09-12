@@ -189,9 +189,13 @@ pub(crate) fn apply_network_proxy_feature_config(
         mitm: None,
     }
     .apply_to_network_proxy_config(config);
+    if let Some(credential_broker) = feature_config.credential_broker {
+        config.set_credential_broker_enabled(credential_broker);
+    }
 }
 
-pub(crate) fn resolve_permission_profile(
+/// Resolves a named permission profile and its inherited configuration.
+pub fn resolve_permission_profile(
     permissions: &PermissionsToml,
     profile_name: &str,
 ) -> io::Result<PermissionProfileToml> {
@@ -236,10 +240,14 @@ fn insert_filesystem_permission_toml(
     entries: &mut BTreeMap<String, FilesystemPermissionToml>,
     entry: FileSystemSandboxEntry,
 ) {
+    if entry.skips_missing_path() {
+        return;
+    }
+
     match entry.path {
         FileSystemPath::Path { path } => {
             entries.insert(
-                path.into_path_buf().to_string_lossy().into_owned(),
+                path.inferred_native_path_string(),
                 FilesystemPermissionToml::Access(entry.access),
             );
         }
@@ -274,7 +282,7 @@ fn insert_special_filesystem_permission_toml(
             insert_scoped_filesystem_permission_toml(
                 entries,
                 ":workspace_roots".to_string(),
-                subpath.unwrap_or_else(|| PathBuf::from(".")),
+                subpath.unwrap_or_else(|| ".".to_string()),
                 access,
             );
         }
@@ -303,7 +311,7 @@ fn insert_special_filesystem_permission_toml(
 fn insert_scoped_filesystem_permission_toml(
     entries: &mut BTreeMap<String, FilesystemPermissionToml>,
     path: String,
-    subpath: PathBuf,
+    subpath: String,
     access: FileSystemAccessMode,
 ) {
     let permission = entries
@@ -311,13 +319,10 @@ fn insert_scoped_filesystem_permission_toml(
         .or_insert_with(|| FilesystemPermissionToml::Scoped(BTreeMap::new()));
     match permission {
         FilesystemPermissionToml::Scoped(scoped_entries) => {
-            scoped_entries.insert(subpath.to_string_lossy().into_owned(), access);
+            scoped_entries.insert(subpath, access);
         }
         FilesystemPermissionToml::Access(_) => {
-            *permission = FilesystemPermissionToml::Scoped(BTreeMap::from([(
-                subpath.to_string_lossy().into_owned(),
-                access,
-            )]));
+            *permission = FilesystemPermissionToml::Scoped(BTreeMap::from([(subpath, access)]));
         }
     }
 }
@@ -343,7 +348,8 @@ pub(crate) fn network_proxy_config_for_profile_selection(
     ))
 }
 
-pub(crate) fn compile_permission_profile(
+/// Compiles a named permission profile into filesystem and network policies.
+pub fn compile_permission_profile(
     permissions: &PermissionsToml,
     profile_name: &str,
     startup_warnings: &mut Vec<String>,
@@ -529,6 +535,7 @@ fn compile_filesystem_permission(
             entries.push(FileSystemSandboxEntry {
                 path: compile_filesystem_access_path(path, *access, startup_warnings)?,
                 access: *access,
+                missing_path_behavior: None,
             });
         }
         FilesystemPermissionToml::Scoped(scoped_entries) => {
@@ -547,6 +554,7 @@ fn compile_filesystem_permission(
                             pattern: compile_scoped_filesystem_pattern(path, subpath, *access)?,
                         },
                         access: *access,
+                        missing_path_behavior: None,
                     };
                     entries.push(entry);
                 } else {
@@ -554,6 +562,7 @@ fn compile_filesystem_permission(
                     entries.push(FileSystemSandboxEntry {
                         path: compile_scoped_filesystem_path(path, subpath, startup_warnings)?,
                         access: *access,
+                        missing_path_behavior: None,
                     });
                 }
             }
@@ -595,7 +604,7 @@ fn compile_filesystem_path(
     }
 
     let path = parse_absolute_path(path)?;
-    Ok(FileSystemPath::Path { path })
+    Ok(path.into())
 }
 
 fn compile_scoped_filesystem_path(
@@ -608,7 +617,9 @@ fn compile_scoped_filesystem_path(
     }
 
     if let Some(special) = parse_special_path(path) {
-        let subpath = parse_relative_subpath(subpath)?;
+        let subpath = parse_relative_subpath(subpath)?
+            .to_string_lossy()
+            .into_owned();
         let special = match special {
             FileSystemSpecialPath::ProjectRoots { .. } => Ok(FileSystemPath::Special {
                 value: FileSystemSpecialPath::project_roots(Some(subpath)),
@@ -630,7 +641,7 @@ fn compile_scoped_filesystem_path(
     let subpath = parse_relative_subpath(subpath)?;
     let base = parse_absolute_path(path)?;
     let path = AbsolutePathBuf::resolve_path_against_base(&subpath, base.as_path());
-    Ok(FileSystemPath::Path { path })
+    Ok(path.into())
 }
 
 fn compile_scoped_filesystem_pattern(
@@ -773,7 +784,10 @@ fn parse_special_path(path: &str) -> Option<FileSystemSpecialPath> {
     match path {
         ":root" => Some(FileSystemSpecialPath::Root),
         ":minimal" => Some(FileSystemSpecialPath::Minimal),
-        ":workspace_roots" => Some(FileSystemSpecialPath::project_roots(/*subpath*/ None)),
+        // `:project_roots` shipped before the canonical rename; keep it as an alias.
+        ":project_roots" | ":workspace_roots" => {
+            Some(FileSystemSpecialPath::project_roots(/*subpath*/ None))
+        }
         ":tmpdir" => Some(FileSystemSpecialPath::Tmpdir),
         ":slash_tmp" => Some(FileSystemSpecialPath::SlashTmp),
         _ if path.starts_with(':') => {
@@ -894,8 +908,7 @@ fn maybe_push_unknown_special_path_warning(
         startup_warnings,
         match subpath.as_deref() {
             Some(subpath) => format!(
-                "Configured filesystem path `{path}` with nested entry `{}` is not recognized by this version of Codex and will be ignored. Upgrade Codex if this path is required.",
-                subpath.display()
+                "Configured filesystem path `{path}` with nested entry `{subpath}` is not recognized by this version of Codex and will be ignored. Upgrade Codex if this path is required."
             ),
             None => format!(
                 "Configured filesystem path `{path}` is not recognized by this version of Codex and will be ignored. Upgrade Codex if this path is required."

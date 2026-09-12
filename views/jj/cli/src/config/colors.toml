@@ -79,14 +79,6 @@
 "config_list overridden source" = "bright black"
 "config_list overridden path" = "bright black"
 
-"views_tree tree" = "bright black"
-"views_tree name" = "magenta"
-"views_tree path" = "bright black"
-"views_tree remote" = "bright black"
-"views_tree branch" = "green"
-"views_tree upstream" = "bright black"
-"views_tree ahead" = { fg = "magenta", bold = true }
-"views_tree behind" = "cyan"
 
 "diff header" = "yellow"
 "diff empty" = "cyan"

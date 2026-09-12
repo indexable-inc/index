@@ -153,7 +153,7 @@ typedef struct ListBuilder ListBuilder;
  *
  * Can be released with nix_gc_decref() when necessary.
  * @struct PrimOp
- * @see nix_alloc_primop, nix_init_primop, nix_register_primop
+ * @see nix_alloc_primop, nix_init_primop
  */
 typedef struct PrimOp PrimOp;
 /** @brief External Value
@@ -210,24 +210,6 @@ PrimOp * nix_alloc_primop(
     const char ** args,
     const char * doc,
     void * user_data);
-
-/** @brief add a primop to the `builtins` attribute set
- * @ingroup primops
- *
- * Only applies to States created after this call.
- *
- * Moves your PrimOp content into the global evaluator registry, meaning
- * your input PrimOp pointer becomes invalid. The PrimOp must not be used
- * with nix_init_primop() before or after this call, as this would cause
- * undefined behavior.
- * You must call nix_gc_decref() on the original PrimOp pointer
- * after this call to release your reference.
- *
- * @param[out] context Optional, stores error information
- * @param[in] primOp PrimOp to register
- * @return error code, NIX_OK on success
- */
-nix_err nix_register_primop(nix_c_context * context, PrimOp * primOp);
 
 // Function prototypes
 

@@ -17,6 +17,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence, get_args, get_origin
 
+_SDK_PYTHON_ROOT = str(Path(__file__).resolve().parents[1])
+if _SDK_PYTHON_ROOT not in sys.path:
+    sys.path.insert(0, _SDK_PYTHON_ROOT)
+
+from release_version import normalize_codex_version  # noqa: E402
+
 SDK_DISTRIBUTION_NAME = "openai-codex"
 RUNTIME_DISTRIBUTION_NAME = "openai-codex-cli-bin"
 RUNTIME_PACKAGE_ROOT = Path("src") / "codex_cli_bin"
@@ -128,22 +134,6 @@ def pinned_runtime_codex_path() -> Path:
     if not codex_path.exists():
         raise RuntimeError(f"Pinned Codex runtime binary not found at {codex_path}.")
     return codex_path
-
-
-def normalize_codex_version(version: str) -> str:
-    normalized = version.strip()
-    if normalized.startswith("rust-v"):
-        normalized = normalized.removeprefix("rust-v")
-    elif normalized.startswith("v"):
-        normalized = normalized.removeprefix("v")
-
-    normalized = re.sub(r"-alpha\.?([0-9]+)$", r"a\1", normalized)
-    normalized = re.sub(r"-beta\.?([0-9]+)$", r"b\1", normalized)
-    normalized = re.sub(r"-rc\.?([0-9]+)$", r"rc\1", normalized)
-
-    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?", normalized):
-        raise RuntimeError(f"Could not normalize Codex version {version!r} to a PEP 440 version")
-    return normalized
 
 
 def _copy_package_tree(src: Path, dst: Path) -> None:
@@ -616,6 +606,9 @@ def generate_v2_all(schema_dir: Path) -> None:
             cwd=sdk_root(),
         )
     _require_nullable_chatgpt_account_email(out_path)
+    _preserve_reasoning_effort_enum(out_path)
+    _preserve_thread_source_enum(out_path)
+    _preserve_plan_type_enum(out_path)
     _normalize_generated_timestamps(out_path)
 
 
@@ -640,6 +633,98 @@ def _require_nullable_chatgpt_account_email(out_path: Path) -> None:
         "    email: str | None",
         1,
     )
+    out_path.write_text(source[:class_start] + class_source + source[class_end:])
+
+
+def _preserve_reasoning_effort_enum(out_path: Path) -> None:
+    """Keep the public effort constants while accepting future wire values."""
+    source = out_path.read_text()
+    class_start = source.find("class ReasoningEffort(RootModel[str]):")
+    if class_start == -1:
+        raise RuntimeError("Generated SDK is missing the open ReasoningEffort model")
+    class_end = source.find("\n\nclass ", class_start)
+    if class_end == -1:
+        class_end = len(source)
+
+    class_source = source[class_start:class_end]
+    if "min_length=1" not in class_source:
+        raise RuntimeError("Generated ReasoningEffort did not preserve the non-empty constraint")
+    open_enum = """class ReasoningEffort(str, Enum):
+    none = "none"
+    minimal = "minimal"
+    low = "low"
+    medium = "medium"
+    high = "high"
+    xhigh = "xhigh"
+    max = "max"
+    ultra = "ultra"
+
+    @classmethod
+    def _missing_(cls, value: object) -> ReasoningEffort | None:
+        if not isinstance(value, str) or not value:
+            return None
+        member = str.__new__(cls, value)
+        member._name_ = value
+        member._value_ = value
+        return member
+"""
+    out_path.write_text(source[:class_start] + open_enum + source[class_end:])
+
+
+def _preserve_thread_source_enum(out_path: Path) -> None:
+    """Keep the public thread-source constants while accepting future wire values."""
+    source = out_path.read_text()
+    class_start = source.find("class ThreadSource(RootModel[str]):")
+    if class_start == -1:
+        raise RuntimeError("Generated SDK is missing the open ThreadSource model")
+    class_end = source.find("\n\nclass ", class_start)
+    if class_end == -1:
+        class_end = len(source)
+
+    open_enum = """class ThreadSource(str, Enum):
+    user = "user"
+    subagent = "subagent"
+    memory_consolidation = "memory_consolidation"
+
+    @classmethod
+    def _missing_(cls, value: object) -> ThreadSource | None:
+        if not isinstance(value, str):
+            return None
+        member = str.__new__(cls, value)
+        member._name_ = value
+        member._value_ = value
+        return member
+"""
+    out_path.write_text(source[:class_start] + open_enum + source[class_end:])
+
+
+def _preserve_plan_type_enum(out_path: Path) -> None:
+    """Keep the public plan constants while accepting values from newer runtimes."""
+    source = out_path.read_text()
+    class_start = source.find("class PlanType(Enum):")
+    if class_start == -1:
+        raise RuntimeError("Generated SDK is missing PlanType")
+    class_end = source.find("\n\nclass ", class_start)
+    if class_end == -1:
+        class_end = len(source)
+
+    class_source = source[class_start:class_end]
+    class_source = class_source.replace(
+        "class PlanType(Enum):",
+        "class PlanType(str, Enum):",
+        1,
+    ).rstrip()
+    class_source += """
+
+    @classmethod
+    def _missing_(cls, value: object) -> PlanType | None:
+        if not isinstance(value, str) or not value:
+            return None
+        member = str.__new__(cls, value)
+        member._name_ = value
+        member._value_ = value
+        return member
+"""
     out_path.write_text(source[:class_start] + class_source + source[class_end:])
 
 
@@ -1217,7 +1302,7 @@ def generate_public_api_flat_methods() -> None:
     thread_fork_fields = _load_public_fields(
         "openai_codex.generated.v2_all",
         "ThreadForkParams",
-        exclude={"thread_id", *approval_fields},
+        exclude={"thread_id", "last_turn_id", *approval_fields},
     )
     thread_fork_fields = _replace_public_sandbox_field(thread_fork_fields, wire_name="sandbox")
     turn_start_fields = _load_public_fields(
@@ -1299,7 +1384,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "Python SDK release version to write into the staged package. "
-            "Accepts PEP 440 versions such as 0.1.0b1."
+            "Accepts PEP 440 versions such as 0.144.4."
         ),
     )
 
@@ -1322,7 +1407,8 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "Codex release version to write into the staged runtime package. "
-            "Accepts PEP 440 versions or release tags such as rust-v0.116.0-alpha.1."
+            "Accepts PEP 440 versions or release tags such as "
+            "rust-v0.116.0-alpha.1.2."
         ),
     )
     stage_runtime_parser.add_argument(

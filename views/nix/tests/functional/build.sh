@@ -238,6 +238,14 @@ fi
 # Uses fifo for synchronization to ensure deterministic behavior.
 # Requires -j2 so slow and fast-fail run concurrently (fifo deadlocks if serialized).
 if isDaemonNewer "2.34pre" && canUseSandbox; then
+    # The fixture flake lives in the source tree as a plain directory, which
+    # is not a flake source (no identity a lock file can name); it is given
+    # one as a jj workspace under TEST_ROOT, as every plain-directory fixture
+    # is (common/functions.sh, `jjFlakeDir`).
+    cancelledBuilds="$TEST_ROOT/cancelled-builds"
+    rm -rf "$cancelledBuilds"
+    jjFlakeDir "$cancelledBuilds"
+    cp "$_NIX_TEST_SOURCE_DIR/cancelled-builds/flake.nix" "$cancelledBuilds/"
     fifoDir="$TEST_ROOT/cancelled-builds-fifo"
     mkdir -p "$fifoDir"
     mkfifo "$fifoDir/fifo"
@@ -250,7 +258,7 @@ if isDaemonNewer "2.34pre" && canUseSandbox; then
     if ! isTestOnNixOS; then
         sandboxPathsArg=(--option sandbox-paths "/nix/store")
     fi
-    out="$(nix flake check ./cancelled-builds --impure -L -j2 \
+    out="$(nix flake check "$cancelledBuilds" --impure -L -j2 \
         --option sandbox true \
         "${sandboxPathsArg[@]}" \
         --option sandbox-build-dir /build-tmp \
@@ -281,10 +289,10 @@ if isDaemonNewer "2.34pre" && canUseSandbox; then
         "${sandboxPathsArg[@]}" \
         --option sandbox-build-dir /build-tmp \
         --option extra-sandbox-paths "/cancelled-builds-fifo=$fifoDir" \
-        "./cancelled-builds#checks.$system.slow" \
-        "./cancelled-builds#checks.$system.depends-on-slow" \
-        "./cancelled-builds#checks.$system.fast-fail" \
-        "./cancelled-builds#checks.$system.depends-on-fail" \
+        "$cancelledBuilds#checks.$system.slow" \
+        "$cancelledBuilds#checks.$system.depends-on-slow" \
+        "$cancelledBuilds#checks.$system.fast-fail" \
+        "$cancelledBuilds#checks.$system.depends-on-fail" \
         2>&1)" && status=0 || status=$?
     rm -rf "$fifoDir"
     test "$status" = 1

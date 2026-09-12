@@ -65,6 +65,94 @@ WHERE thread_id = ?
         row.map(|row| thread_goal_from_row(&row)).transpose()
     }
 
+    pub async fn replace_thread_goal_snapshot(
+        &self,
+        goal: &crate::ThreadGoal,
+    ) -> anyhow::Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+INSERT INTO thread_goals (
+    thread_id,
+    goal_id,
+    objective,
+    status,
+    token_budget,
+    tokens_used,
+    time_used_seconds,
+    created_at_ms,
+    updated_at_ms
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(thread_id) DO UPDATE SET
+    goal_id = excluded.goal_id,
+    objective = excluded.objective,
+    status = excluded.status,
+    token_budget = excluded.token_budget,
+    tokens_used = excluded.tokens_used,
+    time_used_seconds = excluded.time_used_seconds,
+    created_at_ms = excluded.created_at_ms,
+    updated_at_ms = excluded.updated_at_ms
+            "#,
+        )
+        .bind(goal.thread_id.to_string())
+        .bind(&goal.goal_id)
+        .bind(&goal.objective)
+        .bind(goal.status.as_str())
+        .bind(goal.token_budget)
+        .bind(goal.tokens_used)
+        .bind(goal.time_used_seconds)
+        .bind(datetime_to_epoch_millis(goal.created_at))
+        .bind(datetime_to_epoch_millis(goal.updated_at))
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            r#"
+INSERT INTO thread_goal_continuation_deferrals (thread_id)
+VALUES (?)
+ON CONFLICT(thread_id) DO NOTHING
+            "#,
+        )
+        .bind(goal.thread_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
+    pub async fn has_thread_goal_continuation_deferral(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<bool> {
+        sqlx::query_scalar(
+            r#"
+SELECT EXISTS(
+    SELECT 1
+    FROM thread_goal_continuation_deferrals
+    WHERE thread_id = ?
+)
+            "#,
+        )
+        .bind(thread_id.to_string())
+        .fetch_one(self.pool.as_ref())
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn clear_thread_goal_continuation_deferral(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM thread_goal_continuation_deferrals WHERE thread_id = ?")
+            .bind(thread_id.to_string())
+            .execute(self.pool.as_ref())
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn replace_thread_goal(
         &self,
         thread_id: ThreadId,
@@ -546,12 +634,16 @@ mod tests {
     use super::*;
     use crate::runtime::test_support::test_thread_metadata;
     use crate::runtime::test_support::unique_temp_dir;
+    use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
 
     async fn test_runtime() -> std::sync::Arc<StateRuntime> {
-        StateRuntime::init(unique_temp_dir(), "test-provider".to_string())
-            .await
-            .expect("state db should initialize")
+        StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(unique_temp_dir().as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("state db should initialize")
     }
 
     fn test_thread_id() -> ThreadId {
@@ -559,11 +651,8 @@ mod tests {
     }
 
     async fn upsert_test_thread(runtime: &StateRuntime, thread_id: ThreadId) {
-        let metadata = test_thread_metadata(
-            runtime.codex_home(),
-            thread_id,
-            runtime.codex_home().join("workspace"),
-        );
+        let sqlite_home = runtime.sqlite().home();
+        let metadata = test_thread_metadata(sqlite_home, thread_id, sqlite_home.join("workspace"));
         runtime
             .upsert_thread(&metadata)
             .await

@@ -12,12 +12,16 @@ pub struct ExternalAgentConfigImportSuccessRecord {
     pub cwd: Option<PathBuf>,
     pub source: Option<String>,
     pub target: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalAgentConfigImportFailureRecord {
     pub item_type: String,
     pub error_type: Option<String>,
+    #[serde(default)]
+    pub sub_error_type: Option<String>,
     pub failure_stage: String,
     pub message: String,
     pub cwd: Option<PathBuf>,
@@ -33,6 +37,7 @@ pub struct ExternalAgentConfigImportDetailsRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalAgentConfigImportHistoryRecord {
     pub import_id: String,
+    pub provider_id: Option<String>,
     pub completed_at_ms: i64,
     pub successes: Vec<ExternalAgentConfigImportSuccessRecord>,
     pub failures: Vec<ExternalAgentConfigImportFailureRecord>,
@@ -42,6 +47,7 @@ impl StateRuntime {
     pub async fn record_external_agent_config_import_completed(
         &self,
         import_id: &str,
+        provider_id: Option<&str>,
         successes: &[ExternalAgentConfigImportSuccessRecord],
         failures: &[ExternalAgentConfigImportFailureRecord],
     ) -> anyhow::Result<()> {
@@ -49,17 +55,20 @@ impl StateRuntime {
             r#"
 INSERT INTO external_agent_config_imports (
     import_id,
+    provider_id,
     completed_at_ms,
     successes,
     failures
-) VALUES (?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(import_id) DO UPDATE SET
+    provider_id = excluded.provider_id,
     completed_at_ms = excluded.completed_at_ms,
     successes = excluded.successes,
     failures = excluded.failures
 "#,
         )
         .bind(import_id)
+        .bind(provider_id)
         .bind(datetime_to_epoch_millis(Utc::now()))
         .bind(serde_json::to_string(successes)?)
         .bind(serde_json::to_string(failures)?)
@@ -104,6 +113,7 @@ WHERE import_id = ?
             r#"
 SELECT
     import_id,
+    provider_id,
     completed_at_ms,
     successes,
     failures
@@ -117,11 +127,13 @@ ORDER BY completed_at_ms DESC, import_id ASC
         rows.into_iter()
             .map(|row| {
                 let import_id: String = row.try_get("import_id")?;
+                let provider_id: Option<String> = row.try_get("provider_id")?;
                 let completed_at_ms: i64 = row.try_get("completed_at_ms")?;
                 let successes: String = row.try_get("successes")?;
                 let failures: String = row.try_get("failures")?;
                 Ok(ExternalAgentConfigImportHistoryRecord {
                     import_id,
+                    provider_id,
                     completed_at_ms,
                     successes: serde_json::from_str(&successes)?,
                     failures: serde_json::from_str(&failures)?,

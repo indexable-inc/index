@@ -26,8 +26,11 @@ public:
     PosixSourceAccessor(std::filesystem::path && root, bool trackLastModified = false);
 
     /**
-     * The most recent mtime seen by lstat(). This is a hack to
-     * support dumpPathAndGetMtime(). Should remove this eventually.
+     * The most recent mtime seen by lstat(), reported by
+     * `getLastModified()` when `trackLastModified` is set. Nothing in the
+     * tree ships with it set since the `path:` fetcher stopped copying
+     * directories into the store; it survives as an opt-in of
+     * `makeFSSourceAccessor`.
      */
     time_t mtime = 0;
 

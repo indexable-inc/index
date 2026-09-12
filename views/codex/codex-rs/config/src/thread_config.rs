@@ -75,10 +75,6 @@ impl ThreadConfigLoadError {
     pub fn code(&self) -> ThreadConfigLoadErrorCode {
         self.code
     }
-
-    pub fn status_code(&self) -> Option<u16> {
-        self.status_code
-    }
 }
 
 /// Loads typed config sources for a new thread.
@@ -288,6 +284,7 @@ mod tests {
                     wire_api = "responses"
                     requires_openai_auth = false
                     supports_websockets = true
+                    supports_standalone_web_search = true
 
                     [features]
                     plugins = false
@@ -316,6 +313,7 @@ mod tests {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: true,
+            supports_standalone_web_search: true,
         }
     }
 }

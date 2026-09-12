@@ -105,6 +105,31 @@
   # MCP servers at all. Default false, and false is a no-op: the render is
   # byte-identical to a build that never passed it.
   kernelOnly ? false,
+  # True when the HOST delivers the MCP server set through Claude Code's
+  # managed layer (`/Library/Application Support/ClaudeCode/managed-mcp.json`,
+  # rendered by modules/darwin/claude-managed-settings `mcpServers`). That
+  # file is exclusive: with it present, Claude Code 2.1.228 REFUSES to start
+  # when the command line also carries `--mcp-config` ("You cannot
+  # dynamically configure MCP servers when an enterprise MCP config is
+  # present", every launch on hydra after the 2026-09-03 switch), so this
+  # wrapper then bakes no MCP flag at all. The set the host declares must
+  # still carry `index` under the same name: `indexKernelBaked` (the guard
+  # attestation) and the by-name denies keep deriving from the intended set,
+  # because the kernel is attached either way. Default false is a no-op.
+  managedMcp ? false,
+  # Kernel-superseded native tools (Read, Write, Edit, Glob, Grep, WebSearch,
+  # WebFetch) this consumer keeps despite the baked kernel, by name. Rendered
+  # out of the shared deny list; `kernelOnly` denies them regardless (see
+  # policy/permissions.nix `keepClaudeTools`). Default empty renders
+  # byte-identically to a build that never passed it.
+  keepNativeTools ? [],
+  # False bakes `--no-chrome`, keeping the Claude in Chrome browser bridge off
+  # in every session this wrapper starts regardless of ~/.claude.json's
+  # `claudeInChromeDefaultEnabled` toggle (Claude Code rewrites that file, so
+  # a declaration there is the same race as settings.json, #4312). True is
+  # the upstream default and renders byte-identically to a build that never
+  # passed it.
+  chrome ? true,
   # Directories baked into the wrapper as `--add-dir=<dir>` flags, one per entry.
   # `--add-dir` grants tool file-access to a directory, AND (the reason this arg
   # exists) Claude Code loads any `<dir>/.claude/skills/` and `<dir>/CLAUDE.md`
@@ -342,22 +367,29 @@
   # cheaper exclusion than denying its tools by name after loading it. The
   # by-name denies below are the belt to this braces, and both are derived from
   # this one attrset rather than from a hand-written list of server names.
-  effectiveMcpServers =
+  intendedMcpServers =
     if kernelOnly
     then lib.filterAttrs (name: _: name == "index") mcpServers
     else mcpServers;
+  # What the wrapper itself bakes: nothing under `managedMcp`, where the host's
+  # managed-mcp.json carries the same set and a baked flag is fatal (see the
+  # argument doc).
+  effectiveMcpServers =
+    if managedMcp
+    then {}
+    else intendedMcpServers;
 
   # Servers strict mode dropped, rendered as whole-server denies. Redundant
   # with not baking them, deliberately: `--mcp-config` layers MERGE, so a user's
   # own config or a discovered project `.mcp.json` can still introduce a server
   # this wrapper never baked, and only the deny reaches that.
   droppedMcpServerDenies = map (name: "mcp__${name}") (
-    builtins.attrNames (builtins.removeAttrs mcpServers (builtins.attrNames effectiveMcpServers))
+    builtins.attrNames (builtins.removeAttrs mcpServers (builtins.attrNames intendedMcpServers))
   );
 
   # Whether the index kernel rides along, which decides the tools the kernel
   # supersedes (shared policy below).
-  indexKernelBaked = effectiveMcpServers ? index;
+  indexKernelBaked = intendedMcpServers ? index;
 
   # Disabling a tool here puts its BARE name in `permissions.deny`, which
   # strips the tool's schema from the model context entirely; Claude Code has
@@ -560,8 +592,9 @@
   # the overlay build (no kernel) keeps them.
   sharedPermissions = import (ix.paths.packagesRoot + "/agent/policy/permissions.nix") {
     inherit lib indexKernelBaked;
-    exaSearchBaked = effectiveMcpServers ? exa;
+    exaSearchBaked = intendedMcpServers ? exa;
     inherit protectedMergeGuard kernelOnly;
+    keepClaudeTools = keepNativeTools;
   };
 
   # Controlled keys this package always owns: the highest-priority settings
@@ -664,6 +697,8 @@
     ]
     # Default posture for sandboxed ix environments.
     ++ lib.optional dangerouslySkipPermissions "--dangerously-skip-permissions"
+    # Browser bridge off for the whole session (see the `chrome` argument).
+    ++ lib.optional (!chrome) "--no-chrome"
     # Replace the stock prompt when a house prompt is configured.
     ++ lib.optional (
       systemPrompt != null
@@ -853,7 +888,7 @@
       import ./update.nix {
         writeNushellApplication = updateScriptWriter;
         inherit gnupg python3;
-        nix = repoPackages.nix-ix;
+        nix = ix.nixPackageFor "packages/claude-code: updateScript";
       };
 in
   # `allowVendoredUnfree` strips the honest `meta.license` tag below so the

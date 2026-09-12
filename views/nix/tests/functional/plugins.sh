@@ -7,6 +7,8 @@ for ext in so dylib; do
     [[ -f "$plugin" ]] && break
 done
 
-res=$(nix --option setting-set true --option plugin-files "$plugin" eval --expr builtins.anotherNull)
+res=$(nix --option plugin-files "$plugin" config show setting-set)
+[[ "$res" == false ]]
 
-[ "$res"x = "nullx" ]
+res=$(nix --option setting-set true --option plugin-files "$plugin" config show setting-set)
+[[ "$res" == true ]]

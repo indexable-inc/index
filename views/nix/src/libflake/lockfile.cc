@@ -1,93 +1,154 @@
-#include <boost/unordered/unordered_flat_set.hpp>
 #include <nlohmann/json.hpp>
-#include <assert.h>
-#include <boost/unordered/unordered_flat_set_fwd.hpp>
-#include <nlohmann/detail/iterators/iter_impl.hpp>
-#include <nlohmann/detail/iterators/iteration_proxy.hpp>
-#include <nlohmann/json_fwd.hpp>
-#include <algorithm>
 #include <iomanip>
-#include <iterator>
-#include <compare>
 #include <ctime>
-#include <format>
-#include <functional>
-#include <map>
 #include <memory>
-#include <optional>
-#include <ostream>
-#include <regex>
-#include <set>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <variant>
-#include <vector>
+#include <algorithm>
+#include <sstream>
 
+#include "ixe-lock-graph.h"
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/flake/lockfile.hh"
 #include "nix/util/strings.hh"
 #include "nix/fetchers/attrs.hh"
 #include "nix/fetchers/fetchers.hh"
-#include "nix/flake/flakeref.hh"
 #include "nix/store/path.hh"
 #include "nix/util/ansicolor.hh"
-#include "nix/util/configuration.hh"
 #include "nix/util/error.hh"
 #include "nix/util/fmt.hh"
-#include "nix/util/hash.hh"
 #include "nix/util/logging.hh"
-#include "nix/util/ref.hh"
-#include "nix/util/types.hh"
-#include "nix/util/util.hh"
-
-namespace nix {
-class Store;
-} // namespace nix
 
 namespace nix::flake {
 
-static FlakeRef
-getFlakeRef(const fetchers::Settings & fetchSettings, const nlohmann::json & json, const char * attr, const char * info)
+static void checkGraphError(char * raw)
 {
-    auto i = json.find(attr);
-    if (i != json.end()) {
-        auto attrs = fetchers::jsonToAttrs(*i);
-        // FIXME: remove when we drop support for version 5.
-        if (info) {
-            auto j = json.find(info);
-            if (j != json.end()) {
-                for (auto k : fetchers::jsonToAttrs(*j))
-                    attrs.insert_or_assign(k.first, k.second);
-            }
-        }
-        return FlakeRef::fromAttrs(fetchSettings, attrs);
+    if (!raw)
+        return;
+    std::unique_ptr<char, decltype(&ixe_lock_graph_string_free)> error(raw, ixe_lock_graph_string_free);
+    throw Error("%s", error.get());
+}
+
+static IxeLockBytes bytes(std::string_view text)
+{
+    return {reinterpret_cast<const uint8_t *>(text.data()), text.size()};
+}
+
+static std::vector<IxeLockBytes> pathViews(const InputAttrPath & path)
+{
+    std::vector<IxeLockBytes> result;
+    result.reserve(path.size());
+    for (const auto & part : path)
+        result.push_back(bytes(part));
+    return result;
+}
+
+static InputAttrPath copyPath(IxeLockPathView path)
+{
+    InputAttrPath result;
+    result.reserve(path.len);
+    for (size_t i = 0; i < path.len; ++i)
+        result.emplace_back(reinterpret_cast<const char *>(path.data[i].data), path.data[i].len);
+    return result;
+}
+
+struct LockFileImpl
+{
+    std::unique_ptr<IxeLockGraph, decltype(&ixe_lock_graph_free)> graph;
+    std::map<NodeId, LockedNode> payloads;
+
+    LockFileImpl()
+        : graph(nullptr, ixe_lock_graph_free)
+    {
+        IxeLockGraph * raw = nullptr;
+        checkGraphError(ixe_lock_graph_new_empty(&raw));
+        graph.reset(raw);
     }
 
-    throw Error("attribute '%s' missing in lock file", attr);
+    explicit LockFileImpl(std::string_view source)
+        : graph(nullptr, ixe_lock_graph_free)
+    {
+        IxeLockGraph * raw = nullptr;
+        checkGraphError(ixe_lock_graph_parse(bytes(source), &raw));
+        graph.reset(raw);
+    }
+
+    nlohmann::json json(char * (*read)(const IxeLockGraph *, char **) ) const
+    {
+        char * raw = nullptr;
+        checkGraphError(read(graph.get(), &raw));
+        std::unique_ptr<char, decltype(&ixe_lock_graph_string_free)> text(raw, ixe_lock_graph_string_free);
+        return nlohmann::json::parse(text.get());
+    }
+};
+
+struct LockPrefetchImpl
+{
+    std::unique_ptr<IxeLockSchedule, decltype(&ixe_lock_schedule_free)> schedule;
+
+    explicit LockPrefetchImpl(IxeLockSchedule * handle)
+        : schedule(handle, ixe_lock_schedule_free)
+    {
+    }
+};
+
+static std::vector<NodeId> takeNodes(IxeLockNodes * raw)
+{
+    std::unique_ptr<IxeLockNodes, decltype(&ixe_lock_nodes_free)> snapshot(raw, ixe_lock_nodes_free);
+    std::vector<NodeId> nodes;
+    nodes.reserve(ixe_lock_nodes_len(snapshot.get()));
+    for (size_t i = 0; i < ixe_lock_nodes_len(snapshot.get()); ++i) {
+        NodeId id{};
+        checkGraphError(ixe_lock_nodes_get(snapshot.get(), i, &id.value));
+        nodes.push_back(id);
+    }
+    return nodes;
+}
+
+LockPrefetchSchedule LockFile::prefetchSchedule() const
+{
+    IxeLockSchedule * raw = nullptr;
+    checkGraphError(ixe_lock_graph_prefetch_schedule(impl->graph.get(), &raw));
+    return LockPrefetchSchedule(std::make_shared<LockPrefetchImpl>(raw));
+}
+
+std::vector<NodeId> LockPrefetchSchedule::ready() const
+{
+    IxeLockNodes * raw = nullptr;
+    checkGraphError(ixe_lock_schedule_ready(impl->schedule.get(), &raw));
+    return takeNodes(raw);
+}
+
+std::vector<NodeId> LockPrefetchSchedule::complete(NodeId node, bool succeeded) const
+{
+    IxeLockNodes * raw = nullptr;
+    checkGraphError(ixe_lock_schedule_complete(impl->schedule.get(), node.value, succeeded ? 1 : 0, &raw));
+    return takeNodes(raw);
+}
+
+void LockPrefetchSchedule::checkComplete() const
+{
+    checkGraphError(ixe_lock_schedule_check_complete(impl->schedule.get()));
 }
 
 LockedNode::LockedNode(const fetchers::Settings & fetchSettings, const nlohmann::json & json)
-    : lockedRef(getFlakeRef(fetchSettings, json, "locked", "info")) // FIXME: remove "info"
-    , originalRef(getFlakeRef(fetchSettings, json, "original", nullptr))
-    , isFlake(json.find("flake") != json.end() ? (bool) json["flake"] : true)
+    : lockedRef(FlakeRef::fromAttrs(fetchSettings, fetchers::jsonToAttrs(json.at("locked"))))
+    , originalRef(FlakeRef::fromAttrs(fetchSettings, fetchers::jsonToAttrs(json.at("original"))))
+    , isFlake(json.value("flake", true))
     , parentInputAttrPath(
-          json.find("parent") != json.end() ? (std::optional<InputAttrPath>) json["parent"] : std::nullopt)
+          json.contains("parent") ? std::optional(json.at("parent").get<InputAttrPath>()) : std::nullopt)
 {
     if (!lockedRef.input.isLocked(fetchSettings) && !lockedRef.input.isRelative()) {
-        if (lockedRef.input.getNarHash())
+        if (lockedRef.input.getNarHash() || lockedRef.input.getTreeHash())
             warn(
-                "Lock file entry '%s' is unlocked (e.g. lacks a Git revision) but is checked by NAR hash. "
-                "This is not reproducible and will break after garbage collection or when shared.",
+                "Lock file entry '%s' is unlocked but checked by content hash. "
+                "This is not reproducible after garbage collection or sharing.",
                 lockedRef.to_string());
         else
             throw Error(
-                "Lock file contains unlocked input '%s'. Use '--allow-dirty-locks' to accept this lock file.",
+                "Lock file contains unlocked input '%s' with no content hash; re-lock the flake.",
                 fetchers::attrsToJSON(lockedRef.input.toAttrs()));
     }
-
-    // For backward compatibility, lock file entries are implicitly final.
-    assert(!lockedRef.input.attrs.contains("__final"));
+    // A lock node is a final fetch request. __final is a host fetch flag,
+    // not a field in the lock document schema.
     lockedRef.input.attrs.insert_or_assign("__final", Explicit<bool>(true));
 }
 
@@ -96,230 +157,224 @@ StorePath LockedNode::computeStorePath(Store & store) const
     return lockedRef.input.computeStorePath(store);
 }
 
-static std::shared_ptr<Node>
-doFind(const ref<Node> & root, const InputAttrPath & path, std::vector<InputAttrPath> & visited)
+LockFile::LockFile()
+    : impl(std::make_shared<LockFileImpl>())
 {
-    auto pos = root;
-
-    auto found = std::find(visited.cbegin(), visited.cend(), path);
-
-    if (found != visited.end()) {
-        std::vector<std::string> cycle;
-        std::transform(found, visited.cend(), std::back_inserter(cycle), printInputAttrPath);
-        cycle.push_back(printInputAttrPath(path));
-        throw Error("follow cycle detected: [%s]", concatStringsSep(" -> ", cycle));
-    }
-    visited.push_back(path);
-
-    for (auto & elem : path) {
-        if (auto i = get(pos->inputs, elem)) {
-            if (auto node = std::get_if<0>(&*i))
-                pos = *node;
-            else if (auto follows = std::get_if<1>(&*i)) {
-                if (auto p = doFind(root, *follows, visited))
-                    pos = ref(p);
-                else
-                    return {};
-            }
-        } else
-            return {};
-    }
-
-    return pos;
-}
-
-std::shared_ptr<Node> LockFile::findInput(const InputAttrPath & path)
-{
-    std::vector<InputAttrPath> visited;
-    return doFind(root, path, visited);
 }
 
 LockFile::LockFile(const fetchers::Settings & fetchSettings, std::string_view contents, std::string_view path)
 {
-    auto json = [=] {
-        try {
-            return nlohmann::json::parse(contents);
-        } catch (const nlohmann::json::parse_error & e) {
-            throw Error("Could not parse '%s': %s", path, e.what());
-        }
-    }();
-    auto version = json.value("version", 0);
-    if (version < 5 || version > 7)
-        throw Error("lock file '%s' has unsupported version %d", path, version);
+    try {
+        impl = std::make_shared<LockFileImpl>(contents);
+        for (auto & item : impl->json(ixe_lock_graph_payloads))
+            impl->payloads.emplace(
+                NodeId{item.at("id").get<uint64_t>()}, LockedNode(fetchSettings, item.at("payload")));
+    } catch (Error & error) {
+        error.addTrace({}, "while reading lock file '%s'", path);
+        throw;
+    }
+}
 
-    std::string rootKey = json["root"];
-    std::map<std::string, ref<Node>> nodeMap{{rootKey, root}};
+NodeId LockFile::addNode(
+    const FlakeRef & lockedRef,
+    const FlakeRef & originalRef,
+    bool isFlake,
+    std::optional<InputAttrPath> parentInputAttrPath)
+{
+    auto locked = fetchers::attrsToJSON(lockedRef.toAttrs());
+    locked.erase("__final");
+    nlohmann::json payload = {{"locked", locked}, {"original", fetchers::attrsToJSON(originalRef.toAttrs())}};
+    if (!isFlake)
+        payload["flake"] = false;
+    if (parentInputAttrPath)
+        payload["parent"] = *parentInputAttrPath;
+    NodeId id{};
+    checkGraphError(ixe_lock_graph_add(impl->graph.get(), bytes(payload.dump()), &id.value));
+    impl->payloads.emplace(id, LockedNode(lockedRef, originalRef, isFlake, std::move(parentInputAttrPath)));
+    return id;
+}
 
-    [&](this const auto & getInputs, Node & node, const nlohmann::json & jsonNode) {
-        if (jsonNode.find("inputs") == jsonNode.end())
-            return;
-        for (auto & i : jsonNode["inputs"].items()) {
-            if (i.value().is_array()) { // FIXME: remove, obsolete
-                InputAttrPath path;
-                for (auto & j : i.value())
-                    path.push_back(j);
-                node.inputs.insert_or_assign(i.key(), path);
-            } else {
-                std::string inputKey = i.value();
-                auto k = nodeMap.find(inputKey);
-                if (k == nodeMap.end()) {
-                    auto & nodes = json["nodes"];
-                    auto jsonNode2 = nodes.find(inputKey);
-                    if (jsonNode2 == nodes.end())
-                        throw Error("lock file references missing node '%s'", inputKey);
-                    auto input = make_ref<LockedNode>(fetchSettings, *jsonNode2);
-                    k = nodeMap.insert_or_assign(inputKey, input).first;
-                    getInputs(*input, *jsonNode2);
-                }
-                if (auto child = k->second.dynamic_pointer_cast<LockedNode>())
-                    node.inputs.insert_or_assign(i.key(), ref(child));
-                else
-                    // FIXME: replace by follows node
-                    throw Error("lock file contains cycle to root node");
-            }
-        }
-    }(*root, json["nodes"][rootKey]);
+static Edge edgeFromJSON(const nlohmann::json & edge)
+{
+    if (edge.is_array())
+        return edge.get<InputAttrPath>();
+    return NodeId{edge.get<uint64_t>()};
+}
 
-    // FIXME: check that there are no cycles in version >= 7. Cycles
-    // between inputs are only possible using 'follows' indirections.
-    // Once we drop support for version <= 6, we can simplify the code
-    // a bit since we don't need to worry about cycles.
+void LockFile::setInput(NodeId node, const FlakeId & name, const Edge & edge)
+{
+    if (auto target = std::get_if<NodeId>(&edge)) {
+        checkGraphError(ixe_lock_graph_set_direct(impl->graph.get(), node.value, bytes(name), target->value));
+    } else {
+        auto path = pathViews(std::get<InputAttrPath>(edge));
+        checkGraphError(
+            ixe_lock_graph_set_follows(impl->graph.get(), node.value, bytes(name), {path.data(), path.size()}));
+    }
+}
+
+std::map<FlakeId, Edge> LockFile::inputs(NodeId node) const
+{
+    IxeLockInputs * raw = nullptr;
+    checkGraphError(ixe_lock_graph_inputs(impl->graph.get(), node.value, &raw));
+    std::unique_ptr<IxeLockInputs, decltype(&ixe_lock_inputs_free)> snapshot(raw, ixe_lock_inputs_free);
+    std::map<FlakeId, Edge> result;
+    for (size_t i = 0; i < ixe_lock_inputs_len(snapshot.get()); ++i) {
+        IxeLockEdgeView view{};
+        checkGraphError(ixe_lock_inputs_get(snapshot.get(), i, &view));
+        std::string name(reinterpret_cast<const char *>(view.name.data), view.name.len);
+        if (view.kind == 0)
+            result.emplace(std::move(name), NodeId{view.target});
+        else if (view.kind == 1)
+            result.emplace(std::move(name), copyPath(view.follows));
+        else
+            throw Error("invalid Rust lock edge kind %d", view.kind);
+    }
+    return result;
+}
+
+const LockedNode * LockFile::node(NodeId id) const
+{
+    if (id == root)
+        return nullptr;
+    auto found = impl->payloads.find(id);
+    if (found == impl->payloads.end())
+        throw Error("unknown lock node %d", id.value);
+    return &found->second;
+}
+
+std::optional<NodeId> LockFile::findInput(const InputAttrPath & path) const
+{
+    auto views = pathViews(path);
+    NodeId result{};
+    uint8_t found = 0;
+    checkGraphError(ixe_lock_graph_find(impl->graph.get(), {views.data(), views.size()}, &result.value, &found));
+    if (!found)
+        return std::nullopt;
+    return result;
 }
 
 std::pair<nlohmann::json, LockFile::KeyMap> LockFile::toJSON() const
 {
-    nlohmann::json nodes;
-    KeyMap nodeKeys;
-    boost::unordered_flat_set<std::string> keys;
-
-    auto dumpNode = [&](this auto & dumpNode, std::string key, ref<const Node> node) -> std::string {
-        auto k = nodeKeys.find(node);
-        if (k != nodeKeys.end())
-            return k->second;
-
-        if (!keys.insert(key).second) {
-            for (int n = 2;; ++n) {
-                auto k = fmt("%s_%d", key, n);
-                if (keys.insert(k).second) {
-                    key = k;
-                    break;
-                }
-            }
-        }
-
-        nodeKeys.insert_or_assign(node, key);
-
-        auto n = nlohmann::json::object();
-
-        if (!node->inputs.empty()) {
-            auto inputs = nlohmann::json::object();
-            for (auto & i : node->inputs) {
-                if (auto child = std::get_if<0>(&i.second)) {
-                    inputs[i.first] = dumpNode(i.first, *child);
-                } else if (auto follows = std::get_if<1>(&i.second)) {
-                    auto arr = nlohmann::json::array();
-                    for (auto & x : *follows)
-                        arr.push_back(x);
-                    inputs[i.first] = std::move(arr);
-                }
-            }
-            n["inputs"] = std::move(inputs);
-        }
-
-        if (auto lockedNode = node.dynamic_pointer_cast<const LockedNode>()) {
-            n["original"] = fetchers::attrsToJSON(lockedNode->originalRef.toAttrs());
-            n["locked"] = fetchers::attrsToJSON(lockedNode->lockedRef.toAttrs());
-            /* For backward compatibility, omit the "__final"
-               attribute. We never allow non-final inputs in lock files
-               anyway. */
-            assert(lockedNode->lockedRef.input.isFinal() || lockedNode->lockedRef.input.isRelative());
-            n["locked"].erase("__final");
-            if (!lockedNode->isFlake)
-                n["flake"] = false;
-            if (lockedNode->parentInputAttrPath)
-                n["parent"] = *lockedNode->parentInputAttrPath;
-        }
-
-        nodes[key] = std::move(n);
-
-        return key;
-    };
-
-    nlohmann::json json;
-    json["version"] = 7;
-    json["root"] = dumpNode("root", root);
-    json["nodes"] = std::move(nodes);
-
-    return {json, std::move(nodeKeys)};
+    auto serialized = impl->json(ixe_lock_graph_serialize);
+    KeyMap keys;
+    for (auto & item : serialized.at("keys"))
+        keys.emplace(NodeId{item.at("id").get<uint64_t>()}, item.at("key").get<std::string>());
+    return {serialized.at("document"), std::move(keys)};
 }
 
 std::pair<std::string, LockFile::KeyMap> LockFile::to_string() const
 {
-    auto [json, nodeKeys] = toJSON();
-    return {json.dump(2), std::move(nodeKeys)};
+    auto [document, keys] = toJSON();
+    return {document.dump(2), std::move(keys)};
 }
 
 std::ostream & operator<<(std::ostream & stream, const LockFile & lockFile)
 {
-    stream << lockFile.toJSON().first.dump(2);
-    return stream;
+    return stream << lockFile.to_string().first;
+}
+
+std::vector<NodeId> LockFile::reachableNodes() const
+{
+    IxeLockNodes * raw = nullptr;
+    checkGraphError(ixe_lock_graph_reachable(impl->graph.get(), &raw));
+    return takeNodes(raw);
 }
 
 std::optional<FlakeRef> LockFile::isUnlocked(const fetchers::Settings & fetchSettings) const
 {
-    std::set<ref<const Node>> nodes;
-
-    [&](this const auto & visit, ref<const Node> node) {
-        if (!nodes.insert(node).second)
-            return;
-        for (auto & i : node->inputs)
-            if (auto child = std::get_if<0>(&i.second))
-                visit(*child);
-    }(root);
-
-    /* Return whether the input is either locked, or, if
-       `allow-dirty-locks` is enabled, it has a NAR hash. In the
-       latter case, we can verify the input but we may not be able to
-       fetch it from anywhere. */
-    auto isConsideredLocked = [&](const fetchers::Input & input) {
-        return input.isLocked(fetchSettings) || (fetchSettings.allowDirtyLocks && input.getNarHash());
-    };
-
-    for (auto & i : nodes) {
-        if (i == ref<const Node>(root))
+    for (auto id : reachableNodes()) {
+        auto payload = node(id);
+        if (!payload)
             continue;
-        auto node = i.dynamic_pointer_cast<const LockedNode>();
-        if (node && (!isConsideredLocked(node->lockedRef.input) || !node->lockedRef.input.isFinal())
-            && !node->lockedRef.input.isRelative())
-            return node->lockedRef;
+        auto & input = payload->lockedRef.input;
+        bool locked = input.isLocked(fetchSettings)
+                      || (fetchSettings.allowDirtyLocks && (input.getNarHash() || input.getTreeHash()));
+        if ((!locked || !input.isFinal()) && !input.isRelative())
+            return payload->lockedRef;
     }
-
     return {};
 }
 
 bool LockFile::operator==(const LockFile & other) const
 {
-    // FIXME: slow
-    return toJSON().first == other.toJSON().first;
+    uint8_t left[32], right[32];
+    checkGraphError(ixe_lock_graph_identity(impl->graph.get(), left));
+    checkGraphError(ixe_lock_graph_identity(other.impl->graph.get(), right));
+    return std::equal(std::begin(left), std::end(left), std::begin(right));
 }
 
-InputAttrPath parseInputAttrPath(std::string_view s)
+std::map<InputAttrPath, Edge> LockFile::getAllInputs() const
 {
-    InputAttrPath path;
+    std::map<InputAttrPath, Edge> result;
+    for (auto & item : impl->json(ixe_lock_graph_all_inputs))
+        result.emplace(item.at("path").get<InputAttrPath>(), edgeFromJSON(item.at("edge")));
+    return result;
+}
 
-    for (auto & elem : tokenizeString<std::vector<std::string>>(s, "/")) {
-        if (!std::regex_match(elem, flakeIdRegex))
-            throw UsageError("invalid flake input attribute path element '%s'", elem);
-        path.push_back(elem);
+static std::string describe(const LockFile & graph, const Edge & edge)
+{
+    if (auto follows = std::get_if<InputAttrPath>(&edge))
+        return fmt("follows '%s'", printInputAttrPath(*follows));
+    auto & ref = graph.node(std::get<NodeId>(edge))->lockedRef;
+    auto text = fmt("'%s'", ref.to_string());
+    if (auto lastModified = ref.input.getLastModified())
+        text += fmt(" (%s)", std::put_time(std::gmtime(&*lastModified), "%Y-%m-%d"));
+    return text;
+}
+
+std::string LockFile::diff(const LockFile & oldLocks, const LockFile & newLocks)
+{
+    auto oldFlat = oldLocks.getAllInputs();
+    auto newFlat = newLocks.getAllInputs();
+    auto i = oldFlat.begin();
+    auto j = newFlat.begin();
+    std::string result;
+    while (i != oldFlat.end() || j != newFlat.end()) {
+        if (j != newFlat.end() && (i == oldFlat.end() || i->first > j->first)) {
+            result +=
+                fmt("• " ANSI_GREEN "Added input '%s':" ANSI_NORMAL "\n    %s\n",
+                    printInputAttrPath(j->first),
+                    describe(newLocks, j->second));
+            ++j;
+        } else if (i != oldFlat.end() && (j == newFlat.end() || i->first < j->first)) {
+            result += fmt("• " ANSI_RED "Removed input '%s'" ANSI_NORMAL "\n", printInputAttrPath(i->first));
+            ++i;
+        } else {
+            auto oldNode = std::get_if<NodeId>(&i->second);
+            auto newNode = std::get_if<NodeId>(&j->second);
+            bool equal =
+                oldNode && newNode
+                    ? oldLocks.node(*oldNode)->lockedRef == newLocks.node(*newNode)->lockedRef
+                    : !oldNode && !newNode && std::get<InputAttrPath>(i->second) == std::get<InputAttrPath>(j->second);
+            if (!equal)
+                result +=
+                    fmt("• " ANSI_BOLD "Updated input '%s':" ANSI_NORMAL "\n    %s\n  → %s\n",
+                        printInputAttrPath(i->first),
+                        describe(oldLocks, i->second),
+                        describe(newLocks, j->second));
+            ++i;
+            ++j;
+        }
     }
-
-    return path;
+    return result;
 }
 
-std::optional<NonEmptyInputAttrPath> NonEmptyInputAttrPath::parse(std::string_view s)
+void LockFile::check()
 {
-    auto path = parseInputAttrPath(s);
-    return make(std::move(path));
+    checkGraphError(ixe_lock_graph_check(impl->graph.get()));
+}
+
+InputAttrPath parseInputAttrPath(std::string_view source)
+{
+    IxeLockPath * raw = nullptr;
+    checkGraphError(ixe_lock_graph_parse_path(bytes(source), &raw));
+    std::unique_ptr<IxeLockPath, decltype(&ixe_lock_path_free)> path(raw, ixe_lock_path_free);
+    return copyPath(ixe_lock_path_view(path.get()));
+}
+
+std::optional<NonEmptyInputAttrPath> NonEmptyInputAttrPath::parse(std::string_view source)
+{
+    return make(parseInputAttrPath(source));
 }
 
 std::optional<NonEmptyInputAttrPath> NonEmptyInputAttrPath::make(InputAttrPath path)
@@ -328,107 +383,6 @@ std::optional<NonEmptyInputAttrPath> NonEmptyInputAttrPath::make(InputAttrPath p
         return std::nullopt;
     return NonEmptyInputAttrPath{std::move(path)};
 }
-
-std::map<InputAttrPath, Node::Edge> LockFile::getAllInputs() const
-{
-    std::set<ref<Node>> done;
-    std::map<InputAttrPath, Node::Edge> res;
-
-    [&](this const auto & recurse, const InputAttrPath & prefix, ref<Node> node) {
-        if (!done.insert(node).second)
-            return;
-
-        for (auto & [id, input] : node->inputs) {
-            auto inputAttrPath(prefix);
-            inputAttrPath.push_back(id);
-            res.emplace(inputAttrPath, input);
-            if (auto child = std::get_if<0>(&input))
-                recurse(inputAttrPath, *child);
-        }
-    }({}, root);
-
-    return res;
-}
-
-static std::string describe(const FlakeRef & flakeRef)
-{
-    auto s = fmt("'%s'", flakeRef.to_string());
-
-    if (auto lastModified = flakeRef.input.getLastModified())
-        s += fmt(" (%s)", std::put_time(std::gmtime(&*lastModified), "%Y-%m-%d"));
-
-    return s;
-}
-
-std::ostream & operator<<(std::ostream & stream, const Node::Edge & edge)
-{
-    if (auto node = std::get_if<0>(&edge))
-        stream << describe((*node)->lockedRef);
-    else if (auto follows = std::get_if<1>(&edge))
-        stream << fmt("follows '%s'", printInputAttrPath(*follows));
-    return stream;
-}
-
-static bool equals(const Node::Edge & e1, const Node::Edge & e2)
-{
-    if (auto n1 = std::get_if<0>(&e1))
-        if (auto n2 = std::get_if<0>(&e2))
-            return (*n1)->lockedRef == (*n2)->lockedRef;
-    if (auto f1 = std::get_if<1>(&e1))
-        if (auto f2 = std::get_if<1>(&e2))
-            return *f1 == *f2;
-    return false;
-}
-
-std::string LockFile::diff(const LockFile & oldLocks, const LockFile & newLocks)
-{
-    auto oldFlat = oldLocks.getAllInputs();
-    auto newFlat = newLocks.getAllInputs();
-
-    auto i = oldFlat.begin();
-    auto j = newFlat.begin();
-    std::string res;
-
-    while (i != oldFlat.end() || j != newFlat.end()) {
-        if (j != newFlat.end() && (i == oldFlat.end() || i->first > j->first)) {
-            res += fmt(
-                "• " ANSI_GREEN "Added input '%s':" ANSI_NORMAL "\n    %s\n", printInputAttrPath(j->first), j->second);
-            ++j;
-        } else if (i != oldFlat.end() && (j == newFlat.end() || i->first < j->first)) {
-            res += fmt("• " ANSI_RED "Removed input '%s'" ANSI_NORMAL "\n", printInputAttrPath(i->first));
-            ++i;
-        } else {
-            if (!equals(i->second, j->second)) {
-                res +=
-                    fmt("• " ANSI_BOLD "Updated input '%s':" ANSI_NORMAL "\n    %s\n  → %s\n",
-                        printInputAttrPath(i->first),
-                        i->second,
-                        j->second);
-            }
-            ++i;
-            ++j;
-        }
-    }
-
-    return res;
-}
-
-void LockFile::check()
-{
-    auto inputs = getAllInputs();
-
-    for (auto & [inputAttrPath, input] : inputs) {
-        if (auto follows = std::get_if<1>(&input)) {
-            if (!follows->empty() && !findInput(*follows))
-                throw Error(
-                    "input '%s' follows a non-existent input '%s'",
-                    printInputAttrPath(inputAttrPath),
-                    printInputAttrPath(*follows));
-        }
-    }
-}
-
-void check();
 
 std::string printInputAttrPath(const InputAttrPath & path)
 {

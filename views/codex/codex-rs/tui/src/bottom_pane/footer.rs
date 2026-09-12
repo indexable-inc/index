@@ -43,6 +43,7 @@
 //! `FooterProps` mapping.
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
+use crate::key_hint::ShortcutHint;
 use crate::render::line_utils::prefix_lines;
 use crate::status::format_tokens_compact;
 use crate::ui_consts::FOOTER_INDENT_COLS;
@@ -89,10 +90,6 @@ pub(crate) struct FooterProps {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CollaborationModeIndicator {
     Plan,
-    #[allow(dead_code)] // Hidden by current mode filtering; kept for future UI re-enablement.
-    PairProgramming,
-    #[allow(dead_code)] // Hidden by current mode filtering; kept for future UI re-enablement.
-    Execute,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,30 +107,32 @@ const FOOTER_CONTEXT_GAP_COLS: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FooterKeyHints {
-    pub(crate) toggle_shortcuts: Option<KeyBinding>,
-    pub(crate) queue: Option<KeyBinding>,
-    pub(crate) insert_newline: Option<KeyBinding>,
-    pub(crate) external_editor: Option<KeyBinding>,
-    pub(crate) edit_previous: Option<KeyBinding>,
-    pub(crate) show_transcript: Option<KeyBinding>,
-    pub(crate) history_search: Option<KeyBinding>,
-    pub(crate) reasoning_down: Option<KeyBinding>,
-    pub(crate) reasoning_up: Option<KeyBinding>,
+    pub(crate) agents: Option<ShortcutHint>,
+    pub(crate) toggle_shortcuts: Option<ShortcutHint>,
+    pub(crate) queue: Option<ShortcutHint>,
+    pub(crate) insert_newline: Option<ShortcutHint>,
+    pub(crate) external_editor: Option<ShortcutHint>,
+    pub(crate) edit_previous: Option<ShortcutHint>,
+    pub(crate) show_transcript: Option<ShortcutHint>,
+    pub(crate) history_search: Option<ShortcutHint>,
+    pub(crate) reasoning_down: Option<ShortcutHint>,
+    pub(crate) reasoning_up: Option<ShortcutHint>,
 }
 
 impl FooterKeyHints {
     #[cfg(test)]
     pub(crate) fn default_bindings() -> Self {
         Self {
-            toggle_shortcuts: Some(key_hint::plain(KeyCode::Char('?'))),
-            queue: Some(key_hint::plain(KeyCode::Tab)),
-            insert_newline: Some(key_hint::ctrl(KeyCode::Char('j'))),
-            external_editor: Some(key_hint::ctrl(KeyCode::Char('g'))),
-            edit_previous: Some(key_hint::plain(KeyCode::Esc)),
-            show_transcript: Some(key_hint::ctrl(KeyCode::Char('t'))),
-            history_search: Some(key_hint::ctrl(KeyCode::Char('r'))),
-            reasoning_down: Some(key_hint::alt(KeyCode::Char(','))),
-            reasoning_up: Some(key_hint::alt(KeyCode::Char('.'))),
+            agents: None,
+            toggle_shortcuts: Some(key_hint::plain(KeyCode::Char('?')).into()),
+            queue: Some(key_hint::plain(KeyCode::Tab).into()),
+            insert_newline: Some(key_hint::ctrl(KeyCode::Char('j')).into()),
+            external_editor: Some(key_hint::ctrl(KeyCode::Char('g')).into()),
+            edit_previous: Some(key_hint::plain(KeyCode::Esc).into()),
+            show_transcript: Some(key_hint::ctrl(KeyCode::Char('t')).into()),
+            history_search: Some(key_hint::ctrl(KeyCode::Char('r')).into()),
+            reasoning_down: Some(key_hint::alt(KeyCode::Char(',')).into()),
+            reasoning_up: Some(key_hint::alt(KeyCode::Char('.')).into()),
         }
     }
 }
@@ -147,10 +146,6 @@ impl CollaborationModeIndicator {
         };
         match self {
             CollaborationModeIndicator::Plan => format!("Plan mode{suffix}"),
-            CollaborationModeIndicator::PairProgramming => {
-                format!("Pair Programming mode{suffix}")
-            }
-            CollaborationModeIndicator::Execute => format!("Execute mode{suffix}"),
         }
     }
 
@@ -158,8 +153,6 @@ impl CollaborationModeIndicator {
         let label = self.label(show_cycle_hint);
         match self {
             CollaborationModeIndicator::Plan => Span::from(label).magenta(),
-            CollaborationModeIndicator::PairProgramming => Span::from(label).cyan(),
-            CollaborationModeIndicator::Execute => Span::from(label).dim(),
         }
     }
 }
@@ -170,7 +163,7 @@ impl CollaborationModeIndicator {
 /// (for example, showing `QuitShortcutReminder` only while its timer is active).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FooterMode {
-    /// Single-line incremental history search prompt shown while Ctrl+R search is active.
+    /// Single-line query prompt for history recall or Vim buffer search.
     HistorySearch,
     /// Transient "press again to quit" reminder (Ctrl+C/Ctrl+D).
     QuitShortcutReminder,
@@ -322,6 +315,13 @@ fn left_side_line(
     match state.hint {
         SummaryHintKind::None => {}
         SummaryHintKind::Shortcuts => {
+            if let Some(key) = key_hints.agents {
+                line.push_span(key);
+                line.push_span(" for agents".dim());
+                if key_hints.toggle_shortcuts.is_some() {
+                    line.push_span(" · ".dim());
+                }
+            }
             if let Some(key) = key_hints.toggle_shortcuts {
                 line.push_span(key);
                 line.push_span(" for shortcuts".dim());
@@ -393,6 +393,19 @@ pub(crate) fn single_line_footer_layout(
         }
     };
     let state_width = |state: LeftSideState| -> u16 { state_line(state).width() as u16 };
+    if show_shortcuts_hint && key_hints.agents.is_some() {
+        let compact_line = left_side_line(
+            collaboration_mode_indicator,
+            default_state,
+            FooterKeyHints {
+                toggle_shortcuts: None,
+                ..key_hints
+            },
+        );
+        if can_show_left_with_context(area, compact_line.width() as u16, context_width) {
+            return (SummaryLeft::Custom(compact_line), true);
+        }
+    }
     // When the mode cycle hint is applicable (idle, non-queue mode), only show
     // the right-side context indicator if the "(shift+tab to cycle)" variant
     // can also fit.
@@ -550,7 +563,7 @@ pub(crate) fn goal_status_indicator_line(
             }
         }
         GoalStatusIndicator::Paused => "Goal paused (/goal resume)".to_string(),
-        GoalStatusIndicator::Blocked => "Goal blocked (/goal resume)".to_string(),
+        GoalStatusIndicator::Blocked => "Goal stalled (/goal resume)".to_string(),
         GoalStatusIndicator::UsageLimited => "Goal hit usage limits (/goal resume)".to_string(),
         GoalStatusIndicator::BudgetLimited { usage } => {
             if let Some(usage) = usage {
@@ -603,7 +616,7 @@ pub(crate) fn side_conversation_context_line(label: &str) -> Line<'static> {
     if let Some(rest) = label.strip_prefix("Side ") {
         Line::from(vec!["Side".magenta().bold(), format!(" {rest}").magenta()])
     } else {
-        Line::from(label.to_string()).magenta()
+        Line::from(vec![Span::from(label.to_string()).magenta()])
     }
 }
 
@@ -797,6 +810,13 @@ pub(crate) fn passive_footer_status_line(props: &FooterProps) -> Option<Line<'st
         }
     }
 
+    if props.mode == FooterMode::ComposerEmpty
+        && let Some(key) = props.key_hints.agents
+        && let Some(line) = line.as_mut()
+    {
+        line.extend(vec![" · ".dim(), key.into(), " for agents".dim()]);
+    }
+
     line
 }
 
@@ -948,8 +968,13 @@ fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>> {
         ordered.push(change_mode);
     }
     ordered.push(show_transcript);
-
     let mut lines = build_columns(ordered);
+    if let Some(key) = state.key_hints.agents {
+        lines.push(Line::from(vec![
+            key.into(),
+            " for agents (empty prompt)".into(),
+        ]));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         "customize shortcuts with ".into(),
@@ -1097,7 +1122,9 @@ impl ShortcutDescriptor {
             | ShortcutId::FilePaths
             | ShortcutId::PasteImage
             | ShortcutId::Quit
-            | ShortcutId::ChangeMode => self.binding_for(state).map(|binding| binding.key),
+            | ShortcutId::ChangeMode => self
+                .binding_for(state)
+                .map(|binding| ShortcutHint::Single(binding.key)),
         }?;
         let mut line = Line::from(vec![self.prefix.into(), key.into()]);
         match self.id {
@@ -1586,7 +1613,7 @@ mod tests {
                 status_line_value: None,
                 status_line_enabled: false,
                 key_hints: FooterKeyHints {
-                    insert_newline: Some(key_hint::shift(KeyCode::Enter)),
+                    insert_newline: Some(key_hint::shift(KeyCode::Enter).into()),
                     ..FooterKeyHints::default_bindings()
                 },
                 active_agent_label: None,

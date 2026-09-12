@@ -38,43 +38,33 @@ MakeError(NotADirectory, SourceAccessorError);
 MakeError(NotARegularFile, SourceAccessorError);
 
 /**
- * A content address a fetcher already knows for the tree its accessor's
- * root serves, together with the addressing scheme that produced it.
+ * A tree id a fetcher already knows for the tree its accessor's root
+ * serves: the BLAKE3 Merkle root that jj's native (non-Git) object store
+ * maintained incrementally while snapshotting.
  *
- * The scheme has to travel *with* the id. A bare hash cannot say which
- * serialization it addresses, and the only use for a known tree id is to
- * turn it into a store path -- which requires ingesting the tree the same
- * way the id was computed. Two ids over different tree serializations are
- * different addresses even when they share a hash algorithm, so a consumer
- * that guessed would produce a store path that does not correspond to the
- * content. Carrying the family makes that mistake unrepresentable rather
- * than merely unlikely.
+ * Exactly one addressing scheme is represented, on purpose. The only use
+ * for a known tree id is to turn it into a store path, which requires
+ * ingesting the tree the same way the id was computed, and the one method
+ * that ingests trees this way is `ContentAddressMethod::Raw::JjTree`. Every
+ * consumer pairs this id with that method and nothing else (`paths.cc`,
+ * `fetch-to-store.cc`). Nix cannot recompute the id from the files, which
+ * is why an accessor announcing it must serve the object store's bytes
+ * verbatim: the id is trusted, never checked.
+ *
+ * Git tree ids are deliberately NOT announced any more. A git input is
+ * locked by `narHash` (`Input::fetchToStore`, the road `nix flake
+ * prefetch` and `nix flake archive` take), so a mount that addressed the
+ * same input by its git tree id would give one input two store paths
+ * depending on the road, and could never verify the lock it was handed.
+ * Git is the boundary bridge; its identity here is the NAR hash, one per
+ * input.
+ *
+ * A struct rather than a bare `std::optional<Hash>` so that the id cannot
+ * be mistaken for a hash of some other serialization at a call site.
  */
 struct KnownTreeRoot
 {
-    enum struct Family {
-        /**
-         * A Git tree object hash: the id of the root tree as Git
-         * serializes it. `ContentAddressMethod::Raw::Git` ingests trees
-         * that way, so this family can become a store path with no file
-         * reads.
-         */
-        Git,
-
-        /**
-         * A root tree id from jj's own native (non-Git) object store, which
-         * jj maintained incrementally while snapshotting. No nix ingestion
-         * method serializes trees that way, so this family cannot become a
-         * store path: a consumer must fall back to a method that reads the
-         * tree, and may use the id only where an opaque content fingerprint
-         * is wanted.
-         */
-        JjNative,
-    };
-
-    Family family;
-
-    /** The id itself, in whatever hash algorithm the family uses. */
+    /** The BLAKE3 id of the root tree object. */
     Hash id;
 };
 
@@ -250,25 +240,98 @@ struct SourceAccessor : std::enable_shared_from_this<SourceAccessor>
     std::optional<std::string> fingerprint;
 
     /**
-     * If set, the content address that this accessor's root provably
-     * serves, and the family it belongs to. Set only by fetchers that read
-     * straight out of a content-addressed object store and know the served
-     * tree is byte-identical to the named object: no omitted entries, no
-     * content stored outside the tree.
+     * If set, the jj tree id that this accessor's root provably serves. Set
+     * only by fetchers that read straight out of jj's content-addressed
+     * object store and know the served tree is byte-identical to the named
+     * object: no omitted entries, no content stored outside the tree.
      *
-     * A consumer that wants to turn the id into a store path must test the
-     * family against the specific one it can ingest -- never merely test
-     * that an id is present, and never accept "some family addresses a
-     * store path" as a proxy, because the ingestion method has to match the
-     * serialization the id addresses. `Family::Git` plus
-     * `ContentAddressMethod::Raw::Git` is that pairing today: it derives a
-     * CA store path with zero file reads, where the NAR method's flat hash
-     * re-reads the whole tree on every content change. Nix cannot name
-     * `ContentAddressMethod` here (that is a libstore type), which is why
-     * this header carries the family and each consumer states the pairing
-     * itself.
+     * A consumer turns it into a store path through
+     * `ContentAddressMethod::Raw::JjTree` and nothing else, with zero file
+     * reads, where the NAR method's flat hash re-reads the whole tree on
+     * every content change. Nix cannot name `ContentAddressMethod` here
+     * (that is a libstore type), which is why the pairing is stated at each
+     * consumer.
+     *
+     * An accessor that announces an id must also answer `getSubtree`: see
+     * there. The two are one contract, because an announced id says the
+     * tree is a Merkle object, and a Merkle object's directories have ids
+     * of their own.
      */
     std::optional<KnownTreeRoot> knownTreeRoot;
+
+    /**
+     * Return an accessor whose root is the directory `path` of this tree,
+     * or `nullptr` when this tree cannot name its subtrees.
+     *
+     * Only an accessor reading a Merkle object store can answer, and it
+     * answers with the subtree's own object: the result carries a
+     * `knownTreeRoot` naming that subtree, a `fingerprint` derived from it,
+     * and serves the subtree's bytes verbatim, so it is a complete tree in
+     * its own right. A subtree id depends on the subtree's content alone,
+     * never on where it sits, so the same directory committed at the root
+     * of another repository has the same id and, through
+     * `ContentAddressMethod::Raw::JjTree`, the same store path. That is what
+     * lets a relative `path:./sub` flake input inside a jj-backed flake
+     * evaluate as its own store object with no identity of its own in the
+     * lock file: the parent's tree id already fixes it (`flake.cc`,
+     * `resolveRelativePath`).
+     *
+     * Throws `FileNotFound` if `path` does not exist and `NotADirectory`
+     * if it is not a directory.
+     *
+     * `nullptr` is a licence, not an error: it tells the caller to address
+     * the directory as a subpath of this tree's store object
+     * (`<parent>/sub`). That is sound only for a tree whose store path is a
+     * hash of its own bytes (a plain filesystem, a NAR): then `<parent>/sub`
+     * is as good an identity as the directory has anywhere. It is NOT sound
+     * for a tree that announces a `knownTreeRoot`: the directory then has an
+     * id of its own in the object store, and `<parent>/sub` would be a
+     * second identity for the same bytes, chosen by which accessor happened
+     * to serve the parent. So an accessor that announces an id must answer
+     * with the subtree object or throw, never `nullptr`, and a caller that
+     * receives `nullptr` from a mount that announces an id refuses rather
+     * than composes (`flake.cc` does).
+     *
+     * Composite accessors (mounts, unions, filters) delegate on the path
+     * like `getFingerprint`: which tree answers is a property of the path.
+     */
+    virtual std::shared_ptr<SourceAccessor> getSubtree(const CanonPath & path)
+    {
+        return nullptr;
+    }
+
+    /**
+     * Return an accessor serving the directory `path` of this tree with
+     * `filter` applied, as a complete tree object of its own, or `nullptr`
+     * when this tree cannot name such an object.
+     *
+     * The result is what `builtins.path { filter = ...; }` denotes: the
+     * entries under `path` for which `filter` answers true, `filter` being
+     * asked in THIS accessor's coordinates (the absolute path `dumpPath`
+     * would pass it), a refused directory pruning everything beneath it.
+     * Only an accessor reading a Merkle object store can answer, and it
+     * answers as `getSubtree` does: the result carries a `knownTreeRoot`
+     * naming the filtered tree, so its store path follows from that id with
+     * zero file reads, and a subtree the filter left intact keeps its own
+     * id and so its own object. The id is a function of the kept bytes
+     * alone, which is what makes a filtered copy stable under edits
+     * elsewhere in its source.
+     *
+     * A directory the filter empties is dropped from the result (the object
+     * store has no empty directories), where a NAR copy under the same
+     * filter keeps an empty directory. That is the one visible difference
+     * between the two roads.
+     *
+     * Throws as `getSubtree` does. Composites do not delegate: the caller
+     * that wants the object asks the mount (`EvalState::addPathToStore`),
+     * because the impure root filesystem is a union in which a materialized
+     * mount is present twice and cannot be addressed as one tree
+     * (`UnionSourceAccessor::getSubtree`).
+     */
+    virtual std::shared_ptr<SourceAccessor> getFilteredTree(const CanonPath & path, PathFilter & filter)
+    {
+        return nullptr;
+    }
 
     /**
      * Return the fingerprint for `path`. This is usually the

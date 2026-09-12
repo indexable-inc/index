@@ -14,12 +14,10 @@
   # root stays the repo root so the workflow keeps its repo-relative path.
   testSource = fs.toSource {
     inherit (paths) root;
-    fileset = fs.intersection (fs.gitTracked paths.root) (
-      fs.unions [
-        ./tests
-        (paths.root + "/.github/workflows/check.yml")
-      ]
-    );
+    fileset = fs.unions [
+      ./tests
+      (paths.root + "/.github/workflows/check.yml")
+    ];
   };
 in {
   # Exercises the trusted half of the net-trace PR comment: the validate and

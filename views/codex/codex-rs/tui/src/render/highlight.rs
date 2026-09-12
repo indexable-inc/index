@@ -2,12 +2,13 @@
 //!
 //! Wraps [syntect] with the [two_face] grammar and theme bundles to provide
 //! ~250-language syntax highlighting and 32 bundled color themes.  The module
-//! owns four process-global singletons:
+//! owns five process-global singletons:
 //!
 //! | Singleton | Type | Purpose |
 //! |---|---|---|
 //! | `SYNTAX_SET` | `OnceLock<SyntaxSet>` | Grammar database, immutable after init |
 //! | `THEME` | `OnceLock<RwLock<Theme>>` | Active color theme, swappable at runtime |
+//! | `THEME_REVISION` | `AtomicU64` | Invalidates rendered-content caches after theme swaps |
 //! | `THEME_OVERRIDE` | `OnceLock<Option<String>>` | Persisted user preference (write-once) |
 //! | `CODEX_HOME` | `OnceLock<Option<PathBuf>>` | Root for custom `.tmTheme` discovery |
 //!
@@ -17,9 +18,10 @@
 //! swap/snapshot the theme for live preview.  All highlighting functions read
 //! the theme via `theme_lock()`.
 //!
-//! **Guardrails:** inputs exceeding 512 KB or 10 000 lines are rejected early
-//! (returns `None`) to prevent pathological CPU/memory usage.  Callers must
-//! fall back to plain unstyled text.
+//! **Guardrails:** inputs exceeding 512 KB or 10 000 lines, or containing an
+//! individual line longer than 4 KiB, are rejected early (returns `None`) to
+//! prevent pathological CPU/memory usage.  Callers must fall back to plain
+//! unstyled text.
 
 use ratatui::style::Color as RtColor;
 use ratatui::style::Modifier;
@@ -30,6 +32,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::Color as SyntectColor;
 use syntect::highlighting::FontStyle;
@@ -43,10 +47,16 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 use two_face::theme::EmbeddedThemeName;
 
+#[path = "highlight_streaming.rs"]
+mod streaming;
+
+pub(crate) use streaming::StreamingCodeHighlighter;
+
 // -- Global singletons -------------------------------------------------------
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<RwLock<Theme>> = OnceLock::new();
+static THEME_REVISION: AtomicU64 = AtomicU64::new(0);
 static THEME_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
 static CODEX_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
 
@@ -181,24 +191,12 @@ fn load_custom_theme(name: &str, codex_home: &Path) -> Option<Theme> {
     ThemeSet::get_theme(custom_theme_path(name, codex_home)).ok()
 }
 
-/// The two themes the adaptive default can select from terminal background
-/// lightness. Shared by startup selection and the mid-session refresh so the
-/// refresh recognizes every theme the adaptive path could have installed.
-const ADAPTIVE_LIGHT_THEME: (EmbeddedThemeName, &str) =
-    (EmbeddedThemeName::CatppuccinLatte, "catppuccin-latte");
-const ADAPTIVE_DARK_THEME: (EmbeddedThemeName, &str) =
-    (EmbeddedThemeName::CatppuccinMocha, "catppuccin-mocha");
-
 fn adaptive_default_theme_selection() -> (EmbeddedThemeName, &'static str) {
-    adaptive_default_theme_selection_for(crate::terminal_palette::default_bg())
-}
-
-fn adaptive_default_theme_selection_for(
-    terminal_bg: Option<(u8, u8, u8)>,
-) -> (EmbeddedThemeName, &'static str) {
-    match terminal_bg {
-        Some(bg) if crate::color::is_light(bg) => ADAPTIVE_LIGHT_THEME,
-        _ => ADAPTIVE_DARK_THEME,
+    match crate::terminal_palette::default_bg() {
+        Some(bg) if crate::color::is_light(bg) => {
+            (EmbeddedThemeName::CatppuccinLatte, "catppuccin-latte")
+        }
+        _ => (EmbeddedThemeName::CatppuccinMocha, "catppuccin-mocha"),
     }
 }
 
@@ -210,45 +208,6 @@ fn adaptive_default_embedded_theme_name() -> EmbeddedThemeName {
 /// from terminal background lightness.
 pub(crate) fn adaptive_default_theme_name() -> &'static str {
     adaptive_default_theme_selection().1
-}
-
-/// Re-resolve the adaptive default syntax theme from the current terminal
-/// palette, after `terminal_palette::requery_default_colors()` observed a
-/// possible light/dark switch (openai/codex#18942).
-///
-/// The swap only happens when the active theme is one the adaptive default
-/// could have installed: an explicit startup `tui.theme` override and an
-/// in-session `/theme` pick both stay untouched.
-pub(crate) fn refresh_adaptive_default_theme() {
-    let target = adaptive_refresh_target_for(
-        crate::terminal_palette::default_bg(),
-        resolved_theme_override_name().is_some(),
-        current_syntax_theme().name.as_deref(),
-    );
-    if let Some(target) = target {
-        set_syntax_theme(two_face::theme::extra().get(target).clone());
-    }
-}
-
-/// Pure decision core of [`refresh_adaptive_default_theme`]: the theme to
-/// swap to, or `None` when the active theme must be left alone.
-fn adaptive_refresh_target_for(
-    terminal_bg: Option<(u8, u8, u8)>,
-    override_resolves: bool,
-    current_theme_name: Option<&str>,
-) -> Option<EmbeddedThemeName> {
-    if override_resolves {
-        return None;
-    }
-    let ts = two_face::theme::extra();
-    let current_is_adaptive = [ADAPTIVE_LIGHT_THEME.0, ADAPTIVE_DARK_THEME.0]
-        .iter()
-        .any(|candidate| ts.get(*candidate).name.as_deref() == current_theme_name);
-    if !current_is_adaptive {
-        return None;
-    }
-    let (target, _) = adaptive_default_theme_selection_for(terminal_bg);
-    (ts.get(target).name.as_deref() != current_theme_name).then_some(target)
 }
 
 /// Build the theme from current override/default-theme settings.
@@ -288,13 +247,19 @@ fn theme_lock() -> &'static RwLock<Theme> {
     THEME.get_or_init(|| RwLock::new(build_default_theme()))
 }
 
-/// Swap the active syntax theme at runtime (for live preview).
+/// Swap the active syntax theme at runtime and invalidate rendered-content caches.
 pub(crate) fn set_syntax_theme(theme: Theme) {
     let mut guard = match theme_lock().write() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     *guard = theme;
+    THEME_REVISION.fetch_add(1, Ordering::Release);
+}
+
+/// Return the revision of the active syntax theme for rendered-content caches.
+pub(crate) fn syntax_theme_revision() -> u64 {
+    THEME_REVISION.load(Ordering::Acquire)
 }
 
 /// Clone the current syntax theme (e.g. to save for cancel-restore).
@@ -371,18 +336,18 @@ fn foreground_style_for_scopes_with_theme(theme: &Theme, scope_names: &[&str]) -
 /// This intentionally reflects persisted configuration/default selection, not
 /// transient runtime swaps applied via `set_syntax_theme`.
 pub(crate) fn configured_theme_name() -> String {
-    resolved_theme_override_name().unwrap_or_else(|| adaptive_default_theme_name().to_string())
-}
-
-/// The startup `tui.theme` override, when it names a resolvable theme
-/// (bundled or custom `.tmTheme`).
-fn resolved_theme_override_name() -> Option<String> {
-    let name = THEME_OVERRIDE.get()?.as_deref()?;
-    if parse_theme_name(name).is_some() {
-        return Some(name.to_string());
+    // Explicit user override?
+    if let Some(Some(name)) = THEME_OVERRIDE.get() {
+        if parse_theme_name(name).is_some() {
+            return name.clone();
+        }
+        if let Some(Some(home)) = CODEX_HOME.get()
+            && load_custom_theme(name, home).is_some()
+        {
+            return name.clone();
+        }
     }
-    let home = CODEX_HOME.get()?.as_deref()?;
-    load_custom_theme(name, home).map(|_| name.to_string())
+    adaptive_default_theme_name().to_string()
 }
 
 /// Resolve a theme name to a `Theme` (bundled or custom). Returns `None`
@@ -580,6 +545,8 @@ fn find_syntax(lang: &str) -> Option<&'static SyntaxReference> {
     let normalized = lang.to_ascii_lowercase();
     let patched = match normalized.as_str() {
         "csharp" | "c-sharp" => "c#",
+        // CUDA source (.cu) and header (.cuh) files use C++ highlighting as a fallback.
+        "cu" | "cuh" => "cpp",
         "cppm" | "cxxm" | "ixx" => "cpp",
         "golang" => "go",
         "python3" => "python",
@@ -620,6 +587,9 @@ const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
 /// Skip highlighting for inputs with more than 10,000 lines.
 const MAX_HIGHLIGHT_LINES: usize = 10_000;
 
+/// Skip highlighting when an individual line is longer than 4 KiB.
+pub(crate) const MAX_HIGHLIGHT_LINE_BYTES: usize = 4 * 1024;
+
 /// Check whether an input exceeds the safe highlighting limits.
 ///
 /// Callers that highlight content in a loop (e.g. per diff-line) should
@@ -650,7 +620,12 @@ fn highlight_to_line_spans_with_theme(
     // Bail out early for oversized inputs to avoid excessive resource usage.
     // Count actual lines (not newline bytes) to avoid an off-by-one when
     // the input does not end with a newline.
-    if code.len() > MAX_HIGHLIGHT_BYTES || code.lines().count() > MAX_HIGHLIGHT_LINES {
+    if code.len() > MAX_HIGHLIGHT_BYTES
+        || code.lines().count() > MAX_HIGHLIGHT_LINES
+        || code
+            .lines()
+            .any(|line| line.len() > MAX_HIGHLIGHT_LINE_BYTES)
+    {
         return None;
     }
 
@@ -660,23 +635,28 @@ fn highlight_to_line_spans_with_theme(
 
     for line in LinesWithEndings::from(code) {
         let ranges = h.highlight_line(line, syntax_set()).ok()?;
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        for (style, text) in ranges {
-            // Strip trailing line endings (LF and CR) since we handle line
-            // breaks ourselves.  CRLF inputs would otherwise leave a stray \r.
-            let text = text.trim_end_matches(['\n', '\r']);
-            if text.is_empty() {
-                continue;
-            }
-            spans.push(Span::styled(text.to_string(), convert_style(style)));
-        }
-        if spans.is_empty() {
-            spans.push(Span::raw(String::new()));
-        }
-        lines.push(spans);
+        lines.push(highlighted_line_spans(ranges));
     }
 
     Some(lines)
+}
+
+/// Convert one highlighted line into the spans shared by full and streaming renders.
+///
+/// Source line endings are omitted, while empty lines retain their canonical empty span.
+fn highlighted_line_spans(ranges: Vec<(SyntectStyle, &str)>) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (style, text) in ranges {
+        // Line breaks are represented by the surrounding Line, not its spans.
+        let text = text.trim_end_matches(['\n', '\r']);
+        if !text.is_empty() {
+            spans.push(Span::styled(text.to_string(), convert_style(style)));
+        }
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw(String::new()));
+    }
+    spans
 }
 
 /// Parse `code` using syntect for `lang` and return per-line styled spans.
@@ -741,83 +721,6 @@ pub(crate) fn highlight_code_to_styled_spans(
 mod tests {
     use super::*;
     use insta::assert_snapshot;
-
-    const LIGHT_BG: Option<(u8, u8, u8)> = Some((255, 255, 255));
-    const DARK_BG: Option<(u8, u8, u8)> = Some((0, 0, 0));
-
-    fn embedded_theme_name(theme: EmbeddedThemeName) -> Option<String> {
-        two_face::theme::extra().get(theme).name.clone()
-    }
-
-    #[test]
-    fn adaptive_refresh_follows_background_flip() {
-        let mocha = embedded_theme_name(ADAPTIVE_DARK_THEME.0);
-        assert_eq!(
-            adaptive_refresh_target_for(
-                LIGHT_BG,
-                /*override_resolves*/ false,
-                mocha.as_deref(),
-            ),
-            Some(ADAPTIVE_LIGHT_THEME.0)
-        );
-        let latte = embedded_theme_name(ADAPTIVE_LIGHT_THEME.0);
-        assert_eq!(
-            adaptive_refresh_target_for(
-                DARK_BG,
-                /*override_resolves*/ false,
-                latte.as_deref(),
-            ),
-            Some(ADAPTIVE_DARK_THEME.0)
-        );
-    }
-
-    #[test]
-    fn adaptive_refresh_is_noop_when_selection_is_current() {
-        let mocha = embedded_theme_name(ADAPTIVE_DARK_THEME.0);
-        assert_eq!(
-            adaptive_refresh_target_for(
-                DARK_BG,
-                /*override_resolves*/ false,
-                mocha.as_deref(),
-            ),
-            None
-        );
-        // An unreadable palette keeps the dark selection.
-        assert_eq!(
-            adaptive_refresh_target_for(
-                /*terminal_bg*/ None,
-                /*override_resolves*/ false,
-                mocha.as_deref(),
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn adaptive_refresh_preserves_explicit_theme_choices() {
-        // A resolvable startup override pins the theme.
-        let mocha = embedded_theme_name(ADAPTIVE_DARK_THEME.0);
-        assert_eq!(
-            adaptive_refresh_target_for(
-                LIGHT_BG,
-                /*override_resolves*/ true,
-                mocha.as_deref(),
-            ),
-            None
-        );
-        // A non-adaptive active theme (e.g. an in-session /theme pick) is
-        // never swapped.
-        let nord = embedded_theme_name(EmbeddedThemeName::Nord);
-        assert_eq!(
-            adaptive_refresh_target_for(
-                LIGHT_BG,
-                /*override_resolves*/ false,
-                nord.as_deref(),
-            ),
-            None
-        );
-    }
-
     use pretty_assertions::assert_eq;
     use std::str::FromStr;
     use syntect::highlighting::Color as SyntectColor;
@@ -1256,6 +1159,18 @@ mod tests {
     }
 
     #[test]
+    fn long_single_line_bash_skips_highlighting_and_preserves_text() {
+        let token = "eHh4".repeat(MAX_HIGHLIGHT_LINE_BYTES / 4 + 1);
+        let code = format!("printf %s {token} | base64 -d >/dev/null");
+
+        assert!(highlight_code_to_styled_spans(&code, "bash").is_none());
+        assert_eq!(
+            highlight_code_to_lines(&code, "bash"),
+            vec![Line::from(code)]
+        );
+    }
+
+    #[test]
     fn highlight_many_lines_falls_back() {
         // Input exceeding MAX_HIGHLIGHT_LINES should return None.
         let many_lines = "let x = 1;\n".repeat(MAX_HIGHLIGHT_LINES + 1);
@@ -1334,8 +1249,8 @@ mod tests {
         }
         // Patched aliases that two-face cannot resolve on its own.
         for alias in [
-            "csharp", "c-sharp", "cppm", "CPPM", "cxxm", "CxXm", "ixx", "IXX", "golang", "python3",
-            "shell",
+            "csharp", "c-sharp", "cu", "cuh", "cppm", "CPPM", "cxxm", "CxXm", "ixx", "IXX",
+            "golang", "python3", "shell",
         ] {
             assert!(
                 find_syntax(alias).is_some(),

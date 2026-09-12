@@ -4,73 +4,115 @@ use codex_network_proxy::BlockedRequestArgs;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
+use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::test_path_buf;
+use futures::poll;
 use pretty_assertions::assert_eq;
+use std::time::Duration;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-#[tokio::test]
-async fn pending_approvals_are_deduped_per_host_protocol_and_port() {
-    let service = NetworkApprovalService::default();
-    let key = HostApprovalKey {
-        environment_id: "local".to_string(),
-        host: "example.com".to_string(),
-        protocol: "http",
-        port: 443,
-    };
+fn pending_key(host: HostApprovalKey, turn_id: &str, execution_id: &str) -> PendingHostApprovalKey {
+    PendingHostApprovalKey {
+        host,
+        turn_id: turn_id.to_string(),
+        execution_id: Some(execution_id.to_string()),
+    }
+}
 
-    let (first, first_is_owner) = service.get_or_create_pending_approval(key.clone()).await;
-    let (second, second_is_owner) = service.get_or_create_pending_approval(key).await;
+#[test]
+fn pending_approvals_are_deduped_within_one_execution() {
+    let service = NetworkApprovalService::default();
+    let key = pending_key(
+        HostApprovalKey {
+            environment_id: "local".to_string(),
+            host: "example.com".to_string(),
+            protocol: "http",
+            port: 443,
+        },
+        "turn-1",
+        "execution-1",
+    );
+
+    let (first, first_is_owner) = service.get_or_create_pending_approval(key.clone());
+    let (second, second_is_owner) = service.get_or_create_pending_approval(key);
 
     assert!(first_is_owner);
     assert!(!second_is_owner);
     assert!(Arc::ptr_eq(&first, &second));
 }
 
-#[tokio::test]
-async fn pending_approvals_do_not_dedupe_across_ports() {
+#[test]
+fn pending_approvals_do_not_dedupe_across_ports() {
     let service = NetworkApprovalService::default();
-    let first_key = HostApprovalKey {
+    let first_host = HostApprovalKey {
         environment_id: "local".to_string(),
         host: "example.com".to_string(),
         protocol: "https",
         port: 443,
     };
-    let second_key = HostApprovalKey {
-        environment_id: "local".to_string(),
-        host: "example.com".to_string(),
-        protocol: "https",
+    let second_host = HostApprovalKey {
         port: 8443,
+        ..first_host.clone()
     };
 
-    let (first, first_is_owner) = service.get_or_create_pending_approval(first_key).await;
-    let (second, second_is_owner) = service.get_or_create_pending_approval(second_key).await;
+    let (first, first_is_owner) =
+        service.get_or_create_pending_approval(pending_key(first_host, "turn-1", "execution-1"));
+    let (second, second_is_owner) =
+        service.get_or_create_pending_approval(pending_key(second_host, "turn-1", "execution-1"));
 
     assert!(first_is_owner);
     assert!(second_is_owner);
     assert!(!Arc::ptr_eq(&first, &second));
 }
 
-#[tokio::test]
-async fn pending_approvals_do_not_dedupe_across_environments() {
+#[test]
+fn pending_approvals_do_not_dedupe_across_environments() {
     let service = NetworkApprovalService::default();
-    let first_key = HostApprovalKey {
+    let first_host = HostApprovalKey {
         environment_id: "local".to_string(),
         host: "example.com".to_string(),
         protocol: "https",
         port: 443,
     };
-    let second_key = HostApprovalKey {
+    let second_host = HostApprovalKey {
         environment_id: "remote".to_string(),
-        ..first_key.clone()
+        ..first_host.clone()
     };
 
-    let (first, first_is_owner) = service.get_or_create_pending_approval(first_key).await;
-    let (second, second_is_owner) = service.get_or_create_pending_approval(second_key).await;
+    let (first, first_is_owner) =
+        service.get_or_create_pending_approval(pending_key(first_host, "turn-1", "execution-1"));
+    let (second, second_is_owner) =
+        service.get_or_create_pending_approval(pending_key(second_host, "turn-1", "execution-1"));
 
     assert!(first_is_owner);
     assert!(second_is_owner);
     assert!(!Arc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn pending_approvals_do_not_dedupe_across_execution_or_turn() {
+    let service = NetworkApprovalService::default();
+    let host = HostApprovalKey {
+        environment_id: "remote".to_string(),
+        host: "example.com".to_string(),
+        protocol: "https",
+        port: 443,
+    };
+
+    let (first, first_is_owner) =
+        service.get_or_create_pending_approval(pending_key(host.clone(), "turn-1", "execution-1"));
+    let (second, second_is_owner) =
+        service.get_or_create_pending_approval(pending_key(host.clone(), "turn-1", "execution-2"));
+    let (third, third_is_owner) =
+        service.get_or_create_pending_approval(pending_key(host, "turn-2", "execution-1"));
+
+    assert!(first_is_owner);
+    assert!(second_is_owner);
+    assert!(third_is_owner);
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert!(!Arc::ptr_eq(&first, &third));
 }
 
 #[tokio::test]
@@ -226,12 +268,148 @@ async fn pending_waiters_receive_owner_decision() {
         tokio::spawn(async move { pending.wait_for_decision().await })
     };
 
-    pending
-        .set_decision(PendingApprovalDecision::AllowOnce)
-        .await;
+    pending.set_decision(PendingApprovalDecision::AllowOnce);
 
     let decision = waiter.await.expect("waiter should complete");
     assert_eq!(decision, PendingApprovalDecision::AllowOnce);
+}
+
+#[tokio::test]
+async fn dropping_pending_owner_denies_waiters_and_preserves_replacement() {
+    let service = NetworkApprovalService::default();
+    let execution_cancellation =
+        register_call_with_default_shell_trigger(&service, "execution-1").await;
+    let deferred = DeferredNetworkApproval {
+        registration_id: "execution-1".to_string(),
+        cancellation_token: execution_cancellation.clone(),
+        finish_outcome: Arc::new(OnceCell::new()),
+        _execution_proxy: None,
+    };
+    let key = pending_key(
+        HostApprovalKey {
+            environment_id: "remote".to_string(),
+            host: "example.com".to_string(),
+            protocol: "https",
+            port: 443,
+        },
+        "turn-1",
+        "execution-1",
+    );
+    let (pending, is_owner) = service.get_or_create_pending_approval(key.clone());
+    assert!(is_owner);
+    let owner = PendingHostApprovalOwner::new(
+        &service,
+        key.clone(),
+        Arc::clone(&pending),
+        Some(execution_cancellation.clone()),
+    );
+
+    let first_waiter = pending.wait_for_decision();
+    let second_waiter = pending.wait_for_decision();
+    tokio::pin!(first_waiter, second_waiter);
+    assert!(poll!(first_waiter.as_mut()).is_pending());
+    assert!(poll!(second_waiter.as_mut()).is_pending());
+    drop(owner);
+
+    let decisions = timeout(Duration::from_secs(1), async {
+        tokio::join!(first_waiter, second_waiter)
+    })
+    .await
+    .expect("coalesced waiters should fail closed when their owner is dropped");
+    assert_eq!(
+        decisions,
+        (PendingApprovalDecision::Deny, PendingApprovalDecision::Deny)
+    );
+    assert!(execution_cancellation.is_cancelled());
+    let error = deferred
+        .finish(&service)
+        .await
+        .expect_err("abandoned approval should fail its execution closed");
+    assert!(matches!(
+        error,
+        ToolError::Rejected(message) if message == ABANDONED_NETWORK_APPROVAL_MESSAGE
+    ));
+
+    let (replacement, is_owner) = service.get_or_create_pending_approval(key.clone());
+    assert!(is_owner);
+    assert!(!Arc::ptr_eq(&pending, &replacement));
+    let replacement_owner = PendingHostApprovalOwner::new(
+        &service,
+        key.clone(),
+        Arc::clone(&replacement),
+        /*execution_cancellation*/ None,
+    );
+
+    let stale = Arc::new(PendingHostApproval::new());
+    drop(PendingHostApprovalOwner::new(
+        &service,
+        key.clone(),
+        Arc::clone(&stale),
+        /*execution_cancellation*/ None,
+    ));
+    assert_eq!(
+        stale.wait_for_decision().await,
+        PendingApprovalDecision::Deny
+    );
+
+    let (current, is_owner) = service.get_or_create_pending_approval(key);
+    assert!(!is_owner);
+    assert!(Arc::ptr_eq(&current, &replacement));
+    replacement_owner.complete(PendingApprovalDecision::AllowOnce);
+    assert_eq!(
+        replacement.wait_for_decision().await,
+        PendingApprovalDecision::AllowOnce
+    );
+}
+
+#[tokio::test]
+async fn pending_owner_cancels_execution_only_for_denial() {
+    let service = NetworkApprovalService::default();
+    let key = pending_key(
+        HostApprovalKey {
+            environment_id: "remote".to_string(),
+            host: "example.com".to_string(),
+            protocol: "https",
+            port: 443,
+        },
+        "turn-1",
+        "execution-1",
+    );
+    let (pending, is_owner) = service.get_or_create_pending_approval(key.clone());
+    assert!(is_owner);
+    let execution_cancellation = CancellationToken::new();
+    let mut owner = PendingHostApprovalOwner::new(
+        &service,
+        key.clone(),
+        Arc::clone(&pending),
+        Some(execution_cancellation.clone()),
+    );
+    owner.set_decision_on_drop(PendingApprovalDecision::AllowForSession);
+
+    drop(owner);
+
+    assert!(!execution_cancellation.is_cancelled());
+    assert_eq!(
+        pending.wait_for_decision().await,
+        PendingApprovalDecision::AllowForSession
+    );
+
+    let (pending, is_owner) = service.get_or_create_pending_approval(key.clone());
+    assert!(is_owner);
+    let execution_cancellation = CancellationToken::new();
+    PendingHostApprovalOwner::new(
+        &service,
+        key,
+        Arc::clone(&pending),
+        Some(execution_cancellation.clone()),
+    )
+    .complete(PendingApprovalDecision::Deny);
+
+    assert!(execution_cancellation.is_cancelled());
+    assert_eq!(
+        pending.wait_for_decision().await,
+        PendingApprovalDecision::Deny
+    );
 }
 
 #[test]
@@ -297,23 +475,25 @@ async fn register_call_with_default_shell_trigger(
 ) -> CancellationToken {
     let cancellation_token = CancellationToken::new();
     service
-        .register_call(
-            registration_id.to_string(),
-            "turn-1".to_string(),
-            GuardianNetworkAccessTrigger {
+        .register_call(ActiveNetworkApprovalCall {
+            registration_id: registration_id.to_string(),
+            turn_id: "turn-1".to_string(),
+            tool_name: ToolName::plain("exec_command"),
+            trigger: GuardianNetworkAccessTrigger {
                 call_id: "call-1".to_string(),
-                tool_name: "shell_command".to_string(),
+                tool_name: "exec_command".to_string(),
                 command: vec!["curl".to_string(), "https://example.com".to_string()],
-                cwd: test_path_buf("/tmp").abs(),
+                cwd: PathUri::from_abs_path(&test_path_buf("/tmp").abs()),
                 sandbox_permissions: SandboxPermissions::UseDefault,
                 additional_permissions: None,
                 justification: None,
                 tty: None,
             },
-            "curl https://example.com".to_string(),
-            "local".to_string(),
-            cancellation_token.clone(),
-        )
+            command: "curl https://example.com".to_string(),
+            environment_id: "local".to_string(),
+            permission_profile: PermissionProfile::workspace_write(),
+            cancellation_token: cancellation_token.clone(),
+        })
         .await;
     cancellation_token
 }
@@ -321,11 +501,12 @@ async fn register_call_with_default_shell_trigger(
 #[tokio::test]
 async fn active_call_preserves_triggering_command_context() {
     let service = NetworkApprovalService::default();
+    let tool_name = ToolName::namespaced("mcp__example", "exec_command");
     let expected = GuardianNetworkAccessTrigger {
         call_id: "call-1".to_string(),
-        tool_name: "shell_command".to_string(),
+        tool_name: tool_name.to_string(),
         command: vec!["curl".to_string(), "https://example.com".to_string()],
-        cwd: test_path_buf("/repo").abs(),
+        cwd: PathUri::parse("file:///C:/repo").expect("valid Windows path URI"),
         sandbox_permissions: SandboxPermissions::UseDefault,
         additional_permissions: None,
         justification: Some("fetch release metadata".to_string()),
@@ -333,14 +514,16 @@ async fn active_call_preserves_triggering_command_context() {
     };
 
     service
-        .register_call(
-            "registration-1".to_string(),
-            "turn-1".to_string(),
-            expected.clone(),
-            "curl https://example.com".to_string(),
-            "remote".to_string(),
-            CancellationToken::new(),
-        )
+        .register_call(ActiveNetworkApprovalCall {
+            registration_id: "registration-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            trigger: expected.clone(),
+            tool_name: tool_name.clone(),
+            command: "curl https://example.com".to_string(),
+            environment_id: "remote".to_string(),
+            permission_profile: PermissionProfile::workspace_write(),
+            cancellation_token: CancellationToken::new(),
+        })
         .await;
 
     let call = service
@@ -349,6 +532,7 @@ async fn active_call_preserves_triggering_command_context() {
         .expect("single active call should resolve");
 
     assert_eq!(&call.trigger, &expected);
+    assert_eq!(call.tool_name, tool_name);
     assert_eq!(call.command, "curl https://example.com");
     assert_eq!(call.environment_id, "remote");
 }
@@ -380,50 +564,113 @@ async fn record_blocked_request_sets_policy_outcome_for_owner_call() {
     assert!(cancellation_token.is_cancelled());
     assert_eq!(
             service.take_call_outcome("registration-1").await,
-            Some(NetworkApprovalOutcome::DeniedByPolicy(
+            Some(
                 "Network access to \"example.com\" was blocked: domain is not on the allowlist for the current sandbox mode.".to_string()
-            ))
+            )
         );
 }
 
 #[tokio::test]
-async fn blocked_request_policy_does_not_override_user_denial_outcome() {
+async fn blocked_request_does_not_override_recorded_approval_outcome() {
     let service = NetworkApprovalService::default();
     register_call_with_default_shell_trigger(&service, "registration-1").await;
+    let rejection = "approval client unavailable";
 
-    service
-        .record_call_outcome("registration-1", NetworkApprovalOutcome::DeniedByUser)
-        .await;
+    service.record_call_outcome("registration-1", rejection.to_string());
     service
         .record_blocked_request(denied_blocked_request("example.com"))
         .await;
 
+    let error =
+        network_approval_outcome_to_result(service.take_call_outcome("registration-1").await)
+            .expect_err("approval denial should remain an error");
+    assert!(matches!(error, ToolError::Rejected(message) if message == rejection));
+}
+
+#[tokio::test]
+async fn specific_approval_outcome_replaces_earlier_blocked_request() {
+    let service = NetworkApprovalService::default();
+    register_call_with_default_shell_trigger(&service, "registration-1").await;
+    let rejection = "specific approval rejection";
+
+    service
+        .record_blocked_request(denied_blocked_request("example.com"))
+        .await;
+    service.record_call_outcome("registration-1", rejection.to_string());
+
+    let error =
+        network_approval_outcome_to_result(service.take_call_outcome("registration-1").await)
+            .expect_err("specific approval denial should replace blocked policy denial");
+    assert!(matches!(error, ToolError::Rejected(message) if message == rejection));
+}
+
+#[tokio::test]
+async fn disconnect_fallback_preserves_earlier_approval_outcome() {
+    let service = NetworkApprovalService::default();
+    let cancellation = register_call_with_default_shell_trigger(&service, "registration-1").await;
+    let denial = "approval client unavailable";
+
+    service.record_call_outcome("registration-1", denial.to_string());
+    service.record_call_outcome_if_absent("registration-1", "network disconnected".to_string());
+
+    assert!(cancellation.is_cancelled());
     assert_eq!(
         service.take_call_outcome("registration-1").await,
-        Some(NetworkApprovalOutcome::DeniedByUser)
+        Some(denial.to_string())
     );
 }
 
 #[tokio::test]
-async fn finish_call_returns_denial_and_unregisters_active_call() {
+async fn disconnect_fallback_cancels_execution_and_yields_to_explicit_denial() {
+    let service = NetworkApprovalService::default();
+    let cancellation = register_call_with_default_shell_trigger(&service, "registration-1").await;
+    let disconnect = "network disconnected";
+    let denial = "explicit approval denial";
+
+    service.record_call_outcome_if_absent("registration-1", disconnect.to_string());
+    assert!(cancellation.is_cancelled());
+    assert_eq!(
+        service.take_call_outcome("registration-1").await,
+        Some(disconnect.to_string())
+    );
+
+    service.record_call_outcome_if_absent("registration-1", disconnect.to_string());
+    service.record_call_outcome("registration-1", denial.to_string());
+    assert_eq!(
+        service.take_call_outcome("registration-1").await,
+        Some(denial.to_string())
+    );
+}
+
+#[tokio::test]
+async fn latest_specific_approval_outcome_replaces_earlier_specific_outcome() {
     let service = NetworkApprovalService::default();
     register_call_with_default_shell_trigger(&service, "registration-1").await;
 
-    service
-        .record_call_outcome(
-            "registration-1",
-            NetworkApprovalOutcome::DeniedByPolicy("network denied".to_string()),
-        )
-        .await;
+    service.record_call_outcome("registration-1", "earlier approval rejection".to_string());
+    service.record_call_outcome("registration-1", "latest approval rejection".to_string());
 
-    let err = service
-        .finish_call("registration-1")
-        .await
-        .expect_err("denial should be returned");
+    let error =
+        network_approval_outcome_to_result(service.take_call_outcome("registration-1").await)
+            .expect_err("latest approval rejection should remain an error");
+    assert!(matches!(
+        error,
+        ToolError::Rejected(message) if message == "latest approval rejection"
+    ));
+}
 
-    assert!(matches!(err, ToolError::Rejected(message) if message == "network denied"));
-    assert!(service.resolve_single_active_call().await.is_none());
-    assert_eq!(service.take_call_outcome("registration-1").await, None);
+#[test]
+fn approval_denial_messages_are_bounded_for_model_context() {
+    let rejection = "x".repeat(40_000);
+
+    let error = network_approval_outcome_to_result(Some(rejection))
+        .expect_err("approval denial should remain an error");
+    let ToolError::Rejected(message) = error else {
+        panic!("approval denial should produce a rejected tool error");
+    };
+
+    assert!(codex_utils_string::approx_token_count(&message) < 1_000);
+    assert!(message.contains("tokens truncated"));
 }
 
 #[tokio::test]
@@ -437,12 +684,7 @@ async fn deferred_finish_reuses_denial_result_after_first_consumer() {
         finish_outcome: Arc::new(OnceCell::new()),
         _execution_proxy: None,
     };
-    service
-        .record_call_outcome(
-            "registration-1",
-            NetworkApprovalOutcome::DeniedByPolicy("network denied".to_string()),
-        )
-        .await;
+    service.record_call_outcome("registration-1", "network denied".to_string());
 
     let first = deferred
         .finish(&service)
@@ -464,12 +706,7 @@ async fn record_call_outcome_ignores_inactive_call() {
         register_call_with_default_shell_trigger(&service, "registration-1").await;
     service.unregister_call("registration-1").await;
 
-    service
-        .record_call_outcome(
-            "registration-1",
-            NetworkApprovalOutcome::DeniedByPolicy("network denied".to_string()),
-        )
-        .await;
+    service.record_call_outcome("registration-1", "network denied".to_string());
 
     assert!(!cancellation_token.is_cancelled());
     assert_eq!(service.take_call_outcome("registration-1").await, None);
@@ -507,8 +744,8 @@ async fn attributed_blocked_request_targets_one_of_multiple_active_calls() {
     assert_eq!(service.take_call_outcome("registration-1").await, None);
     assert_eq!(
         service.take_call_outcome("registration-2").await,
-        Some(NetworkApprovalOutcome::DeniedByPolicy(
+        Some(
             "Network access to \"example.com\" was blocked: domain is not on the allowlist for the current sandbox mode.".to_string()
-        ))
+        )
     );
 }

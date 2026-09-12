@@ -116,10 +116,19 @@ std::pair<FlakeRef, std::string> parsePathFlakeRefWithFragment(
     auto query = decodeQuery(match[3].str(), /*lenient=*/true);
     auto fragment = percentDecode(match[5].str());
 
-    if (baseDir) {
+    /* An absolute path needs no base directory to be resolved, so it takes
+       the road a path on the command line takes: the `flake.nix` search and
+       the repository detection below. Only a relative path with no base is
+       left to the `path` scheme, as `path:./x`, which is a flake-input
+       notion. Without this, `builtins.getFlake "/abs/checkout"` (parsed with
+       no base directory) became `path:/abs/checkout`, and the `path` scheme
+       serves store objects only: the very checkout `nix build /abs/checkout`
+       resolves to its `git+file` or `jj+file` identity was refused as a
+       mutable directory. */
+    if (baseDir || path.is_absolute()) {
         /* Check if 'url' is a path (either absolute or relative
            to 'baseDir'). If so, search upward to the root of the
-           repo (i.e. the directory containing .git). */
+           repo (i.e. the directory containing .git or .jj). */
 
         path = absPath(path, get(baseDir), true);
 
@@ -150,7 +159,15 @@ std::pair<FlakeRef, std::string> parsePathFlakeRefWithFragment(
                     if (pathExists(path / "flake.nix")) {
                         found = true;
                         break;
-                    } else if (pathExists(path / ".git"))
+                    }
+                    /* The search stops at a repository boundary: a directory
+                       that is its own repository belongs to itself, not to
+                       whatever flake happens to live above it. Both kinds
+                       count. Testing only `.git` here, while the loop below
+                       that picks a fetcher tests `.git` and then `.jj`, let a
+                       jj workspace with no flake.nix of its own be captured
+                       by an ancestor's flake. */
+                    else if (pathExists(path / ".git") || pathExists(path / ".jj"))
                         throw Error(
                             "path %s is not part of a flake (neither it nor its parent directories contain a 'flake.nix' file)",
                             PathFmt(path));

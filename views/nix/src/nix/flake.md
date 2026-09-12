@@ -143,6 +143,13 @@ The following generic flake reference attributes are supported:
   tarballs that lack a unique content identifier such as a Git commit
   hash.
 
+* `treeHash`: For `jj` inputs, the BLAKE3 id (in SRI format,
+  `blake3-...`) of the flake's root tree as Jujutsu's native object
+  store names it. It takes the place of `narHash`: a `jj` input never
+  carries a `narHash`, its store path is derived from `treeHash` with no
+  file reads, and a locked input is verified by comparing ids, never by
+  reading the tree.
+
 In addition, the following attributes are common to several flake
 reference types:
 
@@ -197,8 +204,12 @@ Currently the `type` attribute can be one of the following:
   where *path* is an absolute path to a directory in the file system
   containing a file named `flake.nix`.
 
-  If the flake at *path* is not inside a git repository, the `path:`
-  prefix is implied and can be omitted.
+  If the flake at *path* is not inside a git or jj repository, the
+  `path:` prefix is implied and can be omitted. An absolute path inside
+  one, written anywhere (on the command line, or as the argument of
+  `builtins.getFlake`), names the repository's checkout: it is resolved
+  to the `git+file` or `jj+file` reference for that checkout, with the
+  path below the repository root as `dir`.
 
   If *path* is a relative path (i.e. if it does not start with `/`),
   it is interpreted as follows:
@@ -210,9 +221,18 @@ Currently the `type` attribute can be one of the following:
     the directory containing that `flake.nix`. However, the resolved
     path must be in the same tree. For instance, a `flake.nix` in the
     root of a tree can use `path:./foo` to access the flake in
-    subdirectory `foo`, but `path:../bar` is illegal. On the other
-    hand, a flake in the `/foo` directory of a tree can use
+    subdirectory `foo`, but `path:../bar` is illegal and refused. On the
+    other hand, a flake in the `/foo` directory of a tree can use
     `path:../bar` to refer to the flake in `/bar`.
+
+    The tree is the enclosing repository's, wherever the flake was
+    reached from. A flake in `/foo` that is itself a relative input of
+    another flake in the same tree still resolves its own `path:../bar`
+    to `/bar` of that tree: a relative input is a directory of the tree,
+    and keeps its place in it. When the tree is a Jujutsu repository the
+    directory is a subtree object with an id of its own, and the input
+    evaluates at the store path that id gives it everywhere else; it
+    remains locked by the flake that names it, with no hash of its own.
 
   Path inputs can be specified with path values in `flake.nix`. Path values are a syntax for `path` inputs, and they are converted by
   1. resolving them into relative paths, relative to the base directory of `flake.nix`
@@ -456,6 +476,10 @@ The following attributes are supported in `flake.nix`:
   * `narHash`: The SHA-256 (in SRI format) of the
     [Nix Archive (NAR) serialisation][Nix Archive]
     NAR serialization of the flake's source tree.
+
+  * `treeHash`: For `jj` inputs, the BLAKE3 (in SRI format) Jujutsu
+    tree id of the flake's source tree, see the `treeHash` flake
+    reference attribute above.
 
   The value returned by the `outputs` function must be an attribute
   set. The attributes can have arbitrary values; however, various
@@ -712,6 +736,22 @@ following fields:
   cache: `narHash` allows the store path to be computed, while the
   other attributes are necessary because they provide information not
   stored in the store path.
+
+  A `jj` input records `treeHash` instead of `narHash`: the Jujutsu
+  tree id of its root, from which the store path is computed without
+  reading the tree. A lock file that gives a `jj` input a `narHash` is
+  rejected.
+
+  A relative path input (`path:./sub`) records neither. Its entry is
+  the literal path plus a `parent` field naming the node it is relative
+  to, and it is locked by that parent: the parent's own identity (its
+  `rev`, `narHash` or `treeHash`) already fixes every byte under it, so
+  a hash of the child would be redundant, and a stale child lock cannot
+  exist, because when the parent changes the child follows. When the
+  parent is a `jj` input, the child evaluates as its own store object,
+  addressed by the subtree's tree id, which is the same id the same
+  content has committed at the root of any other repository; the lock
+  file still carries only the path.
 
   The attributes in `locked` are considered "final", meaning that they are the only ones that are passed via the arguments of the `outputs` function of a flake.
   For instance, if `locked` contains a `lastModified` attribute while the fetcher does not return a `lastModified` attribute, then the `lastModified` attribute will be passed to the `outputs` function.

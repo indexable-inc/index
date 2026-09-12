@@ -67,6 +67,7 @@ where
 
     - ["Flat"](@docroot@/store/store-object/content-address.md#method-flat)
     - ["Git"](@docroot@/store/store-object/content-address.md#method-git)
+    - ["Jujutsu tree"](@docroot@/store/store-object/content-address.md#method-jj-tree)
     - ["Nix Archive"](@docroot@/store/store-object/content-address.md#method-nix-archive) if the hash algorithm is not [SHA-256].
 
     `id` is the name of the output (usually, "out").
@@ -118,8 +119,13 @@ where
           ```
           hashes of the [Git blob/tree](https://git-scm.com/book/en/v2/Git-Internals-Git-Objects) [Merkel tree](https://en.wikipedia.org/wiki/Merkle_tree) format
 
+        - ```ebnf
+          | "jj-tree:"
+          ```
+          the [Jujutsu tree id](@docroot@/store/file-system-object/content-address.md#jj-tree) of the root directory; `algo` is always `blake3`
+
       - ```ebnf
-        algo = "md5" | "sha1" | "sha256"
+        algo = "md5" | "sha1" | "sha256" | "blake3"
         ```
 
       - `hash` = base-16 representation of the path or flat hash of the contents of the path (or expected contents of the path for fixed-output derivations).

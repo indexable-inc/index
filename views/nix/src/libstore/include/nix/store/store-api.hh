@@ -52,6 +52,9 @@ enum SubstituteFlag : bool { NoSubstitute = false, Substitute = true };
 
 enum BuildMode : uint8_t { bmNormal, bmRepair, bmCheck };
 
+/** KeepGoing gives independent requests a result each, including root-local errors. */
+enum class BuildFailureMode { Configured, KeepGoing };
+
 enum TrustedFlag : bool { NotTrusted = false, Trusted = true };
 
 struct BuildResult;
@@ -368,7 +371,7 @@ public:
     /**
      * Check whether a path is valid.
      */
-    bool isValidPath(const StorePath & path);
+    virtual bool isValidPath(const StorePath & path);
 
 protected:
 
@@ -578,6 +581,31 @@ public:
         RepairFlag repair = NoRepair);
 
     /**
+     * Write the tree at `path` to the store under a content address the
+     * caller already holds and libstore cannot recompute: `ca.method` must
+     * be `ContentAddressMethod::Raw::JjTree`, whose BLAKE3 id only the jj
+     * object store that minted it can produce. Every other method goes
+     * through `addToStore`, which derives the address from the bytes.
+     *
+     * The caller vouches for `ca`: it must have read the tree out of the
+     * object store under that id (`SourceAccessor::knownTreeRoot`). The
+     * object is registered without a signature check, so over a daemon
+     * connection the client has to be a trusted user; a jj tree object is
+     * not self-certifying (`ValidPathInfo::isSelfCertifying`).
+     *
+     * Costs two walks of the tree (one to hash the NAR the store records
+     * as its own integrity check, one to write it), O(size of the tree),
+     * and runs only when something forces the object to exist on disk
+     * (`EvalState::ensureLazyPathCopied`); the store path itself comes from
+     * `makeFixedOutputPathFromCA` with no reads at all.
+     *
+     * @return The store path `makeFixedOutputPathFromCA(name, ca)`, valid
+     * on return.
+     */
+    StorePath
+    addToStoreWithKnownCA(std::string_view name, const SourcePath & path, const ContentAddress & ca, RepairFlag repair);
+
+    /**
      * Copy the contents of a path to the store and register the
      * validity the resulting path, using a constant amount of
      * memory.
@@ -657,11 +685,14 @@ public:
      * BuildResults corresponding to each element in paths. Note that in
      * case of a build/substitution error, this function won't throw an
      * exception, but return a BuildResult containing an error message.
+     * Explicit KeepGoing also isolates errors in individual goals and
+     * requires the independent-results capability on remote stores.
      */
     virtual std::vector<KeyedBuildResult> buildPathsWithResults(
         const std::vector<DerivedPath> & paths,
         BuildMode buildMode = bmNormal,
-        std::shared_ptr<Store> evalStore = nullptr);
+        std::shared_ptr<Store> evalStore = nullptr,
+        BuildFailureMode failureMode = BuildFailureMode::Configured);
 
     /**
      * Build a single non-materialized derivation (i.e. not from an

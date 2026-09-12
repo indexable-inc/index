@@ -1,0 +1,9 @@
+[package]
+name = "nix-build-scheduler"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1-or-later"
+description = "Safe build child accounting, admission and deadline policies"
+
+[lints]
+workspace = true

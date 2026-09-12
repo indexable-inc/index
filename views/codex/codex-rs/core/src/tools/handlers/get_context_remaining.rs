@@ -36,7 +36,7 @@ impl GetContextRemainingOutput {
 }
 
 impl ToolOutput for GetContextRemainingOutput {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         self.fragment()
     }
 
@@ -67,7 +67,10 @@ impl ToolExecutor<ToolInvocation> for GetContextRemainingHandler {
         create_get_context_remaining_tool()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             if !matches!(invocation.payload, ToolPayload::Function { .. }) {
                 return Err(FunctionCallError::RespondToModel(
@@ -82,7 +85,7 @@ impl ToolExecutor<ToolInvocation> for GetContextRemainingHandler {
             .await;
 
             Ok(boxed_tool_output(GetContextRemainingOutput::new(
-                token_status.tokens_until_compaction,
+                token_status.base_window_tokens_remaining,
             )))
         })
     }

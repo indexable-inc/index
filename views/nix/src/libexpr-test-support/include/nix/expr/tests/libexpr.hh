@@ -7,7 +7,6 @@
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/nixexpr.hh"
-#include "nix/expr/nixexpr.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-gc.hh"
 #include "nix/expr/eval-inline.hh"
@@ -40,24 +39,6 @@ protected:
             return settings;
         })
     {
-    }
-
-    Value eval(std::string input, bool forceValue = true)
-    {
-        Value v;
-        Expr * e = state.parseExprFromString(input, state.rootPath(CanonPath::root));
-        assert(e);
-        state.eval(e, v);
-        if (forceValue)
-            state.forceValue(v, noPos);
-        return v;
-    }
-
-    Value * maybeThunk(std::string input, bool forceValue = true)
-    {
-        Expr * e = state.parseExprFromString(input, state.rootPath(CanonPath::root));
-        assert(e);
-        return e->maybeThunk(state, state.baseEnv);
     }
 
     Symbol createSymbol(const char * value)

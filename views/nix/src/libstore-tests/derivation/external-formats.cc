@@ -1,5 +1,6 @@
 #include <nlohmann/json.hpp>
 #include <gtest/gtest.h>
+#include <gmock/gmock.h>
 
 #include "nix/store/derivations.hh"
 #include "derivation/test-support.hh"
@@ -13,6 +14,46 @@ TEST_F(DerivationTest, BadATerm_version)
 {
     ASSERT_THROW(
         parseDerivation(*store, readFile(goldenMaster("bad-version.drv")), "whatever", mockXpSettings), FormatError);
+}
+
+/* Nix cannot compute a Jujutsu tree id, so an output addressed by one could
+   never be checked after a build. Both readers refuse it with the same
+   FormatError (a bad hash would be a BadHash, so the type discriminates the
+   reason): the ATerm reader, and the JSON reader in both of its shapes, so
+   that a derivation one format admits is never one the other cannot
+   represent. */
+TEST_F(DerivationTest, ATerm_jjTreeOutputRefused)
+{
+    EXPECT_THAT(
+        [&]() {
+            parseDerivation(
+                *store,
+                R"(Derive([("out","","jj-tree:blake3","4c03db2dcce5d043f423d486b8b7d69953e182638477d0018c8ce875619df9a0")],[],[],"x86_64-linux","foo",[],[]))",
+                "foo",
+                mockXpSettings);
+        },
+        testing::ThrowsMessage<FormatError>(testing::HasSubstr("jj-tree")));
+}
+
+TEST_F(DerivationTest, JSON_jjTreeFixedOutputRefused)
+{
+    EXPECT_THAT(
+        [&]() {
+            nlohmann::adl_serializer<DerivationOutput>::from_json(
+                json::parse(R"({"method":"jj-tree","hash":"blake3-TAPbLczl0EP0I9SGuLfWmVPhgmOEd9ABjIzodWGd+aA="})"),
+                mockXpSettings);
+        },
+        testing::ThrowsMessage<FormatError>(testing::HasSubstr("jj-tree")));
+}
+
+TEST_F(CaDerivationTest, JSON_jjTreeFloatingOutputRefused)
+{
+    EXPECT_THAT(
+        [&]() {
+            nlohmann::adl_serializer<DerivationOutput>::from_json(
+                json::parse(R"({"method":"jj-tree","hashAlgo":"blake3"})"), mockXpSettings);
+        },
+        testing::ThrowsMessage<FormatError>(testing::HasSubstr("jj-tree")));
 }
 
 TEST_F(DynDerivationTest, BadATerm_oldVersionDynDeps)

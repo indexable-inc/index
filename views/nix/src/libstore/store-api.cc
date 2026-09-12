@@ -136,6 +136,11 @@ StorePath Store::addToStore(
         // Use NAR; Git is not a serialization method
         fsm = FileSerialisationMethod::NixArchive;
         break;
+    case FileIngestionMethod::JjTree:
+        throw TreeIdNotComputable(
+            "cannot add '%s' to the store by its Jujutsu tree id: Nix does not compute those; "
+            "a caller holding the id uses Store::addToStoreWithKnownCA",
+            path);
     }
     std::optional<StorePath> storePath;
     auto sink = sourceToSink([&](Source & source) {
@@ -242,6 +247,56 @@ void Store::addMultipleToStore(Source & source, RepairFlag repair, CheckSigsFlag
     }
 }
 
+StorePath Store::addToStoreWithKnownCA(
+    std::string_view name, const SourcePath & path, const ContentAddress & ca, RepairFlag repair)
+{
+    if (ca.method != ContentAddressMethod::Raw::JjTree)
+        throw Error(
+            "addToStoreWithKnownCA is for content addresses Nix cannot recompute; '%s' is derived from the bytes, "
+            "use addToStore for '%s'",
+            std::string(ca.method.render()),
+            path);
+
+    /* Pass 1: the NAR hash and size, which the store records as its own
+       integrity check of the bytes (`nix store verify` re-reads them). The
+       tree id is not recomputed anywhere: nothing in Nix can. */
+    HashSink narSink{HashAlgorithm::SHA256};
+    path.dumpPath(narSink);
+    auto [narHash, narSize] = narSink.finish();
+
+    auto info = ValidPathInfo::makeFromCA(*this, name, ContentAddressWithReferences::withoutRefs(ca), narHash);
+    info.narSize = narSize;
+
+    if (repair || !isValidPath(info.path)) {
+        /* Pass 2: write. NoCheckSigs because the caller read these bytes
+           out of the object store under `ca` and vouches for them; the
+           object cannot be self-certifying (see `isSelfCertifying`).
+
+           That vouching only reaches as far as this process is trusted. A
+           daemon forces the signature check back on for a client that is
+           not in `trusted-users` (daemon.cc, `AddToStoreNar`), and with no
+           signature and no way to recompute the id the object then counts
+           zero signatures and is refused with the store's generic message.
+           Name the three things that make it pass, since the generic
+           message names none of them. */
+        auto source = sinkToSource([&](Sink & sink) { path.dumpPath(sink); });
+        try {
+            addToStore(info, *source, repair, NoCheckSigs);
+        } catch (Error & e) {
+            e.addTrace(
+                {},
+                "while registering '%s' as a Jujutsu tree object (%s); such an object is not self-certifying, so a "
+                "store that checks signatures admits it only from a user in 'trusted-users' (a daemon client is one "
+                "or is not) or with a signature by a key in 'trusted-public-keys'",
+                printStorePath(info.path),
+                ca.render());
+            throw;
+        }
+    }
+
+    return info.path;
+}
+
 /*
 The aim of this function is to compute in one pass the correct ValidPathInfo for
 the files that we are trying to add to the store. To accomplish that in one
@@ -273,6 +328,12 @@ ValidPathInfo Store::addToStoreSlow(
     const StorePathSet & references,
     std::optional<Hash> expectedCAHash)
 {
+    if (method == ContentAddressMethod::Raw::JjTree)
+        throw TreeIdNotComputable(
+            "cannot add '%s' to the store by its Jujutsu tree id: Nix does not compute those; "
+            "a caller holding the id uses Store::addToStoreWithKnownCA",
+            srcPath);
+
     HashSink narHashSink{HashAlgorithm::SHA256};
     HashSink caHashSink{hashAlgo};
 

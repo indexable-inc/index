@@ -58,11 +58,6 @@ namespace nix {
 void dumpPath(const std::filesystem::path & path, Sink & sink, PathFilter & filter = defaultPathFilter);
 
 /**
- * Same as dumpPath(), but returns the last modified date of the path.
- */
-time_t dumpPathAndGetMtime(const std::filesystem::path & path, Sink & sink, PathFilter & filter = defaultPathFilter);
-
-/**
  * Dump an archive with a single file with these contents.
  *
  * @param s Contents of the file.

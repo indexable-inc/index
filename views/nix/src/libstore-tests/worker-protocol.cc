@@ -950,6 +950,39 @@ TEST_F(WorkerProtoTest, handshake_features)
         }));
 }
 
+TEST_F(WorkerProtoTest, independentResultsRequireBothPeersToAdvertiseSupport)
+{
+    for (bool clientSupports : {false, true}) {
+        for (bool daemonSupports : {false, true}) {
+            Pipe toClient, toServer;
+            toClient.create();
+            toServer.create();
+            auto clientVersion = WorkerProto::latest;
+            auto daemonVersion = WorkerProto::latest;
+            if (!clientSupports)
+                clientVersion.features.erase(WorkerProto::independentBuildResults);
+            if (!daemonSupports)
+                daemonVersion.features.erase(WorkerProto::independentBuildResults);
+            WorkerProto::Version clientResult;
+
+            auto clientThread = std::thread([&]() {
+                FdSink out{toServer.writeSide.get()};
+                FdSource in{toClient.readSide.get()};
+                clientResult = WorkerProto::BasicClientConnection::handshake(out, in, clientVersion);
+            });
+            FdSink out{toClient.writeSide.get()};
+            FdSource in{toServer.readSide.get()};
+            auto daemonResult = WorkerProto::BasicServerConnection::handshake(out, in, daemonVersion);
+            clientThread.join();
+
+            EXPECT_EQ(clientResult, daemonResult);
+            EXPECT_EQ(
+                clientResult.features.contains(WorkerProto::independentBuildResults),
+                clientSupports && daemonSupports);
+        }
+    }
+}
+
 /// Has to be a `BufferedSink` for handshake.
 struct NullBufferedSink : BufferedSink
 {

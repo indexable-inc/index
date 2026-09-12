@@ -7,8 +7,8 @@ in
   # nix-cargo-unit bootstraps the unit graph, so it cannot consume ix.cargoUnit
   # and is built as a plain Rust package. It is a standalone Cargo workspace
   # (its own Cargo.toml + Cargo.lock, excluded from the root workspace), so the
-  # build closure is exactly its git-tracked folder: a root-workspace lock bump
-  # no longer invalidates it. `srcRoot = ./.` filters to `gitTracked ./.`, and
+  # build closure is exactly its own folder: a root-workspace lock bump no
+  # longer invalidates it. `srcRoot = ./.` imports that folder whole, and
   # defaults `cargoLock` to the in-tree `Cargo.lock` and `meta.mainProgram` to
   # the pname.
   ix.buildRustPackage pkgs {

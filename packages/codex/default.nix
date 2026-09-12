@@ -108,8 +108,10 @@
   modelInstructionsFile ? null,
 }: let
   # Cross signal from the RFC 0009 lane (lib/per-system.nix `crossIxFor`): on a
-  # Linux build host this ix carries `cross = { isCross; target; targetSystem; }`
-  # and codex-rs is cross-compiled to Darwin. `null`/absent on a native build.
+  # Linux build host this ix carries `cross = { isCross; target; targetSystem;
+  # pkgs; }` (`pkgs` = the target's nixpkgs cross scope; the `pkgs` argument of
+  # THIS file stays the build host's) and codex-rs is cross-compiled to Darwin.
+  # `null`/absent on a native build.
   crossTarget = ix.cross.target or null;
   isCross = ix.cross.isCross or false;
 
@@ -148,8 +150,23 @@
     };
   localMcpServers = lib.filterAttrs (_: server: server ? command) mcpServers;
   remoteMcpServers = lib.filterAttrs (_: server: !(server ? command)) mcpServers;
+  # Dirs prepended to PATH at launch (the old `--prefix PATH :`): the pinned
+  # ripgrep codex shells out to, and bubblewrap for its Linux sandbox. Passed to
+  # the launcher as `path_prepend` (it joins them ahead of the caller's PATH).
+  # Native builds only. Under the Linux->Darwin cross lane (lib/per-system.nix
+  # `buildCrossPackage`) this `pkgs` is the x86_64-linux BUILD host's scope:
+  # `ripgrep`/`bubblewrap` are ELF and `hostPlatform.isLinux` is true, so
+  # prepending them shadows the Mac's own rg with one that cannot exec (shipped
+  # once, HM gen 738, 2026-09-03). A Darwin ripgrep through `ix.cross.pkgs`
+  # costs 49 derivations including a cross rustc (dry-run, nixpkgs
+  # 46db2e09e1d3), so the cross spec prepends nothing and codex resolves rg on
+  # the caller's PATH, as it did before the launcher.
+  pathPrepend = lib.optionals (!isCross) (map (p: "${lib.getBin p}/bin") (
+    [ripgrep] ++ lib.optional pkgs.stdenv.hostPlatform.isLinux bubblewrap
+  ));
   specValue = {
     target = lib.getExe codexWithNotifications;
+    path_prepend = pathPrepend;
     config_dir_env = "CODEX_HOME";
     config_dir_default = "~/.codex";
     config_file = "config.toml";
@@ -212,15 +229,24 @@
     target = crossTarget;
   };
   codexBinary = codexRust.binary;
+  codexHostBinary = codexRust.hostBinary;
 
-  # Reassemble the pieces `rustPlatform`'s codex used to provide around the raw
-  # binary: ripgrep on PATH (codex shells out to it; bubblewrap too on Linux for
-  # its sandbox) and shell completions. Completions run the binary, so they are
-  # gated on the build host being able to execute it (skipped when cross).
+  # The raw codex binary and `codex-code-mode-host` side by side in ONE bin/,
+  # plus shell completions. Side by side is load-bearing: codex resolves the
+  # host as a sibling of `current_exe()` (install-context
+  # `code_mode_host_program`), and on Linux `current_exe()` is /proc/self/exe,
+  # the REAL file, so a wrapper or symlink elsewhere would point the lookup
+  # back at codex's own unit output where no host lives. Hence both are copied
+  # (cargoUnit roots are one derivation per binary, there is no shared output
+  # to link) and no wrapper sits between the user and the real codex here; the
+  # PATH tools codex shells out to ride the launch spec's `path_prepend` on
+  # native builds (a cross spec prepends nothing, see `pathPrepend`).
+  # Completions run the binary, so they are gated on the build host being able
+  # to execute it (skipped when cross).
   codexWithNotifications =
     runCommand "codex-${version}" {
       inherit version;
-      nativeBuildInputs = lib.optionals (!isCross) [makeBinaryWrapper installShellFiles];
+      nativeBuildInputs = lib.optional (!isCross) installShellFiles;
       meta = {
         description = "OpenAI Codex CLI";
         homepage = "https://github.com/openai/codex";
@@ -229,37 +255,19 @@
         mainProgram = binName;
         platforms = lib.platforms.unix;
       };
-    } (
-      if isCross
-      then ''
-        # Cross (Linux->Darwin) lane: makeBinaryWrapper would compile a
-        # build-host (Linux ELF) wrapper that is dead on the Mac, so ship the
-        # Mach-O binary directly. The runtime PATH tools (ripgrep, and bubblewrap
-        # on Linux) are host-native with no Darwin artifact in this pkgs, so they
-        # drop out on cross (RFC 0009 nativePathSuffix posture) and the Mac codex
-        # finds ripgrep on the ambient PATH. Completions are skipped: generating
-        # them runs the binary, which the Linux host cannot execute.
-        # ponytail: no bundled rg on the Mac cross build; wire a Darwin ripgrep
-        # onto PATH here (a portable sh wrapper) if codex search must not rely on
-        # an ambient rg.
-        mkdir -p "$out/bin"
-        cp ${codexBinary}/bin/${binName} "$out/bin/${binName}"
-        chmod 0755 "$out/bin/${binName}"
-      ''
-      else ''
-        # shell
-        makeBinaryWrapper ${codexBinary}/bin/${binName} "$out/bin/${binName}" \
-          --prefix PATH : ${
-          lib.makeBinPath ([ripgrep] ++ lib.optional pkgs.stdenv.hostPlatform.isLinux bubblewrap)
-        }
-        ${lib.optionalString (pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform) ''
-          installShellCompletion --cmd ${binName} \
-            --bash <("$out/bin/${binName}" completion bash) \
-            --fish <("$out/bin/${binName}" completion fish) \
-            --zsh <("$out/bin/${binName}" completion zsh)
-        ''}
-      ''
-    );
+    } ''
+      # shell
+      mkdir -p "$out/bin"
+      cp ${codexBinary}/bin/${binName} "$out/bin/${binName}"
+      cp ${codexHostBinary}/bin/codex-code-mode-host "$out/bin/codex-code-mode-host"
+      chmod 0755 "$out/bin/${binName}" "$out/bin/codex-code-mode-host"
+      ${lib.optionalString (!isCross && pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform) ''
+        installShellCompletion --cmd ${binName} \
+          --bash <("$out/bin/${binName}" completion bash) \
+          --fish <("$out/bin/${binName}" completion fish) \
+          --zsh <("$out/bin/${binName}" completion zsh)
+      ''}
+    '';
 in
   # These baked defaults also reach the Codex GUI app's remote-SSH sessions, not
   # just terminal use. The desktop app does NOT ship its own binary to the remote

@@ -15,7 +15,7 @@
 #        omit the option entirely -- the plain upstream path every other arm
 #        must match. Was CORES; generalised because the identity question is the
 #        same for any setting that must not move a drvPath (eval-cores,
-#        lazy-trees, ...) and hardcoding one setting meant copying the file to
+#        eval-cache, ...) and hardcoding one setting meant copying the file to
 #        ask about the next.
 #
 #        eval-cores=N also enables the parallel-eval experimental feature, which
@@ -34,7 +34,7 @@
 #        about. So `none` against `SETTING=<nix's own default>` reads as two
 #        differing arms while being one configuration twice, which is the very
 #        thing the gate is meant to refuse. Prefer naming both arms explicitly
-#        (lazy-trees=false against lazy-trees=true) whenever the baseline is a
+#        (eval-cache=false against eval-cache=true) whenever the baseline is a
 #        value rather than the absence of a flag; then every eff= comes from nix
 #        and the comparison is honest. "none" stays for eval-cores, whose
 #        baseline really is "no option and no experimental feature".

@@ -2,10 +2,11 @@
   description = "ix apply multi-VM switch: several NixOS VMs switched in one command";
 
   inputs = {
-    # https://github.com/indexable-inc/index/issues/1537: every standalone
-    # example points at the public Index flake; this one still demonstrates raw
-    # NixOS attrs, not the ix VM wrapper, so only the `.ix` converter is used
-    # from index.
+    # The one example that keeps the bare public index flake as its input.
+    # Every other example reads index through ix (`ix.index`, index
+    # instantiated with its guest Nix) because it applies an index image; this
+    # one demonstrates raw NixOS attrs, not the ix VM wrapper, so it uses only
+    # the `.ix` converter from index, which needs no guest Nix.
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     index = {
       url = "github:indexable-inc/index";

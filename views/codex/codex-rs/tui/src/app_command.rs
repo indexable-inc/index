@@ -24,14 +24,13 @@ use serde_json::Value;
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) enum AppCommand {
-    Interrupt {
-        behavior: InterruptBehavior,
-    },
+    Interrupt,
     CleanBackgroundTerminals,
     RunUserShellCommand {
         command: String,
     },
     UserTurn {
+        client_user_message_id: String,
         items: Vec<UserInput>,
         cwd: PathBuf,
         approval_policy: AskForApproval,
@@ -92,10 +91,6 @@ pub(crate) enum AppCommand {
     SetThreadName {
         name: String,
     },
-    Shutdown,
-    ThreadRollback {
-        num_turns: u32,
-    },
     Review {
         target: ReviewTarget,
     },
@@ -104,23 +99,9 @@ pub(crate) enum AppCommand {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub(crate) enum InterruptBehavior {
-    Default,
-    RestorePromptIfNoOutput,
-}
-
 impl AppCommand {
     pub(crate) fn interrupt() -> Self {
-        Self::Interrupt {
-            behavior: InterruptBehavior::Default,
-        }
-    }
-
-    pub(crate) fn interrupt_and_restore_prompt_if_no_output() -> Self {
-        Self::Interrupt {
-            behavior: InterruptBehavior::RestorePromptIfNoOutput,
-        }
+        Self::Interrupt
     }
 
     pub(crate) fn clean_background_terminals() -> Self {
@@ -133,6 +114,7 @@ impl AppCommand {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn user_turn(
+        client_user_message_id: String,
         items: Vec<UserInput>,
         cwd: PathBuf,
         approval_policy: AskForApproval,
@@ -146,6 +128,7 @@ impl AppCommand {
         personality: Option<Personality>,
     ) -> Self {
         Self::UserTurn {
+            client_user_message_id,
             items,
             cwd,
             approval_policy,
@@ -249,15 +232,6 @@ impl AppCommand {
 
     pub(crate) fn set_thread_name(name: String) -> Self {
         Self::SetThreadName { name }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn shutdown() -> Self {
-        Self::Shutdown
-    }
-
-    pub(crate) fn thread_rollback(num_turns: u32) -> Self {
-        Self::ThreadRollback { num_turns }
     }
 
     pub(crate) fn review(target: ReviewTarget) -> Self {

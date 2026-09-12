@@ -67,6 +67,22 @@ std::string_view FilteringSourceAccessor::identityClass(const CanonPath & path)
     return next->identityClass(prefix / path);
 }
 
+std::shared_ptr<SourceAccessor> FilteringSourceAccessor::getSubtree(const CanonPath & path)
+{
+    /* A subtree accessor serves every path beneath its root straight from
+       the tree below, so handing one out answers, once, for all of them. A
+       filter is a predicate over single paths: passing it at `path` says
+       nothing about the children (an allow-list admits `/a` when `/a/b` is
+       listed and still refuses `/a/c`), so delegating here would serve the
+       children unfiltered. Only a filter that knows its admission at `path`
+       to be prefix-closed may delegate, and the generic one knows no such
+       thing: it names no subtree, and the caller keeps reading through it
+       path by path. The access check stays so that a refused path fails
+       here, where the refusal is named, not on a later read. */
+    checkAccess(path);
+    return nullptr;
+}
+
 void FilteringSourceAccessor::invalidateCache(const CanonPath & path)
 {
     next->invalidateCache(prefix / path);
@@ -102,6 +118,34 @@ struct AllowListSourceAccessorImpl : AllowListSourceAccessor
     void allowPrefix(CanonPath prefix) override
     {
         allowedPrefixes.lock()->insert(std::move(prefix));
+    }
+
+    /* Whether `path` and everything beneath it is allowed: `path` or an
+       ancestor of it is an allowed prefix. `isAllowed` admits more than this
+       (a path that is the ancestor of an allowed one, so that directories on
+       the way down can be listed; and the exact paths in `allowedPaths`),
+       and neither of those admissions extends to children. */
+    bool isAllowedWithChildren(const CanonPath & path)
+    {
+        auto prefixes = allowedPrefixes.readLock();
+        auto p = path;
+        while (true) {
+            if (prefixes->contains(p))
+                return true;
+            if (p.isRoot())
+                return false;
+            p.pop();
+        }
+    }
+
+    /* The allow-list is the one filter whose admission can be prefix-closed,
+       so it is the one that may hand out a subtree: a subtree accessor for a
+       path under an allowed prefix serves nothing the filter would refuse
+       path by path. Anywhere else the answer is the base class's `nullptr`. */
+    std::shared_ptr<SourceAccessor> getSubtree(const CanonPath & path) override
+    {
+        checkAccess(path);
+        return isAllowedWithChildren(path) ? next->getSubtree(prefix / path) : nullptr;
     }
 };
 

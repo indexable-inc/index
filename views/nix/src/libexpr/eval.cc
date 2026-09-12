@@ -3,11 +3,9 @@
 #include "nix/expr/eval-perf-census.hh"
 #include "nix/expr/eval-readset.hh"
 #include "nix/expr/eval-settings.hh"
-#include "nix/expr/primops.hh"
 #include "nix/expr/print-options.hh"
 #include "nix/expr/symbol-table.hh"
 #include "nix/expr/value.hh"
-#include "nix/util/exit.hh"
 #include "nix/util/types.hh"
 #include "nix/util/util.hh"
 #include "nix/util/environment-variables.hh"
@@ -24,16 +22,13 @@
 #include "nix/util/mounted-source-accessor.hh"
 #include "nix/expr/gc-small-vector.hh"
 #include "nix/expr/rust-eval-refusal.hh"
-#include "nix/expr/shadow-census.hh"
 #include "nix/util/url.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/fetchers/tarball.hh"
 #include "nix/fetchers/input-cache.hh"
 #include "nix/util/current-process.hh"
 #include "nix/util/experimental-features.hh"
-#include "nix/expr/parallel-eval.hh"
-
-#include "parser-tab.hh"
+#include "nix/expr/value-wait.hh"
 
 #include <algorithm>
 #include <cstddef>
@@ -63,36 +58,6 @@
 using json = nlohmann::json;
 
 namespace nix {
-
-/**
- * Just for doc strings. Not for regular string values.
- */
-static char * allocString(size_t size)
-{
-    char * t;
-    t = (char *) GC_MALLOC_ATOMIC(size);
-    if (!t)
-        throw std::bad_alloc();
-    return t;
-}
-
-// When there's no need to write to the string, we can optimize away empty
-// string allocations.
-// This function handles makeImmutableString(std::string_view()) by returning
-// the empty string.
-/**
- * Just for doc strings. Not for regular string values.
- */
-static const char * makeImmutableString(std::string_view s)
-{
-    const size_t size = s.size();
-    if (size == 0)
-        return "";
-    auto t = allocString(size + 1);
-    memcpy(t, s.data(), size);
-    t[size] = '\0';
-    return t;
-}
 
 StringData & StringData::alloc(EvalMemory & mem, size_t size)
 {
@@ -252,8 +217,6 @@ static Symbol getName(const AttrName & name, EvalState & state, Env & env)
     }
 }
 
-static constexpr size_t BASE_ENV_SIZE = 128;
-
 EvalMemory::EvalMemory()
 {
     assertGCInitialized();
@@ -316,41 +279,20 @@ EvalState::EvalState(
         return accessor;
     }())
     , corepkgsFS(make_ref<MemorySourceAccessor>())
-    , internalFS(make_ref<MemorySourceAccessor>())
-    , derivationInternal{internalFS->addFile(
-          CanonPath("derivation-internal.nix"),
-#include "primops/derivation.nix.gen.hh"
-          )}
-    , importedDrvToDerivation{internalFS->addFile(
-          CanonPath("imported-drv-to-derivation.nix"),
-#include "imported-drv-to-derivation.nix.gen.hh"
-          )}
     , store(store)
     , buildStore(buildStore ? buildStore : store)
     , inputCache(fetchers::InputCache::create())
-    , debugRepl(nullptr)
-    , debugStop(false)
-    , trylevel(0)
     , importResolutionCache(make_ref<decltype(importResolutionCache)::element_type>())
+    , srcToStore(make_ref<decltype(srcToStore)::element_type>())
     , fileEvalCache(make_ref<decltype(fileEvalCache)::element_type>())
-    , positionToDocComment(make_ref<decltype(positionToDocComment)::element_type>())
     , lookupPathResolved(make_ref<decltype(lookupPathResolved)::element_type>())
-    , regexCache(makeRegexCache())
-#if NIX_USE_BOEHMGC
-    , baseEnvP(std::allocate_shared<Env *>(traceable_allocator<Env *>(), &mem.allocEnv(BASE_ENV_SIZE)))
-    , baseEnv(**baseEnvP)
-#else
-    , baseEnv(mem.allocEnv(BASE_ENV_SIZE))
-#endif
-    , staticBaseEnv{std::make_shared<StaticEnv>(nullptr, nullptr)}
     , countCalls(getEnv("NIX_COUNT_CALLS").value_or("0") != "0")
     , primOpCalls(make_ref<decltype(primOpCalls)::element_type>())
     , functionCalls(make_ref<decltype(functionCalls)::element_type>())
     , attrSelects(make_ref<decltype(attrSelects)::element_type>())
-    , executor{make_ref<Executor>(settings)}
+    , valueInterruptCallback(registerValueInterruptCallback())
 {
     corepkgsFS->setPathDisplay("<nix", ">");
-    internalFS->setPathDisplay("«nix-internal»", "");
 
     static_assert(sizeof(Env) <= 16, "environment must be <= 16 bytes");
 
@@ -381,8 +323,6 @@ EvalState::EvalState(
 #include "fetchurl.nix.gen.hh"
     );
 
-    createBaseEnv(settings);
-
     /* Register function call tracer. */
     if (settings.traceFunctionCalls)
         profiler.addProfiler(make_ref<FunctionCallTrace>());
@@ -401,35 +341,6 @@ EvalState::EvalState(
     if (!settings.readSetTraceFile.get().empty())
         readSetTracker = std::make_unique<ReadSetTracker>(
             *this, std::optional(std::filesystem::path(settings.readSetTraceFile.get())), settings.readSetHashContents);
-
-    /* One place decides what `eval-backend` means, rather than each command
-       deciding for itself: ten call sites construct an EvalState and only one
-       of them used to look at the setting, so `eval-backend = rust` was
-       silently ignored everywhere else. Set last, so nothing this constructor
-       evaluates for itself counts as the user's expression. */
-    if (settings.evalBackend.get() == "rust") {
-        experimentalFeatureSettings.require(Xp::RustEval);
-        rustBackendRequested = true;
-    }
-    /* `shadow` requires the same feature and deliberately does *not* set
-       `rustBackendRequested`. The flag means "the C++ evaluator must refuse",
-       and under shadow the opposite is true: the C++ arm is what the user is
-       served, and the Rust arm runs beside it with everything caught. Setting
-       it here would turn every shadowed command into the refusal the flag
-       exists to raise, which is the one outcome shadow must never produce. */
-    if (settings.evalBackend.get() == "shadow")
-        experimentalFeatureSettings.require(Xp::RustEval);
-
-    /* And discard the C++ evaluations this constructor did for itself, for
-       the same reason `rustBackendRequested` is set here rather than earlier:
-       building the base environment evaluates, and that is the evaluator
-       setting itself up, not the user's expression. Left in, it made every
-       Rust-backed run report `evaluator: mixed` with `cpp: 1` -- true about
-       the process and useless as the flip check, because `mixed` would then
-       be the answer for a working flip and for a broken one alike. Measured:
-       `nix-instantiate --eval -E 1` counts 2 here under cpp and 1 under
-       rust, and the one they share is this. */
-    nrCppEvals = 0;
 }
 
 EvalState::~EvalState() {}
@@ -524,38 +435,6 @@ void EvalState::checkURI(const std::string & uri0)
     throw RestrictedPathError("access to URI '%s' is forbidden in restricted mode", uri0);
 }
 
-Value * EvalState::addConstant(const std::string & name, Value & v, Constant info)
-{
-    Value * v2 = allocValue();
-    // Do a raw copy since `operator =` barfs on thunks.
-    memcpy((char *) v2, (char *) &v, sizeof(Value));
-    addConstant(name, v2, info);
-    return v2;
-}
-
-void EvalState::addConstant(const std::string & name, Value * v, Constant info)
-{
-    auto name2 = name.substr(0, 2) == "__" ? name.substr(2) : name;
-
-    constantInfos.push_back({name2, info});
-
-    if (!(settings.pureEval && info.impureOnly)) {
-        /* Check the type, if possible.
-
-           We might know the type of a thunk in advance, so be allowed
-           to just write it down in that case. */
-        if (v->isFinished()) {
-            if (auto gotType = v->type(); gotType != nThunk)
-                assert(info.type == gotType);
-        }
-
-        /* Install value the base environment. */
-        staticBaseEnv->vars.emplace_back(symbols.create(name), baseEnvDispl);
-        baseEnv.values[baseEnvDispl++] = v;
-        const_cast<Bindings *>(getBuiltins().attrs())->push_back(Attr(symbols.create(name2), v));
-    }
-}
-
 void PrimOp::check()
 {
     if (arity > maxPrimOpArity) {
@@ -589,320 +468,6 @@ void Value::mkPrimOp(PrimOp * p)
     setStorage(p);
 }
 
-Value * EvalState::addPrimOp(PrimOp && primOp)
-{
-    /* Hack to make constants lazy: turn them into a application of
-       the primop to a dummy value. */
-    if (primOp.arity == 0) {
-        primOp.arity = 1;
-        auto vPrimOp = allocValue();
-        vPrimOp->mkPrimOp(new PrimOp(std::move(primOp)));
-        Value v;
-        v.mkApp(vPrimOp, vPrimOp);
-        auto & primOp1 = *vPrimOp->primOp();
-        return addConstant(
-            primOp1.name,
-            v,
-            {
-                .type = nThunk, // FIXME
-                .doc = primOp1.doc ? primOp1.doc->c_str() : nullptr,
-            });
-    }
-
-    auto envName = symbols.create(primOp.name);
-    if (hasPrefix(primOp.name, "__"))
-        primOp.name = primOp.name.substr(2);
-
-    Value * v = allocValue();
-    v->mkPrimOp(new PrimOp(primOp));
-
-    if (primOp.internal)
-        internalPrimOps.emplace(primOp.name, v);
-    else {
-        staticBaseEnv->vars.emplace_back(envName, baseEnvDispl);
-        baseEnv.values[baseEnvDispl++] = v;
-        const_cast<Bindings *>(getBuiltins().attrs())->push_back(Attr(symbols.create(primOp.name), v));
-    }
-
-    return v;
-}
-
-Value & EvalState::getBuiltins()
-{
-    return *baseEnv.values[0];
-}
-
-Value & EvalState::getBuiltin(const std::string & name)
-{
-    auto it = getBuiltins().attrs()->get(symbols.create(name));
-    if (it)
-        return *it->value;
-    else
-        error<EvalError>("builtin '%1%' not found", name).debugThrow();
-}
-
-std::optional<EvalState::Doc> EvalState::getDoc(Value & v)
-{
-    if (v.isPrimOp()) {
-        auto v2 = &v;
-        auto & primOp = *v2->primOp();
-        if (primOp.doc)
-            return Doc{
-                .pos = {},
-                .name = primOp.name,
-                .arity = primOp.arity,
-                .args = primOp.args,
-                .doc = primOp.doc->c_str(),
-            };
-    }
-    if (v.isLambda()) {
-        auto exprLambda = v.lambda().fun;
-
-        std::ostringstream s;
-        std::string name;
-        auto pos = positions[exprLambda->getPos()];
-        std::string docStr;
-
-        if (exprLambda->name) {
-            name = symbols[exprLambda->name];
-        }
-
-        if (exprLambda->docComment) {
-            docStr = exprLambda->docComment.getInnerText(positions);
-        }
-
-        if (name.empty()) {
-            s << "Function ";
-        } else {
-            s << "Function `" << name << "`";
-            if (pos)
-                s << "\\\n  … ";
-            else
-                s << "\\\n";
-        }
-        if (pos) {
-            s << "defined at " << pos;
-        }
-        if (!docStr.empty()) {
-            s << "\n\n";
-        }
-
-        s << docStr;
-
-        return Doc{
-            .pos = pos,
-            .name = name,
-            .arity = 0, // FIXME: figure out how deep by syntax only? It's not semantically useful though...
-            .args = {},
-            /* N.B. Can't use StringData here, because that would lead to an interior pointer.
-               NOTE: memory leak when compiled without GC. */
-            .doc = makeImmutableString(s.view()),
-        };
-    }
-    if (isFunctor(v)) {
-        try {
-            Value & functor = *v.attrs()->get(s.functor)->value;
-            Value * vp[] = {&v};
-            Value partiallyApplied;
-            // The first parameter is not user-provided, and may be
-            // handled by code that is opaque to the user, like lib.const = x: y: y;
-            // So preferably we show docs that are relevant to the
-            // "partially applied" function returned by e.g. `const`.
-            // We apply the first argument:
-            callFunction(functor, vp, partiallyApplied, noPos);
-            auto _level = addCallDepth(noPos);
-            return getDoc(partiallyApplied);
-        } catch (Error & e) {
-            e.addTrace(nullptr, "while partially calling '%1%' to retrieve documentation", "__functor");
-            throw;
-        }
-    }
-    return {};
-}
-
-// just for the current level of StaticEnv, not the whole chain.
-void printStaticEnvBindings(const SymbolTable & st, const StaticEnv & se)
-{
-    std::cout << ANSI_MAGENTA;
-    for (auto & i : se.vars)
-        std::cout << st[i.first] << " ";
-    std::cout << ANSI_NORMAL;
-    std::cout << std::endl;
-}
-
-// just for the current level of Env, not the whole chain.
-void printWithBindings(const SymbolTable & st, const Env & env)
-{
-    if (env.values[0]->isFinished()) {
-        std::cout << "with: ";
-        std::cout << ANSI_MAGENTA;
-        auto j = env.values[0]->attrs()->begin();
-        while (j != env.values[0]->attrs()->end()) {
-            std::cout << st[j->name] << " ";
-            ++j;
-        }
-        std::cout << ANSI_NORMAL;
-        std::cout << std::endl;
-    }
-}
-
-void printEnvBindings(const SymbolTable & st, const StaticEnv & se, const Env & env, int lvl)
-{
-    std::cout << "Env level " << lvl << std::endl;
-
-    if (se.up && env.up) {
-        std::cout << "static: ";
-        printStaticEnvBindings(st, se);
-        if (se.isWith)
-            printWithBindings(st, env);
-        std::cout << std::endl;
-        printEnvBindings(st, *se.up, *env.up, ++lvl);
-    } else {
-        std::cout << ANSI_MAGENTA;
-        // for the top level, don't print the double underscore ones;
-        // they are in builtins.
-        for (auto & i : se.vars)
-            if (!hasPrefix(st[i.first], "__"))
-                std::cout << st[i.first] << " ";
-        std::cout << ANSI_NORMAL;
-        std::cout << std::endl;
-        if (se.isWith)
-            printWithBindings(st, env); // probably nothing there for the top level.
-        std::cout << std::endl;
-    }
-}
-
-void printEnvBindings(const EvalState & es, const Expr & expr, const Env & env)
-{
-    // just print the names for now
-    auto se = es.getStaticEnv(expr);
-    if (se)
-        printEnvBindings(es.symbols, *se, env, 0);
-}
-
-void mapStaticEnvBindings(const SymbolTable & st, const StaticEnv & se, const Env & env, ValMap & vm)
-{
-    // add bindings for the next level up first, so that the bindings for this level
-    // override the higher levels.
-    // The top level bindings (builtins) are skipped since they are added for us by initEnv()
-    if (env.up && se.up) {
-        mapStaticEnvBindings(st, *se.up, *env.up, vm);
-
-        if (se.isWith && env.values[0]->isFinished()) {
-            // add 'with' bindings.
-            for (auto & j : *env.values[0]->attrs())
-                vm.insert_or_assign(std::string(st[j.name]), j.value);
-        } else {
-            // iterate through staticenv bindings and add them.
-            for (auto & i : se.vars)
-                vm.insert_or_assign(std::string(st[i.first]), env.values[i.second]);
-        }
-    }
-}
-
-std::unique_ptr<ValMap> mapStaticEnvBindings(const SymbolTable & st, const StaticEnv & se, const Env & env)
-{
-    auto vm = std::make_unique<ValMap>();
-    mapStaticEnvBindings(st, se, env, *vm);
-    return vm;
-}
-
-/**
- * Sets `inDebugger` to true on construction and false on destruction.
- */
-class DebuggerGuard
-{
-    bool & inDebugger;
-public:
-    DebuggerGuard(bool & inDebugger)
-        : inDebugger(inDebugger)
-    {
-        inDebugger = true;
-    }
-
-    DebuggerGuard(DebuggerGuard &&) = delete;
-    DebuggerGuard(const DebuggerGuard &) = delete;
-    DebuggerGuard & operator=(DebuggerGuard &&) = delete;
-    DebuggerGuard & operator=(const DebuggerGuard &) = delete;
-
-    ~DebuggerGuard()
-    {
-        inDebugger = false;
-    }
-};
-
-bool EvalState::canDebug()
-{
-    return debugRepl && !debugTraces.empty();
-}
-
-void EvalState::runDebugRepl(const Error * error)
-{
-    if (!canDebug())
-        return;
-
-    assert(!debugTraces.empty());
-    const DebugTrace & last = debugTraces.front();
-    const Env & env = last.env;
-    const Expr & expr = last.expr;
-
-    runDebugRepl(error, env, expr);
-}
-
-void EvalState::runDebugRepl(const Error * error, const Env & env, const Expr & expr)
-{
-    // Make sure we have a debugger to run and we're not already in a debugger.
-    if (!debugRepl || inDebugger)
-        return;
-
-    auto dts = [&]() -> std::unique_ptr<DebugTraceStacker> {
-        if (error && expr.getPos()) {
-            auto trace = DebugTrace{
-                .pos = [&]() -> std::variant<Pos, PosIdx> {
-                    if (error->info().pos) {
-                        if (auto * pos = error->info().pos.get())
-                            return *pos;
-                        return noPos;
-                    }
-                    return expr.getPos();
-                }(),
-                .expr = expr,
-                .env = env,
-                .hint = error->info().msg,
-                .isError = true};
-
-            return std::make_unique<DebugTraceStacker>(*this, std::move(trace));
-        }
-        return nullptr;
-    }();
-
-    if (error) {
-        printError("%s\n", error->what());
-
-        if (trylevel > 0 && error->info().level != lvlInfo)
-            printError(
-                "This exception occurred in a 'tryEval' call. Use " ANSI_GREEN "--ignore-try" ANSI_NORMAL
-                " to skip these.\n");
-    }
-
-    auto se = getStaticEnv(expr);
-    if (se) {
-        auto vm = mapStaticEnvBindings(symbols, *se.get(), env);
-        DebuggerGuard _guard(inDebugger);
-        auto exitStatus = (debugRepl) (ref<EvalState>(shared_from_this()), *vm);
-        switch (exitStatus) {
-        case ReplExitStatus::QuitAll:
-            if (error)
-                throw *error;
-            throw Exit(0);
-        case ReplExitStatus::Continue:
-            break;
-        default:
-            unreachable();
-        }
-    }
-}
-
 template<typename... Args>
 void EvalState::addErrorTrace(Error & e, const Args &... formatArgs) const
 {
@@ -913,24 +478,6 @@ template<typename... Args>
 void EvalState::addErrorTrace(Error & e, const PosIdx pos, const Args &... formatArgs) const
 {
     e.addTrace(positions[pos], HintFmt(formatArgs...));
-}
-
-template<typename... Args>
-static std::unique_ptr<DebugTraceStacker> makeDebugTraceStacker(
-    EvalState & state, Expr & expr, Env & env, std::variant<Pos, PosIdx> pos, const Args &... formatArgs)
-{
-    return std::make_unique<DebugTraceStacker>(
-        state,
-        DebugTrace{.pos = std::move(pos), .expr = expr, .env = env, .hint = HintFmt(formatArgs...), .isError = false});
-}
-
-DebugTraceStacker::DebugTraceStacker(EvalState & evalState, DebugTrace t)
-    : evalState(evalState)
-    , trace(std::move(t))
-{
-    evalState.debugTraces.push_front(trace);
-    if (evalState.debugStop && evalState.debugRepl)
-        evalState.runDebugRepl(nullptr, trace.env, trace.expr);
 }
 
 void Value::mkString(std::string_view s, EvalMemory & mem)
@@ -988,10 +535,7 @@ void Value::mkPath(const SourcePath & path, EvalMemory & mem)
             return j->value;
         }
         if (!fromWith->parentWith) [[unlikely]]
-            error<UndefinedVarError>("undefined variable '%1%'", symbols[var.name])
-                .atPos(var.pos)
-                .withFrame(*env, var)
-                .debugThrow();
+            error<UndefinedVarError>("undefined variable '%1%'", symbols[var.name]).atPos(var.pos).debugThrow();
         for (size_t l = fromWith->prevWith; l; --l, env = env->up)
             ;
         fromWith = fromWith->parentWith;
@@ -1011,39 +555,10 @@ Value * EvalState::getBool(bool b)
 
 static Counter nrThunks;
 
-uint64_t getNrThunks()
-{
-    return nrThunks.load();
-}
-
 static inline void mkThunk(Value & v, Env & env, Expr * expr)
 {
     v.mkThunk(&env, expr);
     nrThunks++;
-}
-
-void EvalState::mkThunk_(Value & v, Expr * expr)
-{
-    mkThunk(v, baseEnv, expr);
-}
-
-void EvalState::mkPos(Value & v, PosIdx p)
-{
-    auto origin = positions.originOf(p);
-    if (auto path = std::get_if<SourcePath>(&origin)) {
-        if (readSetTracker && settings.readSetTrackPositions) [[unlikely]]
-            /* Without the line and column, because those are separate thunks
-               (see `makePositionThunks`) and are recorded when forced. Whether
-               a position was observed at all is a weaker input than where it
-               points, and code that only reads `.file` should not be
-               invalidated by an edit that shifts lines. */
-            readSetTracker->recordPosition(Pos(0, 0, *path), false);
-        auto attrs = buildBindings(3);
-        attrs.alloc(s.file).mkString(path->path.abs(), mem);
-        makePositionThunks(*this, p, attrs.alloc(s.line), attrs.alloc(s.column));
-        v.mkAttrs(attrs);
-    } else
-        v.mkNull();
 }
 
 void EvalState::mkStorePathString(const StorePath & p, Value & v)
@@ -1157,255 +672,42 @@ Value * ExprPath::maybeThunk(EvalState & state, Env & env)
     return &v;
 }
 
-/**
- * A helper `Expr` class to lets us parse and evaluate Nix expressions
- * from a thunk, ensuring that every file is parsed/evaluated only
- * once (via the thunk stored in `EvalState::fileEvalCache`).
- */
-struct ExprParseFile : Expr
+void EvalState::evalFile(const SourcePath &, Value &, bool)
 {
-    SourcePath & path;
-    bool mustBeTrivial;
-
-    ExprParseFile(SourcePath & path, bool mustBeTrivial)
-        : path(path)
-        , mustBeTrivial(mustBeTrivial)
-    {
-    }
-
-    void eval(EvalState & state, Env & env, Value & v) override
-    {
-        printTalkative("evaluating file '%s'", path);
-
-        auto e = state.parseExprFromFile(path);
-
-        try {
-            auto dts =
-                state.debugRepl
-                    ? makeDebugTraceStacker(
-                          state, *e, state.baseEnv, e->getPos(), "while evaluating the file '%s':", path.to_string())
-                    : nullptr;
-
-            // Enforce that 'flake.nix' is a direct attrset, not a
-            // computation.
-            if (mustBeTrivial && !(dynamic_cast<ExprAttrs *>(e)))
-                state.error<EvalError>("file '%s' must be an attribute set", path).debugThrow();
-
-            state.eval(e, v);
-        } catch (Error & e) {
-            state.addErrorTrace(e, "while evaluating the file '%s':", path.to_string());
-            throw;
-        }
-    }
-};
-
-void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
-{
-    nrEvalFileCalls++;
-
-    auto resolvedPath = getConcurrent(*importResolutionCache, path);
-
-    if (!resolvedPath) {
-        resolvedPath = resolveExprPath(path);
-        importResolutionCache->emplace(path, *resolvedPath);
-    }
-
-    {
-        Value * v2 = nullptr;
-        fileEvalCache->cvisit(*resolvedPath, [&](auto & i) { v2 = i.second; });
-        if (v2) {
-            nrEvalFilePathHits++;
-            /* The second and every later import of a file is served from here
-               and enters no boundary, so phase 1 recorded no relationship
-               between the file and any of those consumers. Without this edge
-               invalidating a file reaches exactly the one entry that happened
-               to import it first. */
-            if (readSetTracker) [[unlikely]]
-                readSetTracker->noteDemand(v2);
-            forceValue(*v2, noPos);
-            v = *v2;
-            return;
-        }
-    }
-
-    Value * vExpr;
-    ExprParseFile expr{*resolvedPath, mustBeTrivial};
-
-    fileEvalCache->try_emplace_and_cvisit(
-        *resolvedPath,
-        nullptr,
-        [&](auto & i) {
-            vExpr = allocValue();
-            vExpr->mkThunk(&baseEnv, &expr);
-            i.second = vExpr;
-        },
-        [&](auto & i) { vExpr = i.second; });
-
-    {
-        /* The tracked import boundary. Only the first request for a file
-           reaches here; later ones are served from `fileEvalCache` above and
-           are not separate entries, which is what makes the entry count the
-           number of files evaluated rather than the number of imports. */
-        ReadSetFrame frame(
-            readSetTracker.get(),
-            TrackedEntryKind::import,
-            /* The path within the tree that answers for it, which is what
-               survives an edit. Neither `to_string()` nor `path.abs()` will
-               do: the first prefixes the accessor display, which embeds the
-               revision, and the second is a full store path for anything the
-               store accessor answers for, which embeds the hash of the whole
-               tree. Either way the same file at two revisions keys as two
-               unrelated entries, which measured as 664 of 5,732 imports for a
-               one character edit. */
-            [&] { return resolvedPath->accessor->getFingerprint(resolvedPath->path).first.abs(); },
-            resolvedPath->accessor->number);
-        /* `vExpr` is what `fileEvalCache` hands to every later importer, so it
-           is the identity a demand from one of them is recognised by. The cache
-           holds it for the rest of the evaluation, which is what makes the
-           address safe to key on. */
-        frame.produces(vExpr);
-        forceValue(*vExpr, noPos);
-        /* The address registration above serves the memo table; consumers
-           receive struct copies, which only the payload identity survives. */
-        frame.producesValue(*vExpr);
-    }
-
-    v = *vExpr;
+    requireBackendCanServe();
 }
 
 void EvalState::resetFileCache()
 {
     importResolutionCache->clear();
+    srcToStore->clear();
     fileEvalCache->clear();
     inputCache->clear();
     positions.clear();
 }
 
-void EvalState::eval(Expr * e, Value & v)
+size_t EvalState::prepareForNextRequest()
 {
-    /* Every expression the user asked to evaluate arrives here, and the Rust
-       backend does not: a command that supports it hands the source to
-       nix-eval-rs and never calls this. So reaching this line with the Rust
-       backend selected means the command cannot serve it, and continuing
-       would run the C++ evaluator instead.
+    importResolutionCache->clear();
+    srcToStore->clear();
+    fileEvalCache->clear();
+    lookupPathResolved->clear();
+    return inputCache->evictUnlocked(fetchSettings);
+}
 
-       That has to be an error rather than a fallback. The two evaluators
-       differ in what they implement, and the whole point of the setting is to
-       find out where; a silent fallback means a user who asked for `rust` is
-       told nothing and learns it did not happen from a timing, or from a
-       divergence months later. Refuse, and name the setting. */
+void EvalState::eval(Expr *, Value &)
+{
     requireBackendCanServe();
-    /* Counted here rather than at the top of the function: everything above
-       is the refusal, and a refused evaluation is not one the C++ backend
-       served. This is the only increment, because this is the only place a
-       user expression reaches the C++ evaluator.
-
-       Except while a flake is being locked, which is not a user expression:
-       `requireBackendCanServe` has already counted it into
-       `nrCppFlakeLockEvals` and this must not count it again. Written as a
-       second condition rather than folded into that function because the two
-       counters were briefly both incremented for the same two evaluations,
-       and the run reported `evaluator: mixed` with `cpp: 2, cppFlakeLock: 2`
-       -- one number, printed twice, describing an exemption that had not
-       escaped anything. */
-    if (lockingFlake == 0)
-        nrCppEvals++;
-    e->eval(*this, baseEnv, v);
 }
 
 void EvalState::requireBackendCanServe()
 {
-    if (!rustBackendRequested)
-        return;
-
-    /* Locking a flake is cppnix's job and it evaluates `flake.nix` to do it.
-       See `EvalState::lockingFlake` for why this is the one exemption and
-       why it is not a fallback: what leaves the scope is a lock file, and the
-       flake's `outputs` are evaluated afterwards by the selected backend. */
-    if (lockingFlake > 0) {
-        nrCppFlakeLockEvals++;
-        return;
-    }
-
-    /* Through the refusal helper rather than a bare throw, because this is the
-       catch-all: every command not wired to the Rust backend arrives here, so
-       it is the largest refusal in the fleet and was the only one emitting no
-       census token at all. A refusal is fatal, which makes the journal line
-       written here -- not the stats block, which the throw skips -- the
-       production census. Without it a query grouping refusals by token
-       reported zero for `nix build`, and ix CI evaluates all twelve host
-       toplevels through `nix build --dry-run`; zero refusals and a clean
-       evaluation are the same reading (ENG-12711).
-
-       The detail is the command and nothing else, because that is what orders
-       the work: `command-unsupported` with no detail is one row for the whole
-       unserved surface. The sentence a human needs is advice, kept out of the
-       detail so the histogram stays groupable. */
-    refuseWithAdvice(
-        refusalTokens::unsupported,
-        RefusingCommand::get(),
-        "'eval-backend = rust' selects an evaluator this command has no path to, and "
-        "continuing would have silently used the C++ evaluator instead. Re-run with "
-        "'eval-backend = cpp', or use a command the Rust evaluator serves: 'nix eval' "
-        "or 'nix build' with '--expr' or '--file', or 'nix-instantiate --eval --strict'.");
+    refuse(refusalTokens::unsupported, RefusingCommand::get());
 }
 
-inline bool EvalState::evalBool(Env & env, Expr * e, const PosIdx pos, std::string_view errorCtx)
+void Expr::eval(EvalState & state, Env &, Value &)
 {
-    try {
-        Value v;
-        e->eval(*this, env, v);
-        if (v.type() != nBool)
-            error<TypeError>(
-                "expected a Boolean but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-                .atPos(pos)
-                .withFrame(env, *e)
-                .debugThrow();
-        return v.boolean();
-    } catch (Error & e) {
-        e.addTrace(positions[pos], errorCtx);
-        throw;
-    }
-}
-
-inline void EvalState::evalAttrs(Env & env, Expr * e, Value & v, const PosIdx pos, std::string_view errorCtx)
-{
-    try {
-        e->eval(*this, env, v);
-        if (v.type() != nAttrs)
-            error<TypeError>(
-                "expected a set but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-                .withFrame(env, *e)
-                .debugThrow();
-    } catch (Error & e) {
-        e.addTrace(positions[pos], errorCtx);
-        throw;
-    }
-}
-
-void Expr::eval(EvalState & state, Env & env, Value & v)
-{
-    unreachable();
-}
-
-void ExprInt::eval(EvalState & state, Env & env, Value & v)
-{
-    v = this->v;
-}
-
-void ExprFloat::eval(EvalState & state, Env & env, Value & v)
-{
-    v = this->v;
-}
-
-void ExprString::eval(EvalState & state, Env & env, Value & v)
-{
-    v = this->v;
-}
-
-void ExprPath::eval(EvalState & state, Env & env, Value & v)
-{
-    v = this->v;
+    state.requireBackendCanServe();
 }
 
 Env * ExprAttrs::buildInheritFromEnv(EvalState & state, Env & up)
@@ -1420,257 +722,12 @@ Env * ExprAttrs::buildInheritFromEnv(EvalState & state, Env & up)
     return &inheritEnv;
 }
 
-void ExprAttrs::eval(EvalState & state, Env & env, Value & v)
-{
-    auto bindings = state.buildBindings(attrs->size() + dynamicAttrs->size());
-    auto dynamicEnv = &env;
-    bool sort = false;
-
-    if (recursive) {
-        /* Create a new environment that contains the attributes in
-           this `rec'. */
-        Env & env2(state.mem.allocEnv(attrs->size()));
-        env2.up = &env;
-        dynamicEnv = &env2;
-        Env * inheritEnv = inheritFromExprs ? buildInheritFromEnv(state, env2) : nullptr;
-
-        AttrDefs::iterator overrides = attrs->find(state.s.overrides);
-        bool hasOverrides = overrides != attrs->end();
-
-        /* The recursive attributes are evaluated in the new
-           environment, while the inherited attributes are evaluated
-           in the original environment. */
-        Displacement displ = 0;
-        for (auto & i : *attrs) {
-            Value * vAttr;
-            if (hasOverrides && i.second.kind != AttrDef::Kind::Inherited) {
-                vAttr = state.allocValue();
-                mkThunk(*vAttr, *i.second.chooseByKind(&env2, &env, inheritEnv), i.second.e);
-            } else
-                vAttr = i.second.e->maybeThunk(state, *i.second.chooseByKind(&env2, &env, inheritEnv));
-            env2.values[displ++] = vAttr;
-            bindings.insert(i.first, vAttr, i.second.pos);
-        }
-
-        /* If the rec contains an attribute called `__overrides', then
-           evaluate it, and add the attributes in that set to the rec.
-           This allows overriding of recursive attributes, which is
-           otherwise not possible.  (You can use the // operator to
-           replace an attribute, but other attributes in the rec will
-           still reference the original value, because that value has
-           been substituted into the bodies of the other attributes.
-           Hence we need __overrides.) */
-        if (hasOverrides) {
-            Value * vOverrides = (*bindings.bindings)[overrides->second.displ].value;
-            state.forceAttrs(
-                *vOverrides,
-                [&]() { return vOverrides->determinePos(noPos); },
-                "while evaluating the `__overrides` attribute");
-            bindings.grow(state.buildBindings(bindings.capacity() + vOverrides->attrs()->size()));
-            for (auto & i : *vOverrides->attrs()) {
-                AttrDefs::iterator j = attrs->find(i.name);
-                if (j != attrs->end()) {
-                    (*bindings.bindings)[j->second.displ] = i;
-                    env2.values[j->second.displ] = i.value;
-                } else
-                    bindings.push_back(i);
-            }
-            sort = true;
-        }
-    }
-
-    else {
-        Env * inheritEnv = inheritFromExprs ? buildInheritFromEnv(state, env) : nullptr;
-        for (auto & i : *attrs)
-            bindings.insert(
-                i.first, i.second.e->maybeThunk(state, *i.second.chooseByKind(&env, &env, inheritEnv)), i.second.pos);
-    }
-
-    /* Dynamic attrs apply *after* rec and __overrides. */
-    for (auto & i : *dynamicAttrs) {
-        Value nameVal;
-        i.nameExpr->eval(state, *dynamicEnv, nameVal);
-        state.forceValue(nameVal, i.pos);
-        if (nameVal.type() == nNull)
-            continue;
-        state.forceStringNoCtx(nameVal, i.pos, "while evaluating the name of a dynamic attribute");
-        auto nameSym = state.symbols.create(nameVal.string_view());
-        if (sort)
-            // FIXME: inefficient
-            bindings.bindings->sort();
-        if (auto j = bindings.bindings->get(nameSym))
-            state
-                .error<EvalError>(
-                    "dynamic attribute '%1%' already defined at %2%", state.symbols[nameSym], state.positions[j->pos])
-                .atPos(i.pos)
-                .withFrame(env, *this)
-                .debugThrow();
-
-        i.valueExpr->setName(nameSym);
-        /* Keep sorted order so find can catch duplicates */
-        bindings.insert(nameSym, i.valueExpr->maybeThunk(state, *dynamicEnv), i.pos);
-        sort = true;
-    }
-
-    /* Empty attrsets share the static Bindings::emptyBindings, which we
-       must not write to: apart from being a data race, it causes false
-       sharing on emptyBindings' cache line (which may also hold other hot
-       globals such as Counter::enabled) between all evaluator threads. */
-    if (bindings.bindings != &Bindings::emptyBindings)
-        bindings.bindings->pos = pos;
-
-    v.mkAttrs(sort ? bindings.finish() : bindings.alreadySorted());
-}
-
-void ExprLet::eval(EvalState & state, Env & env, Value & v)
-{
-    /* Create a new environment that contains the attributes in this
-       `let'. */
-    Env & env2(state.mem.allocEnv(attrs->attrs->size()));
-    env2.up = &env;
-
-    Env * inheritEnv = attrs->inheritFromExprs ? attrs->buildInheritFromEnv(state, env2) : nullptr;
-
-    /* The recursive attributes are evaluated in the new environment,
-       while the inherited attributes are evaluated in the original
-       environment. */
-    Displacement displ = 0;
-    for (auto & i : *attrs->attrs) {
-        env2.values[displ++] = i.second.e->maybeThunk(state, *i.second.chooseByKind(&env2, &env, inheritEnv));
-    }
-
-    auto dts = state.debugRepl
-                   ? makeDebugTraceStacker(state, *this, env2, getPos(), "while evaluating a '%1%' expression", "let")
-                   : nullptr;
-
-    body->eval(state, env2, v);
-}
-
-void ExprList::eval(EvalState & state, Env & env, Value & v)
-{
-    auto list = state.buildList(elems.size());
-    for (const auto & [n, v2] : enumerate(list))
-        v2 = elems[n]->maybeThunk(state, env);
-    v.mkList(list);
-}
-
 Value * ExprList::maybeThunk(EvalState & state, Env & env)
 {
     if (elems.empty()) {
         return &Value::vEmptyList;
     }
     return Expr::maybeThunk(state, env);
-}
-
-void ExprVar::eval(EvalState & state, Env & env, Value & v)
-{
-    Value * v2 = state.lookupVar(&env, *this, false);
-    state.forceValue(*v2, pos);
-    v = *v2;
-}
-
-static std::string showAttrSelectionPath(EvalState & state, Env & env, std::span<const AttrName> attrPath)
-{
-    std::ostringstream out;
-    bool first = true;
-    for (auto & i : attrPath) {
-        if (!first)
-            out << '.';
-        else
-            first = false;
-        try {
-            out << state.symbols[getName(i, state, env)];
-        } catch (Error & e) {
-            assert(!i.symbol);
-            out << "\"${";
-            i.expr->show(state.symbols, out);
-            out << "}\"";
-        }
-    }
-    return out.str();
-}
-
-void ExprSelect::eval(EvalState & state, Env & env, Value & v)
-{
-    Value vTmp;
-    PosIdx pos2;
-    Value * vAttrs = &vTmp;
-
-    e->eval(state, env, vTmp);
-
-    try {
-        auto dts = state.debugRepl ? makeDebugTraceStacker(
-                                         state,
-                                         *this,
-                                         env,
-                                         getPos(),
-                                         "while evaluating the attribute '%1%'",
-                                         showAttrSelectionPath(state, env, getAttrPath()))
-                                   : nullptr;
-
-        /* The container forced by the previous step, so that each step can
-           hand (container, selected) to the provenance hook once both are
-           forced. The hook is how a registration on an import's top-level
-           attrset reaches the values selected out of it. */
-        Value * provBase = nullptr;
-        auto * tracker = state.readSetTracker.get();
-
-        for (auto & i : getAttrPath()) {
-            state.nrLookups++;
-            const Attr * j;
-            auto name = getName(i, state, env);
-            if (def) {
-                state.forceValue(*vAttrs, pos);
-                if (tracker) [[unlikely]] {
-                    if (provBase)
-                        tracker->provSelect(*provBase, *vAttrs);
-                    provBase = vAttrs;
-                }
-                if (vAttrs->type() != nAttrs || !(j = vAttrs->attrs()->get(name))) {
-                    def->eval(state, env, v);
-                    return;
-                }
-            } else {
-                state.forceAttrs(*vAttrs, pos, "while selecting an attribute");
-                if (tracker) [[unlikely]] {
-                    if (provBase)
-                        tracker->provSelect(*provBase, *vAttrs);
-                    provBase = vAttrs;
-                }
-                if (!(j = vAttrs->attrs()->get(name))) {
-                    StringSet allAttrNames;
-                    for (auto & attr : *vAttrs->attrs())
-                        allAttrNames.insert(std::string(state.symbols[attr.name]));
-                    auto suggestions = Suggestions::bestMatches(allAttrNames, state.symbols[name]);
-                    state.error<EvalError>("attribute '%1%' missing", state.symbols[name])
-                        .atPos(pos)
-                        .withSuggestions(suggestions)
-                        .withFrame(env, *this)
-                        .debugThrow();
-                }
-            }
-            vAttrs = j->value;
-            pos2 = j->pos;
-            if (state.countCalls)
-                state.attrSelects->try_emplace_or_visit(pos2, 1, [](auto & i) { i.second++; });
-        }
-
-        state.forceValue(*vAttrs, pos2 ? pos2 : this->pos);
-        if (tracker && provBase) [[unlikely]]
-            tracker->provSelect(*provBase, *vAttrs);
-
-    } catch (Error & e) {
-        if (pos2) {
-            auto pos2r = state.positions[pos2];
-            auto origin = std::get_if<SourcePath>(&pos2r.origin);
-            if (!(origin && *origin == state.derivationInternal))
-                state.addErrorTrace(
-                    e, pos2, "while evaluating the attribute '%1%'", showAttrSelectionPath(state, env, getAttrPath()));
-        }
-        throw;
-    }
-
-    v = *vAttrs;
 }
 
 Symbol ExprSelect::evalExceptFinalSelect(EvalState & state, Env & env, Value & attrs)
@@ -1687,33 +744,6 @@ Symbol ExprSelect::evalExceptFinalSelect(EvalState & state, Env & env, Value & a
     }
     attrs = vTmp;
     return name;
-}
-
-void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
-{
-    Value vTmp;
-    Value * vAttrs = &vTmp;
-
-    e->eval(state, env, vTmp);
-
-    for (auto & i : attrPath) {
-        state.forceValue(*vAttrs, getPos());
-        const Attr * j;
-        auto name = getName(i, state, env);
-        if (vAttrs->type() == nAttrs && (j = vAttrs->attrs()->get(name))) {
-            vAttrs = j->value;
-        } else {
-            v.mkBool(false);
-            return;
-        }
-    }
-
-    v.mkBool(true);
-}
-
-void ExprLambda::eval(EvalState & state, Env & env, Value & v)
-{
-    v.mkLambda(&env, this);
 }
 
 [[gnu::tls_model("initial-exec")]] thread_local size_t EvalState::callDepth = 0;
@@ -1785,7 +815,6 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                                 symbols[i.name])
                                 .atPos(lambda.pos)
                                 .withTrace(pos, "from call site")
-                                .withFrame(*vCur.lambda().env, lambda)
                                 .debugThrow();
                         }
                         env2.values[displ++] = i.def->maybeThunk(*this, env2);
@@ -1813,7 +842,6 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                                 .atPos(lambda.pos)
                                 .withTrace(pos, "from call site")
                                 .withSuggestions(suggestions)
-                                .withFrame(*vCur.lambda().env, lambda)
                                 .debugThrow();
                         }
                     unreachable();
@@ -1828,17 +856,6 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
 
             /* Evaluate the body. */
             try {
-                auto dts = debugRepl
-                               ? makeDebugTraceStacker(
-                                     *this,
-                                     *lambda.body,
-                                     env2,
-                                     lambda.pos,
-                                     "while calling %s",
-                                     lambda.name ? concatStrings("'", symbols[lambda.name], "'") : "anonymous lambda")
-                               : nullptr;
-
-                vCur.reset();
                 lambda.body->eval(*this, env2, vCur);
             } catch (Error & e) {
                 if (loggerSettings.showTrace.get()) {
@@ -1967,27 +984,6 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
     vRes = vCur;
 }
 
-void ExprCall::eval(EvalState & state, Env & env, Value & v)
-{
-    auto dts =
-        state.debugRepl ? makeDebugTraceStacker(state, *this, env, getPos(), "while calling a function") : nullptr;
-
-    Value vFun;
-    fun->eval(state, env, vFun);
-
-    // Empirical arity of Nixpkgs lambdas by regex e.g. ([a-zA-Z]+:(\s|(/\*.*\/)|(#.*\n))*){5}
-    // 2: over 4000
-    // 3: about 300
-    // 4: about 60
-    // 5: under 10
-    // This excluded attrset lambdas (`{...}:`). Contributions of mixed lambdas appears insignificant at ~150 total.
-    SmallValueVector<4> vArgs(args->size());
-    for (size_t i = 0; i < args->size(); ++i)
-        vArgs[i] = (*args)[i]->maybeThunk(state, env);
-
-    state.callFunction(vFun, vArgs, v, pos);
-}
-
 // Lifted out of callFunction() because it creates a temporary that
 // prevents tail-call optimisation.
 void EvalState::incrFunctionCall(ExprLambda * fun)
@@ -2040,199 +1036,12 @@ values, or passed explicitly with '--arg' or '--argstr'. See
 https://nix.dev/manual/nix/stable/language/syntax.html#functions.)",
                     symbols[i.name])
                     .atPos(i.pos)
-                    .withFrame(*fun.lambda().env, *fun.lambda().fun)
                     .debugThrow();
             }
         }
     }
 
     callFunction(fun, allocValue()->mkAttrs(attrs), res, pos);
-}
-
-void ExprWith::eval(EvalState & state, Env & env, Value & v)
-{
-    Env & env2(state.mem.allocEnv(1));
-    env2.up = &env;
-    env2.values[0] = attrs->maybeThunk(state, env);
-
-    body->eval(state, env2, v);
-}
-
-void ExprIf::eval(EvalState & state, Env & env, Value & v)
-{
-    // We cheat in the parser, and pass the position of the condition as the position of the if itself.
-    (state.evalBool(env, cond, pos, "while evaluating a branch condition") ? then : else_)->eval(state, env, v);
-}
-
-void ExprAssert::eval(EvalState & state, Env & env, Value & v)
-{
-    if (!state.evalBool(env, cond, pos, "in the condition of the assert statement")) {
-        std::ostringstream out;
-        cond->show(state.symbols, out);
-        auto exprStr = out.view();
-
-        if (auto eq = dynamic_cast<ExprOpEq *>(cond)) {
-            try {
-                Value v1;
-                eq->e1->eval(state, env, v1);
-                Value v2;
-                eq->e2->eval(state, env, v2);
-                state.assertEqValues(v1, v2, eq->pos, "in an equality assertion");
-            } catch (AssertionError & e) {
-                e.addTrace(state.positions[pos], "while evaluating the condition of the assertion '%s'", exprStr);
-                throw;
-            }
-        }
-
-        state.error<AssertionError>("assertion '%1%' failed", exprStr).atPos(pos).withFrame(env, *this).debugThrow();
-    }
-    body->eval(state, env, v);
-}
-
-void ExprOpNot::eval(EvalState & state, Env & env, Value & v)
-{
-    v.mkBool(!state.evalBool(env, e, getPos(), "in the argument of the not operator")); // XXX: FIXME: !
-}
-
-void ExprOpEq::eval(EvalState & state, Env & env, Value & v)
-{
-    Value v1;
-    e1->eval(state, env, v1);
-    Value v2;
-    e2->eval(state, env, v2);
-    v.mkBool(state.eqValues(v1, v2, pos, "while testing two values for equality"));
-}
-
-void ExprOpNEq::eval(EvalState & state, Env & env, Value & v)
-{
-    Value v1;
-    e1->eval(state, env, v1);
-    Value v2;
-    e2->eval(state, env, v2);
-    v.mkBool(!state.eqValues(v1, v2, pos, "while testing two values for inequality"));
-}
-
-void ExprOpAnd::eval(EvalState & state, Env & env, Value & v)
-{
-    v.mkBool(
-        state.evalBool(env, e1, pos, "in the left operand of the AND (&&) operator")
-        && state.evalBool(env, e2, pos, "in the right operand of the AND (&&) operator"));
-}
-
-void ExprOpOr::eval(EvalState & state, Env & env, Value & v)
-{
-    v.mkBool(
-        state.evalBool(env, e1, pos, "in the left operand of the OR (||) operator")
-        || state.evalBool(env, e2, pos, "in the right operand of the OR (||) operator"));
-}
-
-void ExprOpImpl::eval(EvalState & state, Env & env, Value & v)
-{
-    v.mkBool(
-        !state.evalBool(env, e1, pos, "in the left operand of the IMPL (->) operator")
-        || state.evalBool(env, e2, pos, "in the right operand of the IMPL (->) operator"));
-}
-
-void ExprOpUpdate::eval(EvalState & state, Env & env, Value & v)
-{
-    Value v1, v2;
-    state.evalAttrs(env, e1, v1, pos, "in the left operand of the update (//) operator");
-    state.evalAttrs(env, e2, v2, pos, "in the right operand of the update (//) operator");
-
-    state.nrOpUpdates++;
-
-    /* The result of `//` carries values from both sides, so it inherits the
-       provenance of both. Registered here rather than at first read because
-       the merged Bindings is a new payload no earlier registration names. */
-    auto provUpdate = [&](Value & out) {
-        if (auto * tracker = state.readSetTracker.get()) [[unlikely]] {
-            tracker->provSelect(v1, out);
-            tracker->provSelect(v2, out);
-        }
-    };
-
-    const Bindings & bindings1 = *v1.attrs();
-    if (bindings1.empty()) {
-        v = v2;
-        provUpdate(v);
-        return;
-    }
-
-    const Bindings & bindings2 = *v2.attrs();
-    if (bindings2.empty()) {
-        v = v1;
-        provUpdate(v);
-        return;
-    }
-
-    /* Simple heuristic for determining whether attrs2 should be "layered" on top of
-       attrs1 instead of copying to a new Bindings. */
-    bool shouldLayer = [&]() -> bool {
-        if (bindings1.isLayerListFull())
-            return false;
-
-        if (bindings2.size() > state.settings.bindingsUpdateLayerRhsSizeThreshold)
-            return false;
-
-        return true;
-    }();
-
-    if (shouldLayer) {
-        auto attrs = state.buildBindings(bindings2.size());
-        attrs.layerOnTopOf(bindings1);
-
-        std::ranges::copy(bindings2, std::back_inserter(attrs));
-        v.mkAttrs(attrs.alreadySorted());
-
-        state.nrOpUpdateValuesCopied += bindings2.size();
-        return;
-    }
-
-    auto attrs = state.buildBindings(bindings1.size() + bindings2.size());
-
-    /* Merge the sets, preferring values from the second set.  Make
-       sure to keep the resulting vector in sorted order. */
-    auto i = bindings1.begin();
-    auto j = bindings2.begin();
-
-    while (i != bindings1.end() && j != bindings2.end()) {
-        if (i->name == j->name) {
-            attrs.insert(*j);
-            ++i;
-            ++j;
-        } else if (i->name < j->name) {
-            attrs.insert(*i);
-            ++i;
-        } else {
-            attrs.insert(*j);
-            ++j;
-        }
-    }
-
-    while (i != bindings1.end()) {
-        attrs.insert(*i);
-        ++i;
-    }
-
-    while (j != bindings2.end()) {
-        attrs.insert(*j);
-        ++j;
-    }
-
-    v.mkAttrs(attrs.alreadySorted());
-
-    state.nrOpUpdateValuesCopied += v.attrs()->size();
-    provUpdate(v);
-}
-
-void ExprOpConcatLists::eval(EvalState & state, Env & env, Value & v)
-{
-    Value v1;
-    e1->eval(state, env, v1);
-    Value v2;
-    e2->eval(state, env, v2);
-    Value * lists[2] = {&v1, &v2};
-    state.concatLists(v, 2, lists, pos, "while evaluating one of the elements to concatenate");
 }
 
 void EvalState::concatLists(
@@ -2265,118 +1074,6 @@ void EvalState::concatLists(
         pos += l;
     }
     v.mkList(list);
-}
-
-void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
-{
-    /* A concatenation is where a registered string stops being a payload
-       the map knows: the result is a fresh allocation. The scope collects
-       every provenance hit during part coercion and hands the union to the
-       result, so a rendered unit text inherits the provenance of the
-       address interpolated into it. */
-    ProvScope provScope(state.readSetTracker.get());
-    NixStringContext context;
-    std::vector<BackedStringView> strings;
-    size_t sSize = 0;
-    NixInt n{0};
-    NixFloat nf = 0;
-
-    bool first = !forceString;
-    ValueType firstType = nString;
-
-    // List of returned strings. References to these Values must NOT be persisted.
-    SmallTemporaryValueVector<conservativeStackReservation> values(es.size());
-    Value * vTmpP = values.data();
-
-    for (auto & [i_pos, i] : es) {
-        Value & vTmp = *vTmpP++;
-        i->eval(state, env, vTmp);
-
-        /* If the first element is a path, then the result will also
-           be a path, we don't copy anything (yet - that's done later,
-           since paths are copied when they are used in a derivation),
-           and none of the strings are allowed to have contexts. */
-        if (first) {
-            firstType = vTmp.type();
-        }
-
-        if (firstType == nInt) {
-            if (vTmp.type() == nInt) {
-                auto newN = n + vTmp.integer();
-                if (auto checked = newN.valueChecked(); checked.has_value()) {
-                    n = NixInt(*checked);
-                } else {
-                    state.error<EvalError>("integer overflow in adding %1% + %2%", n, vTmp.integer())
-                        .atPos(i_pos)
-                        .debugThrow();
-                }
-            } else if (vTmp.type() == nFloat) {
-                // Upgrade the type from int to float;
-                firstType = nFloat;
-                nf = n.value;
-                nf += vTmp.fpoint();
-            } else
-                state.error<EvalError>("cannot add %1% to an integer", showType(vTmp))
-                    .atPos(i_pos)
-                    .withFrame(env, *this)
-                    .debugThrow();
-        } else if (firstType == nFloat) {
-            if (vTmp.type() == nInt) {
-                nf += vTmp.integer().value;
-            } else if (vTmp.type() == nFloat) {
-                nf += vTmp.fpoint();
-            } else
-                state.error<EvalError>("cannot add %1% to a float", showType(vTmp))
-                    .atPos(i_pos)
-                    .withFrame(env, *this)
-                    .debugThrow();
-        } else {
-            if (strings.empty())
-                strings.reserve(es.size());
-            /* skip canonization of first path, which would only be not
-            canonized in the first place if it's coming from a ./${foo} type
-            path */
-            auto part = state.coerceToString(
-                i_pos, vTmp, context, "while evaluating a path segment", false, firstType == nString, !first);
-            sSize += part->size();
-            strings.emplace_back(std::move(part));
-        }
-
-        first = false;
-    }
-
-    if (firstType == nInt) {
-        v.mkInt(n);
-    } else if (firstType == nFloat) {
-        v.mkFloat(nf);
-    } else if (firstType == nPath) {
-        if (!context.empty())
-            state.error<EvalError>("a string that refers to a store path cannot be appended to a path")
-                .atPos(pos)
-                .withFrame(env, *this)
-                .debugThrow();
-        std::string resultStr;
-        resultStr.reserve(sSize);
-        for (const auto & part : strings) {
-            resultStr += *part;
-        }
-        v.mkPath(state.rootPath(CanonPath(resultStr)), state.mem);
-    } else {
-        auto & resultStr = StringData::alloc(state.mem, sSize);
-        auto * tmp = resultStr.data();
-        for (const auto & part : strings) {
-            std::memcpy(tmp, part->data(), part->size());
-            tmp += part->size();
-        }
-        *tmp = '\0';
-        v.mkStringMove(resultStr, context, state.mem);
-        provScope.finish(v);
-    }
-}
-
-void ExprPos::eval(EvalState & state, Env & env, Value & v)
-{
-    state.mkPos(v, pos);
 }
 
 void EvalState::tryFixupBlackHolePos(Value & v, PosIdx pos)
@@ -2448,17 +1145,6 @@ void EvalState::forceValueDeep(Value & v)
         if (v.type() == nAttrs) {
             for (auto & i : *v.attrs())
                 try {
-                    // If the value is a thunk, we're evaling. Otherwise no trace necessary.
-                    // FIXME: race, thunk might be updated by another thread
-                    auto dts = state.debugRepl && i.value->isThunk() ? makeDebugTraceStacker(
-                                                                           state,
-                                                                           *i.value->thunk().expr,
-                                                                           *i.value->thunk().env,
-                                                                           i.pos,
-                                                                           "while evaluating the attribute '%1%'",
-                                                                           state.symbols[i.name])
-                                                                     : nullptr;
-
                     recurse(*i.value);
                 } catch (Error & e) {
                     state.addErrorTrace(e, i.pos, "while evaluating the attribute '%1%'", state.symbols[i.name]);
@@ -2756,19 +1442,40 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
     if (nix::isDerivation(path.path.abs()))
         error<EvalError>("file names are not allowed to end in '%1%'", drvExtension).debugThrow();
 
-    auto dstPath = fetchToStore(
-        fetchSettings,
-        *store,
-        path.resolveSymlinks(SymlinkResolution::Ancestors),
-        settings.readOnlyMode ? FetchMode::DryRun : FetchMode::Copy,
-        path.baseName(),
-        ContentAddressMethod::Raw::NixArchive,
-        nullptr,
-        repair);
-    allowPath(dstPath);
+    /* One copy per path per evaluation. The first call did the store work
+       and the allow-list entry; a repeat owes only the context element. */
+    if (auto cached = getConcurrent(*srcToStore, path)) {
+        context.insert(NixStringContextElem::Opaque{.path = *cached});
+        return *cached;
+    }
 
+    auto dstPath = copyPathToStoreUncached(path);
+    srcToStore->emplace(path, dstPath);
     context.insert(NixStringContextElem::Opaque{.path = dstPath});
     return dstPath;
+}
+
+StorePath EvalState::copyPathToStoreUncached(const SourcePath & path)
+{
+    auto resolved = path.resolveSymlinks(SymlinkResolution::Ancestors);
+
+    /* A path value naming the root of a mounted input (`./.` in a flake,
+       `self.outPath` as a path) is that input's store object, already
+       addressed: forcing the mount is the copy, and the store path is the
+       one every other spelling of the input has (`ensureLazyPathCopied`,
+       the road a build takes). Copying it again under the literal's base
+       name would give one tree two store paths, `<h2>-<h1>-source` beside
+       `<h1>-source`, the double-named path NixOS/nix#10627 records as
+       unwanted -- and for a tree addressed by its jj id, a NAR walk of a
+       tree whose id is already known, ingested under the wrong method. */
+    if (auto storePath = store->maybeParseStorePath(resolved.path.abs()))
+        if (storeFS->getMount(resolved.path)) {
+            ensureLazyPathCopied(*storePath);
+            allowPath(*storePath);
+            return *storePath;
+        }
+
+    return addPathToStore(resolved, path.baseName(), ContentAddressMethod::Raw::NixArchive, nullptr, std::nullopt, {});
 }
 
 SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext & context, std::string_view errorCtx)
@@ -3202,7 +1909,7 @@ std::optional<std::filesystem::path> evalStatsPath;
 
 void EvalState::maybePrintStats()
 {
-    if (Counter::enabled) {
+    if (Counter::enabled && !statsPrinted.exchange(true)) {
         // Make the final heap size more deterministic.
 #if NIX_USE_BOEHMGC
         if (!fullGC()) {
@@ -3230,12 +1937,7 @@ static bool serialisesAsJsonString(const std::string & s)
     }
 }
 
-/// The JSON pointer of every string in `doc` that the writer will refuse.
-///
-/// Named individually rather than counted, because "the census is damaged" is
-/// not actionable and "/shadow/divergences/3/detail is damaged" is: it says
-/// which finding to go and read out of stderr, and which row's bytes not to
-/// trust.
+/// Find invalid UTF-8 fields so statistics retain an explicit damage report.
 static void collectUnserialisableStrings(const json & doc, const std::string & at, std::vector<std::string> & out)
 {
     if (doc.is_string()) {
@@ -3250,35 +1952,7 @@ static void collectUnserialisableStrings(const json & doc, const std::string & a
     }
 }
 
-/// Render the statistics document, and never fail to render it.
-///
-/// # A census that counted something must not serialise to nothing
-///
-/// `json::dump` throws on a string that is not valid UTF-8, and the throw
-/// takes the WHOLE document with it. That is wildly disproportionate: one
-/// damaged detail cost a shadow run its attempts, its verdicts, its refusal
-/// tokens and all 79 of its divergences, and the file it left behind was zero
-/// bytes, which a harness reads as "nothing to report" rather than as damage
-/// (ENG-12874). Seven of 2638 attributes in one nixpkgs sweep went that way,
-/// and the only thing that caught it was a cross-check of stats files read
-/// against attributes attempted.
-///
-/// A comparison harness that can silence exactly the runs that found
-/// something is the worst failure this project has named, so the rule here is
-/// unconditional: this function returns a document. The damaged strings are
-/// replaced with U+FFFD, every other field survives intact, and the document
-/// grows a `serialisationDamage` block naming each field that was replaced,
-/// so a reader of the JSON alone -- which is what a CI gate is -- cannot
-/// mistake a damaged census for a clean one.
-///
-/// It is also said out loud at error priority. The in-band field is for the
-/// gate and the log line is for the human, and neither substitutes for the
-/// other: a run nobody parses still deserves to complain.
-///
-/// The fix for the one known source of these bytes is in `shadowTruncate`,
-/// which used to cut mid-character. This is here anyway, because the trigger
-/// is not the bug: any odd byte in any message reaching any field would do
-/// the same, and the next one will not be a truncation.
+/// Preserve numeric statistics even if a diagnostic contains invalid UTF-8.
 static std::string renderStatistics(json & topObj)
 {
     try {
@@ -3333,61 +2007,9 @@ void EvalState::printStatistics()
     if (outPath != "-")
         fs.open(outPath, std::fstream::out);
     json topObj = json::object();
-    // Which backend evaluated, counted rather than echoed: this field used to
-    // report `settings.evalBackend.get()`, which is the request and not the
-    // effect, so a binary compiled without the Rust evaluator reported `rust`
-    // while cpp did the work (ENG-12542).
-    //
-    // `none` is its own answer rather than being folded into `mixed`. A
-    // process that printed stats without evaluating anything -- `nix
-    // config show`, or a command that failed before the expression -- has no
-    // evaluator to report, and calling that `mixed` would invent a fact.
-    // Both `none` and `mixed` fail an arm assertion, which is the point.
-    auto nCpp = nrCppEvals.load();
     auto nRust = nrRustEvals.load();
-    /* `cppFlakeLock` is deliberately absent from this verdict, and the reason
-       it can be is structural rather than a promise. Outside
-       `EvalState::LockingFlake`, `requireBackendCanServe` throws on any C++
-       evaluation under `eval-backend = rust` -- so a value that reached an
-       *output* through the C++ evaluator cannot exist: the command would have
-       refused instead of answering. The counter therefore cannot be measuring
-       output work, because output work on this backend either runs on the VM
-       or does not run at all. What it measures is `flake.nix`'s `inputs`,
-       read to produce a lock file, which is data the VM is handed and not a
-       value the user asked for. */
-    topObj["evaluator"] = nRust > 0 && nCpp == 0    ? "rust"
-                          : nCpp > 0 && nRust == 0  ? "cpp"
-                          : nCpp == 0 && nRust == 0 ? "none"
-                                                    : "mixed";
-    // The counts themselves, so a `mixed` verdict says how mixed and a reader
-    // does not have to reproduce the run to find out.
-    topObj["evaluatorCalls"] = {
-        {"cpp", nCpp},
-        {"rust", nRust},
-        // The C++ evaluations the flake lock needed, which are deliberately
-        // not part of the verdict above. Reported because an exemption
-        // nothing counts is one nobody can size.
-        {"cppFlakeLock", nrCppFlakeLockEvals.load()},
-    };
-    /* The refusal histogram. ENG-12546 part 2 landed the counting and the
-       journal line and left this unwired, which made the stats block agree
-       with a build that counts nothing.
-
-       Every token, present at zero, taken from the ABI's own enumeration
-       where it is linked: a row that is absent because it never happened and
-       a row that is absent because this build cannot count it read
-       identically, and the flip criterion is a claim about zeros. Without the
-       denominator the reader cannot tell one from the other.
-
-       In production this block is usually never printed, because a refusal is
-       fatal and the process dies on it -- which is exactly why the journal
-       line, and not this, is the production census. This is the local view
-       and the shadow view, where refusals are caught and the process lives. */
-    /* Where the Rust arm's time went, when it ran. Absent rather than zeroed
-       when it did not: a block of zeros reads as "the rust arm did no work"
-       instead of "the rust arm did not run", and the flip criterion is a
-       claim about zeros. Counted inside the VM because it is a flat
-       trampoline that a sampling profiler cannot decompose (ENG-12859). */
+    topObj["evaluator"] = nRust ? "rust" : "none";
+    topObj["evaluatorCalls"] = {{"rust", nRust}};
     if (EvalPerfCensus::recorded()) {
         auto perf = json::object();
         for (const auto & [key, n] : EvalPerfCensus::snapshot())
@@ -3415,34 +2037,6 @@ void EvalState::printStatistics()
         };
     }
 
-    /* The shadow block, printed whether or not shadow ran, for the same
-       reason: `attempts: 0` under `eval-backend = shadow` is a finding. */
-    {
-        auto shadow = json::object();
-        shadow["attempts"] = ShadowCensus::attempts();
-        shadow["verdicts"] = ShadowCensus::verdicts();
-        shadow["refusalTokens"] = ShadowCensus::refusalTokens();
-        shadow["skipped"] = ShadowCensus::skips();
-        shadow["divergenceKinds"] = ShadowCensus::divergenceKinds();
-        shadow["rustMicros"] = ShadowCensus::micros();
-        /* attempts minus the verdicts. Non-zero is an attempt that reached no
-           conclusion, which is what a Rust arm that died mid-call looks like:
-           attempts are incremented before the call precisely so that hole is
-           visible rather than absorbed. */
-        shadow["unaccounted"] = ShadowCensus::unaccounted();
-        auto list = json::array();
-        for (const auto & d : ShadowCensus::divergences())
-            list.push_back(
-                json::object({
-                    {"kind", d.kind},
-                    {"id", d.id},
-                    {"origin", d.origin},
-                    {"detail", d.detail},
-                    {"count", d.count},
-                }));
-        shadow["divergences"] = list;
-        topObj["shadow"] = shadow;
-    }
     topObj["cpuTime"] = cpuTime;
     topObj["time"] = {
         {"cpu", cpuTime},
@@ -3493,8 +2087,6 @@ void EvalState::printStatistics()
     topObj["nrLookups"] = nrLookups.load();
     topObj["nrPrimOpCalls"] = nrPrimOpCalls.load();
     topObj["nrFunctionCalls"] = nrFunctionCalls.load();
-    topObj["nrEvalFileCalls"] = nrEvalFileCalls.load();
-    topObj["nrEvalFilePathHits"] = nrEvalFilePathHits.load();
 #if NIX_USE_BOEHMGC
     topObj["gc"] = {
         {"heapSize", heapSize},
@@ -3585,63 +2177,6 @@ SourcePath resolveExprPath(SourcePath path, bool addDefaultNix)
         return path / "default.nix";
 
     return path;
-}
-
-Expr * EvalState::parseExprFromFile(const SourcePath & path)
-{
-    return parseExprFromFile(path, staticBaseEnv);
-}
-
-Expr * EvalState::parseExprFromFile(const SourcePath & path, const std::shared_ptr<StaticEnv> & staticEnv)
-{
-    auto buffer = path.resolveSymlinks().readFile();
-    // readFile hopefully have left some extra space for terminators
-    buffer.append("\0\0", 2);
-    return parse(buffer.data(), buffer.size(), Pos::Origin(path), path.parent(), staticEnv);
-}
-
-Expr * EvalState::parseExprFromString(
-    std::string s_, const SourcePath & basePath, const std::shared_ptr<StaticEnv> & staticEnv)
-{
-    // NOTE this method (and parseStdin) must take care to *fully copy* their input
-    // into their respective Pos::Origin until the parser stops overwriting its input
-    // data.
-    auto s = make_ref<std::string>(s_);
-    s_.append("\0\0", 2);
-    return parse(s_.data(), s_.size(), Pos::String{.source = s}, basePath, staticEnv);
-}
-
-Expr * EvalState::parseExprFromString(std::string s, const SourcePath & basePath)
-{
-    return parseExprFromString(std::move(s), basePath, staticBaseEnv);
-}
-
-ExprAttrs *
-EvalState::parseReplBindings(std::string s_, const SourcePath & basePath, const std::shared_ptr<StaticEnv> & staticEnv)
-{
-    return parseReplBindings(s_, s_, basePath, staticEnv);
-}
-
-ExprAttrs * EvalState::parseReplBindings(
-    std::string s_, std::string errorSource, const SourcePath & basePath, const std::shared_ptr<StaticEnv> & staticEnv)
-{
-    auto s = make_ref<std::string>(std::move(errorSource));
-    // flex requires two NUL terminators for yy_scan_buffer
-    s_.append("\0\0", 2);
-    return parseReplBindings(s_.data(), s_.size(), Pos::String{.source = s}, basePath, staticEnv);
-}
-
-Expr * EvalState::parseStdin()
-{
-    // NOTE this method (and parseExprFromString) must take care to *fully copy* their
-    // input into their respective Pos::Origin until the parser stops overwriting its
-    // input data.
-    // Activity act(*logger, lvlTalkative, "parsing standard input");
-    auto buffer = drainFD(0);
-    // drainFD should have left some extra space for terminators
-    buffer.append("\0\0", 2);
-    auto s = make_ref<std::string>(buffer);
-    return parse(buffer.data(), buffer.size(), Pos::Stdin{.source = s}, rootPath("."), staticBaseEnv);
 }
 
 SourcePath EvalState::findFile(const std::string_view path)
@@ -3746,94 +2281,6 @@ std::optional<SourcePath> EvalState::resolveLookupPathPath(const LookupPath::Pat
     }
 
     return finish(std::nullopt);
-}
-
-Expr * EvalState::parse(
-    char * text,
-    size_t length,
-    Pos::Origin origin,
-    const SourcePath & basePath,
-    const std::shared_ptr<StaticEnv> & staticEnv)
-{
-    auto tmpDocComments = make_ref<DocCommentMap>();
-
-    /* Collect the string literals of this file while the parser runs, so
-       their preallocated values can be registered as carrying this file's
-       contents input. Guarded by the tracker because the collection pointer
-       is not thread safe, and the tracker already requires single threaded
-       evaluation. */
-    std::vector<ExprString *> literals;
-    bool collect = readSetTracker && std::holds_alternative<SourcePath>(origin);
-    if (collect) [[unlikely]]
-        mem.exprs.collectStrings = &literals;
-    Finally clearCollect([&] { mem.exprs.collectStrings = nullptr; });
-
-    auto result = parseExprFromBuf(
-        text, length, origin, basePath, mem.exprs, symbols, settings, positions, *tmpDocComments, rootFS);
-
-    if (collect) [[unlikely]] {
-        mem.exprs.collectStrings = nullptr;
-        auto & sourcePath = std::get<SourcePath>(origin);
-        std::vector<Value *> values;
-        values.reserve(literals.size());
-        for (auto * e : literals)
-            values.push_back(&e->v);
-        readSetTracker->registerLiterals(sourcePath, values);
-        parsedStringLiterals.emplace_back(sourcePath, std::move(values));
-    }
-
-    result->bindVars(*this, staticEnv);
-
-    if (auto sourcePath = std::get_if<SourcePath>(&origin))
-        /* A single file might appear multiple times in PosTable if it's
-           parsed by scopedImport. If we are the first then emplace into the map, otherwise
-           copy our positions into the existing map. */
-        positionToDocComment->emplace_or_visit(*sourcePath, tmpDocComments, [&tmpDocComments](auto & kv) {
-            kv.second->insert(tmpDocComments->begin(), tmpDocComments->end());
-        });
-
-    return result;
-}
-
-ExprAttrs * EvalState::parseReplBindings(
-    char * text,
-    size_t length,
-    Pos::Origin origin,
-    const SourcePath & basePath,
-    const std::shared_ptr<StaticEnv> & staticEnv)
-{
-    auto tmpDocComments = make_ref<DocCommentMap>();
-
-    auto bindings = parseReplBindingsFromBuf(
-        text, length, origin, basePath, mem.exprs, symbols, settings, positions, *tmpDocComments, rootFS);
-    assert(bindings);
-
-    bindings->bindVars(*this, staticEnv);
-
-    if (auto sourcePath = std::get_if<SourcePath>(&origin))
-        /* A single file might appear multiple times in PosTable if it's
-           parsed by scopedImport. If we are the first then emplace into the map, otherwise
-           copy our positions into the existing map. */
-        positionToDocComment->emplace_or_visit(*sourcePath, tmpDocComments, [&tmpDocComments](auto & kv) {
-            kv.second->insert(tmpDocComments->begin(), tmpDocComments->end());
-        });
-
-    return bindings;
-}
-
-DocComment EvalState::getDocCommentForPos(PosIdx pos)
-{
-    auto pos2 = positions[pos];
-    auto path = pos2.getSourcePath();
-    if (!path)
-        return {};
-
-    DocComment result;
-    positionToDocComment->visit(*path, [&](const auto & kv) {
-        if (auto it = kv.second->find(pos); it != kv.second->end())
-            result = it->second;
-    });
-    return result;
 }
 
 std::string ExternalValueBase::coerceToString(

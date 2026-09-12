@@ -2,7 +2,9 @@ use crate::path_utils::resolve_symlink_write_paths;
 use crate::path_utils::write_atomically;
 use anyhow::Context;
 use codex_config::CONFIG_TOML_FILE;
+use codex_config::is_structured_feature_path;
 use codex_config::types::McpServerConfig;
+use codex_config::types::ResumeCwdMode;
 use codex_config::types::SessionPickerViewMode;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_features::FEATURES;
@@ -24,6 +26,7 @@ use toml_edit::value;
 
 const NOTICE_TABLE_KEY: &str = "notice";
 
+mod bedrock;
 mod document_helpers;
 
 /// Discrete config mutations supported by the persistence engine.
@@ -311,7 +314,7 @@ impl ConfigDocument {
                 &[NOTICE_TABLE_KEY, "model_migrations", from.as_str()],
                 value(to.clone()),
             )),
-            ConfigEdit::ReplaceMcpServers(servers) => Ok(self.replace_mcp_servers(servers)),
+            ConfigEdit::ReplaceMcpServers(servers) => self.replace_mcp_servers(servers),
             ConfigEdit::AddToolSuggestDisabledTool(disabled_tool) => {
                 Ok(self.add_tool_suggest_disabled_tool(disabled_tool))
             }
@@ -321,8 +324,40 @@ impl ConfigDocument {
             ConfigEdit::SetSkillConfigByName { name, enabled } => {
                 Ok(self.set_skill_config(SkillConfigSelector::Name(name.clone()), *enabled))
             }
-            ConfigEdit::SetPath { segments, value } => Ok(self.insert(segments, value.clone())),
-            ConfigEdit::ClearPath { segments } => Ok(self.clear_owned(segments)),
+            ConfigEdit::SetPath { segments, value } => {
+                if is_structured_feature_path(segments) && value.as_bool().is_some() {
+                    let mut existing = Some(self.doc.as_item());
+                    for segment in segments {
+                        existing = existing.and_then(|item| item.as_table_like()?.get(segment));
+                    }
+                    if existing.and_then(TomlItem::as_table_like).is_some() {
+                        let mut enabled_segments = segments.clone();
+                        enabled_segments.push("enabled".to_string());
+                        return Ok(self.insert(&enabled_segments, value.clone()));
+                    }
+                }
+                Ok(self.insert(segments, value.clone()))
+            }
+            ConfigEdit::ClearPath { segments } => {
+                let preserves_broker_settings = is_structured_feature_path(segments)
+                    && segments
+                        .last()
+                        .is_some_and(|feature| feature == "network_proxy")
+                    && segments
+                        .iter()
+                        .try_fold(self.doc.as_item(), |item, segment| {
+                            item.as_table_like()?.get(segment)
+                        })
+                        .and_then(TomlItem::as_table_like)
+                        .is_some_and(|feature| feature.contains_key("credential_broker"));
+                if preserves_broker_settings {
+                    let mut enabled_segments = segments.clone();
+                    enabled_segments.push("enabled".to_string());
+                    Ok(self.insert(&enabled_segments, value(false)))
+                } else {
+                    Ok(self.clear_owned(segments))
+                }
+            }
             ConfigEdit::SetProjectTrustLevel { path, level } => {
                 // Delegate to the existing, tested logic in config.rs to
                 // ensure tables are explicit and migration is preserved.
@@ -397,9 +432,12 @@ impl ConfigDocument {
         self.remove(segments)
     }
 
-    fn replace_mcp_servers(&mut self, servers: &BTreeMap<String, McpServerConfig>) -> bool {
+    fn replace_mcp_servers(
+        &mut self,
+        servers: &BTreeMap<String, McpServerConfig>,
+    ) -> anyhow::Result<bool> {
         if servers.is_empty() {
-            return self.clear(&["mcp_servers"]);
+            return Ok(self.clear(&["mcp_servers"]));
         }
 
         let root = self.doc.as_table_mut();
@@ -411,7 +449,7 @@ impl ConfigDocument {
         }
 
         let Some(item) = root.get_mut("mcp_servers") else {
-            return false;
+            return Ok(false);
         };
 
         if document_helpers::ensure_table_for_write(item).is_none() {
@@ -419,7 +457,7 @@ impl ConfigDocument {
         }
 
         let Some(table) = item.as_table_mut() else {
-            return false;
+            return Ok(false);
         };
 
         let keys_to_remove: Vec<String> = table
@@ -437,17 +475,17 @@ impl ConfigDocument {
                 if let TomlItem::Value(value) = existing
                     && let Some(inline) = value.as_inline_table_mut()
                 {
-                    let replacement = document_helpers::serialize_mcp_server_inline(config);
+                    let replacement = document_helpers::serialize_mcp_server_inline(config)?;
                     document_helpers::merge_inline_table(inline, replacement);
                 } else {
-                    *existing = document_helpers::serialize_mcp_server(config);
+                    *existing = document_helpers::serialize_mcp_server(config)?;
                 }
             } else {
-                table.insert(name, document_helpers::serialize_mcp_server(config));
+                table.insert(name, document_helpers::serialize_mcp_server(config)?);
             }
         }
 
-        true
+        Ok(true)
     }
 
     fn set_skill_config(&mut self, selector: SkillConfigSelector, enabled: bool) -> bool {
@@ -593,7 +631,7 @@ impl ConfigDocument {
     fn descend(&mut self, segments: &[String], mode: TraversalMode) -> Option<&mut TomlTable> {
         let mut current = self.doc.as_table_mut();
 
-        for segment in segments {
+        for (index, segment) in segments.iter().enumerate() {
             match mode {
                 TraversalMode::Create => {
                     if !current.contains_key(segment.as_str()) {
@@ -604,6 +642,13 @@ impl ConfigDocument {
                     }
 
                     let item = current.get_mut(segment.as_str())?;
+                    if is_structured_feature_path(&segments[..=index])
+                        && let Some(enabled) = item.as_bool()
+                    {
+                        let mut feature = document_helpers::new_implicit_table();
+                        feature.insert("enabled", value(enabled));
+                        *item = TomlItem::Table(feature);
+                    }
                     current = document_helpers::ensure_table_for_write(item)?;
                 }
                 TraversalMode::Existing => {
@@ -738,16 +783,6 @@ fn apply_blocking_to_resolved_file(
     Ok(())
 }
 
-/// Persist edits asynchronously by offloading the blocking writer.
-///
-pub async fn apply(codex_home: &Path, edits: Vec<ConfigEdit>) -> anyhow::Result<()> {
-    let codex_home = codex_home.to_path_buf();
-    let config_path = codex_home.join(CONFIG_TOML_FILE);
-    task::spawn_blocking(move || apply_blocking_to_resolved_file(&config_path, &edits))
-        .await
-        .context("config persistence task panicked")?
-}
-
 /// Fluent builder to batch config edits and apply them atomically.
 #[derive(Default)]
 pub struct ConfigEditsBuilder {
@@ -789,12 +824,6 @@ impl ConfigEditsBuilder {
         self
     }
 
-    pub fn set_personality(mut self, personality: Option<Personality>) -> Self {
-        self.edits
-            .push(ConfigEdit::SetModelPersonality { personality });
-        self
-    }
-
     pub fn set_hide_full_access_warning(mut self, acknowledged: bool) -> Self {
         self.edits
             .push(ConfigEdit::SetNoticeHideFullAccessWarning(acknowledged));
@@ -810,37 +839,6 @@ impl ConfigEditsBuilder {
     pub fn set_hide_rate_limit_model_nudge(mut self, acknowledged: bool) -> Self {
         self.edits
             .push(ConfigEdit::SetNoticeHideRateLimitModelNudge(acknowledged));
-        self
-    }
-
-    pub fn set_hide_model_migration_prompt(mut self, model: &str, acknowledged: bool) -> Self {
-        self.edits
-            .push(ConfigEdit::SetNoticeHideModelMigrationPrompt(
-                model.to_string(),
-                acknowledged,
-            ));
-        self
-    }
-
-    pub fn set_hide_external_config_migration_prompt_home(mut self, acknowledged: bool) -> Self {
-        self.edits
-            .push(ConfigEdit::SetNoticeHideExternalConfigMigrationPromptHome(
-                acknowledged,
-            ));
-        self
-    }
-
-    pub fn set_hide_external_config_migration_prompt_project(
-        mut self,
-        project: &str,
-        acknowledged: bool,
-    ) -> Self {
-        self.edits.push(
-            ConfigEdit::SetNoticeHideExternalConfigMigrationPromptProject(
-                project.to_string(),
-                acknowledged,
-            ),
-        );
         self
     }
 
@@ -880,9 +878,18 @@ impl ConfigEditsBuilder {
     ///
     /// Disabling a default-false feature clears the key instead of
     /// persisting `false`, so the config does not pin the feature once it
-    /// graduates to globally enabled.
+    /// graduates to globally enabled. Structured multi-agent v2 settings are
+    /// an exception: its explicit `enabled = false` preserves nested options.
     pub fn set_feature_enabled(mut self, key: &str, enabled: bool) -> Self {
-        let segments = vec!["features".to_string(), key.to_string()];
+        let mut segments = vec!["features".to_string(), key.to_string()];
+        if key == "multi_agent_v2" && !enabled {
+            segments.push("enabled".to_string());
+            self.edits.push(ConfigEdit::SetPath {
+                segments,
+                value: value(false),
+            });
+            return self;
+        }
         let is_default_false_feature = FEATURES
             .iter()
             .find(|spec| spec.key == key)
@@ -958,6 +965,14 @@ impl ConfigEditsBuilder {
         self.edits.push(ConfigEdit::SetPath {
             segments: vec!["tui".to_string(), "session_picker_view".to_string()],
             value: value(mode.to_string()),
+        });
+        self
+    }
+
+    pub fn set_resume_cwd(mut self, mode: ResumeCwdMode) -> Self {
+        self.edits.push(ConfigEdit::SetPath {
+            segments: vec!["tui".to_string(), "resume_cwd".to_string()],
+            value: value(mode.as_str()),
         });
         self
     }

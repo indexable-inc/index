@@ -1,6 +1,8 @@
 use super::session::Session;
 use super::turn_context::TurnContext;
+use crate::config::Config;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
+use codex_protocol::openai_models::ModelInfo;
 
 #[derive(Debug)]
 pub(crate) struct ContextWindowTokenStatus {
@@ -10,81 +12,108 @@ pub(crate) struct ContextWindowTokenStatus {
     pub(crate) auto_compact_scope_tokens: i64,
     pub(crate) auto_compact_scope_limit: Option<i64>,
     pub(crate) full_context_window_limit: Option<i64>,
-    pub(crate) tokens_until_compaction: Option<i64>,
+    pub(crate) base_window_tokens_remaining: Option<i64>,
     pub(crate) auto_compact_window_prefill_tokens: Option<i64>,
     pub(crate) full_context_window_limit_reached: bool,
     pub(crate) token_limit_reached: bool,
 }
 
-struct BodyAfterPrefixWindowStatus {
-    full_context_window_limit: Option<i64>,
-    auto_compact_window_prefill_tokens: Option<i64>,
+fn tokens_remaining(limit: Option<i64>, used: i64) -> Option<i64> {
+    limit.map(|limit| limit.saturating_sub(used).max(0))
 }
 
 pub(crate) async fn context_window_token_status(
     sess: &Session,
     turn_context: &TurnContext,
 ) -> ContextWindowTokenStatus {
+    context_window_token_status_with_config(
+        sess,
+        turn_context.config.as_ref(),
+        turn_context.model_info().as_ref(),
+    )
+    .await
+}
+
+pub(crate) async fn context_window_token_status_for_model(
+    sess: &Session,
+    config: &Config,
+    turn_context: &TurnContext,
+    model_info: &ModelInfo,
+) -> ContextWindowTokenStatus {
+    let mut config = config.clone();
+    config.token_budget = super::token_budget::resolve_token_budget(
+        turn_context.configured_token_budget.as_ref(),
+        turn_context.use_model_token_budget_defaults,
+        model_info,
+    );
+    context_window_token_status_with_config(sess, &config, model_info).await
+}
+
+async fn context_window_token_status_with_config(
+    sess: &Session,
+    config: &Config,
+    model_info: &ModelInfo,
+) -> ContextWindowTokenStatus {
     let active_context_tokens = sess.get_total_token_usage().await;
 
-    let (auto_compact_scope_tokens, auto_compact_scope_limit, body_window) =
-        match turn_context.config.model_auto_compact_token_limit_scope {
+    // Count either the full active context or only the tokens added after the initial prefix.
+    let (auto_compact_scope_tokens, auto_compact_scope_limit, auto_compact_window_prefill_tokens) =
+        match config.model_auto_compact_token_limit_scope {
             AutoCompactTokenLimitScope::Total => (
                 active_context_tokens,
-                turn_context.model_info.auto_compact_token_limit(),
+                model_info.auto_compact_token_limit(),
                 None,
             ),
             AutoCompactTokenLimitScope::BodyAfterPrefix => {
                 let window = sess.auto_compact_window_snapshot().await;
                 let baseline = window.prefill_input_tokens.unwrap_or(active_context_tokens);
 
-                let scope_limit = turn_context
-                    .config
+                let scope_limit = config
                     .model_auto_compact_token_limit
-                    .or_else(|| turn_context.model_info.auto_compact_token_limit());
-                let full_context_window_limit = turn_context.model_context_window();
-
+                    .or_else(|| model_info.auto_compact_token_limit());
                 (
                     active_context_tokens.saturating_sub(baseline),
                     scope_limit,
-                    Some(BodyAfterPrefixWindowStatus {
-                        full_context_window_limit,
-                        auto_compact_window_prefill_tokens: window.prefill_input_tokens,
-                    }),
+                    window.prefill_input_tokens,
                 )
             }
         };
 
-    let full_context_window_limit = body_window
-        .as_ref()
-        .and_then(|window| window.full_context_window_limit);
-    let auto_compact_window_prefill_tokens = body_window
-        .as_ref()
-        .and_then(|window| window.auto_compact_window_prefill_tokens);
+    // The model's full context window is a hard cap, independent of the auto-compaction scope.
+    let full_context_window_limit = model_info.resolved_context_window().map(|context_window| {
+        context_window.saturating_mul(model_info.effective_context_window_percent) / 100
+    });
 
+    // Report remaining tokens against the base (unbuffered) window, capped by the full context.
+    let base_window_tokens_remaining = [
+        tokens_remaining(auto_compact_scope_limit, auto_compact_scope_tokens),
+        tokens_remaining(full_context_window_limit, active_context_tokens),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+
+    // Only reserve the fallback buffer when there is a fallback prompt to use it.
+    let auto_compact_fallback_buffer_tokens = config
+        .token_budget
+        .as_ref()
+        .map_or(0, crate::config::TokenBudgetConfig::fallback_buffer_tokens);
+    let buffered_auto_compact_limit = auto_compact_scope_limit
+        .map(|limit| limit.saturating_add(auto_compact_fallback_buffer_tokens));
+
+    // Force compaction once the buffered window or the model's full context window is reached.
     let full_context_window_limit_reached =
-        full_context_window_limit.is_some_and(|full_context_window_limit| {
-            active_context_tokens >= full_context_window_limit
-        });
-    let token_limit_reached = auto_compact_scope_limit
+        full_context_window_limit.is_some_and(|limit| active_context_tokens >= limit);
+    let token_limit_reached = buffered_auto_compact_limit
         .is_some_and(|limit| auto_compact_scope_tokens >= limit)
         || full_context_window_limit_reached;
-
-    let auto_compact_scope_remaining = auto_compact_scope_limit
-        .map(|limit| limit.saturating_sub(auto_compact_scope_tokens).max(0));
-    let full_context_remaining =
-        full_context_window_limit.map(|limit| limit.saturating_sub(active_context_tokens).max(0));
-    let tokens_until_compaction = match (auto_compact_scope_remaining, full_context_remaining) {
-        (Some(scope_remaining), Some(full_remaining)) => Some(scope_remaining.min(full_remaining)),
-        (scope_remaining, full_remaining) => scope_remaining.or(full_remaining),
-    };
 
     ContextWindowTokenStatus {
         active_context_tokens,
         auto_compact_scope_tokens,
         auto_compact_scope_limit,
         full_context_window_limit,
-        tokens_until_compaction,
+        base_window_tokens_remaining,
         auto_compact_window_prefill_tokens,
         full_context_window_limit_reached,
         token_limit_reached,

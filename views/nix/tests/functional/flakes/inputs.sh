@@ -8,6 +8,9 @@ requireGit
 test_subdir_self_path() {
     baseDir=$TEST_ROOT/$RANDOM
     flakeDir=$baseDir/b-low
+    # `b-low` is reached through `baseDir`'s own tree (`?dir=b-low`), so only
+    # the root gets an identity: a workspace inside a workspace is a bug.
+    jjFlakeDir "$baseDir"
     mkdir -p "$flakeDir"
     writeSimpleFlake "$baseDir"
     writeSimpleFlake "$flakeDir"
@@ -62,7 +65,7 @@ EOF
     )
 
     clientDir=$TEST_ROOT/client-$RANDOM
-    mkdir -p "$clientDir"
+    jjFlakeDir "$clientDir"
     cat > "$clientDir"/flake.nix <<EOF
 {
   inputs.inp = {

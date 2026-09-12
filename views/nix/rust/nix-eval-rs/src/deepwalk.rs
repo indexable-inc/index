@@ -29,6 +29,7 @@ use crate::task::{NeedPath, Yield};
 use crate::value2::{ContextElem, NixStr, Slot, Value, type_name};
 use crate::vm::{Result, Vm, VmError};
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 /// cppnix's `max-call-depth`, which both walks take a slot of per level
 /// (`printValueAsJSON` and `printValueAsXML` each open their recursion with
@@ -345,7 +346,7 @@ impl Renderer for Json {
             // path interpolated into a string. ENG-12607.
             Value::Path(p) => {
                 return Ok(Step::Wait(
-                    Yield::Need(NeedPath::StorePath(p.to_string())),
+                    Yield::Need(NeedPath::StorePath(Rc::clone(p))),
                     J_STORE_PATH,
                 ));
             }
@@ -423,7 +424,7 @@ impl Renderer for Json {
             // walk and not a type test: a set returned from `__toString`
             // coerces on through its own `__toString` or `outPath`. ENG-12670.
             J_TO_STR_RESULT => Ok(Step::Wait(
-                Yield::Sub(crate::task::Task::coerce_to_json_string(Slot::value(v))),
+                Yield::sub(crate::task::Task::coerce_to_json_string(Slot::value(v))),
                 J_TO_STR_COERCED,
             )),
             // `copyToStore` off is what makes this differ from the
@@ -446,10 +447,7 @@ impl Renderer for Json {
 
 /// cppnix's `lexicographicOrder`: attribute names sorted as strings, not by
 /// symbol id, which is interning order and differs between runs.
-fn sorted_entries(
-    vm: &mut Vm,
-    m: &std::collections::BTreeMap<crate::value2::Sym, Slot>,
-) -> Vec<(String, Slot)> {
+fn sorted_entries(vm: &mut Vm, m: &crate::value2::AttrMap) -> Vec<(String, Slot)> {
     let mut entries: Vec<(String, Slot)> = m
         .iter()
         .map(|(k, s)| (vm.sym_name(*k).to_owned(), s.clone()))

@@ -43,7 +43,6 @@ enum struct ExperimentalFeature {
     WasmBuiltin,
     InvocationRecords,
     ParallelEval,
-    RustEval,
 };
 
 /**

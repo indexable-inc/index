@@ -586,4 +586,4 @@ There are also two shortcuts, `--debug` to run in `DEBUG` verbosity level and
 
 # Appendix 1: Commands naming exceptions
 
-`nix init` and `nix repl` are well established
+`nix init` is well established.

@@ -4,7 +4,7 @@ source ./common.sh
 
 flake1Dir=$TEST_ROOT/flake1
 
-mkdir -p "$flake1Dir"
+jjFlakeDir "$flake1Dir"
 cat > "$flake1Dir"/flake.nix <<EOF
 {
     outputs = { self }: {

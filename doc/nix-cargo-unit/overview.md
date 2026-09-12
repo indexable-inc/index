@@ -88,6 +88,24 @@ include set a closure needs). The `Cargo.lock` source map disambiguates which
 vendored path a registry/git unit resolves to (`src/render.rs:102`-`155`). Detail
 in [internals](internals.md).
 
+Nested Cargo packages remain part of their parent source by default. A package
+may declare that those child packages are separate inputs:
+
+```toml
+[package.metadata.ix.inputs]
+exclude-nested-packages = true
+```
+
+Before enabling this boolean, audit the package's build tools, procedural
+macros, module paths and included files. A child file read while compiling the
+parent is a parent input even if Cargo treats the child as another package.
+The renderer preserves recognized explicit includes and module-path attributes,
+and keeps the full package when a build script or unresolved syntax prevents a
+safe split. This conservative scan supplements the package owner's audit; it
+cannot infer arbitrary filesystem reads by procedural macros. Revisit the audit
+when adding a macro, build tool or cross-package source input. The rendered
+`sourceAudit.excludedRelatives` records any excluded child roots.
+
 ## How it is built and wired
 
 - **Package** (`default.nix:16`): built as a plain `ix.buildRustPackage` with
@@ -113,7 +131,8 @@ in [internals](internals.md).
 
 `clap` (CLI), `color-eyre` (errors), `object` (rlib/object
 parsing for the panic scan), `serde`/`serde_json` (unit graph), `sha2` (identity
-hashing), `toml` (`Cargo.lock` and manifests), `url` (package-id parsing).
+hashing), `toml` (`Cargo.lock` and manifests), `url` (package-id parsing),
+`proc-macro2` (Rust token boundaries for source-input checks).
 
 ## Module map
 

@@ -12,7 +12,10 @@ restartDaemon
 
 # Make a flake.
 flake1Dir=$TEST_ROOT/flake1
-mkdir -p "$flake1Dir"
+# This fixture is rewritten between installs on purpose: the upgrade path is
+# what the test walks. jj gives it an identity without ever adding a commit
+# step, because every fetch snapshots what is on disk.
+jjFlakeDir "$flake1Dir"
 
 # shellcheck disable=SC2154,SC1039
 cat > "$flake1Dir"/flake.nix <<EOF
@@ -54,7 +57,10 @@ cp "${config_nix}" "$flake1Dir"/
 nix-env -f ./user-envs.nix -i foo-1.0
 nix profile list | grep -A2 'Name:.*foo' | grep 'Store paths:.*foo-1.0'
 nix profile add "$flake1Dir" -L
-nix profile list | grep -A4 'Name:.*flake1' | grep 'Locked flake URL:.*narHash'
+# The locked URL names the identity the input was pinned to. For a jj input
+# that is `rev=`: `narHash` was the path fetcher's lock, and a jj input never
+# carries one (src/libfetchers/fetchers.cc).
+nix profile list | grep -A4 'Name:.*flake1' | grep 'Locked flake URL:.*rev='
 [[ $("$TEST_HOME"/.nix-profile/bin/hello) = "Hello World" ]]
 [ -e "$TEST_HOME"/.nix-profile/share/man ]
 # shellcheck disable=SC2235
@@ -196,7 +202,11 @@ nix profile remove flake1 2>&1 | grep 'removed 1 packages'
 # Make another flake.
 flake2Dir=$TEST_ROOT/flake2
 printf World > "$flake1Dir"/who
-cp -r "$flake1Dir" "$flake2Dir"
+jjFlakeDir "$flake2Dir"
+# The fixture's own files, named one by one: `cp -r` of the directory would
+# carry `.jj` across and leave two workspaces sharing one repository.
+cp "$flake1Dir"/flake.nix "$flake1Dir"/who "$flake1Dir"/version \
+   "$flake1Dir"/ca.nix "$flake1Dir"/config.nix "$flake2Dir"/
 printf World2 > "$flake2Dir"/who
 
 nix profile add "$flake1Dir"
@@ -224,11 +234,11 @@ error: An existing package already provides the following file:
        The conflicting packages have a priority of 5.
        To prioritise the new package:
 
-         nix profile add path:${flake2Dir}#packages.${system}.default --priority 4
+         nix profile add jj+file://${flake2Dir}#packages.${system}.default --priority 4
 
        To prioritise the existing package:
 
-         nix profile add path:${flake2Dir}#packages.${system}.default --priority 6
+         nix profile add jj+file://${flake2Dir}#packages.${system}.default --priority 6
 EOF
 )
 [[ $("$TEST_HOME"/.nix-profile/bin/hello) = "Hello World" ]]
@@ -245,7 +255,9 @@ nix profile add "$flake2Dir" --priority 0
 clearProfiles
 # shellcheck disable=SC2046
 nix profile add $(nix build "$flake1Dir" --no-link --print-out-paths)
-expect 1 nix profile add --impure --expr "(builtins.getFlake ''$flake2Dir'').packages.$system.default"
+# Spelled out because `builtins.getFlake` parses with no base directory
+# (src/libflake/flake-primops.cc): a bare path would stay a `path:` input.
+expect 1 nix profile add --impure --expr "(builtins.getFlake ''jj+file://$flake2Dir'').packages.$system.default"
 
 # Test upgrading from profile version 2.
 clearProfiles

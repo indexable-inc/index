@@ -2,16 +2,23 @@
 
 source ./common.sh
 
-requireGit
-
 flakeFollowsA=$TEST_ROOT/follows/flakeA
 flakeFollowsB=$TEST_ROOT/follows/flakeA/flakeB
 flakeFollowsC=$TEST_ROOT/follows/flakeA/flakeB/flakeC
 flakeFollowsD=$TEST_ROOT/follows/flakeA/flakeD
 flakeFollowsE=$TEST_ROOT/follows/flakeA/flakeE
 
+# flakeA is the only workspace: B, C, D and E are directories inside its tree,
+# so an absolute reference to one of them names flakeA and a `dir=`. The three
+# flakes that name flakeE all name it the same way, which is what makes them
+# share one lock node.
+urlFollowsB="jj+file://$flakeFollowsA?dir=flakeB"
+urlFollowsC="jj+file://$flakeFollowsA?dir=flakeB/flakeC"
+urlFollowsD="jj+file://$flakeFollowsA?dir=flakeD"
+urlFollowsE="jj+file://$flakeFollowsA?dir=flakeE"
+
 # Test following path flakerefs.
-createGitRepo "$flakeFollowsA"
+jjFlakeDir "$flakeFollowsA"
 mkdir -p "$flakeFollowsB"
 mkdir -p "$flakeFollowsC"
 mkdir -p "$flakeFollowsD"
@@ -26,7 +33,7 @@ cat > "$flakeFollowsA"/flake.nix <<EOF
             inputs.foobar.follows = "foobar";
         };
 
-        foobar.url = "path:$flakeFollowsA/flakeE";
+        foobar.url = "$urlFollowsE";
     };
     outputs = { ... }: {};
 }
@@ -36,7 +43,7 @@ cat > "$flakeFollowsB"/flake.nix <<EOF
 {
     description = "Flake B";
     inputs = {
-        foobar.url = "path:$flakeFollowsA/flakeE";
+        foobar.url = "$urlFollowsE";
         goodoo.follows = "C/goodoo";
         C = {
             url = "path:./flakeC";
@@ -51,7 +58,7 @@ cat > "$flakeFollowsC"/flake.nix <<EOF
 {
     description = "Flake C";
     inputs = {
-        foobar.url = "path:$flakeFollowsA/flakeE";
+        foobar.url = "$urlFollowsE";
         goodoo.follows = "foobar";
     };
     outputs = { ... }: {};
@@ -73,9 +80,6 @@ cat > "$flakeFollowsE"/flake.nix <<EOF
     outputs = { ... }: {};
 }
 EOF
-
-git -C "$flakeFollowsA" add flake.nix flakeB/flake.nix \
-  flakeB/flakeC/flake.nix flakeD/flake.nix flakeE/flake.nix
 
 nix flake metadata "$flakeFollowsA"
 
@@ -117,7 +121,10 @@ nix flake lock "$flakeFollowsA"
 [[ $(jq -c .nodes.B.inputs.foobar "$flakeFollowsA"/flake.lock) = '"foobar"' ]]
 jq -r -c '.nodes | keys | .[]' "$flakeFollowsA"/flake.lock | grep "^foobar$"
 
-# Check that path: inputs cannot escape from their root.
+# Check that path: inputs cannot escape from their root. A relative path is a
+# directory of the flake's own tree; one that climbs above the tree's root is
+# refused by name, and pure and impure evaluation agree, because nothing was
+# read from the filesystem to find that out.
 cat > "$flakeFollowsA"/flake.nix <<EOF
 {
     description = "Flake A";
@@ -128,10 +135,8 @@ cat > "$flakeFollowsA"/flake.nix <<EOF
 }
 EOF
 
-git -C "$flakeFollowsA" add flake.nix
-
-expect 1 nix flake lock "$flakeFollowsA" 2>&1 | grep '/flakeB.*is forbidden in pure evaluation mode'
-expect 1 nix flake lock --impure "$flakeFollowsA" 2>&1 | grep "'flakeB' is too short to be a valid store path"
+expect 1 nix flake lock "$flakeFollowsA" 2>&1 | grep "input 'B'.*'../flakeB'.*is outside the tree of that flake"
+expect 1 nix flake lock --impure "$flakeFollowsA" 2>&1 | grep "input 'B'.*'../flakeB'.*is outside the tree of that flake"
 
 # Test relative non-flake inputs.
 cat > "$flakeFollowsA"/flake.nix <<EOF
@@ -146,8 +151,6 @@ cat > "$flakeFollowsA"/flake.nix <<EOF
 EOF
 
 echo 123 > "$flakeFollowsA"/foo.nix
-
-git -C "$flakeFollowsA" add flake.nix foo.nix
 
 nix flake lock "$flakeFollowsA"
 
@@ -166,8 +169,6 @@ cat >"$flakeFollowsA"/flake.nix <<EOF
     outputs = { ... }: {};
 }
 EOF
-
-git -C "$flakeFollowsA" add flake.nix
 
 nix flake lock "$flakeFollowsA" 2>&1 | grep "warning: input 'B' has an override for a non-existent input 'invalid'"
 nix flake lock "$flakeFollowsA" 2>&1 | grep "warning: input 'B' has an override for a non-existent input 'invalid2'"
@@ -198,7 +199,7 @@ flakeFollowsOverloadC="$TEST_ROOT/follows/overload/flakeA/flakeB/flakeC"
 flakeFollowsOverloadD="$TEST_ROOT/follows/overload/flakeA/flakeB/flakeC/flakeD"
 
 # Test following path flakerefs.
-createGitRepo "$flakeFollowsOverloadA"
+jjFlakeDir "$flakeFollowsOverloadA"
 mkdir -p "$flakeFollowsOverloadB"
 mkdir -p "$flakeFollowsOverloadC"
 mkdir -p "$flakeFollowsOverloadD"
@@ -247,9 +248,6 @@ cat > "$flakeFollowsOverloadA/flake.nix" <<EOF
 }
 EOF
 
-git -C "$flakeFollowsOverloadA" add flake.nix flakeB/flake.nix \
-  flakeB/flakeC/flake.nix flakeB/flakeC/flakeD/flake.nix
-
 nix flake metadata "$flakeFollowsOverloadA"
 nix flake update --flake "$flakeFollowsOverloadA"
 nix flake lock "$flakeFollowsOverloadA"
@@ -267,7 +265,7 @@ nix flake lock "$flakeFollowsOverloadA"
 flakeFollowCycle="$TEST_ROOT/follows/followCycle"
 
 # Test following path flakerefs.
-mkdir -p "$flakeFollowCycle"
+jjFlakeDir "$flakeFollowCycle"
 
 cat > "$flakeFollowCycle"/flake.nix <<EOF
 {
@@ -302,7 +300,7 @@ flakeFollowsCustomUrlC="$TEST_ROOT/follows/custom-url/flakeA/flakeB/flakeC"
 flakeFollowsCustomUrlD="$TEST_ROOT/follows/custom-url/flakeA/flakeB/flakeD"
 
 
-createGitRepo "$flakeFollowsCustomUrlA"
+jjFlakeDir "$flakeFollowsCustomUrlA"
 mkdir -p "$flakeFollowsCustomUrlB"
 mkdir -p "$flakeFollowsCustomUrlC"
 mkdir -p "$flakeFollowsCustomUrlD"
@@ -348,9 +346,6 @@ cat > "$flakeFollowsCustomUrlA/flake.nix" <<EOF
 }
 EOF
 
-git -C "$flakeFollowsCustomUrlA" add flake.nix flakeB/flake.nix \
-  flakeB/flakeC/flake.nix flakeB/flakeD/flake.nix
-
 # lock "original" entry should contain overridden url
 json=$(nix flake metadata "$flakeFollowsCustomUrlA" --json)
 [[ $(echo "$json" | jq -r .locks.nodes.C.original.path) = './flakeB/flakeD' ]]
@@ -374,14 +369,14 @@ cat <<EOF > "$flakeFollowsC"/flake.nix
 EOF
 cat <<EOF > "$flakeFollowsB"/flake.nix
 {
-  inputs.C.url = "path:$flakeFollowsC";
+  inputs.C.url = "$urlFollowsC";
   outputs = _: {};
 }
 EOF
 cat <<EOF > "$flakeFollowsA"/flake.nix
 {
-  inputs.B.url = "path:$flakeFollowsB";
-  inputs.D.url = "path:$flakeFollowsD";
+  inputs.B.url = "$urlFollowsB";
+  inputs.D.url = "$urlFollowsD";
   inputs.B.inputs.C.inputs.D.follows = "D";
   outputs = _: {};
 }
@@ -395,7 +390,7 @@ nix flake lock "$flakeFollowsA"
 
 cat <<EOF > "$flakeFollowsC"/flake.nix
 {
-  inputs.D.url = "path:$flakeFollowsD";
+  inputs.D.url = "$urlFollowsD";
   outputs = _: {};
 }
 EOF
@@ -408,8 +403,8 @@ cat <<EOF > "$flakeFollowsB"/flake.nix
 EOF
 cat <<EOF > "$flakeFollowsA"/flake.nix
 {
-  inputs.B.url = "path:$flakeFollowsB";
-  inputs.C.url = "path:$flakeFollowsC";
+  inputs.B.url = "$urlFollowsB";
+  inputs.C.url = "$urlFollowsC";
   inputs.B.inputs.C.follows = "C";
   outputs = _: {};
 }

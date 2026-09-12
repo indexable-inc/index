@@ -5,8 +5,10 @@ use std::time::Instant;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
+use tracing::Instrument;
 use tracing::info;
 use tracing::instrument;
+use tracing::trace_span;
 use tracing::warn;
 
 use crate::client::ModelClientSession;
@@ -15,7 +17,7 @@ use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::INITIAL_SUBMIT_ID;
 use crate::session::session::Session;
 use crate::session::turn::build_prompt;
-use crate::session::turn::built_tools;
+use codex_features::Feature;
 use codex_otel::STARTUP_PREWARM_AGE_AT_FIRST_TURN_METRIC;
 use codex_otel::STARTUP_PREWARM_DURATION_METRIC;
 use codex_otel::SessionTelemetry;
@@ -182,6 +184,17 @@ impl SessionStartupPrewarmHandle {
 
 impl Session {
     pub(crate) async fn schedule_startup_prewarm(self: &Arc<Self>, base_instructions: String) {
+        if self.features().enabled(Feature::CodeModePrewarm)
+            && self.services.code_mode_service.is_available()
+        {
+            let session = Arc::clone(self);
+            tokio::spawn(async move {
+                if session.services.code_mode_service.session().await.is_err() {
+                    warn!("code-mode host startup prewarm failed");
+                }
+            });
+        }
+
         if !self.services.model_client.responses_websocket_enabled() {
             // Without websocket prewarm, resolve auth once so Agent Identity bootstrap can
             // register or engage this session's bearer fallback before the first user request.
@@ -198,22 +211,30 @@ impl Session {
         let websocket_connect_timeout = self.provider().await.websocket_connect_timeout();
         let started_at = Instant::now();
         let startup_prewarm_session = Arc::clone(self);
-        let startup_prewarm = tokio::spawn(async move {
-            let result =
-                schedule_startup_prewarm_inner(startup_prewarm_session, base_instructions).await;
-            let status = if result.is_ok() { "ready" } else { "failed" };
-            session_telemetry.record_startup_phase(
-                "startup_prewarm_total",
-                started_at.elapsed(),
-                Some(status),
-            );
-            session_telemetry.record_duration(
-                STARTUP_PREWARM_DURATION_METRIC,
-                started_at.elapsed(),
-                &[("status", status)],
-            );
-            result
-        });
+        let startup_prewarm = tokio::spawn(
+            async move {
+                let result =
+                    schedule_startup_prewarm_inner(startup_prewarm_session, base_instructions)
+                        .await;
+                let status = if result.is_ok() { "ready" } else { "failed" };
+                session_telemetry.record_startup_phase(
+                    "startup_prewarm_total",
+                    started_at.elapsed(),
+                    Some(status),
+                );
+                session_telemetry.record_duration(
+                    STARTUP_PREWARM_DURATION_METRIC,
+                    started_at.elapsed(),
+                    &[("status", status)],
+                );
+                result
+            }
+            .instrument(trace_span!(
+                "startup_prewarm",
+                otel.name = "startup_prewarm",
+                thread.id = %self.thread_id(),
+            )),
+        );
         self.set_session_startup_prewarm(SessionStartupPrewarmHandle::new(
             startup_prewarm,
             started_at,
@@ -268,14 +289,11 @@ async fn schedule_startup_prewarm_inner(
     let built_tools_started_at = Instant::now();
     // Startup prewarm runs before run_turn and needs its own tool-building snapshot.
     let step_context = session
-        .capture_step_context(Arc::clone(&startup_turn_context))
-        .await;
-    let startup_router = built_tools(
-        session.as_ref(),
-        step_context.as_ref(),
-        &startup_cancellation_token,
-    )
-    .await?;
+        .capture_step_context(
+            Arc::clone(&startup_turn_context),
+            &startup_cancellation_token,
+        )
+        .await?;
     startup_turn_context.session_telemetry.record_startup_phase(
         "startup_prewarm_build_tools",
         built_tools_started_at.elapsed(),
@@ -284,10 +302,10 @@ async fn schedule_startup_prewarm_inner(
     let build_prompt_started_at = Instant::now();
     let startup_prompt = build_prompt(
         Vec::new(),
-        startup_router.as_ref(),
-        startup_turn_context.as_ref(),
+        step_context.as_ref(),
         BaseInstructions {
             text: base_instructions,
+            provenance: None,
         },
     );
     startup_turn_context.session_telemetry.record_startup_phase(
@@ -295,24 +313,19 @@ async fn schedule_startup_prewarm_inner(
         build_prompt_started_at.elapsed(),
         /*status*/ None,
     );
-    let window_id = session.current_window_id().await;
-    let responses_metadata = startup_turn_context
-        .turn_metadata_state
-        .to_responses_metadata(
-            session.installation_id.clone(),
-            window_id,
-            CodexResponsesRequestKind::Prewarm,
-        );
+    let responses_metadata = session
+        .responses_metadata(&startup_turn_context, CodexResponsesRequestKind::Prewarm)
+        .await;
     let mut client_session = session.services.model_client.new_session();
     let websocket_warmup_started_at = Instant::now();
     client_session
         .prewarm_websocket(
             &startup_prompt,
-            &startup_turn_context.model_info,
-            &startup_turn_context.session_telemetry,
-            startup_turn_context.reasoning_effort.clone(),
-            startup_turn_context.reasoning_summary,
-            startup_turn_context.config.service_tier.clone(),
+            &step_context.settings.model_info,
+            &step_context.session_telemetry,
+            step_context.settings.reasoning_effort().cloned(),
+            step_context.settings.reasoning_summary,
+            step_context.settings.service_tier.clone(),
             &responses_metadata,
         )
         .await?;

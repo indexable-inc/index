@@ -46,6 +46,22 @@
         default = null;
         description = "Host-native lifelog package supplied by the consuming flake.";
       };
+      jj = lib.mkOption {
+        type = lib.types.nullOr lib.types.package;
+        default = null;
+        description = ''
+          Host-native jj supplied by the consuming flake, installed as `jj`.
+          Must be ix's native client (`packages/jj-ix` in the ix repository),
+          not nixpkgs' jujutsu and not the vendored fork's own binary: it is
+          the only one that opens an ix-backed repo and the only one that
+          carries `jj view`, which `vcs-prompt` spawns on every prompt.
+
+          Supplied by the host rather than taken from `indexPackages` because
+          the client is a package of the ix ROOT flake, whose `packages/` this
+          index-side profile cannot reach (index's flake source root is
+          `./index`).
+        '';
+      };
       mercuryCli = lib.mkOption {
         type = lib.types.nullOr lib.types.package;
         default = null;

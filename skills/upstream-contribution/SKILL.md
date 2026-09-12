@@ -86,26 +86,24 @@ without that record wastes the maintainer's time twice.
 
 ### In this repo
 
-Maintained forks are jj views. The root `.jj-views.toml` owns each view's path,
-published fork, upstream, branch, and anchor. Inspect the local commit series
-before choosing a contribution:
+Maintained forks are jj views. The root `views.toml` owns each view's path,
+transport, upstream remote, ref, and the recorded import. Inspect the local
+series before choosing a contribution:
 
 ```sh
-jj views status <view>
-jj views patches <view>
+jj view status <view>
+jj view patches <view> -r @ --output <empty dir> --archive <path>.tar.zst
 ```
 
-An upstream PR is an outward-facing third-party action, so get the operator's
-approval for that PR. Publish the chosen view revision to a new branch on our
-fork:
+(`view` is a verb of `jj` itself: every host installs ix's native client
+under that name.)
 
-```sh
-jj views push <view> -r <revision>
-```
-
-Use the branch reported by `jj views push` as the draft PR head on the
-upstream's forge. Follow the upstream's submission rules above. Do not push the
-view's default branch for an upstream contribution.
+The export is a `git format-patch`-shaped series with paths relative to the
+subtree, applicable with `git am` onto the upstream commit named as
+`upstream_commit` in its `manifest.json`. An upstream PR is an outward-facing
+third-party action, so get the operator's approval for that PR, then push the
+series to a fork with git tooling outside this repository; `jj view` has no
+push leg by design.
 
 When a PR is rejected or closed unmerged, record the upstream response and PR
 URL in the issue that authorized the contribution. Link that issue from the

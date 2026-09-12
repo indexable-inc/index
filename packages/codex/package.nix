@@ -1,5 +1,6 @@
 {
   id = "codex";
+  workspaceIfdRoots = true;
   # `packageSet` here means the index package set (`index.packages.<sys>.codex`,
   # built via packageSetFor), NOT a nixpkgs overlay: it does not inject into
   # `pkgs`, so `pkgs.codex` stays the plain nixpkgs CLI (see the `flake`-only

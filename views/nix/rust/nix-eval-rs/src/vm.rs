@@ -27,11 +27,11 @@ use crate::print;
 use crate::refusal::{Refusal, RefusalToken};
 use crate::task::{NeedPath, Task, Yield};
 use crate::value2::{
-    BuiltinData, ClosureData, Env, EnvNode, NixStr, Slot, SlotState, Sym, Value, type_name,
+    AttrMap, AttrOrigin, BuiltinData, ClosureData, Env, EnvNode, NixStr, Slot, SlotState, Sym,
+    Value, type_name,
 };
-use ix_kernel::hash::{self, Hash};
 use rustc_hash::FxHashMap;
-use std::cell::RefCell;
+use rustc_hash::FxHashSet;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
@@ -111,6 +111,12 @@ pub enum ErrKind {
     Thrown,
     /// A failed `assert`.
     Assertion,
+    /// Import from derivation was disabled by the embedder.
+    ImportFromDerivation,
+    /// A function auto-called at the top level (`--arg`/`--argstr` and the
+    /// formals' defaults) has a formal with neither. cppnix's
+    /// `MissingArgumentError`.
+    MissingArgument,
 }
 
 #[derive(Debug)]
@@ -146,6 +152,16 @@ impl VmError {
             message: msg.into(),
             catchable: true,
             kind: ErrKind::Assertion,
+            pos: None,
+        })
+    }
+
+    /// cppnix's `IFDError`, which command walkers may catch separately.
+    pub fn import_from_derivation(msg: impl Into<String>) -> Self {
+        VmError::Throw(Catchable {
+            message: msg.into(),
+            catchable: false,
+            kind: ErrKind::ImportFromDerivation,
             pos: None,
         })
     }
@@ -355,16 +371,17 @@ struct ApplyFrame {
     arg: Slot,
 }
 
+/// Boxing the task keeps a `Frame` at the size of `UnitFrame`: frames are
+/// popped by value in `advance`/`deliver` and pushed back in
+/// `advance_task_step`, and a `Task` (Print, Coerce, Builtin{Cont}) is
+/// several Vecs and sets wide. `frames_and_yields_are_not_task_sized` pins
+/// the shape.
 enum Frame {
     Unit(UnitFrame),
     Force(ForceFrame),
     Apply(ApplyFrame),
-    Task(Task),
+    Task(Box<Task>),
 }
-
-/// Domain separation for the import cache key, versioned so that changing
-/// what goes into it is a rename rather than a silent reinterpretation.
-const IMPORT_TAG: &str = "ixe-import-v1";
 
 /// The one piece of interpreter state outside the frames: what to do next.
 enum Flow {
@@ -443,6 +460,10 @@ const DERIVATION_INTERNAL_PATH: &str = "/derivation-internal.nix";
 /// compiler so there is one path from the name to the op rather than two.
 const NIX_PATH_GLOBAL: &str = "__nixPath";
 
+/// Source of [`Vm::id`]. Process-wide so two VMs on different threads never
+/// share an id, which is what lets a module's link table trust the id alone.
+static NEXT_VM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// What that one-line module is called in a message.
 const NIX_PATH_GLOBAL_PATH: &str = "/nix-path-global.nix";
 
@@ -460,6 +481,10 @@ const NIX_PATH_GLOBAL_PATH: &str = "/nix-path-global.nix";
 pub(crate) const FANOUT_WIDTH: usize = 16;
 
 pub struct Vm {
+    /// Which VM this is, for the per-module link tables (`Module::linked`):
+    /// a table built by another VM's interner must not answer for this one.
+    /// Process-unique, from [`NEXT_VM_ID`].
+    id: u64,
     /// Global interner; module-local symbols map through `msym`.
     ///
     /// `Rc<str>` rather than `String` so a name is allocated once and the
@@ -545,17 +570,28 @@ pub struct Vm {
     /// it out (ENG-13150 review C1).
     pending_done: Option<Value>,
     next_token: u64,
-    /// Compiled imports, keyed by the content they were compiled from rather
-    /// than by the path they came from. Without a cache a file imported from n
-    /// places is compiled n times, which is what cppnix's path-keyed cache
-    /// avoids; keying on content instead buys the same sharing and also makes
-    /// the cache safe to keep across evaluations. A path-keyed entry is only
-    /// valid while the file behind the path has not changed, which is true
-    /// within one evaluation and false for a process that outlives one, and
-    /// getting that wrong serves a pre-edit answer to a post-edit request.
-    /// Here an edit changes the text, so it changes the key, so it misses:
-    /// invalidation is content addressing rather than a separate mechanism.
-    modules: BTreeMap<Hash, Rc<Module>>,
+    /// Compiled modules: every file this machine imports and every top-level
+    /// program a session compiles through it. Owned here because the compile
+    /// happens inside the machine (`import` is an op), and the cache it fills
+    /// has to be the cache the next process reads: behind a store
+    /// ([`crate::modcache::ModuleCache::persistent`]) a cold process decodes
+    /// the imports its predecessor compiled instead of compiling them again.
+    ///
+    /// Keyed by the content compiled, never by the path it came from
+    /// (`modcache::request`). Without a cache a file imported from n places is
+    /// compiled n times, which is what cppnix's path-keyed cache avoids; keying
+    /// on content buys the same sharing and also makes the cache safe to keep
+    /// across evaluations and processes. A path-keyed entry is only valid
+    /// while the file behind the path has not changed, which is true within
+    /// one evaluation and false for anything that outlives one, and getting
+    /// that wrong serves a pre-edit answer to a post-edit request. Here an edit
+    /// changes the text, so it changes the key, so it misses: invalidation is
+    /// content addressing rather than a separate mechanism.
+    modules: crate::modcache::ModuleCache,
+    /// Modules this VM was started on, weakly, for the test probes above the
+    /// origin slabs: see `Vm::probed_modules`.
+    #[cfg(test)]
+    started_modules: Vec<std::rc::Weak<Module>>,
     /// Whether the last run ended because the operator interrupted it.
     ///
     /// An interrupt is not a property of the expression, so a memoising
@@ -583,6 +619,44 @@ pub struct Vm {
     /// is what holds it -- if that test ever goes green on a store read, this
     /// table stops being the only source of an input's hash.
     drv_hashes: BTreeMap<String, crate::drvpath::DrvHash>,
+    /// The `.drv` paths this evaluation has already handed to the host to
+    /// write. cppnix writes a derivation every time `derivationStrict`
+    /// builds it, and nixpkgs builds the same one many times over (the
+    /// home-manager closure: 73k writes for 23k distinct derivations); the
+    /// store answered every repeat "already valid" at the price of a round
+    /// trip. Here the repeat is not asked: the answer is the same bytes'
+    /// same path, and the first ask is what put it in the store. Keyed by
+    /// path because the path is the content: two derivations with one path
+    /// are one derivation.
+    drvs_written: FxHashSet<String>,
+    /// Compiled regular expressions by translated pattern: cppnix's
+    /// `EvalState::regexCache`, scoped to one VM.
+    ///
+    /// `builtins.match` and `builtins.split` are called with a handful of
+    /// distinct patterns and hundreds of thousands of subjects (nixpkgs
+    /// version parsing, `lib.strings` helpers), and compiling a pattern costs
+    /// more than matching it against a short subject. Before this table the
+    /// darwin toplevel spent ~2.7% of its main thread inside
+    /// `RegexBuilder::build` recompiling the same few patterns (round 8
+    /// profile, goals/rust-eval.md). Keyed on the exact bytes handed to the
+    /// builder, after anchoring and bracket translation, so `match` and
+    /// `split` of the same source pattern are two entries that never answer
+    /// for each other. Only successful compiles are stored: an invalid
+    /// pattern is an error every time, as in cppnix. A `Regex` clone is an
+    /// `Arc` bump, so a hit allocates nothing.
+    regexes: FxHashMap<Box<[u8]>, regex::bytes::Regex>,
+    /// Argument hashes already counted for the two high-volume store
+    /// questions. They are per VM because one VM is one evaluator session;
+    /// nothing invalidates them during that session. Hash collisions can only
+    /// undercount diagnostics and cannot affect evaluation.
+    #[cfg(feature = "perf")]
+    store_path_question_args: FxHashSet<[u8; 16]>,
+    #[cfg(feature = "perf")]
+    write_drv_question_args: FxHashSet<[u8; 16]>,
+    /// The `perf::reset_epoch` the two sets above were last cleared at,
+    /// so a perf reset empties them along with the counters they feed.
+    #[cfg(feature = "perf")]
+    question_args_epoch: u64,
     /// The `builtins` set and the `derivation` cell, built on first use and
     /// then shared, which is what cppnix does: both live in `staticBaseEnv`,
     /// constructed once per `EvalState`, and every reference is that one
@@ -622,14 +696,25 @@ pub struct Vm {
     /// way: `settings.thisSystem` and friends are read once when the
     /// `EvalState` is built, so an expression cannot see one change under it.
     settings: crate::eval::Settings,
+    import_cache_enabled: bool,
+}
+
+pub(crate) enum ImportEntry {
+    Cached(Value),
+    Evaluate {
+        module: Rc<Module>,
+        key: Option<crate::import_cache::ImportKey>,
+    },
 }
 
 impl Vm {
-    /// A VM that will evaluate under `settings`.
+    /// A VM that will evaluate under `settings`, with a compile cache that
+    /// dies with it.
     ///
-    /// The only constructor that exists, and deliberately: there is no
-    /// `Vm::with_settings(crate::eval::Settings::default())` and no `Default`, because the two callers mean different
-    /// things and the difference is invisible at a call site that does not
+    /// One of two constructors, both taking the settings, and deliberately:
+    /// there is no `Vm::with_settings(crate::eval::Settings::default())` and
+    /// no `Default`, because the two callers mean different things and the
+    /// difference is invisible at a call site that does not
     /// say. Production wants the process configuration
     /// ([`Vm::from_process_settings`]); a test wants a configuration it chose
     /// ([`crate::eval::Settings::default`]), so that no other test can move it.
@@ -637,7 +722,21 @@ impl Vm {
     /// silently -- an embedder evaluating against `/nix/store` when the store
     /// is elsewhere computes wrong output paths and reports nothing.
     pub fn with_settings(settings: crate::eval::Settings) -> Self {
+        Self::with_modules(settings, crate::modcache::ModuleCache::in_memory())
+    }
+
+    /// A VM that compiles through `modules`: in production the session's
+    /// on-disk cache ([`crate::modcache::ModuleCache::persistent`]), so a cold
+    /// process decodes the imports its predecessor compiled instead of
+    /// compiling them again. [`Vm::with_settings`] is this with a cache that
+    /// dies with the machine.
+    pub fn with_modules(
+        settings: crate::eval::Settings,
+        modules: crate::modcache::ModuleCache,
+    ) -> Self {
         Vm {
+            import_cache_enabled: true,
+            id: NEXT_VM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             interner: Vec::new(),
             interner_idx: FxHashMap::default(),
             cur: Fiber::new(),
@@ -647,9 +746,19 @@ impl Vm {
             fanout_offer: VecDeque::new(),
             pending_done: None,
             next_token: 0,
-            modules: BTreeMap::new(),
+            modules,
+            #[cfg(test)]
+            started_modules: Vec::new(),
             interrupted: false,
             drv_hashes: BTreeMap::new(),
+            drvs_written: FxHashSet::default(),
+            regexes: FxHashMap::default(),
+            #[cfg(feature = "perf")]
+            store_path_question_args: FxHashSet::default(),
+            #[cfg(feature = "perf")]
+            write_drv_question_args: FxHashSet::default(),
+            #[cfg(feature = "perf")]
+            question_args_epoch: crate::perf::reset_epoch(),
             builtins_value: None,
             derivation_slot: None,
             interrupt_countdown: INTERRUPT_CHECK_STRIDE,
@@ -692,6 +801,34 @@ impl Vm {
     #[must_use]
     pub fn settings(&self) -> &crate::eval::Settings {
         &self.settings
+    }
+
+    /// The compile cache this machine imports through. See the field.
+    #[must_use]
+    pub fn modules(&self) -> &crate::modcache::ModuleCache {
+        &self.modules
+    }
+
+    /// The compile cache, to drain its corruption reports.
+    pub fn modules_mut(&mut self) -> &mut crate::modcache::ModuleCache {
+        &mut self.modules
+    }
+
+    /// Compile a program through this machine's cache, under its settings.
+    ///
+    /// What `import` does for a file, and what a session does for the
+    /// top-level expression before deciding whether to run it
+    /// ([`crate::session::evaluate`] keys the result memo on the module's
+    /// id). Here rather than on the cache so the settings the compile sees are
+    /// the machine's own: a caller passing them alongside could pass somebody
+    /// else's.
+    pub fn compile(
+        &mut self,
+        text: &str,
+        base_dir: &str,
+        origin: crate::compile::Origin<'_>,
+    ) -> std::result::Result<crate::modcache::Compiled, crate::modcache::CacheError> {
+        self.modules.compile(text, base_dir, origin, &self.settings)
     }
 
     /// The `builtins` attrset, built once per VM. See the fields.
@@ -753,6 +890,79 @@ impl Vm {
         &mut self.drv_hashes
     }
 
+    /// Record that `drv_path` is being handed to the host to write: `true`
+    /// the first time in this evaluation, `false` for a repeat. See the
+    /// field.
+    pub fn note_drv_written(&mut self, drv_path: &str) -> bool {
+        if self.drvs_written.contains(drv_path) {
+            return false;
+        }
+        self.drvs_written.insert(drv_path.to_owned())
+    }
+
+    /// The compiled regular expression for `pattern`, compiling it through
+    /// `compile` on the first request and serving the table afterwards. See
+    /// the field for why this exists and what the key is.
+    pub fn regex(
+        &mut self,
+        pattern: &[u8],
+        compile: impl FnOnce(&[u8]) -> Result<regex::bytes::Regex>,
+    ) -> Result<regex::bytes::Regex> {
+        if let Some(rx) = self.regexes.get(pattern) {
+            return Ok(rx.clone());
+        }
+        let rx = compile(pattern)?;
+        self.regexes.insert(pattern.into(), rx.clone());
+        Ok(rx)
+    }
+
+    /// Count a distinct argument to `StorePath` or `WriteDrv` once for this
+    /// VM. The perf module retains only cardinalities and remains IO-free.
+    pub fn note_question_argument(&mut self, need: &NeedPath) {
+        #[cfg(not(feature = "perf"))]
+        let _ = need;
+        #[cfg(feature = "perf")]
+        {
+            let epoch = crate::perf::reset_epoch();
+            if epoch != self.question_args_epoch {
+                self.store_path_question_args.clear();
+                self.write_drv_question_args.clear();
+                self.question_args_epoch = epoch;
+            }
+            match need {
+                NeedPath::StorePath(path) => {
+                    let argument = crate::readset::question_argument_digest(
+                        &crate::readset::Question::CopyToStore(path.clone()),
+                    );
+                    if self.store_path_question_args.insert(argument) {
+                        crate::perf::note_unique_store_path();
+                    }
+                }
+                NeedPath::WriteDrv {
+                    name,
+                    aterm,
+                    expected,
+                } => {
+                    // The question the recorder files for this operation,
+                    // framed exactly as it files it: the ATerm by its
+                    // content address and the path the write is expected to
+                    // produce, which is the answer a successful write gives.
+                    let argument = crate::readset::question_argument_digest(
+                        &crate::readset::Question::WriteDrv {
+                            name: name.clone(),
+                            answer: crate::readset::WriteDrvAnswer::Written(expected.clone()),
+                            aterm: ix_kernel::ObjId::of(aterm.as_bytes()),
+                        },
+                    );
+                    if self.write_drv_question_args.insert(argument) {
+                        crate::perf::note_unique_write_drv();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Set the call-depth ceiling, mirroring cppnix's `max-call-depth`.
     pub fn set_max_call_depth(&mut self, depth: u32) {
         self.settings.max_call_depth = depth;
@@ -790,8 +1000,89 @@ impl Vm {
     /// The base directory is part of the key alongside the text because
     /// `compile_source` makes path literals absolute against it, so the same
     /// text under two directories is two different modules.
-    pub fn import_module(&mut self, path: &str, text: &str, base: &str) -> Result<Rc<Module>> {
-        self.compile_cached(path, text, base, crate::compile::Origin::File(path))
+    pub fn import_module(
+        &mut self,
+        path: &crate::value2::PathValue,
+        text: &str,
+        base: &str,
+    ) -> Result<Rc<Module>> {
+        self.compile_import(path, text, base)
+            .map(|compiled| compiled.module)
+    }
+
+    fn compile_import(
+        &mut self,
+        path: &crate::value2::PathValue,
+        text: &str,
+        base: &str,
+    ) -> Result<crate::modcache::Compiled> {
+        let origin = match &path.root {
+            crate::value2::Root::Ambient => crate::compile::Origin::File(path.as_ref()),
+            crate::value2::Root::Mounted(mount_point) => crate::compile::Origin::MountedFile {
+                path: path.as_ref(),
+                mount_point,
+            },
+        };
+        self.compile_cached_identity(text, base, origin)
+    }
+
+    pub(crate) fn set_import_cache_enabled(&mut self, enabled: bool) -> bool {
+        std::mem::replace(&mut self.import_cache_enabled, enabled)
+    }
+
+    /// The source has already been read through the scheduler. Only certified
+    /// closed scalar computations may skip their existing root force here.
+    pub(crate) fn import_entry(
+        &mut self,
+        path: &crate::value2::PathValue,
+        text: &str,
+        base: &str,
+    ) -> Result<ImportEntry> {
+        let compiled = self.compile_import(path, text, base)?;
+        let mut key = None;
+        if self.import_cache_enabled
+            && let Some(store) = self.modules.store()
+        {
+            match crate::import_cache::probe(
+                store,
+                compiled.id,
+                &compiled.module,
+                &self.settings,
+                self.cur.call_depth,
+            ) {
+                Ok(crate::import_cache::Probe::Hit(value)) => {
+                    crate::perf::note_import_cache_hit();
+                    return Ok(ImportEntry::Cached(value));
+                }
+                Ok(crate::import_cache::Probe::Miss(request)) => {
+                    crate::perf::note_import_cache_miss();
+                    key = Some(request);
+                }
+                Ok(crate::import_cache::Probe::Damaged {
+                    key: request,
+                    warning,
+                }) => {
+                    crate::perf::note_import_cache_miss();
+                    self.modules.note_cache_warning(warning);
+                    key = Some(request);
+                }
+                Ok(crate::import_cache::Probe::Ineligible) => {}
+                Err(error) => self.modules.note_cache_warning(error),
+            }
+        }
+        Ok(ImportEntry::Evaluate {
+            module: compiled.module,
+            key,
+        })
+    }
+
+    pub(crate) fn complete_import(&mut self, key: &crate::import_cache::ImportKey, value: &Value) {
+        if self.import_cache_enabled
+            && let Some(store) = self.modules.store()
+            && let Err(error) = crate::import_cache::insert(store, key, value)
+        {
+            self.modules.note_cache_warning(error);
+        }
     }
 
     /// The compiled module for a program the *embedder* supplied rather than
@@ -807,54 +1098,60 @@ impl Vm {
     /// seam -- it sends an empty `file` -- so the two seams compile one
     /// program one way.
     pub fn internal_module(&mut self, text: &str, base: &str) -> Result<Rc<Module>> {
-        // The empty path in the key is not a placeholder standing in for a
-        // name: it IS the origin, and `Origin::String` compiles `__curPos` to
+        // `Origin::String` is the key's origin, and it compiles `__curPos` to
         // null regardless. Two internal programs with the same text under the
         // same base are the same module, which is what we want.
-        self.compile_cached("", text, base, crate::compile::Origin::String)
+        self.compile_cached(text, base, crate::compile::Origin::String)
     }
 
     fn compile_cached(
         &mut self,
-        path: &str,
         text: &str,
         base: &str,
         origin: crate::compile::Origin<'_>,
     ) -> Result<Rc<Module>> {
-        // The path is in the key as well as the base directory, because
-        // `__curPos` compiles to the name of the file it is written in: two
-        // files in one directory with the same text are two modules
-        // (ENG-12713). It also carries the settings that decide which globals
-        // resolve, for the reason `modcache::request` gives.
-        let settings = self.settings.fingerprint();
-        let key = hash::tagged(
-            IMPORT_TAG,
-            &[
-                base.as_bytes(),
-                path.as_bytes(),
-                settings.as_bytes(),
-                text.as_bytes(),
-            ],
-        );
-        if let Some(m) = self.modules.get(&key) {
-            return Ok(m.clone());
+        self.compile_cached_identity(text, base, origin)
+            .map(|compiled| compiled.module)
+    }
+
+    fn compile_cached_identity(
+        &mut self,
+        text: &str,
+        base: &str,
+        origin: crate::compile::Origin<'_>,
+    ) -> Result<crate::modcache::Compiled> {
+        // The key is `modcache::request`'s: base directory, origin, the
+        // settings fingerprint, and the text. The origin carries the file's
+        // path, because `__curPos` compiles to the name of the file it is
+        // written in and two files in one directory with the same text are two
+        // modules (ENG-12713); for a mounted file it carries the root too, so
+        // the same store spelling compiled once through rootFS and once through
+        // a mounted accessor is two modules with different relative path
+        // constants.
+        match self.compile(text, base, origin) {
+            Ok(compiled) => Ok(compiled),
+            Err(crate::modcache::CacheError::Compile(error)) => Err(match error {
+                crate::compile::CompileError::Unimplemented(w) => VmError::Unimplemented(w),
+                crate::compile::CompileError::UndefinedVariable(n) => {
+                    VmError::eval(format!("undefined variable '{n}'"))
+                }
+                crate::compile::CompileError::Parse(m) => VmError::eval(format!(
+                    "in imported file '{}': {m}",
+                    origin.source_path().unwrap_or("")
+                )),
+                // Not prefixed with the file, unlike a parse error: cppnix
+                // raises these while parsing the import too, but as a plain
+                // `Error` whose message already names the offending path.
+                crate::compile::CompileError::Eval(m) => VmError::eval(m),
+            }),
+            // The cache itself failed under a compile that succeeded or was
+            // never reached: the store's directory refused an I/O, or a row
+            // names an object that is gone. Not turned into a recompile: a
+            // cache that quietly re-performs everything looks exactly like a
+            // cold one, and the session-level compile fails the same way
+            // (`session::compile_failure`).
+            Err(error) => Err(VmError::eval(format!("compile cache: {error}"))),
         }
-        let compiled = crate::compile::compile_source(text, base, origin, &self.settings);
-        let module = Rc::new(compiled.map_err(|e| match e {
-            crate::compile::CompileError::Unimplemented(w) => VmError::Unimplemented(w),
-            crate::compile::CompileError::UndefinedVariable(n) => {
-                VmError::eval(format!("undefined variable '{n}'"))
-            }
-            crate::compile::CompileError::Parse(m) => {
-                VmError::eval(format!("in imported file '{path}': {m}"))
-            }
-            // Not prefixed with the file, unlike a parse error: cppnix raises
-            // these while parsing the import too, but as a plain `Error`
-            // whose message already names the offending path.
-            crate::compile::CompileError::Eval(m) => VmError::eval(m),
-        })?);
-        self.modules.insert(key, module.clone());
-        Ok(module)
     }
 
     /// A cell over the `derivation` wrapper, for the two places cppnix's
@@ -878,7 +1175,8 @@ impl Vm {
         if let Some(slot) = &self.derivation_slot {
             return Ok(slot.clone());
         }
-        let module = self.import_module(DERIVATION_INTERNAL_PATH, DERIVATION_INTERNAL, "/")?;
+        let path = crate::value2::PathValue::ambient(DERIVATION_INTERNAL_PATH);
+        let module = self.import_module(&path, DERIVATION_INTERNAL, "/")?;
         let entry = module.entry;
         let slot = Slot::thunk(module, entry, Rc::new(crate::value2::EnvNode::Root));
         self.derivation_slot = Some(slot.clone());
@@ -894,7 +1192,8 @@ impl Vm {
     /// round trip, and an expression that never mentions a search path should
     /// not pay for one, nor record it in a read set.
     pub fn nix_path_cell(&mut self) -> Result<Slot> {
-        let module = self.import_module(NIX_PATH_GLOBAL_PATH, NIX_PATH_GLOBAL, "/")?;
+        let path = crate::value2::PathValue::ambient(NIX_PATH_GLOBAL_PATH);
+        let module = self.import_module(&path, NIX_PATH_GLOBAL, "/")?;
         let entry = module.entry;
         Ok(Slot::thunk(
             module,
@@ -903,42 +1202,240 @@ impl Vm {
         ))
     }
 
-    /// Add attribute pairs to a set under construction, with cppnix's name
-    /// rules: a `null` name is skipped, anything but a string is a type
-    /// error, and a repeat is "already defined".
-    fn insert_attr_pairs(
+    /// The static attributes of a set under construction: the values
+    /// `MkAttrs` popped, zipped with the attr site's static names, sorted
+    /// once into the map they become.
+    ///
+    /// No string is read and nothing is interned: each module symbol goes
+    /// through the link table, one indexed load after the module's first
+    /// use. Source order is not symbol order, so the pairs are sorted here,
+    /// one `sort_unstable` over `(u32, pointer)` pairs, instead of one
+    /// shifting insert per name. The duplicate check is the compiler's
+    /// ("already defined" is a compile error for static names) repeated as an
+    /// internal invariant, because a site whose names do not match its values
+    /// would land here first; after the sort a repeat is two equal
+    /// neighbours.
+    fn static_attrs(
         &mut self,
-        map: &mut BTreeMap<Sym, Slot>,
+        module: &Rc<Module>,
+        names: &[(u32, u32)],
+        values: Vec<Slot>,
+    ) -> Result<AttrMap> {
+        if names.len() != values.len() {
+            return Err(VmError::eval(format!(
+                "internal: MkAttrs pops {} static values but its site names {}",
+                values.len(),
+                names.len()
+            )));
+        }
+        let mut entries: Vec<(Sym, Slot)> = Vec::with_capacity(names.len());
+        for (&(sym, _), v) in names.iter().zip(values) {
+            entries.push((self.msym(module, sym)?, v));
+        }
+        entries.sort_unstable_by_key(|(k, _)| *k);
+        let repeat = entries.windows(2).find_map(|w| match w {
+            [(a, _), (b, _)] if a == b => Some(*a),
+            _ => None,
+        });
+        if let Some(g) = repeat {
+            return Err(VmError::eval(format!(
+                "attribute '{}' already defined",
+                self.sym_name(g)
+            )));
+        }
+        Ok(AttrMap::from_sorted(entries))
+    }
+
+    /// Add the dynamic (name, value) pairs to a set under construction, with
+    /// cppnix's name rules: a `null` name is skipped, anything but a string
+    /// is a type error, and a repeat is "already defined". Returns where each
+    /// name that landed was written, for the set's dynamic origin.
+    fn insert_dynamic_attrs(
+        &mut self,
+        map: &mut AttrMap,
         pairs: Vec<(Value, Slot)>,
-    ) -> Result<()> {
-        for (k, v) in pairs {
+        dynamic_names: &[(u32, u32)],
+    ) -> Result<Vec<(Sym, u32)>> {
+        if pairs.len() != dynamic_names.len() {
+            return Err(VmError::eval(format!(
+                "internal: {} dynamic attribute pairs but the site names {}",
+                pairs.len(),
+                dynamic_names.len()
+            )));
+        }
+        let mut positions = Vec::with_capacity(dynamic_names.len());
+        for (pair_index, ((k, v), &(site_pair, pos))) in
+            pairs.into_iter().zip(dynamic_names).enumerate()
+        {
+            if usize::try_from(site_pair) != Ok(pair_index) {
+                return Err(VmError::eval(
+                    "internal: dynamic attribute site is not in pair order",
+                ));
+            }
             // cppnix skips a dynamic binding whose name evaluates to null, so
             // `{ ${null} = true; }` is the empty set rather than an error.
             if matches!(k, Value::Null) {
                 continue;
             }
-            let name = match k {
-                Value::Str(s) => {
-                    // eval.cc:1434, "while evaluating the name of a dynamic
-                    // attribute": same refusal as the select path, different
-                    // expression.
-                    crate::primops_pure::refuse_context(&s)?;
-                    crate::primops_pure::text_of(&s)?.to_owned()
-                }
-                other => {
-                    return Err(VmError::eval(format!(
-                        "expected a string but found {}: {other}",
-                        type_name(&other)
-                    )));
-                }
+            let Value::Str(s) = &k else {
+                return Err(VmError::eval(format!(
+                    "expected a string but found {}: {k}",
+                    type_name(&k)
+                )));
             };
+            // eval.cc:1434, "while evaluating the name of a dynamic
+            // attribute": same refusal as the select path, different
+            // expression.
+            crate::primops_pure::refuse_context(s)?;
+            // Borrowed, not copied: the interner allocates on a miss only.
+            let name = crate::primops_pure::text_of(s)?;
             crate::perf::note_attr_name_intern();
-            let sym = self.intern(&name);
+            let sym = self.intern(name);
             if map.insert(sym, v).is_some() {
                 return Err(VmError::eval(format!("attribute '{name}' already defined")));
             }
+            positions.push((sym, pos));
         }
-        Ok(())
+        Ok(positions)
+    }
+
+    fn dynamic_attr_origin(
+        &mut self,
+        module: &Rc<Module>,
+        site: &crate::ir::AttrSite,
+        positions: Vec<(Sym, u32)>,
+        fallback: Option<AttrOrigin>,
+    ) -> Result<AttrOrigin> {
+        if site.dynamic_names().is_empty() {
+            return Err(VmError::eval(
+                "internal: dynamic MkAttrs has no runtime pair site",
+            ));
+        }
+        AttrOrigin::dynamic(Rc::clone(module), positions.into_boxed_slice(), fallback)
+            .ok_or_else(|| VmError::eval("too many live dynamic attribute origins"))
+    }
+
+    pub(crate) fn static_attr_origin(&self, module: &Rc<Module>, unit: u32, ip: u32) -> AttrOrigin {
+        AttrOrigin {
+            module: Rc::clone(module),
+            unit,
+            ip,
+        }
+    }
+
+    pub(crate) fn attr_origin_position(
+        &self,
+        origin: &AttrOrigin,
+        name: &str,
+        sym: Sym,
+    ) -> Option<crate::value2::AttrPosition> {
+        origin.position_of(name, sym)
+    }
+
+    /// Flatten the positions selected by `left // right` into one projected
+    /// origin. The sorted two-pointer walk makes the same choice as the value
+    /// merge: right wins equality, and left supplies names right lacks.
+    fn projected_update_origin(
+        &self,
+        owner: &Rc<Module>,
+        left: &crate::value2::Attrs,
+        right: &crate::value2::Attrs,
+    ) -> Result<Option<AttrOrigin>> {
+        if left.is_empty() {
+            return Ok(right.origin.clone());
+        }
+        if right.is_empty() {
+            return Ok(left.origin.clone());
+        }
+        // The names left supplies are the ones right lacks; right supplies
+        // all of its own. Each side is then resolved as one sorted run, so a
+        // projected side (the accumulator of a fold) answers in a single
+        // linear walk, and the two runs are disjoint and merge back into one
+        // sorted projection.
+        let mut left_only: Vec<Sym> = Vec::with_capacity(left.len());
+        let mut left_entries = left.keys().copied().peekable();
+        let mut right_entries = right.keys().copied().peekable();
+        while let (Some(&left_sym), Some(&right_sym)) = (left_entries.peek(), right_entries.peek())
+        {
+            match left_sym.cmp(&right_sym) {
+                std::cmp::Ordering::Less => {
+                    left_only.push(left_sym);
+                    left_entries.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    right_entries.next();
+                }
+                std::cmp::Ordering::Equal => {
+                    left_entries.next();
+                    right_entries.next();
+                }
+            }
+        }
+        left_only.extend(left_entries);
+        let right_all: Vec<Sym> = right.keys().copied().collect();
+        let mut lefts = Vec::with_capacity(left_only.len());
+        if let Some(origin) = left.origin.as_ref() {
+            origin.positions_of(&left_only, |sym| self.sym_name(sym), &mut lefts);
+        }
+        let mut rights = Vec::with_capacity(right_all.len());
+        if let Some(origin) = right.origin.as_ref() {
+            origin.positions_of(&right_all, |sym| self.sym_name(sym), &mut rights);
+        }
+        if lefts.is_empty() && rights.is_empty() {
+            return Ok(None);
+        }
+        let mut positions = Vec::with_capacity(lefts.len().saturating_add(rights.len()));
+        let mut lefts = lefts.into_iter().peekable();
+        let mut rights = rights.into_iter().peekable();
+        while let (Some(l), Some(r)) = (lefts.peek(), rights.peek()) {
+            let next = if l.sym() < r.sym() {
+                lefts.next()
+            } else {
+                rights.next()
+            };
+            positions.extend(next);
+        }
+        positions.extend(lefts);
+        positions.extend(rights);
+        let origin = AttrOrigin::projected(Rc::clone(owner), positions.into_boxed_slice())
+            .ok_or_else(|| VmError::eval("too many live projected attribute origins"))?;
+        Ok(Some(origin))
+    }
+
+    /// Every module this VM can still see: its import memo, plus the modules
+    /// it was started on that something still holds (a value handle keeps
+    /// its module alive through the origins it names). Weak on purpose: a
+    /// started module nothing holds is gone, and a probe that kept it alive
+    /// would hide exactly the leak it exists to catch.
+    #[cfg(test)]
+    fn probed_modules(&self) -> Vec<Rc<Module>> {
+        let mut all: Vec<Rc<Module>> = self.modules.loaded().cloned().collect();
+        for started in self
+            .started_modules
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+        {
+            if !all.iter().any(|known| Rc::ptr_eq(known, &started)) {
+                all.push(started);
+            }
+        }
+        all
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_dynamic_attr_origins(&self) -> usize {
+        self.probed_modules()
+            .iter()
+            .map(|module| module.dynamic_attr_origins.live_len())
+            .sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dynamic_attr_origin_slots(&self) -> usize {
+        self.probed_modules()
+            .iter()
+            .map(|module| module.dynamic_attr_origins.slot_len())
+            .sum()
     }
 
     pub fn intern(&mut self, s: &str) -> Sym {
@@ -964,13 +1461,25 @@ impl Vm {
     }
 
     /// Map a module-local symbol to the global interner.
+    ///
+    /// An indexed load from the module's link table once this VM has linked
+    /// the module; the first name it needs links every symbol at once (one
+    /// intern each, and an intern only allocates on a miss). See
+    /// [`crate::value2::LinkedSymbols`] for why the table is per VM.
     fn msym(&mut self, module: &Module, sym: u32) -> Result<Sym> {
-        let name = module
+        if let Some(global) = module.linked.get(self.id, sym) {
+            return Ok(global);
+        }
+        let table: Box<[Sym]> = module
             .symbols
-            .get(sym as usize)
-            .ok_or_else(|| VmError::eval("internal: bad symbol index"))?
-            .clone();
-        Ok(self.intern(&name))
+            .iter()
+            .map(|name| self.intern(name))
+            .collect();
+        module.linked.set(self.id, table);
+        module
+            .linked
+            .get(self.id, sym)
+            .ok_or_else(|| VmError::eval("internal: bad symbol index"))
     }
 
     // -- scheduler surface -------------------------------------------------
@@ -978,6 +1487,15 @@ impl Vm {
     /// Seed the machine with a module's entry unit.
     pub fn start_module(&mut self, module: &Rc<Module>) {
         self.reset();
+        #[cfg(test)]
+        if !self
+            .started_modules
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .any(|seen| Rc::ptr_eq(&seen, module))
+        {
+            self.started_modules.push(Rc::downgrade(module));
+        }
         let env: Env = Rc::new(EnvNode::Root);
         self.push_unit(module.clone(), module.entry, env);
     }
@@ -996,7 +1514,15 @@ impl Vm {
     /// second driver for each.
     pub fn start_task(&mut self, task: Task) {
         self.reset();
-        self.cur.frames.push(Frame::Task(task));
+        self.push_task(task);
+    }
+
+    /// The one place a fresh task becomes a frame: boxed here, once, and moved
+    /// as one word from then on. A task that already lives in a `Box` (a
+    /// continuation being re-queued, a sub-task from [`Yield::Sub`]) goes back
+    /// on the stack in the box it arrived in, never through here.
+    fn push_task(&mut self, task: Task) {
+        self.cur.frames.push(Frame::Task(Box::new(task)));
     }
 
     /// Seed the machine with forcing one slot. The result is that slot's
@@ -1579,9 +2105,7 @@ impl Vm {
                     slot: f.slot.clone(),
                     entered: true,
                 }));
-                self.cur
-                    .frames
-                    .push(Frame::Task(Task::apply_chain(func, args)));
+                self.push_task(Task::apply_chain(func, args));
                 self.cur.flow = Flow::Advance;
                 Ok(())
             }
@@ -1592,19 +2116,18 @@ impl Vm {
         match &a.f {
             Value::Closure(c) => {
                 let c = c.clone();
-                let param = c
+                let unit = c
                     .module
                     .units
                     .get(c.unit as usize)
-                    .ok_or_else(|| VmError::eval("internal: bad closure unit"))?
-                    .param
-                    .clone();
-                match param {
+                    .ok_or_else(|| VmError::eval("internal: bad closure unit"))?;
+                // Borrowed through the closure's own `Rc<Module>`, not cloned:
+                // the `Param` carries the formals `Vec`, and cloning it once
+                // per application was one allocation per call before any
+                // argument was looked at.
+                match &unit.param {
                     Some(Param::Ident(_)) => {
-                        let frame: Env = Rc::new(EnvNode::Frame {
-                            up: c.env.clone(),
-                            slots: RefCell::new(vec![a.arg.clone()]),
-                        });
+                        let frame = EnvNode::frame(c.env.clone(), vec![a.arg.clone()]);
                         self.push_call_unit(c.module.clone(), c.unit, frame)?;
                         self.cur.flow = Flow::Advance;
                         Ok(())
@@ -1636,32 +2159,35 @@ impl Vm {
                             }
                         };
                         // Slot order: fields in declaration order, then @.
-                        let frame: Env = Rc::new(EnvNode::Frame {
-                            up: c.env.clone(),
-                            slots: RefCell::new(Vec::new()),
-                        });
-                        let mut slots = Vec::new();
-                        for formal in &fields {
-                            let default_unit = &formal.default;
-                            let name = c
-                                .module
-                                .symbols
-                                .get(formal.sym as usize)
-                                .cloned()
-                                .unwrap_or_default();
-                            crate::perf::note_formal_name_intern();
-                            let g = self.intern(&name);
+                        // Built empty and filled below: a default's thunk
+                        // captures the frame it will be looked up in.
+                        let frame = EnvNode::frame(c.env.clone(), Vec::new());
+                        // A formal's name is a module symbol, and the link
+                        // table maps it to this VM's numbering with one
+                        // indexed load (`msym`), the path `Op::Select` takes.
+                        // Until 2026-09-04 this cloned the name `String` and
+                        // re-interned it on every call: 50.7M interns on a
+                        // NixOS toplevel, most of them here and in `MkAttrs`.
+                        let mut slots =
+                            Vec::with_capacity(fields.len() + usize::from(bind.is_some()));
+                        let mut matched = 0usize;
+                        for formal in fields {
+                            let g = self.msym(&c.module, formal.sym)?;
                             match map.get(&g) {
-                                Some(s) => slots.push(s.clone()),
-                                None => match default_unit {
-                                    Some(unit) => slots.push(Slot::thunk(
+                                Some(s) => {
+                                    matched += 1;
+                                    slots.push(s.clone());
+                                }
+                                None => match formal.default {
+                                    Some(default_unit) => slots.push(Slot::thunk(
                                         c.module.clone(),
-                                        *unit,
+                                        default_unit,
                                         frame.clone(),
                                     )),
                                     None => {
                                         return Err(VmError::eval(format!(
-                                            "function called without required argument '{name}'"
+                                            "function called without required argument '{}'",
+                                            self.sym_name(g)
                                         )));
                                     }
                                 },
@@ -1670,23 +2196,32 @@ impl Vm {
                         if bind.is_some() {
                             slots.push(a.arg.clone());
                         }
-                        if !ellipsis {
+                        // cppnix (`callFunction`, `attrsUsed != args.size()`):
+                        // every argument matched a formal iff the counts
+                        // agree, so the search for the unexpected one runs
+                        // only on the failing call. Formal names are distinct
+                        // (the parser rejects `{ a, a }`), so no argument
+                        // matches twice.
+                        if !*ellipsis && matched != map.len() {
+                            // Symbols against symbols; the text compare this
+                            // replaces allocated the key's name per argument.
                             for k in map.keys() {
-                                let name = self.sym_name(*k).to_owned();
-                                let known = fields.iter().any(|f| {
-                                    c.module.symbols.get(f.sym as usize).map(String::as_str)
-                                        == Some(name.as_str())
-                                });
+                                let mut known = false;
+                                for formal in fields {
+                                    if self.msym(&c.module, formal.sym)? == *k {
+                                        known = true;
+                                        break;
+                                    }
+                                }
                                 if !known {
                                     return Err(VmError::eval(format!(
-                                        "function called with unexpected argument '{name}'"
+                                        "function called with unexpected argument '{}'",
+                                        self.sym_name(*k)
                                     )));
                                 }
                             }
                         }
-                        if let EnvNode::Frame { slots: fslots, .. } = &*frame {
-                            *fslots.borrow_mut() = slots;
-                        }
+                        EnvNode::fill(&frame, slots)?;
                         self.push_call_unit(c.module.clone(), c.unit, frame)?;
                         self.cur.flow = Flow::Advance;
                         Ok(())
@@ -1705,9 +2240,7 @@ impl Vm {
                     self.cur.flow =
                         Flow::Deliver(Value::Builtin(Rc::new(BuiltinData { idx: b.idx, args })));
                 } else {
-                    self.cur
-                        .frames
-                        .push(Frame::Task(Task::builtin(b.idx, args)));
+                    self.push_task(Task::builtin(b.idx, args));
                     self.cur.flow = Flow::Advance;
                 }
                 Ok(())
@@ -1727,7 +2260,7 @@ impl Vm {
                             functor.clone(),
                             a.arg.clone(),
                         ));
-                        self.cur.frames.push(Frame::Task(task));
+                        self.push_task(task);
                         self.cur.flow = Flow::Advance;
                         Ok(())
                     }
@@ -1744,7 +2277,7 @@ impl Vm {
         }
     }
 
-    fn advance_task(&mut self, t: Task, incoming: Option<Value>) -> Result<()> {
+    fn advance_task(&mut self, t: Box<Task>, incoming: Option<Value>) -> Result<()> {
         match self.advance_task_step(t, incoming)? {
             None => Ok(()),
             Some(need) => {
@@ -1758,7 +2291,7 @@ impl Vm {
     /// it into the `Step` that leaves `poll`.
     fn advance_task_step(
         &mut self,
-        mut t: Task,
+        mut t: Box<Task>,
         incoming: Option<Value>,
     ) -> Result<Option<NeedPath>> {
         let y = match t.step(self, incoming) {
@@ -1907,7 +2440,7 @@ impl Vm {
 
     fn yield_task(&mut self, u: UnitFrame, t: Task) -> Result<()> {
         self.cur.frames.push(Frame::Unit(u));
-        self.cur.frames.push(Frame::Task(t));
+        self.push_task(t);
         self.cur.flow = Flow::Advance;
         Ok(())
     }
@@ -2009,13 +2542,6 @@ impl Vm {
                     u.ip += 1;
                     return self.yield_task(u, Task::NixPath);
                 }
-                Op::UnimplementedGlobal { sym } => {
-                    let g = self.msym(&u.module, sym)?;
-                    return Err(VmError::Unimplemented(Refusal::new(
-                        RefusalToken::UnimplementedBuiltin,
-                        format!("global {}", self.sym_name(g)),
-                    )));
-                }
                 Op::Thunk { unit } => {
                     u.stack.push(StackEntry::Lazy(Slot::thunk(
                         u.module.clone(),
@@ -2059,17 +2585,12 @@ impl Vm {
                     // bodies need self-reference. compile_bindings compiled
                     // value thunks inside the new scope, so re-point them at
                     // the new frame.
-                    let frame: Env = Rc::new(EnvNode::Frame {
-                        up: u.env.clone(),
-                        slots: RefCell::new(Vec::new()),
-                    });
+                    let frame = EnvNode::frame(u.env.clone(), Vec::new());
                     let repointed: Vec<Slot> = slots
                         .into_iter()
                         .map(|s| repoint_thunk(&s, &frame))
                         .collect();
-                    if let EnvNode::Frame { slots, .. } = &*frame {
-                        *slots.borrow_mut() = repointed;
-                    }
+                    EnvNode::fill(&frame, repointed)?;
                     u.env = frame;
                     u.ip += 1;
                 }
@@ -2295,6 +2816,11 @@ impl Vm {
                         parts.push(pop_value(&mut u.stack)?);
                     }
                     parts.reverse();
+                    if !matches!(parts.first(), Some(Value::Path(_))) {
+                        return Err(VmError::eval(
+                            "path concatenation did not start with a path",
+                        ));
+                    }
                     let mut out = String::new();
                     for part in &parts {
                         // cppnix collects the context of every part and
@@ -2315,18 +2841,14 @@ impl Vm {
                     // cppnix's per-part `canonicalizePath = !first` reaches
                     // only a path value in a later position, and every path
                     // this evaluator holds is already normalized.
-                    u.stack.push(StackEntry::Val(Value::Path(
-                        crate::value2::normalize_path(&out).into(),
-                    )));
+                    u.stack.push(StackEntry::Val(Value::Path(Rc::new(
+                        crate::value2::PathValue::normalized(crate::value2::Root::Ambient, &out),
+                    ))));
                     u.ip += 1;
                 }
                 Op::MkList { n } => {
-                    let mut items = Vec::with_capacity(n as usize);
-                    for _ in 0..n {
-                        items.push(pop_slot(&mut u.stack)?);
-                    }
-                    items.reverse();
-                    u.stack.push(StackEntry::Val(Value::List(Rc::new(items))));
+                    let items = pop_slots(&mut u.stack, n)?;
+                    u.stack.push(StackEntry::Val(Value::list(items)));
                     u.ip += 1;
                 }
                 Op::ConcatLists => {
@@ -2339,7 +2861,7 @@ impl Vm {
                         (Value::List(a), Value::List(b)) => {
                             let mut out = (*a).clone();
                             out.extend(b.iter().cloned());
-                            u.stack.push(StackEntry::Val(Value::List(Rc::new(out))));
+                            u.stack.push(StackEntry::Val(Value::list(out)));
                         }
                         (l, _) => {
                             return Err(VmError::eval(format!(
@@ -2350,23 +2872,44 @@ impl Vm {
                     }
                     u.ip += 1;
                 }
-                Op::MkAttrs { n, .. } => {
-                    // Names are strict, values stay lazy: forcing a value here
-                    // would make `{ a = throw "x"; } ? a` throw.
-                    if let Some(s) = strict_names(&mut u, n) {
+                Op::MkAttrs { statics, dynamics } => {
+                    // Dynamic names are strict, values stay lazy: forcing a
+                    // value here would make `{ a = throw "x"; } ? a` throw.
+                    if let Some(s) = strict_names(&mut u, dynamics) {
                         return self.yield_force(u, s);
                     }
-                    let mut map = BTreeMap::new();
-                    let pairs = pop_attr_pairs(&mut u.stack, n)?;
-                    self.insert_attr_pairs(&mut map, pairs)?;
-                    // Where the set was written, for `unsafeGetAttrPos`.
-                    // Two `u32` copies and one refcount bump; the names and
-                    // their offsets are already in the module, and nothing
-                    // reads them unless someone asks.
-                    let origin = crate::value2::AttrOrigin {
-                        module: Rc::clone(&u.module),
-                        unit: u.unit,
-                        ip: u32::try_from(u.ip).unwrap_or(u32::MAX),
+                    let ip = u32::try_from(u.ip).map_err(|_| {
+                        VmError::eval(
+                            "internal: instruction index does not fit below AttrOrigin::FORMALS",
+                        )
+                    })?;
+                    let pairs = pop_attr_pairs(&mut u.stack, dynamics)?;
+                    let values = pop_slots(&mut u.stack, statics)?;
+                    // Where the set was written, for `unsafeGetAttrPos`: a
+                    // static set's origin is two `u32`s and one refcount; a
+                    // dynamic set puts only its now-known dynamic names in a
+                    // reclaiming slab slot and falls back to the compiled
+                    // static site for the others. `{}` has no site
+                    // (`Emit::attr_site` files nothing for it); every set
+                    // that builds something has one.
+                    let (map, origin) = if statics > 0 || dynamics > 0 {
+                        let site = attr_site(&u.module, u.unit, ip)?;
+                        let mut map = self.static_attrs(&u.module, site.static_names(), values)?;
+                        let origin = if dynamics > 0 {
+                            let positions =
+                                self.insert_dynamic_attrs(&mut map, pairs, site.dynamic_names())?;
+                            let fallback = (statics > 0)
+                                .then(|| self.static_attr_origin(&u.module, u.unit, ip));
+                            self.dynamic_attr_origin(&u.module, site, positions, fallback)?
+                        } else {
+                            self.static_attr_origin(&u.module, u.unit, ip)
+                        };
+                        (map, origin)
+                    } else {
+                        (
+                            AttrMap::new(),
+                            self.static_attr_origin(&u.module, u.unit, ip),
+                        )
                     };
                     u.stack.push(StackEntry::Val(Value::Attrs(Rc::new(
                         crate::value2::Attrs::at(map, origin),
@@ -2391,20 +2934,28 @@ impl Vm {
                             type_name(&base)
                         )));
                     };
-                    let mut map = (*base).clone();
-                    self.insert_attr_pairs(&mut map, pairs)?;
-                    // The dynamic names this op adds were written HERE, so the
-                    // result takes this site rather than the base's: the base
-                    // arrived through `Update`, which already gave the set the
-                    // right operand's origin, and an attribute the base alone
-                    // has falls out of `offset_of` as `None` rather than as a
-                    // wrong line.
-                    map.origin = Some(crate::value2::AttrOrigin {
-                        module: Rc::clone(&u.module),
-                        unit: u.unit,
-                        ip: u32::try_from(u.ip).unwrap_or(u32::MAX),
-                    });
-                    u.stack.push(StackEntry::Val(Value::Attrs(Rc::new(map))));
+                    // The map is copied and extended, and the set is built
+                    // once from the result, so the census sees one set at its
+                    // final width rather than a clone of the base plus
+                    // uncounted appends.
+                    let mut map = (**base).clone();
+                    let ip = u32::try_from(u.ip).map_err(|_| {
+                        VmError::eval(
+                            "internal: instruction index does not fit below AttrOrigin::FORMALS",
+                        )
+                    })?;
+                    let site = attr_site(&u.module, u.unit, ip)?;
+                    let positions =
+                        self.insert_dynamic_attrs(&mut map, pairs, site.dynamic_names())?;
+                    // The dynamic names this op adds were written here. Names
+                    // it did not add keep the post-`Update` base origin, so an
+                    // override position remains available after appending a
+                    // dynamic binding.
+                    let fallback = base.origin.clone();
+                    let origin = self.dynamic_attr_origin(&u.module, site, positions, fallback)?;
+                    u.stack.push(StackEntry::Val(Value::Attrs(Rc::new(
+                        crate::value2::Attrs::at(map, origin),
+                    ))));
                     u.ip += 1;
                 }
                 Op::Update => {
@@ -2415,20 +2966,13 @@ impl Vm {
                     let l = pop_value(&mut u.stack)?;
                     match (l, r) {
                         (Value::Attrs(a), Value::Attrs(b)) => {
-                            let mut out = (*a).clone();
-                            for (k, v) in b.iter() {
-                                out.insert(*k, v.clone());
-                            }
-                            // The RIGHT operand's origin, not the left's.
-                            // `//` takes the right's value wherever both have
-                            // a name, so every name the right's site lists
-                            // and the result still has came from the right;
-                            // a name only the left had is absent from that
-                            // site and answers `null`. Keeping the left's
-                            // instead would report a real line of a real file
-                            // for an attribute that came from the right one,
-                            // and nothing downstream could tell.
-                            out.origin = b.origin.clone();
+                            // One flat `(name, position)` projection for the
+                            // result, so a `//` fold never retains a chain of
+                            // prior result origins; the bindings are one merge
+                            // pass over two sorted maps.
+                            let origin = self.projected_update_origin(&u.module, &a, &b)?;
+                            let mut out = crate::value2::Attrs::new(a.update(&b));
+                            out.origin = origin;
                             u.stack.push(StackEntry::Val(Value::Attrs(Rc::new(out))));
                         }
                         (l, r) => {
@@ -2619,9 +3163,10 @@ impl Vm {
                     refuse_context_under_a_path(&r)?;
                     let b = coerce_interpolated(&r)?;
                     let b = crate::primops_pure::text_of_bytes(&b)?;
-                    return Ok(Value::Path(
-                        crate::value2::normalize_path(&format!("{a}{b}")).into(),
-                    ));
+                    return Ok(Value::Path(Rc::new(crate::value2::PathValue::normalized(
+                        crate::value2::Root::Ambient,
+                        &format!("{a}{b}"),
+                    ))));
                 }
                 // Only a number on the left is arithmetic. cppnix reaches
                 // `coerceToString` for everything else and refuses there, with
@@ -2730,11 +3275,11 @@ fn strict_gap(u: &mut UnitFrame, k: usize) -> Option<Slot> {
 ///
 /// Leftmost first because that is the order cppnix coerces the parts in, so
 /// two unwritable paths in one string report the same one on both arms.
-fn store_copy_gap(u: &mut UnitFrame, k: usize) -> Option<String> {
+fn store_copy_gap(u: &mut UnitFrame, k: usize) -> Option<Rc<crate::value2::PathValue>> {
     let base = u.stack.len().checked_sub(k)?;
     for i in base..u.stack.len() {
         if let Some(StackEntry::Val(Value::Path(p))) = u.stack.get(i) {
-            let p = p.to_string();
+            let p = Rc::clone(p);
             u.dest = Dest::Stack(i);
             return Some(p);
         }
@@ -2840,7 +3385,7 @@ fn demote_path_to_string(u: &mut UnitFrame) {
     }
 }
 
-fn store_copy_after_string(u: &mut UnitFrame) -> Option<String> {
+fn store_copy_after_string(u: &mut UnitFrame) -> Option<Rc<crate::value2::PathValue>> {
     let top = u.stack.len().checked_sub(1)?;
     let StackEntry::Val(Value::Str(_)) = u.stack.get(top.checked_sub(1)?)? else {
         return None;
@@ -2848,7 +3393,7 @@ fn store_copy_after_string(u: &mut UnitFrame) -> Option<String> {
     let StackEntry::Val(Value::Path(p)) = u.stack.get(top)? else {
         return None;
     };
-    let p = p.to_string();
+    let p = Rc::clone(p);
     u.dest = Dest::Stack(top);
     Some(p)
 }
@@ -2864,7 +3409,36 @@ fn strict_at(u: &mut UnitFrame, off: usize) -> Option<Slot> {
     Some(s)
 }
 
-/// The `n` (name, value) pairs on top of the stack, in source order.
+/// The attribute-position site for one set-building op.
+fn attr_site(module: &Module, unit: u32, ip: u32) -> Result<&crate::ir::AttrSite> {
+    module
+        .units
+        .get(unit as usize)
+        .and_then(|unit| {
+            unit.attr_sites
+                .binary_search_by_key(&ip, |site| site.ip)
+                .ok()
+                .and_then(|i| unit.attr_sites.get(i))
+        })
+        .ok_or_else(|| {
+            VmError::eval(format!(
+                "internal: set-building op at unit {unit} ip {ip} has no attribute site"
+            ))
+        })
+}
+
+/// The `n` values on top of the stack, in push order: a list's items, or a
+/// set's static values (whose names are in its attr site, same order).
+fn pop_slots(stack: &mut Vec<StackEntry>, n: u16) -> Result<Vec<Slot>> {
+    let mut slots = Vec::with_capacity(usize::from(n));
+    for _ in 0..n {
+        slots.push(pop_slot(stack)?);
+    }
+    slots.reverse();
+    Ok(slots)
+}
+
+/// The `n` dynamic (name, value) pairs on top of the stack, in source order.
 ///
 /// Shared by `MkAttrs` and `MkAttrsOnto` so the two cannot drift about what a
 /// pair is; the ONLY difference between them is what map the pairs land in.
@@ -2879,8 +3453,9 @@ fn pop_attr_pairs(stack: &mut Vec<StackEntry>, n: u16) -> Result<Vec<(Value, Slo
     Ok(pairs)
 }
 
-/// The attribute-name half of the `n` (name, value) pairs `MkAttrs` consumes,
-/// topmost pair first (the order the op pops them in).
+/// The attribute-name half of the `n` dynamic (name, value) pairs on top of
+/// the stack, topmost pair first (the order `MkAttrs` and `MkAttrsOnto` pop
+/// them in). Static names are not on the stack and have nothing to force.
 fn strict_names(u: &mut UnitFrame, n: u16) -> Option<Slot> {
     for j in 0..usize::from(n) {
         if let Some(s) = strict_at(u, 2 + 2 * j) {
@@ -3005,11 +3580,15 @@ fn entry_value(u: &UnitFrame, off: usize) -> Result<Value> {
     }
 }
 
+/// Walks the chain by reference: the version before this cloned the `Rc` at
+/// every hop, two refcount writes per hop per variable read, on a path the
+/// profile put at 1.5% of the edit run before any of the slot's own work
+/// (dev-compute-4, 2026-09-04). Only the slot found is cloned.
 fn lookup_local(env: &Env, depth: u16, slot: u16) -> Result<Slot> {
-    let mut node = env.clone();
+    let mut node: &EnvNode = env;
     let mut d = depth;
     loop {
-        match &*node {
+        match node {
             EnvNode::Frame { up, slots } => {
                 if d == 0 {
                     return slots
@@ -3019,14 +3598,14 @@ fn lookup_local(env: &Env, depth: u16, slot: u16) -> Result<Slot> {
                         .ok_or_else(|| VmError::eval("internal: bad local slot"));
                 }
                 d -= 1;
-                node = up.clone();
+                node = &**up;
             }
             EnvNode::With { up, .. } => {
                 if d == 0 {
                     return Err(VmError::eval("internal: local depth hit with-scope"));
                 }
                 d -= 1;
-                node = up.clone();
+                node = &**up;
             }
             EnvNode::Root => return Err(VmError::eval("internal: local depth underflow")),
         }
@@ -3050,7 +3629,7 @@ fn const_value(c: &Const) -> Value {
         Const::Bool(b) => Value::Bool(*b),
         Const::Null => Value::Null,
         Const::Str(s) => Value::Str(s.clone().into()),
-        Const::Path(p) => Value::Path(p.clone().into()),
+        Const::Path(path) => Value::Path(Rc::new(path.clone())),
     }
 }
 
@@ -3058,6 +3637,36 @@ fn const_value(c: &Const) -> Value {
 mod tests {
     use super::*;
     use crate::ir::CodeUnit;
+
+    /// `Task` is the fat state machine. Boxing it keeps every hot move
+    /// (`advance`/`deliver` pop a `Frame`, `advance_task_step` pushes it back,
+    /// every `Task::step` returns a `Yield`) at the size of the small
+    /// variants. Relative bounds, not constants: the property is "no bigger
+    /// than the variants that must be inline", whatever those measure.
+    #[test]
+    fn frames_and_yields_are_not_task_sized() {
+        use std::mem::{align_of, size_of};
+        let task = size_of::<Task>();
+        let (frame, unit) = (size_of::<Frame>(), size_of::<UnitFrame>());
+        assert!(
+            frame < task,
+            "Frame is {frame} bytes, Task {task}: a Task rides inline"
+        );
+        assert!(
+            frame <= unit + align_of::<Frame>(),
+            "Frame is {frame} bytes, UnitFrame {unit}: more than a tag's worth of slack"
+        );
+        let yld = size_of::<crate::task::Yield>();
+        let largest = size_of::<(Value, Slot)>().max(size_of::<crate::task::NeedPath>());
+        assert!(
+            yld < task,
+            "Yield is {yld} bytes, Task {task}: a Task rides inline"
+        );
+        assert!(
+            yld <= largest + align_of::<crate::task::Yield>(),
+            "Yield is {yld} bytes, its largest non-task variant {largest}: more than a tag's worth of slack"
+        );
+    }
 
     /// Evaluate `src` with an explicit call-depth ceiling, bypassing the
     /// process-global in `eval.rs` so these tests stay independent of each
@@ -3085,50 +3694,205 @@ mod tests {
         }
     }
 
+    /// A repeated `//` owns one flat projection for the accumulator. While an
+    /// update is replacing it, only the old and new slots may coexist; after
+    /// the returned accumulator drops, neither may remain live.
+    #[test]
+    fn an_update_fold_keeps_bounded_projected_origin_storage() -> std::result::Result<(), String> {
+        const ATTRIBUTE_COUNT: usize = 64;
+        const UPDATE_COUNT: usize = 512;
+
+        let bindings = (0..ATTRIBUTE_COUNT)
+            .map(|index| format!("a{index} = {index};"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let source = format!(
+            "let initial = {{ {bindings} }}; rhs = {{ a0 = 999; }}; \
+             in builtins.foldl' \
+             (acc: ignored: acc // rhs) initial \
+             (builtins.genList (ignored: null) {UPDATE_COUNT})"
+        );
+        let mut vm = Vm::with_settings(crate::eval::Settings::default());
+        let module = vm
+            .import_module(
+                &crate::value2::ambient_path("/positions/bounded-fold.nix"),
+                &source,
+                "/positions",
+            )
+            .map_err(|error| format!("compile failed: {error:?}"))?;
+        vm.start_module(&module);
+        let value = crate::eval::drive(&mut vm, &crate::host::RealFs)
+            .map_err(|error| format!("evaluation failed: {error:?}"))?;
+
+        assert_eq!(
+            vm.live_dynamic_attr_origins(),
+            1,
+            "only the returned accumulator should retain a projected origin"
+        );
+        assert!(
+            vm.dynamic_attr_origin_slots() <= 2,
+            "a flat fold used {} slab slots for {UPDATE_COUNT} updates",
+            vm.dynamic_attr_origin_slots()
+        );
+
+        let Value::Attrs(attrs) = &value else {
+            return Err(format!("fold returned {value:?}, not an attribute set"));
+        };
+        let origin = attrs
+            .origin
+            .as_ref()
+            .ok_or_else(|| "fold accumulator has no projected origin".to_owned())?;
+        for index in [0, ATTRIBUTE_COUNT / 2, ATTRIBUTE_COUNT - 1] {
+            let name = format!("a{index}");
+            let sym = vm.intern(&name);
+            let position = origin
+                .position_of(&name, sym)
+                .ok_or_else(|| format!("no projected position for {name}"))?;
+            let binding = if index == 0 {
+                "a0 = 999".to_owned()
+            } else {
+                format!("{name} = {index}")
+            };
+            let expected = source
+                .find(&binding)
+                .ok_or_else(|| format!("fixture has no binding for {name}"))?;
+            assert_eq!(position.offset as usize, expected, "position for {name}");
+            assert!(
+                Rc::ptr_eq(&position.module, &module),
+                "{name} position belongs to another module"
+            );
+        }
+
+        drop(value);
+        assert_eq!(
+            vm.live_dynamic_attr_origins(),
+            0,
+            "dropping the accumulator did not reclaim its projected origin"
+        );
+        Ok(())
+    }
+
     /// The attribute-name intern counter counts what the VM actually does,
     /// not what a test hands it directly.
     ///
     /// Calling `perf::note_attr_name_intern` in a perf test would prove only
-    /// that a `Cell` increments. This evaluates a real attrset and reads the
-    /// counter afterwards, which is the only thing that ties the number in
-    /// `maintainers/ix/nixos-toplevel-profile.md` to `Op::MkAttrs`.
+    /// that a `Cell` increments. This evaluates real attrsets and reads the
+    /// counter afterwards: building a static set interns no attribute name
+    /// (its names come from the attr site through the link table, which
+    /// interned the module's symbols once when the module was linked, and
+    /// that is not this counter; before, every attribute of every set built
+    /// re-interned its name, 50.7M times on one NixOS toplevel), and a
+    /// dynamic name interns exactly once per set built. The static arm is the
+    /// one that matters and needs its control: the dynamic arm is what proves
+    /// the counter can count at all.
     ///
     /// Serialised against the other counter tests by taking the same lock
     /// they do, because the counters are thread-local but this binary runs
     /// tests on one thread per case and `reset` is global to the thread.
     #[test]
-    fn attribute_names_are_interned_once_per_attribute_built() {
+    fn static_attribute_names_are_not_re_interned_when_a_set_is_built() {
         crate::perf::reset();
         let before = crate::perf::snapshot();
         assert_eq!(before.attr_name_interns, 0, "reset left a residue");
 
-        // Three attributes in the outer set, two in the inner: five names,
-        // and the inner set is built once because the outer is not lazy in
-        // its names.
+        // Static: three attributes in the outer set, two in the inner, a rec
+        // and an inherit, all built (toJSON forces everything).
         let out = eval_at_depth(
-            r#"builtins.toJSON { a = 1; b = 2; c = { d = 3; e = 4; }; }"#,
+            r#"let x = 0; in builtins.toJSON { a = 1; b = 2; c = rec { d = 3; e = d; inherit x; }; }"#,
             100,
         );
         assert!(out.is_ok(), "{out:?}");
-
-        let after = crate::perf::snapshot();
-        if !after.ops_counted {
+        let after_static = crate::perf::snapshot();
+        if !after_static.ops_counted {
             assert_eq!(
-                after.attr_name_interns, 0,
+                after_static.attr_name_interns, 0,
                 "counted without the perf-ops feature"
             );
             return;
         }
         assert_eq!(
-            after.attr_name_interns, 5,
-            "expected one intern per attribute built"
+            after_static.attr_name_interns, 0,
+            "a static set interned an attribute name at run time"
+        );
+
+        // Dynamic control: two run-time names, one intern each, plus the
+        // static sibling that interns nothing.
+        let out = eval_at_depth(
+            r#"let k = "d"; in builtins.toJSON { a = 1; ${k} = 2; ${k + "2"} = 3; }"#,
+            100,
+        );
+        assert!(out.is_ok(), "{out:?}");
+        let after_dynamic = crate::perf::snapshot();
+        assert_eq!(
+            after_dynamic.attr_name_interns, 2,
+            "expected one intern per dynamic attribute built"
         );
         assert!(
-            after.attr_name_interns <= after.interns,
+            after_dynamic.attr_name_interns <= after_dynamic.interns,
             "attr_name_interns ({}) must be a subset of interns ({})",
-            after.attr_name_interns,
-            after.interns
+            after_dynamic.attr_name_interns,
+            after_dynamic.interns
         );
+    }
+
+    /// The VM zips a set's popped values with its attr site's static names by
+    /// POSITION, so the one thing that must hold is that each value lands
+    /// under the name written next to it, for every emitter: a plain set, a
+    /// rec set, `inherit`, `inherit (e)`, `__overrides`, and a mixed dynamic
+    /// set. Names are chosen out of text order (`z` before `a`) so a table
+    /// that was sorted, or reversed, would swap values and fail here.
+    #[test]
+    fn every_set_emitter_lands_each_value_under_its_own_name() {
+        for (src, want) in [
+            (
+                "let x = 9; s = { z = 1; inherit x; a = 2; m = 3; }; in [ s.z s.x s.a s.m ]",
+                "[ 1 9 2 3 ]",
+            ),
+            (
+                "let x = 9; s = rec { z = 1; inherit x; a = z + 1; m = a + 1; }; in [ s.z s.x s.a s.m ]",
+                "[ 1 9 2 3 ]",
+            ),
+            (
+                "let e = { p = 5; q = 6; }; s = { z = 1; inherit (e) q p; a = 2; }; in [ s.z s.q s.p s.a ]",
+                "[ 1 6 5 2 ]",
+            ),
+            (
+                "let s = rec { z = 1; __overrides = { a = 20; n = 7; }; a = 2; m = a + 1; }; in [ s.z s.a s.m s.n ]",
+                "[ 1 20 21 7 ]",
+            ),
+            (
+                "let k = \"d\"; s = { z = 1; ${k} = 4; a = 2; }; in [ s.z s.d s.a ]",
+                "[ 1 4 2 ]",
+            ),
+        ] {
+            let out = eval_at_depth(src, 100);
+            assert_eq!(
+                out.as_deref().map_err(|e| format!("{e:?}")),
+                Ok(want),
+                "{src}"
+            );
+        }
+    }
+
+    /// WriteDrv uniqueness uses the operation a RecordingHost records, not the
+    /// evaluator-only expected path. Changing an actual recorded field must
+    /// still produce a second argument digest.
+    #[test]
+    fn write_drv_uniqueness_matches_the_recording_question() {
+        crate::perf::reset();
+        let mut vm = Vm::with_settings(crate::eval::Settings::default());
+        let question = |expected: &str, aterm: &str| NeedPath::WriteDrv {
+            name: "diagnostic".to_owned(),
+            aterm: aterm.to_owned(),
+            expected: expected.to_owned(),
+        };
+
+        vm.note_question_argument(&question("/nix/store/first.drv", "aterm"));
+        vm.note_question_argument(&question("/nix/store/second.drv", "aterm"));
+        vm.note_question_argument(&question("/nix/store/second.drv", "other-aterm"));
+
+        let expected = if cfg!(feature = "perf") { 2 } else { 0 };
+        assert_eq!(crate::perf::snapshot().write_drv_unique, expected);
     }
 
     /// Evaluate an interpolated path literal as if the file containing it
@@ -3660,7 +4424,7 @@ mod tests {
         ));
         let refused = vm.arith(
             Op::Add,
-            Value::Path("/x".into()),
+            Value::Path(crate::value2::ambient_path("/x")),
             Value::Str(NixStr::with_context(b"/y".as_slice(), context)),
         );
         assert!(
@@ -3674,17 +4438,100 @@ mod tests {
         // `/x/y` for this and for the set spelling below.
         let plain = vm.arith(
             Op::Add,
-            Value::Path("/x".into()),
+            Value::Path(crate::value2::ambient_path("/x")),
             Value::Str(NixStr::from("/y")),
         );
         assert!(
-            matches!(&plain, Ok(Value::Path(p)) if &**p == "/x/y"),
+            matches!(&plain, Ok(Value::Path(p)) if p.path.as_ref() == "/x/y"),
             "want the path /x/y; got: {plain:?}"
         );
         assert_eq!(
             eval_at_depth(r#"/x + { outPath = "/y"; }"#, 1000),
             Ok("/x/y".to_owned())
         );
+    }
+
+    #[test]
+    fn path_addition_rebuilds_under_the_ambient_root() {
+        let mount = "/nix/store/00000000000000000000000000000000-source";
+        let mut vm = Vm::with_settings(crate::eval::Settings::default());
+        let original = Rc::new(crate::value2::PathValue::new(
+            crate::value2::Root::mounted(mount),
+            format!("{mount}/a"),
+        ));
+        let same_spelling = vm
+            .arith(
+                Op::Add,
+                Value::Path(Rc::clone(&original)),
+                Value::Str(NixStr::from("")),
+            )
+            .expect("append empty string");
+        assert!(matches!(
+            same_spelling,
+            Value::Path(path)
+                if path.root == crate::value2::Root::Ambient
+                    && path.path == original.path
+                    && path.as_ref() != original.as_ref()
+        ));
+        let result = vm.arith(
+            Op::Add,
+            Value::Path(Rc::clone(&original)),
+            Value::Str(NixStr::from("/../outside")),
+        );
+        let Ok(Value::Path(path)) = result else {
+            unreachable!("path addition did not return a path")
+        };
+        assert_eq!(path.root, crate::value2::Root::Ambient);
+        assert_eq!(path.as_ref().as_ref(), format!("{mount}/outside"));
+        assert_ne!(
+            original.as_ref(),
+            path.as_ref(),
+            "a mounted p must differ from p + empty-or-string because cppnix rebuilds under rootFS"
+        );
+    }
+
+    #[test]
+    fn interpolated_mounted_path_rebuilds_under_the_ambient_root() {
+        let mount = "/nix/store/00000000000000000000000000000000-source";
+        let source = crate::value2::PathValue::new(
+            crate::value2::Root::mounted(mount),
+            format!("{mount}/module.nix"),
+        );
+        let mut vm = Vm::with_settings(crate::eval::Settings::default());
+        let module = vm
+            .import_module(&source, r#"./${"a/../b"}"#, mount)
+            .expect("compile mounted interpolation");
+        vm.start_module(&module);
+        let value = crate::eval::drive(&mut vm, &crate::host::RealFs)
+            .expect("evaluate mounted interpolation");
+
+        assert!(matches!(
+            value,
+            Value::Path(path)
+                if path.root == crate::value2::Root::Ambient
+                    && path.as_ref().as_ref() == format!("{mount}/b")
+        ));
+    }
+
+    #[test]
+    fn compile_memo_separates_identical_spellings_by_module_root() {
+        let path = "/nix/store/00000000000000000000000000000000-source/m.nix";
+        let mount = "/nix/store/00000000000000000000000000000000-source";
+        let mut vm = Vm::with_settings(crate::eval::Settings::default());
+        let ambient = vm
+            .import_module(&crate::value2::PathValue::ambient(path), "./dep.nix", mount)
+            .expect("compile ambient module");
+        let mounted = vm
+            .import_module(
+                &crate::value2::PathValue::new(crate::value2::Root::mounted(mount), path),
+                "./dep.nix",
+                mount,
+            )
+            .expect("compile mounted module");
+
+        assert!(!Rc::ptr_eq(&ambient, &mounted));
+        assert_eq!(ambient.root, crate::value2::Root::Ambient);
+        assert_eq!(mounted.root, crate::value2::Root::mounted(mount));
     }
 
     /// ENG-12432. This VM holds its frames on the heap, so a self-application
@@ -3761,7 +4608,10 @@ mod tests {
             }],
             entry: 0,
             origin: crate::ir::SrcOrigin::String,
+            root: crate::value2::Root::Ambient,
             line_starts: Vec::new(),
+            dynamic_attr_origins: crate::value2::DynamicAttrOriginSlab::default(),
+            linked: crate::value2::LinkedSymbols::default(),
         });
         let mut vm = Vm::with_settings(crate::eval::Settings::default());
         vm.start_module(&module);

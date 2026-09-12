@@ -6,7 +6,6 @@
 //! in-progress state) the way starship's own `git_*` modules do.
 
 use std::fmt::Write as _;
-use std::time::Duration;
 
 use anstyle::{AnsiColor, Reset, Style};
 
@@ -54,22 +53,21 @@ impl Segment {
     }
 }
 
-/// How stale a view's survey record may be before the segment says so. Under
-/// this, the counts are effectively now and the vintage is noise; over it, the
-/// vintage is the most important thing about them.
-const SURVEY_FRESH: Duration = Duration::from_mins(15);
-
-/// `on 󱗆 ykosps main⇕⇡10⇣97 * ix⇣241·8h`: the working-copy change id, the
-/// local bookmark naming it, where it stands against trunk, the state flags,
-/// and the view it sits in with the last survey's counts and their vintage.
+/// `on 󱗆 ykosps main⇕⇡10⇣97 * ix~`: the working-copy change id, the local
+/// bookmark naming it, where it stands against trunk, the state flags, and
+/// the view it sits in with one flag for the subtree's state.
 ///
 /// Every number names a comparison a reader can restate: `⇡` is `trunk()..@`
 /// less an empty working-copy commit (a placeholder holds nothing trunk
-/// lacks), `⇣` is `@..trunk()`, and the view's arrows are the last survey
-/// against the published repository, dated. There is no separate dirty count:
-/// in jj the edits are already in @, so a non-empty working copy is the dirty
-/// signal.
-pub fn jj(head: &jj::Head, view: Option<&views::View>, color: bool) -> String {
+/// lacks), `⇣` is `@..trunk()`. The view flag is an id comparison `jj view`
+/// made against the working-copy commit: `~` when the subtree differs from
+/// the imported tree, `=` when it is conflicted, `?` when no import is
+/// recorded, `!` when the path is missing or not a directory, and nothing
+/// when the subtree is the imported tree. A lookup that failed renders
+/// `view:ERR`: silence would read as "outside every view". There is no
+/// separate dirty count: in jj the edits are already in @, so a non-empty
+/// working copy is the dirty signal.
+pub fn jj(head: &jj::Head, view: &views::Segment, color: bool) -> String {
     let mut segment = Segment::new(color);
     segment.push_plain("on ");
     segment.push(NAME, JJ_SYMBOL);
@@ -112,22 +110,20 @@ pub fn jj(head: &jj::Head, view: Option<&views::View>, color: bool) -> String {
     }
 
     // The view the directory is inside: context the way the submodule
-    // breadcrumb is, so the name is muted, with the last survey's counts
-    // against the published repository beside it.
-    if let Some(view) = view {
-        segment.push_plain(" ");
-        segment.push(MUTED, &view.name);
-        if let Some(counts) = view.counts {
-            let arrows = ahead_behind(counts.ahead, counts.behind);
-            if !arrows.is_empty() {
-                segment.push(COUNTS, &arrows);
-                // The vintage rides with the counts or not at all: an arrow
-                // with no date reads as "now", which is the misreading this
-                // suffix exists to prevent.
-                if let Some(vintage) = view.age.and_then(vintage) {
-                    segment.push(MUTED, &vintage);
-                }
+    // breadcrumb is, so the name is muted, with the subtree's state flag
+    // beside it when there is one.
+    match view {
+        views::Segment::Outside => {}
+        views::Segment::Inside(view) => {
+            segment.push_plain(" ");
+            segment.push(MUTED, &view.name);
+            if let Some(flag) = view_flag(view.state) {
+                segment.push(COUNTS, flag);
             }
+        }
+        views::Segment::Failed => {
+            segment.push_plain(" ");
+            segment.push(COUNTS, "view:ERR");
         }
     }
 
@@ -178,23 +174,23 @@ fn counts(counts: &git::Counts, tracking: Option<git::Tracking>) -> String {
     rendered
 }
 
-/// A survey record's age as one dense token, `·8h`, or `None` while the
-/// record is fresh enough that its counts can be read as current.
-fn vintage(age: Duration) -> Option<String> {
-    if age < SURVEY_FRESH {
-        return None;
+/// The ahead/behind arrows, shared with the git tracking counts so the two
+/// read identically.
+/// One character per `jj view` state; `Pristine` carries no flag,
+/// EXPLICITLY: the match is exhaustive over the enum the protocol boundary
+/// parsed (views.rs), so an unknown wire word can never arrive here and
+/// render flagless -- it already failed the parse and rendered `view:ERR`.
+const fn view_flag(state: views::ViewState) -> Option<&'static str> {
+    use crate::views::ViewState;
+    match state {
+        ViewState::Pristine => None,
+        ViewState::Patched => Some("~"),
+        ViewState::Conflicted => Some("="),
+        ViewState::Unanchored => Some("?"),
+        ViewState::Missing | ViewState::NotADirectory => Some("!"),
     }
-    let minutes = age.as_secs() / 60;
-    let (value, unit) = match minutes {
-        ..60 => (minutes, 'm'),
-        60..1440 => (minutes / 60, 'h'),
-        _ => (minutes / 1440, 'd'),
-    };
-    Some(format!("\u{b7}{value}{unit}"))
 }
 
-/// The ahead/behind arrows, shared by the git tracking counts and the jj
-/// view counts so the two read identically.
 fn ahead_behind(ahead: usize, behind: usize) -> String {
     match (ahead, behind) {
         (0, 0) => String::new(),
@@ -206,11 +202,9 @@ fn ahead_behind(ahead: usize, behind: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use crate::git::{Counts as GitCounts, Head as GitHead, HeadName, Tracking};
     use crate::jj::{Flags, Head as JjHead, Trunk};
-    use crate::views::{Counts, View};
+    use crate::views::{Segment, View};
 
     fn head(bookmark: Option<&str>, trunk: Option<Trunk>, empty: bool) -> JjHead {
         JjHead {
@@ -234,12 +228,11 @@ mod tests {
         }
     }
 
-    fn view(name: &str, counts: Option<Counts>, age: Option<Duration>) -> View {
-        View {
+    fn view(name: &str, state: &str) -> Segment {
+        Segment::Inside(View {
             name: name.to_owned(),
-            counts,
-            age,
-        }
+            state: super::views::ViewState::parse(state).expect("test states are vocabulary words"),
+        })
     }
 
     /// The regression this rewrite exists for. The old segment rendered
@@ -247,16 +240,30 @@ mod tests {
     /// 97 commits of trunk that @ did not have.
     #[test]
     fn a_diverged_working_copy_shows_both_sides_against_a_named_trunk() {
-        let rendered = super::jj(&head(None, Some(trunk("main*", 10, 97)), false), None, false);
+        let rendered = super::jj(
+            &head(None, Some(trunk("main*", 10, 97)), false),
+            &Segment::Outside,
+            false,
+        );
 
-        assert_eq!(rendered, "on \u{f15c6} ykosps main*\u{21d5}\u{21e1}10\u{21e3}97 *");
-        assert!(!rendered.contains("@git"), "a pseudo-remote reached the prompt");
+        assert_eq!(
+            rendered,
+            "on \u{f15c6} ykosps main*\u{21d5}\u{21e1}10\u{21e3}97 *"
+        );
+        assert!(
+            !rendered.contains("@git"),
+            "a pseudo-remote reached the prompt"
+        );
     }
 
     #[test]
     fn a_working_copy_level_with_trunk_shows_the_name_alone() {
         assert_eq!(
-            super::jj(&head(None, Some(trunk("main", 0, 0)), true), None, false),
+            super::jj(
+                &head(None, Some(trunk("main", 0, 0)), true),
+                &Segment::Outside,
+                false
+            ),
             "on \u{f15c6} ykosps main"
         );
     }
@@ -264,7 +271,11 @@ mod tests {
     #[test]
     fn only_ahead_of_trunk_is_one_arrow() {
         assert_eq!(
-            super::jj(&head(None, Some(trunk("ix-patched", 2, 0)), false), None, false),
+            super::jj(
+                &head(None, Some(trunk("ix-patched", 2, 0)), false),
+                &Segment::Outside,
+                false
+            ),
             "on \u{f15c6} ykosps ix-patched\u{21e1}2 *"
         );
     }
@@ -276,7 +287,7 @@ mod tests {
         assert_eq!(
             super::jj(
                 &head(Some("feature"), Some(trunk("main", 3, 1)), true),
-                None,
+                &Segment::Outside,
                 false
             ),
             "on \u{f15c6} ykosps feature main\u{21d5}\u{21e1}3\u{21e3}1"
@@ -288,7 +299,7 @@ mod tests {
         assert_eq!(
             super::jj(
                 &head(Some("main*"), Some(trunk("main*", 1, 0)), true),
-                None,
+                &Segment::Outside,
                 false
             ),
             "on \u{f15c6} ykosps main*\u{21e1}1"
@@ -300,75 +311,41 @@ mod tests {
     #[test]
     fn no_trunk_leaves_the_change_id_and_flags() {
         assert_eq!(
-            super::jj(&head(None, None, false), None, false),
+            super::jj(&head(None, None, false), &Segment::Outside, false),
             "on \u{f15c6} ykosps *"
         );
     }
 
     #[test]
-    fn a_fresh_survey_needs_no_vintage() {
-        let counts = Some(Counts {
-            behind: 25,
-            ahead: 0,
-        });
+    fn a_patched_view_carries_its_flag() {
         assert_eq!(
-            super::jj(
-                &head(None, None, true),
-                Some(&view("ix", counts, Some(Duration::from_mins(2)))),
-                false
-            ),
-            "on \u{f15c6} ykosps ix\u{21e3}25"
-        );
-    }
-
-    /// The bug this suffix exists for: a count with no date reads as "now".
-    #[test]
-    fn a_stale_survey_carries_its_vintage() {
-        let counts = Some(Counts {
-            behind: 241,
-            ahead: 1,
-        });
-        let age = Some(Duration::from_mins(7 * 60 + 41));
-        assert_eq!(
-            super::jj(
-                &head(None, None, true),
-                Some(&view("ix", counts, age)),
-                false
-            ),
-            "on \u{f15c6} ykosps ix\u{21d5}\u{21e1}1\u{21e3}241\u{b7}7h"
+            super::jj(&head(None, None, true), &view("ix", "patched"), false),
+            "on \u{f15c6} ykosps ix~"
         );
     }
 
     #[test]
-    fn a_view_with_nothing_to_report_is_just_its_name() {
-        for counts in [
-            None,
-            Some(Counts {
-                behind: 0,
-                ahead: 0,
-            }),
+    fn a_pristine_view_is_just_its_name() {
+        assert_eq!(
+            super::jj(&head(None, None, true), &view("ix", "pristine"), false),
+            "on \u{f15c6} ykosps ix"
+        );
+    }
+
+    #[test]
+    fn every_other_state_has_one_flag() {
+        for (state, flag) in [
+            ("conflicted", "="),
+            ("unanchored", "?"),
+            ("missing", "!"),
+            ("not-a-directory", "!"),
         ] {
             assert_eq!(
-                super::jj(
-                    &head(None, None, true),
-                    Some(&view("ix", counts, Some(Duration::from_hours(27)))),
-                    false
-                ),
-                "on \u{f15c6} ykosps ix",
-                "a zero count must not drag a vintage in behind it"
+                super::jj(&head(None, None, true), &view("ix", state), false),
+                format!("on \u{f15c6} ykosps ix{flag}"),
+                "state {state}"
             );
         }
-    }
-
-    #[test]
-    fn vintage_units_step_from_minutes_through_days() {
-        assert_eq!(super::vintage(Duration::from_mins(1)), None);
-        assert_eq!(super::vintage(Duration::from_mins(20)), Some("\u{b7}20m".to_owned()));
-        assert_eq!(super::vintage(Duration::from_hours(3)), Some("\u{b7}3h".to_owned()));
-        assert_eq!(
-            super::vintage(Duration::from_hours(73)),
-            Some("\u{b7}3d".to_owned())
-        );
     }
 
     #[test]
@@ -376,7 +353,18 @@ mod tests {
         let mut h = head(None, None, false);
         h.flags.conflict = true;
         h.flags.divergent = true;
-        assert_eq!(super::jj(&h, None, false), "on \u{f15c6} ykosps =??*");
+        assert_eq!(
+            super::jj(&h, &Segment::Outside, false),
+            "on \u{f15c6} ykosps =??*"
+        );
+    }
+
+    #[test]
+    fn a_failed_view_lookup_is_visible_not_silent() {
+        assert_eq!(
+            super::jj(&head(None, None, true), &Segment::Failed, false),
+            "on \u{f15c6} ykosps view:ERR"
+        );
     }
 
     #[test]
@@ -394,7 +382,10 @@ mod tests {
             },
         };
 
-        assert_eq!(super::git(&head, false), "on \u{e0a0} main !3?1\u{21d5}\u{21e1}2\u{21e3}1");
+        assert_eq!(
+            super::git(&head, false),
+            "on \u{e0a0} main !3?1\u{21d5}\u{21e1}2\u{21e3}1"
+        );
     }
 
     #[test]

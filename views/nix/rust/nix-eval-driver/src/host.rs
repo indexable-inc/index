@@ -1,7 +1,7 @@
 //! The driver's embedder: a [`Host`] that answers store questions for real.
 //!
 //! This is the third embedder of `nix-eval-rs` and it plays the same role as
-//! the other two. `src/nix/rust-eval-session.cc` answers out of cppnix's
+//! the other two. `src/libcmd/rust-eval-session.cc` answers out of cppnix's
 //! `Store`; `examples/nixpkgs-probe.rs` answers by shelling out to a `nix`
 //! binary; this answers out of [`crate::store::LocalStore`], which is the
 //! point -- the charter's rule is that a store write must not be a `nix`
@@ -33,7 +33,13 @@
 //!   `builtins.appendContext`'s `ensurePath`, because realising needs a
 //!   builder and a validity database and this store has neither. See
 //!   [`crate::store::LocalStore`] for what direct writes gave up.
-//! * `"${./path}"` ([`Host::copy_to_store`]) and `builtins.path`
+//! * the witness verifier's store questions ([`Host::valid_paths`],
+//!   [`Host::sealed_paths`], [`Host::allow_paths`], [`Host::allow_closures`]):
+//!   each is a statement about validity, and this store has no validity
+//!   database to make one from. The verifier reads a refusal as "cannot say"
+//!   and asks the effect itself again, which lands on one of the answers or
+//!   refusals above.
+//! * `"${./path}"` ([`Host::copy_to_store`], [`Host::store_path`]) and `builtins.path`
 //!   ([`Host::store_filtered`]). These are the honest gap in this plank
 //!   rather than a scoping decision: both are NAR ingestion, cppnix's
 //!   `addToStore` with `ContentAddressMethod::Raw::NixArchive`, and the
@@ -48,8 +54,9 @@
 //! being storeless. `Unsupported` says this backend cannot carry the answer,
 //! which is the true statement and the one that surfaces as unimplemented.
 
-use nix_eval_rs::host::{FileType, Host, LookupError, RealFs, StoreError};
+use nix_eval_rs::host::{FileType, Host, Links, LookupError, RealFs, StoreError, StorePathResult};
 use nix_eval_rs::task::SearchPathEntry;
+use nix_eval_rs::value2::PathValue;
 
 use crate::store::LocalStore;
 
@@ -109,11 +116,11 @@ fn refuse(who: &str, why: &str) -> StoreError {
 impl Host for DriverHost {
     // -- filesystem: RealFs's, unchanged ------------------------------------
 
-    fn read_file(&self, path: &str) -> Result<String, String> {
+    fn read_file(&self, path: &PathValue) -> Result<String, String> {
         RealFs.read_file(path)
     }
 
-    fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+    fn read_file_bytes(&self, path: &PathValue) -> Result<Vec<u8>, String> {
         RealFs.read_file_bytes(path)
     }
 
@@ -121,19 +128,23 @@ impl Host for DriverHost {
         RealFs.get_env(name)
     }
 
-    fn read_dir(&self, path: &str) -> Result<Vec<(String, FileType)>, String> {
+    fn read_dir(&self, path: &PathValue) -> Result<Vec<(String, FileType)>, String> {
         RealFs.read_dir(path)
     }
 
-    fn path_exists(&self, path: &str) -> bool {
-        RealFs.path_exists(path)
+    fn path_exists_checked(&self, path: &PathValue) -> Result<bool, String> {
+        RealFs.path_exists_checked(path)
     }
 
-    fn file_type(&self, path: &str) -> Result<Option<FileType>, String> {
+    fn dir_exists_checked(&self, path: &PathValue) -> Result<bool, String> {
+        RealFs.dir_exists_checked(path)
+    }
+
+    fn file_type(&self, path: &PathValue) -> Result<Option<FileType>, String> {
         RealFs.file_type(path)
     }
 
-    fn file_type_resolved(&self, path: &str) -> Result<FileType, String> {
+    fn file_type_resolved(&self, path: &PathValue) -> Result<FileType, String> {
         RealFs.file_type_resolved(path)
     }
 
@@ -150,31 +161,43 @@ impl Host for DriverHost {
             .map_err(|e| Self::failed(&e))
     }
 
-    fn write_derivation(
-        &self,
-        name: &str,
-        aterm: &str,
-        references: &[String],
-    ) -> Result<String, StoreError> {
+    fn write_derivation(&self, name: &str, aterm: &str) -> Result<String, StoreError> {
         // The suffix is appended here, exactly as cppnix's `writeDerivation`
-        // appends it and as `rustWriteDerivation` does in the bridge: the
-        // evaluator hands the name over bare so that this call reads like
-        // cppnix's. Below the suffix this is the same `add_text` that serves
-        // `builtins.toFile`, because cppnix's `writeDerivation` *is*
-        // `addTextToStore` of the ATerm -- a second spelling here would be a
-        // mirror to drift from.
+        // appends it and as the bridge does: the evaluator hands the name over
+        // bare so that this call reads like cppnix's. Below the suffix this is
+        // the same `add_text` that serves `builtins.toFile`, because cppnix's
+        // `writeDerivation` *is* `addTextToStore` of the ATerm -- a second
+        // spelling here would be a mirror to drift from.
+        //
+        // The references are read off the ATerm, as the bridge reads them
+        // (`capi::EmbedderHost::write_derivation`): the trait hands over the
+        // bytes alone, so that a memo replay, which has nothing else, asks the
+        // same question.
+        let drv = nix_eval_rs::drv::parse(aterm).map_err(|e| {
+            StoreError::Failed(format!(
+                "derivation '{name}': the ATerm handed to the store does not parse: {e:?}"
+            ))
+        })?;
         self.store
-            .add_text(&format!("{name}.drv"), aterm, references)
+            .add_text(&format!("{name}.drv"), aterm, &drv.references())
             .map_err(|e| Self::failed(&e))
     }
 
     // -- store: refused by name ---------------------------------------------
 
-    fn copy_to_store(&self, path: &str) -> Result<String, StoreError> {
+    fn copy_to_store(&self, path: &PathValue) -> Result<String, StoreError> {
         Err(refuse(
             &format!("copying '{path}' into the store"),
             "it is NAR ingestion (cppnix's addToStore with the NixArchive method) \
              and this crate has no NAR writer yet",
+        ))
+    }
+
+    fn store_path(&self, path: &PathValue) -> Result<StorePathResult, StoreError> {
+        Err(refuse(
+            &format!("coercing '{path}' to its store path"),
+            "it is the path a NAR ingestion would produce (cppnix's addToStore with \
+             the NixArchive method) and this crate has no NAR writer yet",
         ))
     }
 
@@ -229,6 +252,57 @@ impl Host for DriverHost {
             &format!("making '{path}' present"),
             "this store cannot substitute or build, having no daemon and no validity database",
         ))
+    }
+
+    // -- the witness verifier's store questions: refused by name ------------
+    //
+    // Each is a statement about validity -- which paths the store holds,
+    // which objects are sealed, which reads are allowed -- and this store has
+    // no validity database to make one from (`ensure_path` says the same).
+    // The verifier reads a refusal as "cannot say" and asks the effect itself
+    // again, which is the outcome under a host with no store.
+
+    fn valid_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        Err(refuse(
+            &format!("querying the validity of {} store path(s)", paths.len()),
+            "this store has no validity database",
+        ))
+    }
+
+    fn sealed_paths(&self, objects: &[String]) -> Result<Links, StoreError> {
+        Err(refuse(
+            &format!(
+                "querying which of {} store object(s) are sealed",
+                objects.len()
+            ),
+            "this store has no validity database",
+        ))
+    }
+
+    fn allow_paths(&self, paths: &[String]) -> Result<(), StoreError> {
+        Err(refuse(
+            &format!("allowing reads through {} store path(s)", paths.len()),
+            "this host has no allow list, and the copies and fetches an allowance \
+             would follow are refused above",
+        ))
+    }
+
+    fn allow_closures(&self, outputs: &[String]) -> Result<(), StoreError> {
+        Err(refuse(
+            &format!(
+                "allowing reads through the closures of {} output path(s)",
+                outputs.len()
+            ),
+            "realising is refused above, so no realisation is ever served by validity",
+        ))
+    }
+
+    /// Nothing is deferred: `add_text` writes when asked.
+    fn settle(&self) -> Result<(), StoreError> {
+        Ok(())
     }
 
     fn realise(
@@ -290,8 +364,8 @@ impl Host for DriverHost {
 
     // -- search path ---------------------------------------------------------
 
-    fn find_file(&self, entries: &[SearchPathEntry], name: &str) -> Result<String, LookupError> {
-        find_in(entries, name)
+    fn find_file(&self, entries: &[SearchPathEntry], name: &str) -> Result<PathValue, LookupError> {
+        find_in(entries, name).map(PathValue::ambient)
     }
 
     fn nix_path(&self) -> Result<Vec<SearchPathEntry>, LookupError> {
@@ -461,6 +535,7 @@ mod tests {
     use crate::store::LocalStore;
     use nix_eval_rs::host::{Host, StoreError};
     use nix_eval_rs::task::SearchPathEntry;
+    use nix_eval_rs::value2::PathValue;
 
     fn host() -> Result<DriverHost, String> {
         Ok(DriverHost::new(
@@ -497,7 +572,17 @@ mod tests {
 
         expect(
             "copying '/etc/hostname'",
-            host.copy_to_store("/etc/hostname"),
+            host.copy_to_store(&PathValue::ambient("/etc/hostname")),
+        )?;
+        expect(
+            "coercing '/etc/hostname'",
+            host.store_path(&PathValue::ambient("/etc/hostname"))
+                .map(|found| found.store_path),
+        )?;
+        expect(
+            "validity of 2 store path(s)",
+            host.valid_paths(&[String::from("/nix/store/a"), String::from("/nix/store/b")])
+                .map(|held| format!("{held:?}")),
         )?;
         expect(
             "import from derivation",
@@ -507,7 +592,7 @@ mod tests {
             "builtins.getFlake",
             host.lock_flake("nixpkgs").map(|_| String::new()),
         )?;
-        if checked.len() != 3 {
+        if checked.len() != 5 {
             return Err(format!("only checked {checked:?}"));
         }
         Ok(())
@@ -571,7 +656,7 @@ mod tests {
             .store_text("f", "contents", &[])
             .map_err(|e| format!("toFile was refused: {e:?}"))?;
         let drv = host
-            .write_derivation("d", "Derive([],[],[],\"\",\"\",[],[])", &[])
+            .write_derivation("d", "Derive([],[],[],\"s\",\"/bin/sh\",[],[])")
             .map_err(|e| format!("a .drv write was refused: {e:?}"))?;
 
         if file != nix_eval_rs::drvpath::text_store_path("/nix/store", "f", "contents", &[]) {

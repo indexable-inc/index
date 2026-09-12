@@ -458,9 +458,7 @@ defmodule IxMcp.Stdlib.Forge do
              env.land,
              [
                env.jj,
-               "ix",
                "clone",
-               "--server",
                env.server,
                "--repo",
                "ix",

@@ -93,7 +93,12 @@
     "-E ${escapeShellArg "not (${lib.concatMapStringsSep " | " (testName: "test(~${testName})") policy.skip})"}";
 
   /**
-  Build a Rust workspace as one Nix derivation per Cargo rustc unit.
+  Plan a Rust workspace as one Nix derivation per Cargo rustc unit.
+
+  `helpers` exposes the planner source, graph and renderer before generated
+  units are imported. `workspace` is the normal buildWorkspace result.
+  Derivation-produced sources must be resident before helper identities can
+  be evaluated; planning does not remove that earlier source dependency.
 
   Each generated unit gets a scoped source input by default. Workspace crates
   receive their own package root, and registry/git crates receive their own
@@ -196,7 +201,7 @@
   `extraUnits`/`extraLibraries`, the `test*` forwarding) each have a single
   reader and are read from raw args at that use site.
   */
-  buildWorkspace = rawArgs: let
+  planWorkspace = rawArgs: let
     resolved = rust.resolveArgs rawArgs;
     inherit
       (resolved)
@@ -389,7 +394,7 @@
         filter = path: type:
           type == "directory" || plannerReadsContent (lib.removePrefix (srcRoot + "/") path);
       };
-      fileListFile = pkgs.writeText "cargo-unit-planner-file-list" (
+      fileListFile = builtins.toFile "cargo-unit-planner-file-list" (
         lib.concatLines (filesUnder srcRoot)
       );
     in
@@ -594,8 +599,7 @@
     # `-Werror` is the class, so this belongs here and not in one Cargo.toml.
     #
     # What is given up: fortify is a real hardening measure, and this turns it
-    # off for the C dependencies of dev-profile builds. That is acceptable
-    # because a dev-profile artifact is not shipped -- it exists for
+    # off for the C dependencies of dev- and test-profile builds. They exist for
     # `debug_assertions`, tests and boot gates. Do not widen this to release,
     # where the artifact does ship and where `-O` satisfies glibc anyway so
     # there is nothing to fix. If you are reading this because a hardening
@@ -607,7 +611,7 @@
     # is the guard: it builds a C dependency whose configure probes under
     # `-Werror` and fails if this seam has become unnecessary or insufficient.
     unitHardeningDisable =
-      if (rawArgs.profile or "release") == "dev"
+      if builtins.elem (rawArgs.profile or "release") ["dev" "test"]
       then ["fortify" "fortify3"]
       else [];
 
@@ -809,8 +813,8 @@
     # A rename or a typo would otherwise turn a lint gate off without turning
     # anything red. Listing the real names matters as much as naming the
     # offender, because two spellings are in play: this attrset is keyed by
-    # cargo PACKAGE name (`jj-views`), while the unit keys next door carry the
-    # lib TARGET name (`jj_views-0.43.0-<hash>`). "jj_views is not a package"
+    # cargo PACKAGE name (`jj-vfs`), while the unit keys next door carry the
+    # lib TARGET name (`jj_vfs-0.43.0-<hash>`). "jj_vfs is not a package"
     # is useless without the list that shows the hyphen.
     unknownClippyPackages =
       lib.subtractLists (attrNames clippyUnits.clippyByPackage)
@@ -1012,24 +1016,31 @@
         printf '%s\n' "''${target_names[@]}" > "$out/test-targets"
         echo "ran ''${#target_names[@]} cargo-unit test targets" > "$out/result"
       '';
-  in
-    workspaceUnits
-    // {
-      inherit
-        plannerSource
-        unitGraphJson
-        unitsNix
-        vendorDir
-        testPolicyByPackage
-        nextestByTarget
-        nextestExport
-        testChecksByTarget
-        testChecksAll
-        ;
-      cargoConfigScript = context.configScript;
-      targetSets = namedTargetSets;
-      inherit (args) policy;
-    };
+  in {
+    # These derivations precede the generated units import. Keep them outside
+    # the workspace attrset merge so callers can batch metadata builds first.
+    helpers = {inherit plannerSource unitGraphJson unitsNix;};
+    workspace =
+      workspaceUnits
+      // {
+        inherit
+          plannerSource
+          unitGraphJson
+          unitsNix
+          vendorDir
+          testPolicyByPackage
+          nextestByTarget
+          nextestExport
+          testChecksByTarget
+          testChecksAll
+          ;
+        cargoConfigScript = context.configScript;
+        targetSets = namedTargetSets;
+        inherit (args) policy;
+      };
+  };
+
+  buildWorkspace = args: (planWorkspace args).workspace;
 
   # One lookup for every selector that picks a root out of a workspace: fail
   # with the calling selector's name and the full set of available keys, so a
@@ -1404,6 +1415,7 @@ in {
     buildBinary
     buildBinaries
     buildWorkspace
+    planWorkspace
     selectBinaryWithTests
     selectLibraryWithTests
     defaultToolchainId

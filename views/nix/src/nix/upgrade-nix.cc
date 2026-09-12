@@ -3,10 +3,8 @@
 #include "nix/cmd/command.hh"
 #include "nix/main/common-args.hh"
 #include "nix/store/store-api.hh"
-#include "nix/store/filetransfer.hh"
-#include "nix/expr/eval.hh"
+#include "nix/expr/rust-eval-refusal.hh"
 #include "nix/expr/eval-settings.hh"
-#include "nix/expr/attr-path.hh"
 #include "nix/store/names.hh"
 #include "nix/util/executable-path.hh"
 #include "nix/store/globals.hh"
@@ -192,20 +190,7 @@ struct CmdUpgradeNix : MixDryRun, StoreCommand
     /* Return the store path of the latest stable Nix. */
     StorePath getLatestNix(ref<Store> store)
     {
-        Activity act(*logger, lvlInfo, actUnknown, "querying latest Nix version");
-
-        // FIXME: use nixos.org?
-        auto req = FileTransferRequest(parseURL(upgradeSettings.storePathUrl.get()));
-        auto res = getFileTransfer()->download(req);
-
-        auto state = std::make_shared<EvalState>(LookupPath{}, store, fetchSettings, evalSettings);
-        auto v = state->allocValue();
-        state->eval(state->parseExprFromString(res.data, state->rootPath(CanonPath("/no-such-path"))), *v);
-        Bindings & bindings = Bindings::emptyBindings;
-        auto v2 = findAlongAttrPath(*state, settings.thisSystem, bindings, *v).first;
-
-        return store->parseStorePath(
-            state->forceString(*v2, noPos, "while evaluating the path tho latest nix version"));
+        refuse(refusalTokens::unsupported, "nix upgrade-nix");
     }
 };
 

@@ -26,6 +26,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
+#include <iostream>
+
 namespace nix {
 
 /* TODO: Separate these store types into different files, give them better names */
@@ -284,7 +287,14 @@ RemoteStore::queryPartialDerivationOutputMap(const StorePath & path, Store * eva
             return WorkerProto::Serialise<std::map<std::string, std::optional<StorePath>>>::read(*this, *conn);
         } else {
             auto & evalStore = *evalStore_;
+            /* Where an already-built context's `resolveDerivedPath` spends
+               its time (bed l2cb1: 17 asks, 1.83 s, five of them 128-664 ms
+               with `buildPaths` skipped): the static read of the derivation
+               from the evaluation store, or the daemon's answer. */
+            static const bool trace = getEnv("IXE_REPLAY_TRACE").has_value();
+            auto started = std::chrono::steady_clock::now();
             auto outputs = evalStore.queryStaticPartialDerivationOutputMap(path);
+            auto staticDone = std::chrono::steady_clock::now();
             // union with the first branch overriding the statically-known ones
             // when non-`std::nullopt`.
             for (auto && [outputName, optPath] : queryPartialDerivationOutputMap(path, nullptr)) {
@@ -292,6 +302,13 @@ RemoteStore::queryPartialDerivationOutputMap(const StorePath & path, Store * eva
                     outputs.insert_or_assign(std::move(outputName), std::move(optPath));
                 else
                     outputs.insert({std::move(outputName), std::nullopt});
+            }
+            if (trace) {
+                auto ns = [](auto from, auto to) {
+                    return std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count();
+                };
+                std::cerr << "ixe drv-outputs: " << printStorePath(path) << " static_ns=" << ns(started, staticDone)
+                          << " remote_ns=" << ns(staticDone, std::chrono::steady_clock::now()) << "\n";
             }
             return outputs;
         }
@@ -345,6 +362,10 @@ ref<const ValidPathInfo> RemoteStore::addCAToStore(
             throw Error("repairing is not supported when building through the Nix daemon protocol < 1.25");
 
         switch (caMethod.raw) {
+        case ContentAddressMethod::Raw::JjTree:
+            /* Never computable, by any daemon: `addToStoreFromDump` refuses
+               before reaching here. */
+            throw TreeIdNotComputable("cannot add '%s' by its Jujutsu tree id through the daemon", name);
         case ContentAddressMethod::Raw::Text: {
             if (hashAlgo != HashAlgorithm::SHA256)
                 throw UnimplementedError(
@@ -422,6 +443,11 @@ StorePath RemoteStore::addToStoreFromDump(
         // Use NAR; Git is not a serialization method
         fsm = FileSerialisationMethod::NixArchive;
         break;
+    case FileIngestionMethod::JjTree:
+        throw TreeIdNotComputable(
+            "cannot add '%s' to the store by its Jujutsu tree id from a dump: Nix does not compute those; "
+            "a caller holding the id uses Store::addToStoreWithKnownCA",
+            name);
     default:
         assert(false);
     }
@@ -581,20 +607,30 @@ void RemoteStore::buildPaths(
 }
 
 std::vector<KeyedBuildResult> RemoteStore::buildPathsWithResults(
-    const std::vector<DerivedPath> & paths, BuildMode buildMode, std::shared_ptr<Store> evalStore)
+    const std::vector<DerivedPath> & paths,
+    BuildMode buildMode,
+    std::shared_ptr<Store> evalStore,
+    BuildFailureMode failureMode)
 {
     copyDrvsFromEvalStore(paths, evalStore);
 
     std::optional<ConnectionHandle> conn_(getConnection());
     auto & conn = *conn_;
 
+    bool independent = failureMode == BuildFailureMode::KeepGoing;
+    if (independent && !conn->protoVersion.features.contains(WorkerProto::independentBuildResults))
+        throw Error("the remote store did not negotiate independent build results; update its Nix daemon");
+
     if (conn->protoVersion >= WorkerProto::Version{.number = {1, 34}}) {
-        conn->to << WorkerProto::Op::BuildPathsWithResults;
+        conn->to << (independent ? WorkerProto::Op::BuildPathsWithResultsIndependent
+                                : WorkerProto::Op::BuildPathsWithResults);
         WorkerProto::write(*this, *conn, paths);
         conn->to << buildMode;
         conn.processStderr();
         return WorkerProto::Serialise<std::vector<KeyedBuildResult>>::read(*this, *conn);
     } else {
+        if (failureMode != BuildFailureMode::Configured)
+            throw Error("the remote store does not support independent build results (protocol 1.34 required)");
         // Avoid deadlock.
         conn_.reset();
 

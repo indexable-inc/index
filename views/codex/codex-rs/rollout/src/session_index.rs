@@ -2,23 +2,23 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::ErrorKind;
-use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::time::SystemTime;
 
+use crate::reverse_jsonl_scanner::ReverseJsonlScanner;
+use crate::reverse_jsonl_scanner::ScanOutcome;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::SessionSource;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::io::AsyncBufReadExt;
 
 const SESSION_INDEX_FILE: &str = "session_index.jsonl";
-const READ_CHUNK_SIZE: usize = 8192;
 static SESSION_INDEX_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -152,19 +152,42 @@ pub async fn find_thread_names_by_ids(
     Ok(names)
 }
 
-/// Locate a recorded thread rollout and read its session metadata by thread name.
-/// Returns the newest indexed name that still has a readable rollout header.
+/// Locate the readable rollout with the newest modification time for a recorded thread name.
 pub async fn find_thread_meta_by_name_str(
     codex_home: &Path,
     name: &str,
     state_db_ctx: Option<&codex_state::StateRuntime>,
 ) -> std::io::Result<Option<(PathBuf, SessionMetaLine)>> {
+    Ok(find_thread_meta_candidates_by_name_str(
+        codex_home,
+        name,
+        state_db_ctx,
+        /*allowed_sources*/ &[],
+        /*allowed_model_providers*/ &[],
+    )
+    .await?
+    .into_iter()
+    .next())
+}
+
+/// Locate readable rollouts for a recorded thread name, newest modification time first.
+///
+/// Empty filter slices disable their respective filters. Provider filtering only rejects explicit
+/// mismatches because older rollouts omitted provider metadata. Filtering happens before ranking,
+/// so an ineligible newer duplicate cannot hide an older usable session.
+pub async fn find_thread_meta_candidates_by_name_str(
+    codex_home: &Path,
+    name: &str,
+    state_db_ctx: Option<&codex_state::StateRuntime>,
+    allowed_sources: &[SessionSource],
+    allowed_model_providers: &[String],
+) -> std::io::Result<Vec<(PathBuf, SessionMetaLine)>> {
     if name.trim().is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let path = session_index_path(codex_home);
     if !path.exists() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let name = name.to_string();
@@ -173,6 +196,7 @@ pub async fn find_thread_meta_by_name_str(
     let scan =
         tokio::task::spawn_blocking(move || stream_thread_ids_from_end_by_name(&path, &name, tx));
 
+    let mut candidates = Vec::new();
     while let Some(thread_id) = rx.recv().await {
         // Keep walking until a matching id resolves to a loadable rollout so an unsaved or partial
         // rename cannot shadow an older persisted session with the same name.
@@ -183,15 +207,29 @@ pub async fn find_thread_meta_by_name_str(
         )
         .await?
             && let Ok(session_meta) = super::list::read_session_meta_line(&path).await
+            && (allowed_sources.is_empty() || allowed_sources.contains(&session_meta.meta.source))
+            && session_meta
+                .meta
+                .model_provider
+                .as_ref()
+                .is_none_or(|provider| {
+                    allowed_model_providers.is_empty() || allowed_model_providers.contains(provider)
+                })
         {
-            drop(rx);
-            scan.await.map_err(std::io::Error::other)??;
-            return Ok(Some((path, session_meta)));
+            let modified = tokio::fs::metadata(&path)
+                .await
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            candidates.push((modified, path, session_meta));
         }
     }
     scan.await.map_err(std::io::Error::other)??;
+    candidates.sort_by(|(left, _, _), (right, _, _)| right.cmp(left));
 
-    Ok(None)
+    Ok(candidates
+        .into_iter()
+        .map(|(_, path, session_meta)| (path, session_meta))
+        .collect())
 }
 
 fn session_index_path(codex_home: &Path) -> PathBuf {
@@ -245,62 +283,16 @@ fn scan_index_from_end_for_each<F>(
 where
     F: FnMut(&SessionIndexEntry) -> std::io::Result<Option<SessionIndexEntry>>,
 {
-    let mut file = File::open(path)?;
-    let mut remaining = file.metadata()?.len();
-    let mut line_rev: Vec<u8> = Vec::new();
-    let mut buf = vec![0u8; READ_CHUNK_SIZE];
-
-    while remaining > 0 {
-        let read_size = usize::try_from(remaining.min(READ_CHUNK_SIZE as u64))
-            .map_err(std::io::Error::other)?;
-        remaining -= read_size as u64;
-        file.seek(SeekFrom::Start(remaining))?;
-        file.read_exact(&mut buf[..read_size])?;
-
-        for &byte in buf[..read_size].iter().rev() {
-            if byte == b'\n' {
-                if let Some(entry) = parse_line_from_rev(&mut line_rev, &mut visit_entry)? {
-                    return Ok(Some(entry));
-                }
-                continue;
-            }
-            line_rev.push(byte);
+    let mut scanner = ReverseJsonlScanner::new(File::open(path)?)?;
+    while let Some(outcome) = scanner.scan_next::<SessionIndexEntry>()? {
+        let ScanOutcome::Parsed(entry) = outcome else {
+            continue;
+        };
+        if let Some(entry) = visit_entry(&entry)? {
+            return Ok(Some(entry));
         }
     }
-
-    if let Some(entry) = parse_line_from_rev(&mut line_rev, &mut visit_entry)? {
-        return Ok(Some(entry));
-    }
-
     Ok(None)
-}
-
-fn parse_line_from_rev<F>(
-    line_rev: &mut Vec<u8>,
-    visit_entry: &mut F,
-) -> std::io::Result<Option<SessionIndexEntry>>
-where
-    F: FnMut(&SessionIndexEntry) -> std::io::Result<Option<SessionIndexEntry>>,
-{
-    if line_rev.is_empty() {
-        return Ok(None);
-    }
-    line_rev.reverse();
-    let line = std::mem::take(line_rev);
-    let Ok(mut line) = String::from_utf8(line) else {
-        return Ok(None);
-    };
-    if line.ends_with('\r') {
-        line.pop();
-    }
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(trimmed) else {
-        return Ok(None);
-    };
-    visit_entry(&entry)
 }
 
 #[cfg(test)]

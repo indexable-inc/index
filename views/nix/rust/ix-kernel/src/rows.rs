@@ -131,6 +131,22 @@ pub struct RowInfo {
     pub output: Option<ObjId>,
 }
 
+/// A `.tmp-*` file: a write that was interrupted before its rename, or one
+/// in flight right now. Which of the two is the caller's to know; a sweep that
+/// holds the publication lock knows nothing is in flight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Temporary {
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+/// What [`DirRows::inventory_all`] found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Inventory {
+    pub rows: Vec<RowInfo>,
+    pub temporaries: Vec<Temporary>,
+}
+
 /// Distinguishes temporary files written by this process from each other.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -284,6 +300,21 @@ impl DirRows {
         }
     }
 
+    /// Remove a row, for a caller that has found its answer unusable. `Ok(true)`
+    /// when a row was there; a missing row is `Ok(false)`, not an error, since
+    /// the state the caller wants is "no row" and that is now the case.
+    pub fn remove(&self, domain: Domain, key: Key) -> Result<bool> {
+        let path = self.domain_dir(domain).join(key.hash().to_hex());
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(KernelError::io(
+                format!("removing {}", path.display()),
+                source,
+            )),
+        }
+    }
+
     /// Mark a row as used now, for whatever policy decides what to evict.
     ///
     /// Best effort and deliberately not an error: recency is an optimisation
@@ -310,12 +341,57 @@ impl DirRows {
 
     /// Every row in a domain, as (key, last use, size in bytes), for a caller
     /// deciding what to evict. Rows that will not parse are included: they
-    /// take space and are worth reclaiming first.
+    /// take space and are worth reclaiming first. Temporaries are left out;
+    /// [`DirRows::inventory_all`] reports them.
     pub fn inventory(&self, domain: Domain) -> Result<Vec<RowInfo>> {
-        let dir = self.domain_dir(domain);
-        let entries = match fs::read_dir(&dir) {
+        let mut inventory = Inventory::default();
+        self.inventory_dir(&self.domain_dir(domain), &mut inventory)?;
+        Ok(inventory.rows)
+    }
+
+    /// Every row of every domain, plus the temporaries interrupted writes left
+    /// behind, for a sweep that owns the whole store.
+    ///
+    /// # Nothing is guessed
+    ///
+    /// A row this cannot read is an error, not a row with no output. An
+    /// eviction policy credits an object to the rows that name it, so a live
+    /// row read as "names nothing" does not make the sweep conservative: it
+    /// lets the sweep delete the object the row still points at and report a
+    /// healthy store. The only failure tolerated is a file that vanished
+    /// between listing and reading, which is a row somebody else already
+    /// removed and so cannot be keeping anything alive.
+    pub fn inventory_all(&self) -> Result<Inventory> {
+        let mut inventory = Inventory::default();
+        let read = match fs::read_dir(&self.root) {
+            Ok(read) => read,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(inventory),
+            Err(source) => {
+                return Err(KernelError::io(
+                    format!("reading {}", self.root.display()),
+                    source,
+                ));
+            }
+        };
+        for entry in read {
+            let entry = entry.map_err(|source| {
+                KernelError::io(format!("reading {}", self.root.display()), source)
+            })?;
+            let file_type = entry.file_type().map_err(|source| {
+                KernelError::io(format!("reading {}", entry.path().display()), source)
+            })?;
+            // Only domain directories live directly under the root.
+            if file_type.is_dir() {
+                self.inventory_dir(&entry.path(), &mut inventory)?;
+            }
+        }
+        Ok(inventory)
+    }
+
+    fn inventory_dir(&self, dir: &Path, out: &mut Inventory) -> Result<()> {
+        let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(source) => {
                 return Err(KernelError::io(
                     format!("reading {}", dir.display()),
@@ -323,33 +399,56 @@ impl DirRows {
                 ));
             }
         };
-        let mut out = Vec::new();
         for entry in entries {
             let entry = entry
                 .map_err(|source| KernelError::io(format!("reading {}", dir.display()), source))?;
+            let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with(".tmp-") {
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(KernelError::io(
+                        format!("reading {}", path.display()),
+                        source,
+                    ));
+                }
+            };
+            if !metadata.is_file() {
                 continue;
             }
-            let Ok(metadata) = entry.metadata() else {
+            if name.starts_with(".tmp-") {
+                out.temporaries.push(Temporary {
+                    path,
+                    bytes: metadata.len(),
+                });
                 continue;
+            }
+            let used = metadata.modified().map_err(|source| {
+                KernelError::io(format!("reading the mtime of {}", path.display()), source)
+            })?;
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(KernelError::io(
+                        format!("reading row {}", path.display()),
+                        source,
+                    ));
+                }
             };
-            let used = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-            // A row that will not parse still occupies space, and its output
-            // is unknown, so it references nothing and sweeps cleanly.
-            let output = fs::read(entry.path())
-                .ok()
-                .and_then(|bytes| parse_row(&bytes).ok())
-                .map(|(_, output)| output);
-            out.push(RowInfo {
-                path: entry.path(),
+            // A row that was read and will not parse still occupies space, and
+            // its output is unknown, so it references nothing and sweeps first.
+            let output = parse_row(&bytes).ok().map(|(_, output)| output);
+            out.rows.push(RowInfo {
+                path,
                 name,
                 used,
                 bytes: metadata.len(),
                 output,
             });
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Write one row. Idempotent: the same request and output rewrite the same
@@ -781,6 +880,47 @@ mod tests {
         drop(fs::remove_dir_all(&dir));
         assert_eq!(inventory.len(), 1);
         assert_eq!(inventory.first().and_then(|r| r.output), None);
+        Ok(())
+    }
+
+    /// A sweep that owns the store sees every domain's rows and the
+    /// temporaries an interrupted write left behind, so it can credit objects
+    /// to rows of domains it did not know to name and reclaim the leftovers.
+    #[test]
+    fn inventory_all_lists_every_domain_and_the_temporaries() -> Result<()> {
+        let dir = temp_dir("inventory-all");
+        let rows = DirRows::open(&dir)?;
+        let one = Domain::mint("e", "one");
+        let two = Domain::mint("e", "two");
+        rows.put(one, b"request", ObjId::of(b"answer one"))?;
+        rows.put(two, b"request", ObjId::of(b"answer two"))?;
+        fs::write(
+            dir.join(one.hash().to_hex()).join(".tmp-123-4"),
+            b"half a row",
+        )
+        .map_err(|s| KernelError::io("writing", s))?;
+        let all = rows.inventory_all()?;
+        let per_domain = rows.inventory(one)?;
+        drop(fs::remove_dir_all(&dir));
+        let mut outputs: Vec<Option<ObjId>> = all.rows.iter().map(|r| r.output).collect();
+        outputs.sort();
+        let mut expected = vec![
+            Some(ObjId::of(b"answer one")),
+            Some(ObjId::of(b"answer two")),
+        ];
+        expected.sort();
+        assert_eq!(outputs, expected);
+        assert_eq!(all.temporaries.len(), 1, "{:?}", all.temporaries);
+        assert!(
+            matches!(all.temporaries.as_slice(), [temporary] if temporary.bytes == "half a row".len() as u64),
+            "{:?}",
+            all.temporaries
+        );
+        assert_eq!(
+            per_domain.len(),
+            1,
+            "the per-domain inventory leaks temporaries or other domains"
+        );
         Ok(())
     }
 

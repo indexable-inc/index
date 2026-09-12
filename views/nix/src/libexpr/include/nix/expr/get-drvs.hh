@@ -108,6 +108,7 @@ typedef std::list<PackageInfo, traceable_allocator<PackageInfo>> PackageInfos;
  */
 std::optional<PackageInfo> getDerivation(EvalState & state, Value & v, bool ignoreAssertionFailures);
 
+
 void getDerivations(
     EvalState & state,
     Value & v,

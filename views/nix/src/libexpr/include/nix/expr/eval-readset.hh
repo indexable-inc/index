@@ -17,16 +17,21 @@
  * is attributed to the innermost one.
  */
 
-#include "nix/expr/eval-retain.hh"
 #include "nix/expr/nixexpr.hh"
 #include "nix/util/canon-path.hh"
 #include "nix/util/file-descriptor.hh"
 #include "nix/util/source-read-hook.hh"
 #include "nix/util/source-path.hh"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
+#include <map>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -82,8 +87,7 @@ std::string_view showEdgeKind(EdgeKind kind);
 class ReadSetTracker
 {
 public:
-    ReadSetTracker(
-        EvalState & state, std::optional<std::filesystem::path> traceFile, bool hashContents, bool retain = false);
+    ReadSetTracker(EvalState & state, std::optional<std::filesystem::path> traceFile, bool hashContents);
     ~ReadSetTracker();
 
     ReadSetTracker(const ReadSetTracker &) = delete;
@@ -163,15 +167,6 @@ public:
     void noteDerivationDemand(std::string_view drvPath);
 
     /**
-     * Retain the fully forced result of the innermost derivation entry, so
-     * that a later request in the same process can splice it instead of
-     * forcing the derivation attributes again. A copy of the 16-byte value
-     * is taken because the caller passes the output slot of whatever thunk
-     * is being forced, and that slot belongs to the current request.
-     */
-    void noteDerivationResult(Value & v);
-
-    /**
      * The payload identity of a value: the pointer that survives a 16-byte
      * `Value` struct copy. Nix evaluation copies `Value` structs freely, so
      * an address-of-Value identity breaks at the first assignment; the
@@ -233,36 +228,6 @@ public:
     size_t provScopeBegin();
     void provScopeEnd(size_t start, const Value & result);
     void provScopeAbort();
-
-    /**
-     * The trees this evaluation has fetched so far, for pairing a retained
-     * graph against the run that is now underway.
-     */
-    const std::vector<RetainedTree> & liveTrees() const
-    {
-        return capturedTrees;
-    }
-
-    /**
-     * Finalize this evaluation (popping any entries still open) and move
-     * the captured graph and retained values out. Only meaningful when the
-     * tracker was constructed with `retain`.
-     */
-    std::shared_ptr<RetainedEval> extractRetained();
-
-    /**
-     * Record which entry in the retained graph the innermost entry
-     * corresponds to, so that entries demanded under it can be resolved
-     * among that old entry recorded edges.
-     */
-    void setCurrentOldId(int64_t id);
-
-    /**
-     * The retained-graph counterpart of the nearest enclosing entry that has
-     * one, not counting the innermost entry itself. The root corresponds to
-     * the root by construction.
-     */
-    int64_t parentOldId() const;
 
     /** How many entries of each kind have been emitted. Used by the tests that guard against a silent no op. */
     uint64_t entriesOfKind(TrackedEntryKind kind) const
@@ -348,13 +313,10 @@ private:
 
     EvalState & state;
     bool hashContents;
-    bool retain;
     AutoCloseFD fd;
     std::string buffer;
 
     std::vector<Entry> stack;
-    /** For each open entry, its counterpart in the retained graph, or -1. The root is 0 by construction. */
-    std::vector<int64_t> oldIdStack;
     uint64_t nextEntryId = 0;
     std::array<uint64_t, 4> kindCounts{};
 
@@ -366,9 +328,6 @@ private:
 
     /** Tree identity to id, keyed on the accessor number and the store or mount root. */
     boost::unordered_flat_map<std::string, uint32_t> treeIds;
-
-    /** The tree most recently seen through each accessor, for naming an entry by its tree. */
-    boost::unordered_flat_map<size_t, uint32_t> accessorTreeId;
 
     /**
      * Values a tracked entry produced, mapped to the entry that produced them.
@@ -421,18 +380,6 @@ private:
     uint64_t firstNonStoreReadNs = 0;
     std::string firstNonStoreReadPath;
     uint64_t nrReads = 0;
-
-    /**
-     * The in-memory copy of what the trace file records, kept only when
-     * `retain` is set. `capturedValues` maps each derivation entry id to
-     * its result value; the allocator on that map is what makes the
-     * collector scan it while the request is still running.
-     */
-    std::vector<RetainedTree> capturedTrees;
-    std::vector<RetainedInput> capturedInputs;
-    std::vector<RetainedEntry> capturedEntries;
-    std::map<uint64_t, Value *, std::less<uint64_t>, traceable_allocator<std::pair<const uint64_t, Value *>>>
-        capturedValues;
 };
 
 /**

@@ -10,7 +10,6 @@
   jq,
   git,
   mercurial,
-  jujutsu,
   unixtools,
   util-linux,
   zstd,
@@ -56,10 +55,16 @@ mkMesonDerivation (
       jq
       git
       mercurial
-      # fetchJj.sh and jj-colocated.sh cover the fork-local jj fetcher and call
-      # requireJj, which fails rather than skips, so dropping this turns the
-      # suite red instead of quietly green.
-      jujutsu
+      # The jj client that fetchJj.sh, jj-colocated.sh and the jj-tree tests
+      # need is deliberately NOT declared here. nixpkgs' modular packaging
+      # vendors its own copy of this file and `overrideSource` swaps `src`
+      # only, so this lambda is not called on the path that builds the fork;
+      # the ix package scope appends `packages/jj-ix` to `nativeBuildInputs`
+      # instead (`index/packages/nix/default.nix`, `nix-functional-tests`).
+      # Declaring it here too would be a second author for one input, and as a
+      # required formal that nothing in this tree can bind it threw at eval.
+      # `requireJj` (common/functions.sh) fails rather than skips, so a build
+      # that loses the client is loud rather than quietly green.
       unixtools.script
       # binary-cache.sh rewrites a NAR with the same compressor the cache used,
       # and the default is now zstd. stdenv puts `xz` on PATH but not `zstd`.

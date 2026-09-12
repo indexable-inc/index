@@ -71,7 +71,7 @@ struct CmdRegistryList : StoreCommand
         auto registries = getRegistries(fetchSettings, *store);
 
         for (auto & registry : registries) {
-            for (auto & entry : registry->entries) {
+            for (auto & entry : registry->entries()) {
                 // FIXME: format nicely
                 logger->cout(
                     "%s %s %s",

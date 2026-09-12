@@ -25,6 +25,7 @@ use codex_core::exec::ExecExpirationOutcome;
 use codex_core::exec::IO_DRAIN_TIMEOUT_MS;
 use codex_exec_server::EnvironmentManager;
 use codex_protocol::exec_output::bytes_to_string_smart;
+use codex_protocol::shell_environment::is_non_inheritable_env_var;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
 use codex_utils_pty::ProcessHandle;
@@ -107,6 +108,7 @@ impl ProcessExecRequestProcessor {
                 }
             }
         }
+        env.retain(|name, _| !is_non_inheritable_env_var(name));
         let expiration = match timeout_ms {
             Some(Some(timeout_ms)) => match u64::try_from(timeout_ms) {
                 Ok(timeout_ms) => timeout_ms.into(),
@@ -312,13 +314,22 @@ impl ProcessExecManager {
                 &env,
                 &arg0,
                 size.unwrap_or_default(),
+                &[],
             )
             .await
         } else if stream_stdin {
-            codex_utils_pty::spawn_pipe_process(program, args, cwd.as_path(), &env, &arg0).await
-        } else {
-            codex_utils_pty::spawn_pipe_process_no_stdin(program, args, cwd.as_path(), &env, &arg0)
+            codex_utils_pty::spawn_pipe_process(program, args, cwd.as_path(), &env, &arg0, &[])
                 .await
+        } else {
+            codex_utils_pty::spawn_pipe_process_no_stdin(
+                program,
+                args,
+                cwd.as_path(),
+                &env,
+                &arg0,
+                &[],
+            )
+            .await
         };
         let spawned = match spawned {
             Ok(spawned) => spawned,

@@ -1,4 +1,7 @@
 use codex_config::McpServerConfig;
+use codex_exec_server_protocol::ExecutorCapabilityDiscoverySnapshot;
+use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::protocol::SessionSource;
 
 use crate::ExtensionData;
 use crate::ExtensionDataInit;
@@ -15,10 +18,14 @@ pub struct McpServerContributionContext<'a, C> {
     thread_store: Option<&'a ExtensionData>,
     /// Stable host inputs for the active thread, when resolution is thread-scoped.
     thread_init: Option<&'a ExtensionDataInit>,
+    /// Source of the active thread, when supplied by the host runtime.
+    session_source: Option<&'a SessionSource>,
     /// Effective request originator for the active thread, when resolution is thread-scoped.
     originator: Option<&'a str>,
-    /// Environment IDs whose selected roots may contribute to this exact step.
-    available_environment_ids: Option<&'a [String]>,
+    /// Selected roots resolved against ready environments for this exact step.
+    ready_selected_capability_roots: Option<&'a [SelectedCapabilityRoot]>,
+    /// Executor-materialized capability files shared by all consumers in this exact step.
+    executor_capability_discovery: Option<&'a ExecutorCapabilityDiscoverySnapshot>,
 }
 
 impl<C> Clone for McpServerContributionContext<'_, C> {
@@ -36,8 +43,10 @@ impl<'a, C> McpServerContributionContext<'a, C> {
             config,
             thread_store: None,
             thread_init: None,
+            session_source: None,
             originator: None,
-            available_environment_ids: None,
+            ready_selected_capability_roots: None,
+            executor_capability_discovery: None,
         }
     }
 
@@ -47,15 +56,24 @@ impl<'a, C> McpServerContributionContext<'a, C> {
         thread_init: &'a ExtensionDataInit,
         thread_store: &'a ExtensionData,
         originator: &'a str,
-        available_environment_ids: &'a [String],
+        ready_selected_capability_roots: &'a [SelectedCapabilityRoot],
+        executor_capability_discovery: Option<&'a ExecutorCapabilityDiscoverySnapshot>,
     ) -> Self {
         Self {
             config,
             thread_store: Some(thread_store),
             thread_init: Some(thread_init),
+            session_source: None,
             originator: Some(originator),
-            available_environment_ids: Some(available_environment_ids),
+            ready_selected_capability_roots: Some(ready_selected_capability_roots),
+            executor_capability_discovery,
         }
+    }
+
+    /// Attaches the stable source of the active thread to this contribution.
+    pub fn with_session_source(mut self, session_source: &'a SessionSource) -> Self {
+        self.session_source = Some(session_source);
+        self
     }
 
     /// Returns the host configuration visible during resolution.
@@ -73,18 +91,40 @@ impl<'a, C> McpServerContributionContext<'a, C> {
         self.thread_init
     }
 
+    /// Returns the active thread's source when supplied by the host runtime.
+    pub fn session_source(&self) -> Option<&'a SessionSource> {
+        self.session_source
+    }
+
     /// Returns the effective request originator when resolving for a running thread.
     pub fn originator(&self) -> Option<&'a str> {
         self.originator
     }
 
-    /// Returns the exact environment availability projection for a model step.
-    ///
-    /// `Some` means contributors must omit selected roots whose environment ID is absent from the
-    /// slice. Global resolution returns `None` because it has no thread environments.
-    pub fn available_environment_ids(&self) -> Option<&'a [String]> {
-        self.available_environment_ids
+    /// Returns selected roots resolved against the ready environments for this model step.
+    pub fn ready_selected_capability_roots(&self) -> Option<&'a [SelectedCapabilityRoot]> {
+        self.ready_selected_capability_roots
     }
+
+    /// Returns the executor-materialized capability files for this model step, when enabled.
+    pub fn executor_capability_discovery(&self) -> Option<&'a ExecutorCapabilityDiscoverySnapshot> {
+        self.executor_capability_discovery
+    }
+}
+
+/// Validated plugin identities projected for the current set of selected roots.
+#[derive(Clone, Debug, Default)]
+pub struct SelectedPluginSnapshot {
+    pub plugins: Vec<SelectedPluginIdentity>,
+    /// Selected plugin roots suppressed by the effective plugin feature policy.
+    pub disabled_plugin_roots: Vec<String>,
+}
+
+/// The configured identity of a plugin resolved from one selected root.
+#[derive(Clone, Debug)]
+pub struct SelectedPluginIdentity {
+    pub selected_root_id: String,
+    pub plugin_id: String,
 }
 
 /// One extension-owned overlay for the runtime MCP server configuration.
@@ -95,6 +135,8 @@ pub enum McpServerContribution {
         name: String,
         config: Box<McpServerConfig>,
     },
+    /// Registers the controller-owned Apps server under its reserved name.
+    HostedApps { config: Box<McpServerConfig> },
     /// Registers a server declared by a plugin selected for this thread.
     SelectedPlugin {
         name: String,
@@ -105,6 +147,7 @@ pub enum McpServerContribution {
     },
     /// Records a plugin selected for this thread and any connector IDs it declares.
     SelectedPluginPackage {
+        selected_root_id: String,
         plugin_id: String,
         plugin_display_name: String,
         connector_ids: Vec<String>,

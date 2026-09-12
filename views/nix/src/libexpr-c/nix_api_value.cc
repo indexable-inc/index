@@ -4,7 +4,6 @@
 #include "nix/expr/eval.hh"
 #include "nix/store/globals.hh"
 #include "nix/store/path.hh"
-#include "nix/expr/primops.hh"
 #include "nix/expr/value.hh"
 
 #include "nix_api_expr.h"
@@ -168,16 +167,6 @@ PrimOp * nix_alloc_primop(
         return (PrimOp *) p;
     }
     NIXC_CATCH_ERRS_NULL
-}
-
-nix_err nix_register_primop(nix_c_context * context, PrimOp * primOp)
-{
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        nix::RegisterPrimOp r(std::move(*((nix::PrimOp *) primOp)));
-    }
-    NIXC_CATCH_ERRS
 }
 
 nix_value * nix_alloc_value(nix_c_context * context, EvalState * state)

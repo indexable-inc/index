@@ -20,6 +20,13 @@ git -C "$nonFlakeDir" commit -m 'Initial'
 flake3Dir=$TEST_ROOT/flake3
 createGitRepo "$flake3Dir" ""
 
+# A non-flake input needs an identity just like a flake one, so none of these
+# can name a bare path on disk. README.md is reachable two ways, and both are
+# exercised: `file://` fetches the file itself, so the input's source is that
+# file; `git+file://...?dir=` fetches the repository, so the input's source is
+# the tree and the input points inside it. `file+file://` is the same fetch as
+# `file://` written with its transport spelled out, which is what makes the
+# two comparable inside the build below.
 cat > "$flake3Dir/flake.nix" <<EOF
 {
   inputs = {
@@ -30,15 +37,15 @@ cat > "$flake3Dir/flake.nix" <<EOF
       flake = false;
     };
     nonFlakeFile = {
-      url = "path://$nonFlakeDir/README.md";
+      url = "file://$nonFlakeDir/README.md";
       flake = false;
     };
     nonFlakeFile2 = {
-      url = "$nonFlakeDir/README.md";
+      url = "file+file://$nonFlakeDir/README.md";
       flake = false;
     };
     nonFlakeFile3 = {
-      url = "$nonFlakeDir?dir=README.md";
+      url = "git+file://$nonFlakeDir?dir=README.md";
       flake = false;
     };
     relativeNonFlakeFile = {
@@ -143,7 +150,7 @@ cat > "$flake3Dir/flake.nix" <<EOF
 {
   inputs = {
     nonFlake = {
-      url = "$nonFlakeDir";
+      url = "git+file://$nonFlakeDir";
       flake = false;
     };
   };
@@ -164,9 +171,10 @@ cat > "$flake3Dir/flake.nix" <<EOF
   };
 }
 EOF
-nix flake lock "$flake3Dir"
-git -C "$flake3Dir" add flake.nix flake.lock
-git -C "$flake3Dir" commit -m 'Remove packages.xyzzy'
+git -C "$flake3Dir" commit -a -m 'Remove packages.xyzzy'
+# A git source takes its lock file only as a commit (flakes/lock-file-writes.sh).
+nix flake lock "$flake3Dir" --commit-lock-file
+[[ -z "$(git -C "$flake3Dir" status --porcelain)" ]]
 git -C "$flake3Dir" checkout master
 
 # Test whether fuzzy-matching works for registry entries.

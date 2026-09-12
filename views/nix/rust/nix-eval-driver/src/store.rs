@@ -5,7 +5,7 @@
 //! Two store operations carry this plank: `builtins.toFile` and the `.drv`
 //! write behind `builtins.derivationStrict`. cppnix performs both with one
 //! call -- `addToStoreFromDump(..., ContentAddressMethod::Raw::Text, ...)`,
-//! which `src/nix/rust-eval-session.cc` uses for `rustStoreText` and
+//! which `src/libcmd/rust-eval-session.cc` uses for `rustStoreText` and
 //! `rustWriteDerivation` alike -- and the path it lands on is
 //! `makeFixedOutputPathFromCA` over a `TextInfo`. That computation is already
 //! pure Rust in [`nix_eval_rs::drvpath::text_store_path`], so what is left is

@@ -160,5 +160,5 @@ expectStderr 1 nix eval -v --raw --expr "
     fromPath = $caPath;
     inputAddressed = true;
   }
-" | grepQuiet 'error.*The store object referred to by.*fromPath.* at .* is not input-addressed, but .*inputAddressed.* is set to .*true.*'
+" | grepQuiet 'error.*The store object referred to by.*fromPath.* at .* is content-addressed and self-certifying (not input-addressed), but .*inputAddressed.* is set to .*true.*'
 

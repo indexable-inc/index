@@ -18,7 +18,7 @@
 # The tokenizer moved across rnix releases, so the overlay source is selected
 # by the vendored version, and an unknown version fails the build with
 # instructions (a nixpkgs bump onto a new rnix minor adds a view, not silence).
-# Each flavor is a jj view based on the matching nix-community/rnix-parser tag,
+# Each flavor is a jj view (views.toml) of the matching nix-community/rnix-parser tag,
 # so the flavor's `src/` tree is
 # the patched tokenizer and this overlays it over the vendored crate. The
 # `.cargo-checksum.json` files the nixpkgs vendorers write carry no per-file

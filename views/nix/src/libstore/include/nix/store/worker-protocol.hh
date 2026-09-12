@@ -109,6 +109,8 @@ struct WorkerProto
 
     static const Version minimum;
 
+    static constexpr const char * independentBuildResults = "build-paths-with-results-independent";
+
     /**
      * A unidirectional read connection, to be used by the read half of the
      * canonical serializers below.
@@ -230,6 +232,7 @@ enum struct WorkerProto::Op : uint64_t {
     AddBuildLog = 45,
     BuildPathsWithResults = 46,
     AddPermRoot = 47,
+    BuildPathsWithResultsIndependent = 48,
 };
 
 struct WorkerProto::ClientHandshakeInfo

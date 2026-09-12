@@ -45,6 +45,7 @@
     "prepare": "pnpm run build"
   },
   "devDependencies": {
+    "@modelcontextprotocol/conformance": "github:modelcontextprotocol/conformance#49103de6ed70804e940637bf3e9e29e4a3f54e64",
     "@modelcontextprotocol/sdk": "^1.24.0",
     "@types/jest": "^29.5.14",
     "@types/node": "^20.19.18",
@@ -63,5 +64,5 @@
     "zod": "^3.24.2",
     "zod-to-json-schema": "^3.24.6"
   },
-  "packageManager": "pnpm@10.33.0+sha512.10568bb4a6afb58c9eb3630da90cc9516417abebd3fabbe6739f0ae795728da1491e9db5a544c76ad8eb7570f5c4bb3d6c637b2cb41bfdcdb47fa823c8649319"
+  "packageManager": "pnpm@10.34.5+sha512.a4ee05f2f73658255bd6a89859c065a45c28a57daefae2c893a168ee2b73168c37b91e83e57ea67654ad03f03031746430e8bce38e362e042605fb8abc80192e"
 }

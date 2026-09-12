@@ -80,6 +80,26 @@ impl ResponseMock {
     }
 }
 
+pub fn assert_parent_turn(body: &Value, expected: Option<&str>) -> Result<()> {
+    assert_turn_id(body, "parent_turn_id", expected)
+}
+
+pub fn assert_root_turn(body: &Value, expected: Option<&str>) -> Result<()> {
+    assert_turn_id(body, "root_turn_id", expected)
+}
+
+fn assert_turn_id(body: &Value, key: &str, expected: Option<&str>) -> Result<()> {
+    let metadata = &body["client_metadata"];
+    let payload = metadata["x-codex-turn-metadata"]
+        .as_str()
+        .expect("canonical turn metadata");
+    let canonical: Value = serde_json::from_str(payload)?;
+    let expected = expected.map(Value::from);
+    let actual = (metadata.get(key), canonical.get(key));
+    assert_eq!(actual, (expected.as_ref(), expected.as_ref()));
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct ResponsesRequest(wiremock::Request);
 
@@ -107,6 +127,43 @@ pub fn strip_metadata(mut item: ResponseItem) -> ResponseItem {
 /// Returns response items without internal transport metadata for semantic assertions.
 pub fn strip_metadata_from_items(items: &[ResponseItem]) -> Vec<ResponseItem> {
     items.iter().cloned().map(strip_metadata).collect()
+}
+
+/// Returns a response item without its Responses API item ID for semantic assertions.
+pub fn strip_response_item_id(mut item: ResponseItem) -> ResponseItem {
+    item.set_id(/*new_id*/ None);
+    item
+}
+
+/// Returns response items without their Responses API item IDs for semantic assertions.
+pub fn strip_response_item_ids(items: &[ResponseItem]) -> Vec<ResponseItem> {
+    items.iter().cloned().map(strip_response_item_id).collect()
+}
+
+/// Returns JSON without IDs on recognized Responses API items.
+pub fn strip_response_item_ids_from_json(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(strip_response_item_ids_from_json)
+                .collect(),
+        ),
+        Value::Object(mut map) => {
+            let is_response_item =
+                serde_json::from_value::<ResponseItem>(Value::Object(map.clone()))
+                    .is_ok_and(|item| !matches!(item, ResponseItem::Other));
+            if is_response_item {
+                map.remove("id");
+            }
+            Value::Object(
+                map.into_iter()
+                    .map(|(key, value)| (key, strip_response_item_ids_from_json(value)))
+                    .collect(),
+            )
+        }
+        value => value,
+    }
 }
 
 /// Returns JSON without internal transport metadata for semantic assertions.
@@ -216,11 +273,42 @@ impl ResponsesRequest {
             .collect()
     }
 
+    /// Returns all `input_audio` `audio_url` spans from `message` inputs for the provided role.
+    pub fn message_input_audio_urls(&self, role: &str) -> Vec<String> {
+        self.inputs_of_type("message")
+            .into_iter()
+            .filter(|item| item.get("role").and_then(Value::as_str) == Some(role))
+            .filter_map(|item| item.get("content").and_then(Value::as_array).cloned())
+            .flatten()
+            .filter(|span| span.get("type").and_then(Value::as_str) == Some("input_audio"))
+            .filter_map(|span| {
+                span.get("audio_url")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
     pub fn input(&self) -> Vec<Value> {
         self.body_json()["input"]
             .as_array()
             .expect("input array not found in request")
             .clone()
+    }
+
+    /// Returns whether an input item's content annotations exactly match the given sequence.
+    pub fn has_content_kinds(&self, kinds: &[&str]) -> bool {
+        self.input().into_iter().any(|item| {
+            item["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+                .as_array()
+                .is_some_and(|actual| {
+                    actual.len() == kinds.len()
+                        && actual
+                            .iter()
+                            .zip(kinds)
+                            .all(|(actual, expected)| actual.as_str() == Some(*expected))
+                })
+        })
     }
 
     pub fn inputs_of_type(&self, ty: &str) -> Vec<Value> {
@@ -516,6 +604,7 @@ impl WebSocketTestServer {
         request_index: usize,
     ) -> WebSocketRequest {
         loop {
+            let notified = self.request_log_updated.notified();
             if let Some(request) = self
                 .connections
                 .lock()
@@ -526,7 +615,7 @@ impl WebSocketTestServer {
             {
                 return request;
             }
-            self.request_log_updated.notified().await;
+            notified.await;
         }
     }
 
@@ -913,21 +1002,6 @@ pub fn ev_custom_tool_call_with_namespace(
     })
 }
 
-pub fn ev_local_shell_call(call_id: &str, status: &str, command: Vec<&str>) -> Value {
-    serde_json::json!({
-        "type": "response.output_item.done",
-        "item": {
-            "type": "local_shell_call",
-            "call_id": call_id,
-            "status": status,
-            "action": {
-                "type": "exec",
-                "command": command,
-            }
-        }
-    })
-}
-
 /// Convenience: SSE event for an `apply_patch` custom tool call with raw patch
 /// text. This mirrors the payload produced by the Responses API when the model
 /// invokes `apply_patch` directly.
@@ -943,21 +1017,21 @@ pub fn ev_apply_patch_custom_tool_call(call_id: &str, patch: &str) -> Value {
     })
 }
 
-pub fn ev_shell_command_call(call_id: &str, command: &str) -> Value {
-    let args = serde_json::json!({ "command": command });
-    ev_shell_command_call_with_args(call_id, &args)
+pub fn ev_exec_command_call(call_id: &str, command: &str) -> Value {
+    let args = serde_json::json!({ "cmd": command });
+    ev_exec_command_call_with_args(call_id, &args)
 }
 
-pub fn ev_shell_command_call_with_args(call_id: &str, args: &serde_json::Value) -> Value {
-    let arguments = serde_json::to_string(args).expect("serialize shell command arguments");
-    ev_function_call(call_id, "shell_command", &arguments)
+pub fn ev_exec_command_call_with_args(call_id: &str, args: &serde_json::Value) -> Value {
+    let arguments = serde_json::to_string(args).expect("serialize exec command arguments");
+    ev_function_call(call_id, "exec_command", &arguments)
 }
 
-pub fn ev_apply_patch_shell_command_call_via_heredoc(call_id: &str, patch: &str) -> Value {
-    let args = serde_json::json!({ "command": format!("apply_patch <<'EOF'\n{patch}\nEOF\n") });
+pub fn ev_apply_patch_exec_command_call_via_heredoc(call_id: &str, patch: &str) -> Value {
+    let args = serde_json::json!({ "cmd": format!("apply_patch <<'EOF'\n{patch}\nEOF\n") });
     let arguments = serde_json::to_string(&args).expect("serialize apply_patch arguments");
 
-    ev_function_call(call_id, "shell_command", &arguments)
+    ev_function_call(call_id, "exec_command", &arguments)
 }
 
 pub fn sse_failed(id: &str, code: &str, message: &str) -> String {
@@ -1005,7 +1079,7 @@ where
 fn base_mock() -> (MockBuilder, ResponseMock) {
     let response_mock = ResponseMock::new();
     let mock = Mock::given(method("POST"))
-        .and(path_regex(".*/responses$"))
+        .and(path_regex(".*/(responses|guardian)$"))
         .and(response_mock.clone());
     (mock, response_mock)
 }
@@ -1042,27 +1116,6 @@ where
 pub async fn mount_sse_once(server: &MockServer, body: String) -> ResponseMock {
     let (mock, response_mock) = base_mock();
     mock.respond_with(sse_response(body))
-        .up_to_n_times(1)
-        .mount(server)
-        .await;
-    response_mock
-}
-
-pub async fn mount_compact_json_once_match<M>(
-    server: &MockServer,
-    matcher: M,
-    body: serde_json::Value,
-) -> ResponseMock
-where
-    M: wiremock::Match + Send + Sync + 'static,
-{
-    let (mock, response_mock) = compact_mock();
-    mock.and(matcher)
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "application/json")
-                .set_body_json(body.clone()),
-        )
         .up_to_n_times(1)
         .mount(server)
         .await;
@@ -1610,10 +1663,11 @@ pub async fn mount_compact_response_sequence(
 
 /// Validate invariants on the request body sent to `/v1/responses`.
 ///
-/// - No `function_call_output`/`custom_tool_call_output` with missing/empty `call_id`.
+/// - A `function_call_output` with missing/empty `call_id` must have a nonempty `name`.
+/// - No `custom_tool_call_output` with missing/empty `call_id`.
 /// - `tool_search_output` must have a `call_id` unless it is a server-executed legacy item.
-/// - Every `function_call_output` must match a prior `function_call` or
-///   `local_shell_call` with the same `call_id` in the same `input`.
+/// - Every `function_call_output` with a `call_id` must match a prior `function_call`
+///   or `local_shell_call` with the same `call_id` in the same `input`.
 /// - Every `custom_tool_call_output` must match a prior `custom_tool_call`.
 /// - Every `tool_search_output` must match a prior `tool_search_call`.
 /// - Additionally, enforce symmetry: every `function_call`/`custom_tool_call`/
@@ -1659,9 +1713,19 @@ fn validate_request_body_invariants(request: &wiremock::Request) {
         items
             .iter()
             .filter(|item| item.get("type").and_then(Value::as_str) == Some(kind))
-            .map(|item| {
-                let id = get_call_id(item).expect(missing_msg);
-                id.to_string()
+            .filter_map(|item| {
+                if let Some(id) = get_call_id(item) {
+                    return Some(id.to_string());
+                }
+                if kind == "function_call_output"
+                    && item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.is_empty())
+                {
+                    return None;
+                }
+                panic!("{missing_msg}");
             })
             .collect()
     }

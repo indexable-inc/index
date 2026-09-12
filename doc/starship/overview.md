@@ -39,7 +39,7 @@ touch directory truncation.
   `programs.starship.package`.
 - `meta.homepage` points at `indexable-inc/starship` so the built package
   advertises the fork, not upstream.
-- Update: `jj views anchor starship` from a jj workspace, then move the
+- Update: `jj view refresh starship` from a jj workspace, then move the
   `starship.version` assert in `default.nix` to the new tag.
 
 ## The version assert

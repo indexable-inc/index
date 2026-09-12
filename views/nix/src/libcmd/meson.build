@@ -49,22 +49,6 @@ configdata.set(
   lowdown.version().version_compare('>= 3.0.0').to_int(),
 )
 
-readline_flavor = get_option('readline-flavor')
-if readline_flavor == 'editline'
-  editline = dependency('libeditline', 'editline', version : '>=1.14')
-  deps_private += editline
-elif readline_flavor == 'readline'
-  readline = dependency('readline')
-  deps_private += readline
-else
-  error('illegal editline flavor', readline_flavor)
-endif
-configdata.set(
-  'USE_READLINE',
-  (readline_flavor == 'readline').to_int(),
-  description : 'Use readline instead of editline',
-)
-
 config_priv_h = configure_file(
   configuration : configdata,
   output : 'cmd-config-private.hh',
@@ -73,13 +57,13 @@ config_priv_h = configure_file(
 subdir('nix-meson-build-support/common')
 
 sources = files(
+  'app.cc',
   'built-path.cc',
   'command-installable-value.cc',
   'command.cc',
   'common-eval-args.cc',
   'editor-for.cc',
   'get-build-log.cc',
-  'installable-attr-path.cc',
   'installable-derived-path.cc',
   'installable-flake.cc',
   'installable-value.cc',
@@ -87,8 +71,10 @@ sources = files(
   'markdown.cc',
   'misc-store-flags.cc',
   'network-proxy.cc',
-  'repl-interacter.cc',
-  'repl.cc',
+  'rust-closure-diff.cc',
+  'rust-persistent.cc',
+  'rust-eval-session.cc',
+  'rust-search.cc',
 )
 
 if host_machine.system() != 'windows'
@@ -96,6 +82,8 @@ if host_machine.system() != 'windows'
     'unix/unix-socket-server.cc',
   )
 endif
+
+subdir('nix-meson-build-support/rust-runtime')
 
 subdir('include/nix/cmd')
 
@@ -110,6 +98,8 @@ this_library = library(
   dependencies : deps_public + deps_private + deps_other,
   include_directories : include_dirs,
   link_args : linker_export_flags,
+  build_rpath : rust_runtime_build_rpath,
+  install_rpath : rust_runtime_install_rpath,
   prelink : true, # For C++ static initializers
   install : true,
   cpp_pch : do_pch ? [ 'pch/precompiled-headers.hh' ] : [],
@@ -117,6 +107,30 @@ this_library = library(
 
 install_headers(headers, subdir : 'nix/cmd', preserve_path : true)
 
-libraries_private = []
+# The phantom-token guard. Its own executable because it needs both the
+# command layer's constants and the evaluator's ABI vocabulary linked, and
+# this component links the shared Rust runtime.
+refusal_vocabulary_test = executable(
+  'nix-refusal-vocabulary-test',
+  files('rust-eval-refusal-vocabulary-test.cc'),
+  dependencies : deps_public + deps_private + deps_other,
+  include_directories : include_dirs,
+  build_rpath : rust_runtime_build_rpath,
+)
+test(
+  'refusal-vocabulary',
+  refusal_vocabulary_test,
+  suite : 'nix-cmd',
+  protocol : 'exitcode',
+)
+
+perf_scope_test = executable(
+  'nix-rust-eval-perf-scope-test',
+  files('rust-eval-perf-scope-test.cc'),
+  include_directories : include_dirs,
+)
+test('rust-eval-perf-scope', perf_scope_test, suite : 'nix-cmd')
+
+libraries_private = rust_runtime_libraries_private
 
 subdir('nix-meson-build-support/export')

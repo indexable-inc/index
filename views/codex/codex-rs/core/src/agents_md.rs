@@ -19,16 +19,19 @@ use crate::config::Config;
 use crate::context::UserInstructions as ContextUserInstructions;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use codex_config::ConfigLayerSource;
-use codex_config::ConfigLayerStackOrdering;
 use codex_config::default_project_root_markers;
 use codex_config::merge_toml_values;
 use codex_config::project_root_markers_from_config;
 use codex_exec_server::ExecutorFileSystem;
-use codex_extension_api::UserInstructions;
+use codex_exec_server::GetMetadataOptions;
+use codex_exec_server::ReadFileOptions;
+use codex_extension_api::Instructions;
+use codex_file_system::FileSystemSandboxContext;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use futures::StreamExt;
 use std::io;
 use toml::Value as TomlValue;
 use tracing::error;
@@ -42,36 +45,71 @@ pub const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
 /// concatenated with the following separator.
 const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 
+// Metadata probes are cheap and the exec-server transport already bounds total in-flight calls.
+// This covers typical project hierarchies in one remote round trip without monopolizing that
+// transport when independent startup discovery runs concurrently.
+const MAX_CONCURRENT_ANCESTOR_PROBES: usize = 256;
+
 /// Loads project AGENTS.md content and combines it with host-provided user
 /// instructions.
 pub(crate) async fn load_project_instructions(
     config: &Config,
-    user_instructions: Option<UserInstructions>,
+    user_instructions: Option<Instructions>,
     environments: &TurnEnvironmentSnapshot,
-) -> Option<LoadedAgentsMd> {
+) -> io::Result<Option<LoadedAgentsMd>> {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
-    for turn_environment in &environments.turn_environments {
+    if config.active_project.is_untrusted() {
+        return Ok((!loaded.is_empty()).then_some(loaded));
+    }
+
+    let mut remaining = config.project_doc_max_bytes;
+    for turn_environment in environments.turn_environments() {
+        if remaining == 0 {
+            break;
+        }
+
         let filesystem = turn_environment.environment.get_filesystem();
+        let sandbox = (!turn_environment
+            .permission_profile()
+            .file_system_sandbox_policy()
+            .has_full_disk_read_access())
+        .then(|| turn_environment.sandbox_context(/*additional_permissions*/ None));
         match read_agents_md(
             config,
             filesystem.as_ref(),
-            &turn_environment.environment_id,
+            &turn_environment.selection.environment_id,
             turn_environment.cwd(),
+            remaining,
+            sandbox.as_ref(),
         )
         .await
         {
-            Ok(Some(docs)) => loaded.entries.extend(docs.entries),
+            Ok(Some(docs)) => {
+                for entry in docs.entries {
+                    remaining = remaining.saturating_sub(entry.contents.len());
+                    loaded.entries.push(entry);
+                }
+            }
             Ok(None) => {}
-            Err(e) => {
+            Err(error) if sandbox.is_none() => {
                 error!(
-                    environment_id = turn_environment.environment_id,
-                    "error trying to find AGENTS.md docs: {e:#}"
+                    environment_id = turn_environment.selection.environment_id,
+                    "error trying to find AGENTS.md docs: {error:#}"
                 );
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to load AGENTS.md instructions for environment `{}`: {error}",
+                        turn_environment.selection.environment_id
+                    ),
+                ));
             }
         }
     }
 
-    (!loaded.is_empty()).then_some(loaded)
+    Ok((!loaded.is_empty()).then_some(loaded))
 }
 
 /// Attempt to locate and load AGENTS.md documentation.
@@ -85,14 +123,14 @@ async fn read_agents_md(
     fs: &dyn ExecutorFileSystem,
     environment_id: &str,
     cwd: &PathUri,
+    max_total: usize,
+    sandbox: Option<&FileSystemSandboxContext>,
 ) -> io::Result<Option<LoadedAgentsMd>> {
-    let max_total = config.project_doc_max_bytes;
-
     if max_total == 0 {
         return Ok(None);
     }
 
-    let paths = agents_md_paths(config, cwd, fs).await?;
+    let paths = agents_md_paths(config, cwd, fs, sandbox).await?;
     if paths.is_empty() {
         return Ok(None);
     }
@@ -105,7 +143,7 @@ async fn read_agents_md(
             break;
         }
 
-        let mut data = match fs.read_file(&p, /*sandbox*/ None).await {
+        let mut data = match fs.read_file(&p, ReadFileOptions::default(), sandbox).await {
             Ok(data) => data,
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err),
@@ -150,14 +188,12 @@ async fn agents_md_paths(
     config: &Config,
     cwd: &PathUri,
     fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
 ) -> io::Result<Vec<PathUri>> {
     let dir = cwd.clone();
 
     let mut merged = TomlValue::Table(toml::map::Map::new());
-    for layer in config.config_layer_stack.get_layers(
-        ConfigLayerStackOrdering::LowestPrecedenceFirst,
-        /*include_disabled*/ false,
-    ) {
+    for layer in config.config_layer_stack.layers_low_to_high() {
         if matches!(layer.name, ConfigLayerSource::Project { .. }) {
             continue;
         }
@@ -175,8 +211,8 @@ async fn agents_md_paths(
         fs,
         &dir,
         project_root_markers,
-        FindUpErrorPolicy::Propagate,
-        /*sandbox*/ None,
+        FindUpErrorPolicy::Ignore,
+        sandbox,
     )
     .await?;
     let search_dirs = if let Some(root) = project_root {
@@ -198,22 +234,31 @@ async fn agents_md_paths(
         vec![dir]
     };
 
-    let mut found = Vec::new();
     let candidate_filenames = candidate_filenames(config);
-    for directory in search_dirs {
-        for name in &candidate_filenames {
-            let candidate = directory
-                .join(name)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-            match fs.get_metadata(&candidate, /*sandbox*/ None).await {
-                Ok(metadata) if metadata.is_file => {
-                    found.push(candidate);
-                    break;
+    let candidate_filenames = &candidate_filenames;
+    let mut results = futures::stream::iter(search_dirs)
+        .map(|directory| async move {
+            for name in candidate_filenames {
+                let candidate = directory
+                    .join(name)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+                match fs
+                    .get_metadata(&candidate, GetMetadataOptions::default(), sandbox)
+                    .await
+                {
+                    Ok(metadata) if metadata.is_file => return Ok(Some(candidate)),
+                    Ok(_) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
                 }
-                Ok(_) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
             }
+            Ok(None)
+        })
+        .buffered(MAX_CONCURRENT_ANCESTOR_PROBES);
+    let mut found = Vec::new();
+    while let Some(result) = results.next().await {
+        if let Some(candidate) = result? {
+            found.push(candidate);
         }
     }
     Ok(found)
@@ -240,7 +285,7 @@ fn candidate_filenames(config: &Config) -> Vec<&str> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoadedAgentsMd {
     /// Host-provided user instructions.
-    user_instructions: Option<UserInstructions>,
+    user_instructions: Option<Instructions>,
 
     /// Ordered instructions and their provenance.
     entries: Vec<InstructionEntry>,
@@ -253,7 +298,7 @@ impl LoadedAgentsMd {
             return Self::default();
         }
         Self {
-            user_instructions: Some(UserInstructions {
+            user_instructions: Some(Instructions {
                 text: contents,
                 source: path,
             }),
@@ -261,7 +306,7 @@ impl LoadedAgentsMd {
         }
     }
 
-    fn from_user_instructions(user_instructions: Option<UserInstructions>) -> Self {
+    fn from_user_instructions(user_instructions: Option<Instructions>) -> Self {
         Self {
             user_instructions: user_instructions
                 .filter(|instructions| !instructions.text.trim().is_empty()),

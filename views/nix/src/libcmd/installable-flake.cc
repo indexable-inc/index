@@ -20,6 +20,7 @@
 
 #include <regex>
 #include <queue>
+#include <set>
 
 #include <nlohmann/json.hpp>
 
@@ -197,15 +198,54 @@ ref<flake::LockedFlake> InstallableFlake::getLockedFlake() const
     return ref<flake::LockedFlake>(_lockedFlake);
 }
 
+/* The flake reference a locked node can be fetched by on its own.
+
+   A relative-path input (`path:./nixpkgs`) has no flake reference of its
+   own: its lock entry is the literal path plus the node it is relative to,
+   and it is a directory of that node's tree. Fetched on its own the path
+   resolves to nothing (`Input::isRelative`, "resolves only as a flake
+   input"), so it is named the one way a directory of a tree can be named
+   from outside: the tree's own reference plus `dir`. Nested relative inputs
+   compose the same way up to the first node that has a reference of its
+   own; the root flake is the last resort. */
+static FlakeRef standaloneFlakeRef(
+    const flake::LockedFlake & lockedFlake,
+    flake::NodeId nodeId,
+    std::set<flake::NodeId> & visited)
+{
+    const auto * lockedNode = lockedFlake.lockFile.node(nodeId);
+    if (!lockedNode)
+        return lockedFlake.flake.lockedRef;
+    const auto & node = *lockedNode;
+    /* A lock file is data: a `parent` chain that loops would loop here. */
+    if (!visited.insert(nodeId).second)
+        throw Error(
+            "cycle in lock file: relative input '%s' is (transitively) its own parent",
+            node.lockedRef.to_string());
+    auto relative = node.lockedRef.input.isRelative();
+    if (!relative)
+        return node.lockedRef;
+    auto parent = [&]() -> FlakeRef {
+        if (node.parentInputAttrPath && !node.parentInputAttrPath->empty())
+            if (auto parentNode = lockedFlake.lockFile.findInput(*node.parentInputAttrPath))
+                return standaloneFlakeRef(lockedFlake, *parentNode, visited);
+        return lockedFlake.flake.lockedRef;
+    }();
+    auto dir = CanonPath(relative->string(), CanonPath(parent.subdir));
+    return FlakeRef(fetchers::Input(parent.input), dir.isRoot() ? "" : std::string(dir.rel()));
+}
+
 FlakeRef InstallableFlake::nixpkgsFlakeRef() const
 {
     auto lockedFlake = getLockedFlake();
 
     if (auto nixpkgsInput = lockedFlake->lockFile.findInput({"nixpkgs"})) {
-        if (auto lockedNode = std::dynamic_pointer_cast<const flake::LockedNode>(nixpkgsInput)) {
+        if (auto lockedNode = lockedFlake->lockFile.node(*nixpkgsInput)) {
             if (lockedNode->isFlake) {
-                debug("using nixpkgs flake '%s'", lockedNode->lockedRef);
-                return std::move(lockedNode->lockedRef);
+                std::set<flake::NodeId> visited;
+                auto ref = standaloneFlakeRef(*lockedFlake, *nixpkgsInput, visited);
+                debug("using nixpkgs flake '%s'", ref);
+                return ref;
             }
         }
     }

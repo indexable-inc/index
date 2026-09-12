@@ -8,6 +8,9 @@
 #include "nix/store/globals.hh"
 #include "nix/store/outputs-spec.hh"
 #include "nix/store/derivations.hh"
+#include "nix/cmd/installable-derived-path.hh"
+#include "nix/expr/rust-eval-refusal.hh"
+#include "nix/cmd/rust-eval-session.hh"
 
 #ifndef _WIN32 // TODO re-enable on Windows
 #  include "run.hh"
@@ -480,13 +483,11 @@ struct Common : InstallableCommand, MixProfile
             return *path;
         else {
             auto drvs = Installable::toDerivations(store, {installable});
-
             if (drvs.size() != 1)
                 throw Error(
                     "'%s' needs to evaluate to a single derivation, but it evaluated to %d derivations",
                     installable->what(),
                     drvs.size());
-
             auto & drvPath = *drvs.begin();
 
             return getDerivationEnvironment(store, getEvalStore(), drvPath);
@@ -510,8 +511,10 @@ struct Common : InstallableCommand, MixProfile
 
 struct CmdDevelop : Common, MixEnvironment
 {
+    using InstallableCommand::run;
     std::vector<std::string> command;
     std::optional<std::string> phase;
+    std::optional<RustFlakeContext> rustFlakeContext;
 
     CmdDevelop()
     {
@@ -583,6 +586,26 @@ struct CmdDevelop : Common, MixEnvironment
             ;
     }
 
+    void run(ref<Store> store) override
+    {
+        if (!redirects.empty())
+            refuse(
+                refusalTokens::unsupported,
+                "nix develop --redirect resolves each redirect with SourceExprCommand::parseInstallable after the "
+                "development derivation has been selected");
+
+        auto prefix = ExtendedOutputsSpec::parse(rawInstallable()).first;
+        auto source = rustSourceOf(*this);
+
+        auto state = getEvalState();
+        auto evaluand = rustEvaluandOf(*this, state, source, prefix);
+        rustFlakeContext = evaluand.flakeContext;
+        auto drvPath = rustEvalDerivationPath(*state, evaluand);
+        auto shellOut = getDerivationEnvironment(store, getEvalStore(), drvPath);
+        auto installable = make_ref<InstallableDerivedPath>(store, DerivedPath::Opaque{.path = shellOut});
+        run(store, std::move(installable));
+    }
+
     void run(ref<Store> store, ref<Installable> installable) override
     {
         auto [buildEnvironment, gcroot] = getBuildEnvironment(store, installable);
@@ -593,10 +616,83 @@ struct CmdDevelop : Common, MixEnvironment
 
         auto script = makeRcScript(store, buildEnvironment, tmpDir);
 
+        std::filesystem::path shell = "bash";
+
+        /* The interactive bash from nixpkgs, when it can be resolved. */
+        auto resolveBashInteractive = [&]() -> std::optional<std::filesystem::path> {
+            auto state = getEvalState();
+            StorePathSet bashPaths;
+            auto nixpkgsLockFlags = lockFlags;
+            nixpkgsLockFlags.inputOverrides = {};
+            nixpkgsLockFlags.inputUpdates = {};
+
+            auto nixpkgs = defaultNixpkgsFlakeRef();
+            if (rustFlakeContext)
+                nixpkgs = rustFlakeContext->nixpkgsFlakeRef;
+            else if (auto * i = dynamic_cast<const InstallableFlake *>(&*installable))
+                nixpkgs = i->nixpkgsFlakeRef();
+
+            auto bashInstallable = make_ref<InstallableFlake>(
+                nullptr, //< Don't barf when the command is run with --arg/--argstr
+                state,
+                std::move(nixpkgs),
+                "bashInteractive",
+                ExtendedOutputsSpec::Default(),
+                Strings{},
+                Strings{"legacyPackages." + settings.thisSystem.get() + "."},
+                nixpkgsLockFlags);
+
+            {
+                if (getEnv("_NIX_TEST_RUST_EVAL_DEVELOP_BASH_REFUSAL") == "1")
+                    refuse(refusalTokens::unsupported, "test-only refusal resolving nixpkgs#bashInteractive");
+                auto drv = rustEvalDerivations(*state, rustEvaluandOfInstallable(*state, *bashInstallable));
+                Installables bashDerivedPaths{make_ref<InstallableDerivedPath>(
+                    store,
+                    DerivedPath::Built{
+                        .drvPath = makeConstantStorePathRef(drv.drvPath),
+                        .outputs = OutputsSpec::Names{drv.outputs},
+                    })};
+                bashPaths = Installable::toStorePathSet(
+                    getEvalStore(), store, Realise::Outputs, OperateOn::Output, bashDerivedPaths);
+            }
+
+            for (auto & path : bashPaths) {
+                auto s = store->printStorePath(path) + "/bin/bash";
+                if (pathExists(s))
+                    return std::optional<std::filesystem::path>(s);
+            }
+            /* No `bin/bash` is "not found", the same outcome as an attribute
+               that is not there: the shell stays `bash`. */
+            return std::optional<std::filesystem::path>();
+        };
+
+        // Missing bashInteractive leaves the shell as bash; evaluator refusals propagate.
+        try {
+            if (auto found = resolveBashInteractive())
+                shell = *found;
+        } catch (RustEvalRefusal &) {
+            throw;
+        } catch (Error &) {
+            ignoreExceptionExceptInterrupt();
+        }
+
         if (verbosity >= lvlDebug)
             script += "set -x\n";
 
         script += fmt("command rm -f '%s'\n", rcFilePath.string());
+
+        /* The shell this environment runs under, and its directory on PATH,
+           written BEFORE the phase or command that ends the script: under
+           `--command` the script ends in `exec`, and anything appended after
+           that line never runs -- which is how the dumped environment's own
+           SHELL (bash's login-shell default inside the builder) used to reach
+           the command instead of the resolved one. See
+           https://github.com/NixOS/nix/issues/5873 for the SHELL line; formatted
+           via .string() and not PathFmt intentionally. A resolved shell lives
+           in a store path; plain `bash` has no directory to put on PATH. */
+        script += fmt("SHELL=\"%s\"\n", shell.string());
+        if (shell.has_parent_path())
+            script += fmt("PATH=\"%s${PATH:+:$PATH}\"\n", shell.parent_path().string());
 
         if (phase) {
             if (!command.empty())
@@ -629,59 +725,18 @@ struct CmdDevelop : Common, MixEnvironment
                     fmt("[ -n \"$PS1\" ] && PS1+=%s;\n", escapeShellArgAlways(developSettings.bashPromptSuffix.get()));
         }
 
+        // Flush before `--ignore-env` removes the parent's statistics
+        // settings. Every evaluation, including bashInteractive, is done.
+        getEvalState()->evalCaches.clear();
+        getEvalState()->maybePrintStats();
+
         setEnviron();
         // prevent garbage collection until shell exits
         setEnv("NIX_GCROOT", store->printStorePath(gcroot).c_str());
 
-        std::filesystem::path shell = "bash";
-        bool foundInteractive = false;
-
-        try {
-            auto state = getEvalState();
-
-            auto nixpkgsLockFlags = lockFlags;
-            nixpkgsLockFlags.inputOverrides = {};
-            nixpkgsLockFlags.inputUpdates = {};
-
-            auto nixpkgs = defaultNixpkgsFlakeRef();
-            if (auto * i = dynamic_cast<const InstallableFlake *>(&*installable))
-                nixpkgs = i->nixpkgsFlakeRef();
-
-            auto bashInstallable = make_ref<InstallableFlake>(
-                nullptr, //< Don't barf when the command is run with --arg/--argstr
-                state,
-                std::move(nixpkgs),
-                "bashInteractive",
-                ExtendedOutputsSpec::Default(),
-                Strings{},
-                Strings{"legacyPackages." + settings.thisSystem.get() + "."},
-                nixpkgsLockFlags);
-
-            for (auto & path : Installable::toStorePathSet(
-                     getEvalStore(), store, Realise::Outputs, OperateOn::Output, {bashInstallable})) {
-                auto s = store->printStorePath(path) + "/bin/bash";
-                if (pathExists(s)) {
-                    shell = s;
-                    foundInteractive = true;
-                    break;
-                }
-            }
-
-            if (!foundInteractive)
-                throw Error("package 'nixpkgs#bashInteractive' does not provide a 'bin/bash'");
-
-        } catch (Error &) {
-            ignoreExceptionExceptInterrupt();
-        }
-
         // Override SHELL with the one chosen for this environment.
         // This is to make sure the system shell doesn't leak into the build environment.
         setEnvOs(OS_STR("SHELL"), shell.c_str());
-        /* See: https://github.com/NixOS/nix/issues/5873
-           Format via .string() and not PathFmt intentionally. */
-        script += fmt("SHELL=\"%s\"\n", shell.string());
-        if (foundInteractive)
-            script += fmt("PATH=\"%s${PATH:+:$PATH}\"\n", std::filesystem::path(shell).parent_path().string());
         writeFull(rcFileFd.get(), script);
 
 #ifdef _WIN32 // TODO re-enable on Windows
@@ -695,8 +750,10 @@ struct CmdDevelop : Common, MixEnvironment
         // Need to chdir since phases assume in flake directory
         if (phase) {
             // chdir if installable is a flake of type git+file or path
-            auto installableFlake = installable.dynamic_pointer_cast<InstallableFlake>();
-            if (installableFlake) {
+            if (rustFlakeContext && rustFlakeContext->sourcePath) {
+                if (chdir(rustFlakeContext->sourcePath->c_str()) == -1)
+                    throw SysError("chdir to %s failed", PathFmt(*rustFlakeContext->sourcePath));
+            } else if (auto installableFlake = installable.dynamic_pointer_cast<InstallableFlake>()) {
                 auto sourcePath = installableFlake->getLockedFlake()->flake.resolvedRef.input.getSourcePath();
                 if (sourcePath) {
                     if (chdir(sourcePath->c_str()) == -1) {
@@ -705,10 +762,6 @@ struct CmdDevelop : Common, MixEnvironment
                 }
             }
         }
-
-        // Release our references to eval caches to ensure they are persisted to disk, because
-        // we are about to exec out of this process without running C++ destructors.
-        getEvalState()->evalCaches.clear();
 
         execProgramInStore(store, UseLookupPath::Use, shell, args, buildEnvironment.getSystem());
 #endif

@@ -4,7 +4,7 @@
   ix,
 }:
 # Reference package for the external-Rust-tool house style: a standalone
-# third-party binary built from a checked jj view with
+# third-party binary built from a checked jj view (views.toml) with
 # `rustPlatform.buildRustPackage`. See `skills/dependency-intake/SKILL.md`.
 let
   src = ix.launchkSrc;

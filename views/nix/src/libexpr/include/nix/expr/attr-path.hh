@@ -4,20 +4,27 @@
 #include "nix/expr/eval.hh"
 
 #include <string>
-#include <map>
 
 namespace nix {
 
 MakeError(AttrPathNotFound, Error);
-MakeError(NoPositionInfo, Error);
 
 std::pair<Value *, PosIdx>
 findAlongAttrPath(EvalState & state, const std::string & attrPath, Bindings & autoArgs, Value & vIn);
 
 /**
- * Heuristic to find the filename and lineno or a nix value.
+ * Split an attribute path on unquoted dots, honouring quoted components
+ * (`a."b.c"`). The one splitter: the Rust bridge selects with it too.
  */
-std::pair<SourcePath, uint32_t> findPackageFilename(EvalState & state, Value & v, std::string what);
+Strings parseAttrPath(std::string_view s);
+
+/**
+ * Render components as `a.b."c d"`, quoting whatever is not an identifier.
+ * The one renderer: `AttrPath::to_string` and the Rust bridge's flake-show
+ * paths both go through it.
+ */
+std::string showAttrPath(const std::vector<std::string_view> & components);
+std::string showAttrPath(const std::vector<std::string> & components);
 
 struct AttrPath : std::vector<Symbol>
 {

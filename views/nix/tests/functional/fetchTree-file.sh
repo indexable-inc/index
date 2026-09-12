@@ -27,7 +27,11 @@ EOF
 # they should be, and treated as opaque files when they should be
 test_file_flake_input () {
     rm -fr "$TEST_ROOT/testFlake";
-    mkdir "$TEST_ROOT/testFlake";
+    # `nix flake update` below fetches this directory as a flake, and `path:`
+    # serves store objects only (src/libfetchers/path.cc). The `inputs/`
+    # subdirectory stays a plain directory: it is only ever tar'd and hashed,
+    # never fetched as a flake, and it is part of this workspace's tree.
+    jjFlakeDir "$TEST_ROOT/testFlake";
     pushd testFlake
 
     mkdir inputs

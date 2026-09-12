@@ -141,10 +141,10 @@ static void initLibGit2()
         /* Do not re-hash every object read out of an object database.
            libgit2 enables this by default; git itself verifies object
            hashes on fetch and fsck, not on every read. The re-hash runs
-           SHA1DC (collision-detecting SHA-1), and on a lazy-trees mount,
-           whose mount-time NAR hash reads every blob of the tree through
-           this path, it measured ~30% of a 173k-file hash (~3 s per
-           evaluation). Trust the local odb the way git does. */
+           SHA1DC (collision-detecting SHA-1), and on a lazily mounted
+           input, whose mount-time NAR hash reads every blob of the tree
+           through this path, it measured ~30% of a 173k-file hash (~3 s
+           per evaluation). Trust the local odb the way git does. */
         if (git_libgit2_opts(GIT_OPT_ENABLE_STRICT_HASH_VERIFICATION, 0) < 0)
             warn("could not disable libgit2 strict hash verification");
     });
@@ -926,35 +926,32 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
         } else
             info.headRev = toHash(headRev);
 
-        /* Get all tracked files and determine whether the working
-           directory is dirty. */
+        /* Determine whether the working directory differs from HEAD.
+           Untracked files are deliberately not requested (libgit2 omits
+           them unless asked): they belong to no commit, the accessor never
+           serves them, and a tree whose only difference is an untracked
+           file still *is* its HEAD commit. Unmodified files are not
+           requested either -- the only question here is what changed. */
         std::function<int(const char * path, unsigned int statusFlags)> statusCallback = [&](const char * path,
                                                                                              unsigned int statusFlags) {
-            if (!(statusFlags & GIT_STATUS_INDEX_DELETED) && !(statusFlags & GIT_STATUS_WT_DELETED)) {
-                info.files.insert(CanonPath(path));
-                if (statusFlags != GIT_STATUS_CURRENT)
-                    info.dirtyFiles.insert(CanonPath(path));
-            } else
+            if (statusFlags & (GIT_STATUS_INDEX_DELETED | GIT_STATUS_WT_DELETED))
                 info.deletedFiles.insert(CanonPath(path));
-            if (statusFlags != GIT_STATUS_CURRENT)
-                info.isDirty = true;
+            else
+                info.dirtyFiles.insert(CanonPath(path));
+            info.isDirty = true;
             return 0;
         };
 
         git_status_options options = GIT_STATUS_OPTIONS_INIT;
-        options.flags |= GIT_STATUS_OPT_INCLUDE_UNMODIFIED;
         options.flags |= GIT_STATUS_OPT_EXCLUDE_SUBMODULES;
         if (git_status_foreach_ext(*this, &options, &statusCallbackTrampoline, &statusCallback)) {
             /* libgit2 cannot fetch from a promisor remote, so in a repository
                that defers objects to one it fails here with "object not found"
-               where git would fetch the object and carry on. This walk is the
-               strictest reader in the fetcher: INCLUDE_UNMODIFIED diffs the
-               whole HEAD tree, so it reads trees `git status` never touches,
-               and a clone git considers healthy still fails here. Ask git for
-               HEAD's objects once, then walk again. */
+               where git would fetch the object and carry on: the status walk
+               diffs against HEAD's trees, which such a clone need not have
+               locally. Ask git for HEAD's objects once, then walk again. */
             if (!info.headRev || !materialiseHeadObjects())
                 throw GitError("getting working directory status");
-            info.files.clear();
             info.dirtyFiles.clear();
             info.deletedFiles.clear();
             info.isDirty = false;
@@ -1018,9 +1015,6 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
 
     ref<SourceAccessor>
     getAccessor(const Hash & rev, const GitAccessorOptions & options, std::string displayPrefix) override;
-
-    ref<SourceAccessor>
-    getAccessor(const WorkdirInfo & wd, const GitAccessorOptions & options, MakeNotAllowedError e) override;
 
     ref<GitFileSystemObjectSink> getFileSystemObjectSink() override;
 
@@ -1850,22 +1844,6 @@ GitRepoImpl::getAccessor(const Hash & rev, const GitAccessorOptions & options, s
         return make_ref<GitExportIgnoreSourceAccessor>(self, rawGitAccessor, rev);
     else
         return rawGitAccessor;
-}
-
-ref<SourceAccessor> GitRepoImpl::getAccessor(
-    const WorkdirInfo & wd, const GitAccessorOptions & options, MakeNotAllowedError makeNotAllowedError)
-{
-    auto self = ref<GitRepoImpl>(shared_from_this());
-    ref<SourceAccessor> fileAccessor = AllowListSourceAccessor::create(
-                                           makeFSSourceAccessor(path),
-                                           std::set<CanonPath>{wd.files},
-                                           // Always allow access to the root, but not its children.
-                                           boost::unordered_flat_set<CanonPath>{CanonPath::root},
-                                           std::move(makeNotAllowedError))
-                                           .cast<SourceAccessor>();
-    if (options.exportIgnore)
-        fileAccessor = make_ref<GitExportIgnoreSourceAccessor>(self, fileAccessor, std::nullopt);
-    return fileAccessor;
 }
 
 ref<GitFileSystemObjectSink> GitRepoImpl::getFileSystemObjectSink()

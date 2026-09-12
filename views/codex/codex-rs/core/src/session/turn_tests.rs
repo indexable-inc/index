@@ -1,9 +1,11 @@
 use super::*;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::TurnItemContributor;
+use codex_protocol::ResponseItemId;
 use codex_protocol::items::AgentMessageContent;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
+use tracing_subscriber::prelude::*;
 
 struct RewriteAgentMessageContributor;
 
@@ -27,7 +29,7 @@ impl TurnItemContributor for RewriteAgentMessageContributor {
 
 fn assistant_output_text(text: &str) -> ResponseItem {
     ResponseItem::Message {
-        id: Some("msg-1".to_string()),
+        id: Some(ResponseItemId::with_suffix("msg", "1")),
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
@@ -35,6 +37,25 @@ fn assistant_output_text(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+#[test]
+fn post_sampling_token_estimate_is_disabled_by_always_on_sinks() {
+    let feedback = codex_feedback::CodexFeedback::new();
+    let subscriber = tracing_subscriber::registry()
+        .with(feedback.logger_layer())
+        .with(tracing_subscriber::fmt::layer().with_filter(codex_state::log_db::default_filter()));
+
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        assert!(!tracing::event_enabled!(
+            target: POST_SAMPLING_TOKEN_ESTIMATE_TARGET,
+            tracing::Level::TRACE,
+            turn_id,
+            estimated_token_count,
+            message
+        ));
+    });
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@
 
   nix-flake,
   nix-flake-c,
-  nix-expr-test-support,
+  nix-store-test-support,
 
   rapidcheck,
   gtest,
@@ -42,7 +42,7 @@ mkMesonExecutable (finalAttrs: {
   buildInputs = [
     nix-flake
     nix-flake-c
-    nix-expr-test-support
+    nix-store-test-support
     rapidcheck
     gtest
   ];

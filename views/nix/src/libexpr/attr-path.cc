@@ -1,11 +1,13 @@
 #include "nix/expr/attr-path.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/print.hh"
 #include "nix/util/util.hh"
-#include "nix/util/strings-inline.hh"
+
+#include <sstream>
 
 namespace nix {
 
-static Strings parseAttrPath(std::string_view s)
+Strings parseAttrPath(std::string_view s)
 {
     Strings res;
     std::string cur;
@@ -40,9 +42,26 @@ AttrPath AttrPath::parse(EvalState & state, std::string_view s)
     return res;
 }
 
+std::string showAttrPath(const std::vector<std::string_view> & components)
+{
+    std::ostringstream out;
+    for (const auto & [index, component] : enumerate(components)) {
+        if (index != 0)
+            out << '.';
+        printIdentifier(out, component);
+    }
+    return out.str();
+}
+
+std::string showAttrPath(const std::vector<std::string> & components)
+{
+    return showAttrPath(std::vector<std::string_view>(components.begin(), components.end()));
+}
+
 std::string AttrPath::to_string(EvalState & state) const
 {
-    return dropEmptyInitThenConcatStringsSep(".", state.symbols.resolve({*this}));
+    auto resolved = state.symbols.resolve({*this});
+    return showAttrPath(std::vector<std::string_view>(resolved.begin(), resolved.end()));
 }
 
 std::vector<SymbolStr> AttrPath::resolve(EvalState & state) const
@@ -116,37 +135,6 @@ findAlongAttrPath(EvalState & state, const std::string & attrPath, Bindings & au
     }
 
     return {v, pos};
-}
-
-std::pair<SourcePath, uint32_t> findPackageFilename(EvalState & state, Value & v, std::string what)
-{
-    Value * v2;
-    try {
-        auto & dummyArgs = Bindings::emptyBindings;
-        v2 = findAlongAttrPath(state, "meta.position", dummyArgs, v).first;
-    } catch (Error &) {
-        throw NoPositionInfo("package '%s' has no source location information", what);
-    }
-
-    // FIXME: is it possible to extract the Pos object instead of doing this
-    //        toString + parsing?
-    NixStringContext context;
-    auto path =
-        state.coerceToPath(noPos, *v2, context, "while evaluating the 'meta.position' attribute of a derivation");
-
-    auto fn = path.path.abs();
-
-    auto fail = [fn]() { throw ParseError("cannot parse 'meta.position' attribute '%s'", fn); };
-
-    auto colon = fn.rfind(':');
-    if (colon == std::string::npos)
-        fail();
-
-    auto lineno = string2Int<uint32_t>(std::string_view(fn).substr(colon + 1));
-    if (!lineno)
-        fail();
-
-    return {SourcePath{path.accessor, CanonPath(fn.substr(0, colon))}, *lineno};
 }
 
 } // namespace nix

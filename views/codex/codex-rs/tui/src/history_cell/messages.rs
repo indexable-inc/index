@@ -1,6 +1,12 @@
 //! User, assistant, reasoning, and streaming message history cells.
 
+use super::markdown_render_cache::MarkdownRenderCache;
 use super::*;
+use crate::terminal_hyperlinks::annotate_web_urls_in_line;
+use crate::terminal_hyperlinks::remap_wrapped_line;
+use crate::wrapping::url_preserving_wrap_options;
+use crate::wrapping::word_wrap_line;
+use std::borrow::Cow;
 
 #[derive(Debug)]
 pub(crate) struct UserHistoryCell {
@@ -12,17 +18,67 @@ pub(crate) struct UserHistoryCell {
 }
 
 /// Remove CSI sequences and control characters, preserving tabs and newlines.
-pub(crate) fn sanitize_user_text(text: &str) -> String {
-    let mut sanitized = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.next_if_eq(&'[').is_some() {
-            let _ = chars.find(|ch| ('@'..='~').contains(ch));
-        } else if matches!(ch, '\n' | '\t') || !ch.is_control() {
-            sanitized.push(ch);
-        }
+pub(crate) fn sanitize_user_text(text: Cow<'_, str>) -> Cow<'_, str> {
+    fn sanitize_borrowed(text: &str) -> Cow<'_, str> {
+        let mut remaining = Some(text);
+        let mut spans = std::iter::from_fn(move || {
+            let current = remaining.take()?;
+            let mut escaped = false;
+            let Some((prefix, suffix)) = current.split_once(|ch: char| {
+                escaped = ch == '\x1b';
+                escaped || ch.is_control() && !matches!(ch, '\n' | '\t')
+            }) else {
+                return Some(current);
+            };
+
+            remaining = if escaped && let Some(sequence) = suffix.strip_prefix('[') {
+                sequence
+                    .split_once(|ch: char| ('@'..='~').contains(&ch))
+                    .map(|(_, tail)| tail)
+            } else {
+                Some(suffix)
+            };
+            Some(prefix)
+        })
+        .filter(|span| !span.is_empty());
+
+        let first = spans.next().unwrap_or_default();
+        let Some(second) = spans.next() else {
+            return Cow::Borrowed(first);
+        };
+
+        Cow::Owned([first, second].into_iter().chain(spans).fold(
+            String::with_capacity(text.len()),
+            |mut acc, span| {
+                acc.push_str(span);
+                acc
+            },
+        ))
     }
-    sanitized
+
+    match text {
+        Cow::Borrowed(text) => sanitize_borrowed(text),
+        Cow::Owned(mut text) => match sanitize_borrowed(&text) {
+            Cow::Owned(sanitized) => Cow::Owned(sanitized),
+            Cow::Borrowed(retained) => {
+                if retained.is_empty() {
+                    text.clear();
+                } else if retained.len() != text.len() {
+                    // Cannot underflow because retained is a subslice of text.
+                    // I'd normally assert that here but this crate denies
+                    // clippy::expect_used.
+                    let start = retained.as_ptr().addr() - text.as_ptr().addr();
+                    let end = start + retained.len();
+
+                    // Truncate before draining because truncate is constant
+                    // time while drain is linear in the size of the receiver.
+                    text.truncate(end);
+                    drop(text.drain(..start));
+                }
+                Cow::Owned(text)
+            }
+        },
+    }
 }
 
 /// Build logical lines for a user message with styled text elements.
@@ -95,20 +151,14 @@ fn remote_image_display_line(style: Style, index: usize) -> Line<'static> {
     Line::from(local_image_label_text(index)).style(style)
 }
 
-fn trim_trailing_blank_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    while lines
-        .last()
-        .is_some_and(|line| line.spans.iter().all(|span| span.content.trim().is_empty()))
-    {
-        lines.pop();
-    }
-    lines
-}
-
 impl HistoryCell for UserHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let message = sanitize_user_text(&self.message);
-        let text_elements = if message == self.message {
+        visible_lines(self.display_hyperlink_lines(width))
+    }
+
+    fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        let message = sanitize_user_text((&self.message).into());
+        let text_elements = if message.as_ref() == self.message {
             self.text_elements.as_slice()
         } else {
             &[]
@@ -125,7 +175,7 @@ impl HistoryCell for UserHistoryCell {
         let wrapped_remote_images = if self.remote_image_urls.is_empty() {
             None
         } else {
-            Some(adaptive_wrap_lines(
+            Some(plain_hyperlink_lines(adaptive_wrap_lines(
                 self.remote_image_urls
                     .iter()
                     .enumerate()
@@ -134,36 +184,61 @@ impl HistoryCell for UserHistoryCell {
                     }),
                 RtOptions::new(usize::from(wrap_width))
                     .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
-            ))
+            )))
         };
 
         let wrapped_message = if message.is_empty() && text_elements.is_empty() {
             None
-        } else if text_elements.is_empty() {
-            let message_without_trailing_newlines = message.trim_end_matches(['\r', '\n']);
-            let wrapped = adaptive_wrap_lines(
-                message_without_trailing_newlines
-                    .split('\n')
-                    .map(|line| Line::from(line).style(style)),
-                // Wrap algorithm matches textarea.rs.
-                RtOptions::new(usize::from(wrap_width))
-                    .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
-            );
-            let wrapped = trim_trailing_blank_lines(wrapped);
-            (!wrapped.is_empty()).then_some(wrapped)
         } else {
-            let raw_lines = build_user_message_lines_with_elements(
-                &message,
-                text_elements,
-                style,
-                element_style,
-            );
-            let wrapped = adaptive_wrap_lines(
-                raw_lines,
-                RtOptions::new(usize::from(wrap_width))
-                    .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
-            );
-            let wrapped = trim_trailing_blank_lines(wrapped);
+            let wrap_options = RtOptions::new(usize::from(wrap_width))
+                .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit);
+            let mut wrapped = if text_elements.is_empty() {
+                let message_without_trailing_newlines = message.trim_end_matches(['\r', '\n']);
+                adaptive_wrap_lines(
+                    message_without_trailing_newlines
+                        .split('\n')
+                        .map(|line| Line::from(line).style(style)),
+                    wrap_options,
+                )
+            } else {
+                adaptive_wrap_lines(
+                    build_user_message_lines_with_elements(
+                        message.as_ref(),
+                        text_elements,
+                        style,
+                        element_style,
+                    ),
+                    wrap_options,
+                )
+            }
+            .into_iter()
+            .flat_map(|line| {
+                if line.width() <= usize::from(wrap_width) {
+                    return vec![HyperlinkLine::new(line)];
+                }
+
+                // Terminal autowrap loses the message gutter and background. Explicitly split
+                // oversized URL tokens while retaining their complete OSC-8 destination.
+                let line = annotate_web_urls_in_line(line);
+                let forced_lines = word_wrap_line(
+                    &line.line,
+                    url_preserving_wrap_options(RtOptions::new(usize::from(wrap_width)))
+                        .break_words(/*break_words*/ true),
+                )
+                .iter()
+                .map(line_to_static)
+                .collect();
+                remap_wrapped_line(&line, forced_lines)
+            })
+            .collect::<Vec<_>>();
+            while wrapped.last().is_some_and(|line| {
+                line.line
+                    .spans
+                    .iter()
+                    .all(|span| span.content.trim().is_empty())
+            }) {
+                wrapped.pop();
+            }
             (!wrapped.is_empty()).then_some(wrapped)
         };
 
@@ -171,34 +246,38 @@ impl HistoryCell for UserHistoryCell {
             return Vec::new();
         }
 
-        let mut lines: Vec<Line<'static>> = vec![Line::from("").style(style)];
+        let mut lines = vec![HyperlinkLine::new(Line::from("").style(style))];
 
         if let Some(wrapped_remote_images) = wrapped_remote_images {
-            lines.extend(prefix_lines(
+            lines.extend(prefix_hyperlink_lines(
                 wrapped_remote_images,
                 "  ".into(),
                 "  ".into(),
             ));
             if wrapped_message.is_some() {
-                lines.push(Line::from("").style(style));
+                lines.push(HyperlinkLine::new(Line::from("").style(style)));
             }
         }
 
         if let Some(wrapped_message) = wrapped_message {
-            lines.extend(prefix_lines(
+            lines.extend(prefix_hyperlink_lines(
                 wrapped_message,
                 "› ".bold().dim(),
                 "  ".into(),
             ));
         }
 
-        lines.push(Line::from("").style(style));
+        lines.push(HyperlinkLine::new(Line::from("").style(style)));
         lines
     }
 
+    fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        self.display_hyperlink_lines(width)
+    }
+
     fn raw_lines(&self) -> Vec<Line<'static>> {
-        let message = sanitize_user_text(&self.message);
-        let mut lines = raw_lines_from_source(message.trim_end_matches(['\r', '\n']));
+        let message = sanitize_user_text((&self.message).into());
+        let mut lines = raw_lines_from_source(message.as_ref().trim_end_matches(['\r', '\n']));
         if !self.remote_image_urls.is_empty() {
             if !lines.is_empty() {
                 lines.push(Line::from(""));
@@ -361,10 +440,15 @@ impl HistoryCell for AgentMessageCell {
 /// The cell snapshots `cwd` at construction so local file-link display remains aligned with the
 /// session that produced the message. Reusing the current process cwd during reflow would make old
 /// transcript content change meaning after a later `/cd` or resumed session.
+///
+/// Ordinary markdown caches its latest rich render. Visualization directives bypass that cache
+/// because resolving their local file links depends on filesystem state that can change later.
 #[derive(Debug)]
 pub(crate) struct AgentMarkdownCell {
     markdown_source: String,
     cwd: PathBuf,
+    inline_visualization_context: Option<crate::inline_visualization::InlineVisualizationContext>,
+    rendered_lines: Option<MarkdownRenderCache>,
 }
 
 impl AgentMarkdownCell {
@@ -373,12 +457,47 @@ impl AgentMarkdownCell {
     /// `markdown_source` must be the raw source accumulated by the stream controller, not already
     /// wrapped terminal lines. Passing rendered lines here would make future resize reflow preserve
     /// stale wrapping instead of repairing it.
+    #[cfg(test)]
     pub(crate) fn new(markdown_source: String, cwd: &Path) -> Self {
+        Self::new_with_inline_visualizations(
+            markdown_source,
+            cwd,
+            /*inline_visualization_context*/ None,
+        )
+    }
+
+    pub(crate) fn new_with_inline_visualizations(
+        markdown_source: String,
+        cwd: &Path,
+        inline_visualization_context: Option<
+            crate::inline_visualization::InlineVisualizationContext,
+        >,
+    ) -> Self {
+        let rendered_lines =
+            (!crate::inline_visualization::contains_inline_visualization(&markdown_source))
+                .then(MarkdownRenderCache::default);
         Self {
             markdown_source,
             cwd: cwd.to_path_buf(),
+            inline_visualization_context,
+            rendered_lines,
         }
     }
+}
+
+fn normalize_whitespace_only_hyperlink_lines(mut lines: Vec<HyperlinkLine>) -> Vec<HyperlinkLine> {
+    for line in &mut lines {
+        if line
+            .line
+            .spans
+            .iter()
+            .all(|span| span.content.chars().all(char::is_whitespace))
+        {
+            line.line = Line::default().style(line.line.style);
+            line.hyperlinks.clear();
+        }
+    }
+    lines
 }
 
 impl HistoryCell for AgentMarkdownCell {
@@ -387,24 +506,37 @@ impl HistoryCell for AgentMarkdownCell {
     }
 
     fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
-        let Some(wrap_width) =
-            crate::width::usable_content_width_u16(width, /*reserved_cols*/ 2)
-        else {
-            return prefix_hyperlink_lines(
-                vec![HyperlinkLine::new(Line::default())],
+        let render = || {
+            let Some(wrap_width) =
+                crate::width::usable_content_width_u16(width, /*reserved_cols*/ 2)
+            else {
+                return prefix_hyperlink_lines(
+                    vec![HyperlinkLine::new(Line::default())],
+                    "• ".dim(),
+                    "  ".into(),
+                );
+            };
+
+            // Re-render markdown from source at the current width. Reserve 2 columns for the "• " /
+            // " " prefix prepended below.
+            let lines = crate::markdown::render_markdown_agent_with_links_cwd_and_visualizations(
+                &self.markdown_source,
+                Some(wrap_width),
+                Some(self.cwd.as_path()),
+                self.inline_visualization_context.as_ref(),
+            );
+            normalize_whitespace_only_hyperlink_lines(prefix_hyperlink_lines(
+                lines,
                 "• ".dim(),
                 "  ".into(),
-            );
+            ))
         };
 
-        // Re-render markdown from source at the current width. Reserve 2 columns for the "• " /
-        // " " prefix prepended below.
-        let lines = crate::markdown::render_markdown_agent_with_links_and_cwd(
-            &self.markdown_source,
-            Some(wrap_width),
-            Some(self.cwd.as_path()),
-        );
-        prefix_hyperlink_lines(lines, "• ".dim(), "  ".into())
+        if let Some(rendered_lines) = &self.rendered_lines {
+            rendered_lines.render(width, render)
+        } else {
+            render()
+        }
     }
 
     fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
@@ -414,14 +546,22 @@ impl HistoryCell for AgentMarkdownCell {
     fn raw_lines(&self) -> Vec<Line<'static>> {
         raw_lines_from_source(&self.markdown_source)
     }
+
+    fn has_stable_transcript_height(&self) -> bool {
+        self.rendered_lines.is_some()
+    }
 }
+
+#[cfg(test)]
+#[path = "messages_tests.rs"]
+mod tests;
 
 /// Transient active-cell representation of the mutable tail of an agent stream.
 ///
 /// During streaming, lines that have not yet been committed to scrollback because they belong to
 /// an in-progress table are displayed via this cell in the `active_cell` slot. It is replaced on
-/// every delta and cleared when the stream finalizes.
-#[derive(Debug)]
+/// deltas that change the visible tail and cleared when the stream finalizes.
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct StreamingAgentTailCell {
     lines: Vec<HyperlinkLine>,
     is_first_line: bool,
@@ -444,7 +584,7 @@ impl HistoryCell for StreamingAgentTailCell {
     fn display_hyperlink_lines(&self, _width: u16) -> Vec<HyperlinkLine> {
         // Tail lines are already rendered at the controller's current stream width.
         // Re-wrapping them here can split table borders and produce malformed in-flight rows.
-        let mut lines = prefix_hyperlink_lines(
+        normalize_whitespace_only_hyperlink_lines(prefix_hyperlink_lines(
             self.lines.clone(),
             if self.is_first_line {
                 "• ".dim()
@@ -452,19 +592,7 @@ impl HistoryCell for StreamingAgentTailCell {
                 "  ".into()
             },
             "  ".into(),
-        );
-        for line in &mut lines {
-            if line
-                .line
-                .spans
-                .iter()
-                .all(|span| span.content.chars().all(char::is_whitespace))
-            {
-                line.line = Line::default().style(line.line.style);
-                line.hyperlinks.clear();
-            }
-        }
-        lines
+        ))
     }
 
     fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
@@ -503,7 +631,11 @@ pub(crate) fn new_reasoning_summary_block(
     cwd: &Path,
 ) -> Box<dyn HistoryCell> {
     let (header, content) = split_reasoning_summary_parts(&reasoning_parts);
-    let transcript_only = header.is_empty();
+    let title_only = content
+        .strip_prefix("**")
+        .and_then(|content| content.strip_suffix("**"))
+        .is_some_and(|content| !content.is_empty() && !content.contains("**"));
+    let transcript_only = header.is_empty() && !title_only;
     Box::new(ReasoningSummaryCell::new(
         header,
         content,

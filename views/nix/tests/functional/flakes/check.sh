@@ -3,7 +3,7 @@
 source common.sh
 
 flakeDir=$TEST_ROOT/flake3
-mkdir -p "$flakeDir"
+jjFlakeDir "$flakeDir"
 
 cat > "$flakeDir"/flake.nix <<EOF
 {

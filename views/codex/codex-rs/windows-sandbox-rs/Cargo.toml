@@ -74,6 +74,7 @@ features = [
     "Win32_System_Memory",
     "Win32_System_Kernel",
     "Win32_System_Console",
+    "Win32_System_RemoteDesktop",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_NetworkManagement_NetManagement",
@@ -89,6 +90,7 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_System_Registry",
+    "Win32_System_Services",
 ]
 version = "0.52"
 

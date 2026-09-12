@@ -128,16 +128,9 @@ void SourceAccessor::dumpPath(const CanonPath & path, Sink & sink, PathFilter & 
     }(path, 0);
 }
 
-time_t dumpPathAndGetMtime(const std::filesystem::path & path, Sink & sink, PathFilter & filter)
-{
-    auto path2 = PosixSourceAccessor::createAtRoot(path, /*trackLastModified=*/true);
-    path2.dumpPath(sink, filter);
-    return path2.accessor->getLastModified().value();
-}
-
 void dumpPath(const std::filesystem::path & path, Sink & sink, PathFilter & filter)
 {
-    dumpPathAndGetMtime(path, sink, filter);
+    PosixSourceAccessor::createAtRoot(path).dumpPath(sink, filter);
 }
 
 void dumpString(std::string_view s, Sink & sink)

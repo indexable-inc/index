@@ -22,7 +22,3 @@ In all other cases, the same scope that encloses an expression is the enclosing 
 The Nix language is [statically scoped](https://en.wikipedia.org/wiki/Scope_(computer_science)#Lexical_scope);
 the value of a variable is determined only by the variable's enclosing scope, and not by the dynamic context in which the variable is evaluated.
 
-> **Note**
->
-> Expressions entered into the [Nix REPL](@docroot@/command-ref/new-cli/nix3-repl.md) are enclosed by a scope that can be extended by command line arguments or previous REPL commands.
-> These ways of extending scope are not, strictly speaking, part of the Nix language.

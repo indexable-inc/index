@@ -5,24 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "A Rust-native evaluation driver over nix-eval-rs: evaluate and instantiate without the C++ CLI"
 
-# A sibling crate rather than a bin target in `nix-eval-rs`, for two reasons
-# that both come out of what that crate is.
-#
-# It is the object the C++ binary links. `src/nix/meson.build` runs
-# `cargo build --release -p nix-eval-rs` and copies `libnix_eval_rs.a` into
-# the `nix` link line, so anything added to that package is added to every
-# `nix` built with `-Dnix:rust-eval=enabled`. A store that writes files and a
-# CLI that parses argv have no business inside the archive the bridge embeds.
-#
-# And it is a library whose stated discipline is that the VM performs no IO;
-# the embedder does. A driver *is* an embedder -- the same role
-# `src/nix/rust-eval-session.cc` plays, and the role
-# `examples/nixpkgs-probe.rs` rehearses. Embedders live outside the library.
-# Putting this one beside it keeps the charter's test ("could the probe stand
-# in for the bridge?") literally checkable: this crate reaches the evaluator
-# only through the public `Host` / `Vm` / `eval` surface the bridge reaches it
-# through across the C ABI, so a capability that exists only bridge-side
-# fails to compile here rather than going unnoticed.
+# The production runtime is a shared library loaded by libflake and libcmd.
+# This standalone evaluator driver supplies its own host through the Rust API;
+# its argv parser and filesystem host stay outside that shared runtime.
 
 [[bin]]
 name = "nix-eval-driver"

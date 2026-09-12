@@ -1,3 +1,4 @@
+use crate::context::GuardianReviewEvidence;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -5,12 +6,17 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::request_user_input_spec::REQUEST_USER_INPUT_TOOL_NAME;
+use crate::tools::handlers::request_user_input_spec::RequestUserInputToolArgs;
 use crate::tools::handlers::request_user_input_spec::create_request_user_input_tool;
-use crate::tools::handlers::request_user_input_spec::normalize_request_user_input_args;
+use crate::tools::handlers::request_user_input_spec::normalize_request_user_input_tool_args;
 use crate::tools::handlers::request_user_input_spec::request_user_input_tool_description;
 use crate::tools::handlers::request_user_input_spec::request_user_input_unavailable_message;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use codex_features::Feature;
+use codex_history::RetainedContextEvent;
+use codex_history::VerifiedAnswer;
+use codex_history::VerifiedQuestionAnswer;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_tools::ToolName;
@@ -29,7 +35,10 @@ impl ToolExecutor<ToolInvocation> for RequestUserInputHandler {
         create_request_user_input_tool(request_user_input_tool_description(&self.available_modes))
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
@@ -62,16 +71,22 @@ impl RequestUserInputHandler {
             ));
         }
 
-        let mode = session.collaboration_mode().await.mode;
+        let mode = turn.collaboration_mode().mode;
         if let Some(message) = request_user_input_unavailable_message(mode, &self.available_modes) {
             return Err(FunctionCallError::RespondToModel(message));
         }
 
-        let args: RequestUserInputArgs = parse_arguments(&arguments)?;
-        let args =
-            normalize_request_user_input_args(args).map_err(FunctionCallError::RespondToModel)?;
+        let args: RequestUserInputToolArgs = parse_arguments(&arguments)?;
+        let args = normalize_request_user_input_tool_args(args)
+            .map_err(FunctionCallError::RespondToModel)?;
+        let args = RequestUserInputArgs {
+            questions: args.questions,
+            is_blocking: mode == ModeKind::Plan,
+            auto_resolution_ms: None,
+        };
+        let questions = args.questions.clone();
         let response = session
-            .request_user_input(turn.as_ref(), call_id, args)
+            .request_user_input(turn.as_ref(), call_id.clone(), args)
             .await
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(format!(
@@ -84,15 +99,70 @@ impl RequestUserInputHandler {
                 "failed to serialize {REQUEST_USER_INPUT_TOOL_NAME} response: {err}"
             ))
         })?;
+        if turn.config.features.enabled(Feature::GuardianApproval) {
+            session
+                .services
+                .thread_extension_data
+                .get_or_init(GuardianReviewEvidence::default)
+                .record_user_input(&call_id, &questions, &response);
+        }
+        // Capture and consumption use the same fixed thread feature setting. Legacy
+        // threads must not construct retained answers, persist them, or advance their revision.
+        if turn.config.features.enabled(Feature::GuardianApproval)
+            && session.enabled(Feature::GuardianThreadContext)
+        {
+            let user_input = questions
+                .iter()
+                .filter_map(|question| {
+                    let response = response.answers.get(&question.id)?;
+                    let answers = response
+                        .answers
+                        .iter()
+                        .filter(|answer| !answer.trim().is_empty())
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if answers.is_empty() {
+                        return None;
+                    }
+                    let mut question_text = question.question.clone();
+                    for option in question
+                        .options
+                        .iter()
+                        .flatten()
+                        .filter(|option| response.answers.contains(&option.label))
+                    {
+                        question_text
+                            .push_str(&format!("\n{}: {}", option.label, option.description));
+                    }
+                    Some(VerifiedQuestionAnswer {
+                        question: question_text,
+                        answer: answers.join("\n"),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !user_input.is_empty() {
+                session
+                    .record_retained_context(RetainedContextEvent::VerifiedAnswer(VerifiedAnswer {
+                        turn_id: turn.sub_id.clone(),
+                        call_id,
+                        questions: user_input,
+                    }))
+                    .await;
+            }
+        }
 
         Ok(boxed_tool_output(FunctionToolOutput::from_text(
             content,
-            Some(true),
+            /*success*/ Some(true),
         )))
     }
 }
 
-impl CoreToolRuntime for RequestUserInputHandler {}
+impl CoreToolRuntime for RequestUserInputHandler {
+    fn is_builtin_control_tool(&self) -> bool {
+        true
+    }
+}
 
 #[cfg(test)]
 #[path = "request_user_input_tests.rs"]

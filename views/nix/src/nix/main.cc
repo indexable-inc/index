@@ -24,8 +24,10 @@
 #include "nix/flake/flake.hh"
 #include "nix/flake/settings.hh"
 #include "nix/util/json-utils.hh"
+#include "nix/expr/attr-path.hh"
 
 #include "self-exe.hh"
+#include "nix/cmd/rust-eval-session.hh"
 #include "crash-handler.hh"
 #include "invocation-record.hh"
 #include "cli-config-private.hh"
@@ -256,13 +258,6 @@ static void showHelp(std::vector<std::string> subcommand, NixArgs & toplevel)
         evalSettings);
     auto & state = *statePtr;
 
-    auto vGenerateManpage = state.allocValue();
-    state.eval(
-        state.parseExprFromString(
-#include "generate-manpage.nix.gen.hh"
-            , state.rootPath(CanonPath::root)),
-        *vGenerateManpage);
-
     state.corepkgsFS->addFile(
         CanonPath("utils.nix"),
 #include "utils.nix.gen.hh"
@@ -278,18 +273,33 @@ static void showHelp(std::vector<std::string> subcommand, NixArgs & toplevel)
 #include "generate-store-info.nix.gen.hh"
     );
 
-    auto vDump = state.allocValue();
-    vDump->mkString(toplevel.dumpCli(), state.mem);
+    // Render help through the same evaluator as user expressions.
+    std::string markdown;
+    {
+        RustEvaluand evaluand{
+            .src =
+                RustSource{
+                    .source =
+#include "generate-manpage.nix.gen.hh"
+                        , .baseDir = "/", .file = "",
+                },
+            .args =
+                {RustArgument{.kind = RustArgument::Kind::Json, .text = "false"},
+                 RustArgument{.kind = RustArgument::Kind::Json, .text = nlohmann::json(toplevel.dumpCli()).dump()}},
+            .attrPaths = {fmt("\"%s.md\"", mdName)},
+        };
+        try {
+            markdown = rustEvalRender(state, evaluand, RustRender::Raw);
+        } catch (AttrPathNotFound &) {
+            throw UsageError("Nix has no subcommand '%s'", concatStringsSep(" ", subcommand));
+        }
+    }
 
-    auto vRes = state.allocValue();
-    Value * args[]{&state.getBuiltin("false"), vDump};
-    state.callFunction(*vGenerateManpage, args, *vRes, noPos);
-
-    auto attr = vRes->attrs()->get(state.symbols.create(mdName + ".md"));
-    if (!attr)
-        throw UsageError("Nix has no subcommand '%s'", concatStringsSep("", subcommand));
-
-    auto markdown = state.forceString(*attr->value, noPos, "while evaluating the lowdown help text");
+    /* `NIX_SHOW_STATS` names the evaluator that answered (`evaluator`,
+       `evaluatorCalls`), the same witness every routed command prints; the
+       functional test reads it to prove the page was Rust's and not a
+       fallback. */
+    state.maybePrintStats();
 
     RunPager pager;
     std::cout << renderMarkdownToTerminal(markdown) << "\n";
@@ -417,7 +427,8 @@ void mainWrapped(int argc, char ** argv)
 
     initNix();
     initGC();
-    flakeSettings.configureEvalSettings(evalSettings);
+    if (!std::string_view(NIX_HOST_BUILD_IDENTITY).empty())
+        rustSetHostBuildIdentity(NIX_HOST_BUILD_IDENTITY);
 
 #ifdef __linux__
     if (isRootUser()) {
@@ -469,45 +480,7 @@ void mainWrapped(int argc, char ** argv)
     }
 
     if (argc == 2 && std::string(argv[1]) == "__dump-language") {
-        experimentalFeatureSettings.experimentalFeatures = {
-            Xp::Flakes,
-            Xp::FetchClosure,
-            Xp::DynamicDerivations,
-            Xp::FetchTree,
-        };
-        evalSettings.pureEval = false;
-        auto statePtr = std::make_shared<EvalState>(
-            LookupPath{},
-            openStore(StoreReference{.variant = StoreReference::Specified{.scheme = "dummy"}}),
-            fetchSettings,
-            evalSettings);
-        auto & state = *statePtr;
-        auto builtinsJson = nlohmann::json::object();
-        for (auto & builtinPtr : state.getBuiltins().attrs()->lexicographicOrder(state.symbols)) {
-            auto & builtin = *builtinPtr;
-            auto b = nlohmann::json::object();
-            if (!builtin.value->isPrimOp())
-                continue;
-            auto primOp = builtin.value->primOp();
-            if (!primOp->doc)
-                continue;
-            b["args"] = primOp->args;
-            b["doc"] = trim(stripIndentation(*primOp->doc));
-            if (primOp->experimentalFeature)
-                b["experimental-feature"] = primOp->experimentalFeature;
-            builtinsJson.emplace(state.symbols[builtin.name], std::move(b));
-        }
-        for (auto & [name, info] : state.constantInfos) {
-            auto b = nlohmann::json::object();
-            if (!info.doc)
-                continue;
-            b["doc"] = trim(stripIndentation(info.doc));
-            b["type"] = showType(info.type, false);
-            if (info.impureOnly)
-                b["impure-only"] = true;
-            builtinsJson[name] = std::move(b);
-        }
-        logger->cout("%s", builtinsJson);
+        logger->cout("%s", rustLanguageDocs());
         return;
     }
 
@@ -551,9 +524,9 @@ void mainWrapped(int argc, char ** argv)
        split for the histogram to say which command to wire up next.
 
        Ahead of the help branch rather than after it, because `showHelp` builds
-       its page by evaluating `generate-manpage.nix` -- so `nix flake metadata
-       --help` under `eval-backend = rust` refuses like any other command, and
-       would otherwise be filed under bare `nix`. */
+       its page by evaluating `generate-manpage.nix` through the selected
+       backend, so anything the Rust arm cannot evaluate in the generator is
+       filed under `nix flake metadata --help` rather than under bare `nix`. */
     {
         auto name = programName;
         for (const auto & component : subcommandPath(args))

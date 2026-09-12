@@ -14,6 +14,7 @@ use tracing::warn;
 use url::Url;
 
 use crate::mitm_hook::MitmHookConfig;
+use crate::policy::normalize_host;
 
 /// Variant order encodes effective precedence for duplicate patterns:
 /// `None < Allow < Deny`, so deny wins over allow when entries conflict.
@@ -137,6 +138,9 @@ pub struct NetworkProxyConfig {
     pub mitm: bool,
     #[serde(default)]
     pub credential_broker: bool,
+    /// Trusted OpenAI endpoint derived from local configuration, never sent to remote executors.
+    #[serde(skip)]
+    pub credential_broker_openai_host: Option<String>,
     #[serde(default)]
     pub dangerously_allow_plaintext_credential_injection: bool,
     #[serde(default)]
@@ -160,6 +164,7 @@ impl Default for NetworkProxyConfig {
             allow_local_binding: false,
             mitm: false,
             credential_broker: false,
+            credential_broker_openai_host: None,
             dangerously_allow_plaintext_credential_injection: false,
             mitm_hooks: Vec::new(),
         }
@@ -170,6 +175,10 @@ impl NetworkProxyConfig {
     pub fn set_credential_broker_enabled(&mut self, enabled: bool) {
         self.credential_broker = enabled;
         self.mitm |= enabled;
+    }
+
+    pub fn set_credential_broker_openai_base_url(&mut self, base_url: Option<&str>) {
+        self.credential_broker_openai_host = base_url.and_then(trusted_credential_broker_host);
     }
 
     pub fn allowed_domains(&self) -> Option<Vec<String>> {
@@ -274,6 +283,15 @@ impl NetworkProxyConfig {
         }
         self.unix_sockets = (!unix_sockets.entries.is_empty()).then_some(unix_sockets);
     }
+}
+
+pub(crate) fn trusted_credential_broker_host(base_url: &str) -> Option<String> {
+    Url::parse(base_url)
+        .ok()
+        .filter(|url| {
+            url.scheme() == "https" && url.username().is_empty() && url.password().is_none()
+        })
+        .and_then(|url| url.host_str().map(normalize_host))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -428,6 +446,26 @@ pub fn resolve_runtime(cfg: &NetworkProxyConfig) -> Result<RuntimeConfig> {
         http_addr,
         socks_addr,
     })
+}
+
+/// Returns the sorted loopback ports used by the configured managed proxy listeners.
+pub fn managed_proxy_ports(cfg: &NetworkProxyConfig) -> Result<Vec<u16>> {
+    let runtime = resolve_runtime(cfg)?;
+    if runtime.http_addr.port() == 0 {
+        bail!("network.proxy_url must use a fixed non-zero port for managed proxy provisioning");
+    }
+    let mut ports = vec![runtime.http_addr.port()];
+    if cfg.enable_socks5 {
+        if runtime.socks_addr.port() == 0 {
+            bail!(
+                "network.socks_url must use a fixed non-zero port for managed proxy provisioning"
+            );
+        }
+        ports.push(runtime.socks_addr.port());
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    Ok(ports)
 }
 
 fn resolve_addr(url: &str, default_port: u16) -> Result<SocketAddr> {
@@ -599,10 +637,64 @@ mod tests {
                 allow_local_binding: false,
                 mitm: false,
                 credential_broker: false,
+                credential_broker_openai_host: None,
                 dangerously_allow_plaintext_credential_injection: false,
                 mitm_hooks: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn credential_broker_only_accepts_trusted_https_openai_endpoints() {
+        let mut config = NetworkProxyConfig::default();
+
+        for (base_url, expected_host) in [
+            (
+                Some("https://gateway.example.com/v1"),
+                Some("gateway.example.com"),
+            ),
+            (
+                Some("https://gateway.example.com./v1"),
+                Some("gateway.example.com"),
+            ),
+            (Some("https://[2001:db8::1]/v1"), Some("2001:db8::1")),
+            (Some("http://gateway.example.com/v1"), None),
+            (Some("https://user@gateway.example.com/v1"), None),
+            (Some("not-a-url"), None),
+            (None, None),
+        ] {
+            config.set_credential_broker_openai_base_url(base_url);
+            assert_eq!(
+                config.credential_broker_openai_host.as_deref(),
+                expected_host
+            );
+        }
+    }
+
+    #[test]
+    fn managed_proxy_ports_reject_ephemeral_ports() {
+        let mut config = NetworkProxyConfig {
+            proxy_url: "http://127.0.0.1:0".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            managed_proxy_ports(&config).unwrap_err().to_string(),
+            "network.proxy_url must use a fixed non-zero port for managed proxy provisioning"
+        );
+
+        config.proxy_url = "http://127.0.0.1:3128".to_string();
+        config.socks_url = "socks5h://127.0.0.1:48081".to_string();
+        assert_eq!(managed_proxy_ports(&config).unwrap(), vec![3128, 48081]);
+
+        config.socks_url = "socks5h://127.0.0.1:0".to_string();
+        assert_eq!(
+            managed_proxy_ports(&config).unwrap_err().to_string(),
+            "network.socks_url must use a fixed non-zero port for managed proxy provisioning"
+        );
+
+        config.enable_socks5 = false;
+        assert_eq!(managed_proxy_ports(&config).unwrap(), vec![3128]);
     }
 
     #[test]

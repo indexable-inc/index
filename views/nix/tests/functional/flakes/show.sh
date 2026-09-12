@@ -3,7 +3,7 @@
 source ./common.sh
 
 flakeDir=$TEST_ROOT/flake
-mkdir -p "$flakeDir"
+jjFlakeDir "$flakeDir"
 
 writeSimpleFlake "$flakeDir"
 pushd "$flakeDir"

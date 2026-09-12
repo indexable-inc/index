@@ -4596,8 +4596,32 @@ where
 
 /// CLI command builder and runner.
 #[must_use]
+/// What a run has in hand once the cwd-relative configuration is loaded and
+/// before the command line is parsed: the point where shell completion and
+/// command dispatch part ways.
+struct CwdConfig {
+    config_env: ConfigEnv,
+    config: StackedConfig,
+    maybe_cwd_workspace_loader: Result<Box<dyn WorkspaceLoader>, CommandError>,
+    last_config_migration_descriptions: Vec<(ConfigSource, String)>,
+}
+
+/// Applies the migration rules, keeping the descriptions of the LAST pass so
+/// the caller can print them once, after the final resolution, without
+/// duplicates from the earlier passes.
+fn migrate_config(
+    config: &mut StackedConfig,
+    rules: &[ConfigMigrationRule],
+    last_descriptions: &mut Vec<(ConfigSource, String)>,
+) -> Result<(), CommandError> {
+    *last_descriptions = jj_lib::config::migrate(config, rules)?;
+    Ok(())
+}
+
 pub struct CliRunner<'a> {
-    tracing_subscription: TracingSubscription,
+    /// `None` for an embedded runner: the host process owns tracing, so
+    /// `--debug` has no subscriber to reconfigure and is refused.
+    tracing_subscription: Option<TracingSubscription>,
     app: Command,
     config_layers: Vec<ConfigLayer>,
     config_migrations: Vec<ConfigMigrationRule>,
@@ -4621,6 +4645,24 @@ impl<'a> CliRunner<'a> {
     pub fn init() -> Self {
         let tracing_subscription = TracingSubscription::init();
         crate::cleanup_guard::init();
+        Self::new(Some(tracing_subscription))
+    }
+
+    /// A runner for a host that embeds jj-cli in its own process and drives
+    /// it through [`CliRunner::command_helper`] rather than
+    /// [`CliRunner::run`].
+    ///
+    /// Unlike [`CliRunner::init`] it installs nothing process-wide: no global
+    /// tracing subscriber (a second install panics, and the host owns its
+    /// own) and no `SIGINT`/`SIGTERM`/`SIGHUP` handler (jj's ends in
+    /// `process::exit(1)`, which would skip the host's own shutdown). The one
+    /// consequence is that `--debug`, which reconfigures that subscriber, is
+    /// refused rather than silently ignored.
+    pub fn embedded() -> Self {
+        Self::new(None)
+    }
+
+    fn new(tracing_subscription: Option<TracingSubscription>) -> Self {
         Self {
             tracing_subscription,
             app: crate::commands::default_app(),
@@ -4794,59 +4836,165 @@ impl<'a> CliRunner<'a> {
                      accessed?",
                 )
             })?;
+        let cwd_config = self.load_cwd_config(ui, &cwd, &mut raw_config)?;
+
+        if env::var_os("COMPLETE").is_some_and(|v| !v.is_empty() && v != "0") {
+            return handle_shell_completion(&Ui::null(), &self.app, &cwd_config.config, &cwd);
+        }
+
+        let (command_helper, dispatch) = self.into_command_helper(
+            ui,
+            cwd,
+            env::args_os().collect(),
+            raw_config,
+            cwd_config,
+        )?;
+        dispatch.call(ui, &command_helper).await
+    }
+
+    /// Builds the [`CommandHelper`] that `jj <args>` run from `cwd` would
+    /// dispatch with, and stops there: nothing is dispatched.
+    ///
+    /// This is the entry point for a host that embeds jj-cli in its own
+    /// process (the nix fork's jj fetcher, through the `jj-tree-abi` crate).
+    /// Such a host cannot hand jj the process's working directory or argv,
+    /// which is all [`CliRunner::run`] reads, so both are parameters: `args`
+    /// is the full argv, program name first, exactly as
+    /// [`std::env::args_os`] would yield it, and `cwd` is canonicalized the
+    /// way `run` canonicalizes the process's. Everything else is the code
+    /// `run` executes up to the point of dispatch: the same config stack
+    /// (system, user, repo, workspace, environment, `--config`), the same
+    /// alias and default-command expansion, the same global arguments. That
+    /// is the point of the function: a helper built here snapshots, resolves
+    /// and errors exactly as the command line would, because it is the
+    /// command line's own helper and not a re-derivation of it.
+    ///
+    /// Shell completion (`COMPLETE`) is a protocol between jj and the shell
+    /// that spawned it and is not consulted here. Build the runner with
+    /// [`CliRunner::embedded`]: `init` installs process-wide handlers a host
+    /// must not receive.
+    pub fn command_helper(
+        mut self,
+        ui: &mut Ui,
+        cwd: PathBuf,
+        args: Vec<OsString>,
+    ) -> Result<CommandHelper, CommandError> {
+        let cwd = dunce::canonicalize(&cwd).map_err(|err| {
+            user_error_with_message(format!("Could not canonicalize {}", cwd.display()), err)
+        })?;
+        let mut raw_config = config_from_environment(self.config_layers.drain(..));
+        let cwd_config = self.load_cwd_config(ui, &cwd, &mut raw_config)?;
+        let (command_helper, _dispatch) =
+            self.into_command_helper(ui, cwd, args, raw_config, cwd_config)?;
+        Ok(command_helper)
+    }
+
+    /// Loads the configuration knowable before the command line is parsed:
+    /// system, user, and the cwd workspace's repo and workspace layers.
+    /// Aliases and the default command resolve against this.
+    fn load_cwd_config(
+        &self,
+        ui: &mut Ui,
+        cwd: &Path,
+        raw_config: &mut RawConfig,
+    ) -> Result<CwdConfig, CommandError> {
         let mut config_env = ConfigEnv::from_environment();
         let mut last_config_migration_descriptions = Vec::new();
-        let mut migrate_config = |config: &mut StackedConfig| -> Result<(), CommandError> {
-            last_config_migration_descriptions =
-                jj_lib::config::migrate(config, &self.config_migrations)?;
-            Ok(())
-        };
 
-        // Initial load: user, repo, and workspace-level configs for
-        // alias/default-command resolution
         // Use cwd-relative workspace configs to resolve default command and
         // aliases. WorkspaceLoader::init() won't do any heavy lifting other
         // than the path resolution.
         let maybe_cwd_workspace_loader = self
             .workspace_loader_factory
-            .create(find_workspace_dir(&cwd))
+            .create(find_workspace_dir(cwd))
             .map_err(|err| map_workspace_load_error(err, Some(".")));
-        config_env.reload_system_config(&mut raw_config)?;
-        config_env.reload_user_config(&mut raw_config)?;
+        config_env.reload_system_config(raw_config)?;
+        config_env.reload_user_config(raw_config)?;
         if let Ok(loader) = &maybe_cwd_workspace_loader {
             config_env.reset_repo_path(loader.repo_path());
-            config_env.reload_repo_config(ui, &mut raw_config)?;
+            config_env.reload_repo_config(ui, raw_config)?;
             config_env.reset_workspace_path(loader.workspace_root());
-            config_env.reload_workspace_config(ui, &mut raw_config)?;
+            config_env.reload_workspace_config(ui, raw_config)?;
         }
-        let mut config = config_env.resolve_config(&raw_config)?;
-        migrate_config(&mut config)?;
+        let mut config = config_env.resolve_config(raw_config)?;
+        migrate_config(
+            &mut config,
+            &self.config_migrations,
+            &mut last_config_migration_descriptions,
+        )?;
         ui.reset(&config)?;
+        Ok(CwdConfig {
+            config_env,
+            config,
+            maybe_cwd_workspace_loader,
+            last_config_migration_descriptions,
+        })
+    }
 
-        if env::var_os("COMPLETE").is_some_and(|v| !v.is_empty() && v != "0") {
-            return handle_shell_completion(&Ui::null(), &self.app, &config, &cwd);
-        }
+    /// Parses the command line against the cwd configuration and assembles
+    /// the [`CommandHelper`] plus the dispatch chain the command runs through.
+    fn into_command_helper(
+        self,
+        ui: &mut Ui,
+        cwd: PathBuf,
+        args: Vec<OsString>,
+        mut raw_config: RawConfig,
+        cwd_config: CwdConfig,
+    ) -> Result<(CommandHelper, BoxedAsyncCliDispatch<'a>), CommandError> {
+        let Self {
+            tracing_subscription,
+            app,
+            config_layers: _,
+            config_migrations,
+            store_factories,
+            working_copy_factories,
+            workspace_loader_factory,
+            revset_extensions,
+            commit_template_extensions,
+            operation_template_extensions,
+            dispatch,
+            dispatch_hooks,
+            process_global_args_fns,
+        } = self;
+        let CwdConfig {
+            mut config_env,
+            mut config,
+            maybe_cwd_workspace_loader,
+            mut last_config_migration_descriptions,
+        } = cwd_config;
 
-        let string_args = expand_args(ui, &self.app, env::args_os(), &config)?;
-        let (args, config_layers) = parse_early_args(&self.app, &string_args)?;
+        let string_args = expand_args(ui, &app, args, &config)?;
+        let (args, config_layers) = parse_early_args(&app, &string_args)?;
         if !config_layers.is_empty() {
             raw_config.as_mut().extend_layers(config_layers);
             config = config_env.resolve_config(&raw_config)?;
-            migrate_config(&mut config)?;
+            migrate_config(
+                &mut config,
+                &config_migrations,
+                &mut last_config_migration_descriptions,
+            )?;
             ui.reset(&config)?;
         }
 
         if args.has_config_args() {
-            warn_if_args_mismatch(ui, &self.app, &config, &string_args)?;
+            warn_if_args_mismatch(ui, &app, &config, &string_args)?;
         }
 
-        let (matches, args) = parse_args(&self.app, &string_args)
-            .map_err(|err| map_clap_cli_error(err, ui, &config))?;
+        let (matches, args) =
+            parse_args(&app, &string_args).map_err(|err| map_clap_cli_error(err, ui, &config))?;
         if args.global_args.debug {
             // TODO: set up debug logging as early as possible
-            self.tracing_subscription.enable_debug_logging()?;
+            match &tracing_subscription {
+                Some(tracing_subscription) => tracing_subscription.enable_debug_logging()?,
+                None => {
+                    return Err(cli_error(
+                        "--debug reconfigures the tracing subscriber CliRunner::init installs, \
+                         and this runner is embedded in a host process that owns its own",
+                    ));
+                }
+            }
         }
-        for process_global_args_fn in self.process_global_args_fns {
+        for process_global_args_fn in process_global_args_fns {
             process_global_args_fn(ui, &matches)?;
         }
         config_env.set_command_name(command_name(&matches));
@@ -4856,8 +5004,7 @@ impl<'a> CliRunner<'a> {
             let abs_path = cwd.join(path);
             let abs_path = dunce::canonicalize(&abs_path).unwrap_or(abs_path);
             // Invalid -R path is an error. No need to proceed.
-            let loader = self
-                .workspace_loader_factory
+            let loader = workspace_loader_factory
                 .create(&abs_path)
                 .map_err(|err| map_workspace_load_error(err, Some(path)))?;
             config_env.reset_repo_path(loader.repo_path());
@@ -4871,7 +5018,11 @@ impl<'a> CliRunner<'a> {
 
         // Apply workspace configs, --config arguments, and --when.commands.
         config = config_env.resolve_config(&raw_config)?;
-        migrate_config(&mut config)?;
+        migrate_config(
+            &mut config,
+            &config_migrations,
+            &mut last_config_migration_descriptions,
+        )?;
         ui.reset(&config)?;
 
         // Print only the last migration messages to omit duplicates.
@@ -4892,41 +5043,40 @@ impl<'a> CliRunner<'a> {
         }
 
         if args.global_args.repository.is_some() {
-            warn_if_args_mismatch(ui, &self.app, &config, &string_args)?;
+            warn_if_args_mismatch(ui, &app, &config, &string_args)?;
         }
 
         let settings = UserSettings::from_config(config)?;
         let command_helper_data = CommandHelperData {
-            app: self.app,
+            app,
             cwd,
             string_args,
             matches,
             global_args: args.global_args,
             config_env,
-            config_migrations: self.config_migrations,
+            config_migrations,
             raw_config,
             settings,
-            revset_extensions: self.revset_extensions.into(),
-            commit_template_extensions: self.commit_template_extensions,
-            operation_template_extensions: self.operation_template_extensions,
+            revset_extensions: revset_extensions.into(),
+            commit_template_extensions,
+            operation_template_extensions,
             maybe_workspace_loader,
-            store_factories: self.store_factories,
-            working_copy_factories: self.working_copy_factories,
-            workspace_loader_factory: self.workspace_loader_factory,
+            store_factories,
+            working_copy_factories,
+            workspace_loader_factory,
         };
         let command_helper = CommandHelper {
             data: Rc::new(command_helper_data),
         };
-        let dispatch =
-            self.dispatch_hooks
-                .into_iter()
-                .fold(self.dispatch, |old_dispatch, dispatch_hook| {
-                    let f = async move |ui: &mut Ui, command_helper: &CommandHelper| {
-                        dispatch_hook.call(ui, command_helper, old_dispatch).await
-                    };
-                    Box::new(AsyncCliDispatchFn(f))
-                });
-        dispatch.call(ui, &command_helper).await
+        let dispatch = dispatch_hooks
+            .into_iter()
+            .fold(dispatch, |old_dispatch, dispatch_hook| {
+                let f = async move |ui: &mut Ui, command_helper: &CommandHelper| {
+                    dispatch_hook.call(ui, command_helper, old_dispatch).await
+                };
+                Box::new(AsyncCliDispatchFn(f))
+            });
+        Ok((command_helper, dispatch))
     }
 
     #[must_use]

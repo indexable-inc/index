@@ -15,7 +15,6 @@
 {
   lib,
   pkgs,
-  paths,
   mkCheck,
   astlog,
 }: let
@@ -25,7 +24,7 @@
   # every tracked-file edit the way a whole-tree source would.
   rulesSource = fs.toSource {
     root = ./.;
-    fileset = fs.difference (fs.intersection (fs.gitTracked paths.root) ./.) ./checks.nix;
+    fileset = fs.difference ./. ./checks.nix;
   };
 in {
   astlog-rules = mkCheck "astlog-rules" {

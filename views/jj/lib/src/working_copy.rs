@@ -229,10 +229,11 @@ pub struct SnapshotOptions<'a> {
     /// tracking them anyway if they match this.
     pub force_tracking_matcher: &'a dyn Matcher,
     /// The size of the largest file that should be allowed to become tracked
-    /// (already tracked files are always snapshotted). If there are larger
-    /// files in the working copy, then `LockedWorkingCopy::snapshot()` may
-    /// (depending on implementation)
-    /// return `SnapshotError::NewFileTooLarge`.
+    /// (already tracked files are always snapshotted). A larger untracked
+    /// file is not an error: `LockedWorkingCopy::snapshot()` leaves it
+    /// untracked and reports it in `SnapshotStats::untracked_paths` as
+    /// `UntrackedReason::FileTooLarge`, so a caller that ignores the stats
+    /// gets a tree without the file and no other signal.
     pub max_new_file_size: u64,
 }
 

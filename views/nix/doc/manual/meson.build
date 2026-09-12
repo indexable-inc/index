@@ -321,7 +321,6 @@ nix3_manpages = [
   'nix3-registry',
   'nix3-registry-pin',
   'nix3-registry-remove',
-  'nix3-repl',
   'nix3-run',
   'nix3-search',
   'nix3-store-add',

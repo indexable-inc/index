@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include "nix/util/file-content-address.hh"
+#include "nix/util/source-path.hh"
 
 namespace nix {
 
@@ -46,6 +47,7 @@ TEST(FileIngestionMethod, testRoundTripPrintParse_1)
              FileIngestionMethod::Flat,
              FileIngestionMethod::NixArchive,
              FileIngestionMethod::Git,
+             FileIngestionMethod::JjTree,
          }) {
         EXPECT_EQ(parseFileIngestionMethod(renderFileIngestionMethod(fim)), fim);
     }
@@ -57,9 +59,20 @@ TEST(FileIngestionMethod, testRoundTripPrintParse_2)
              "flat",
              "nar",
              "git",
+             "jj-tree",
          }) {
         EXPECT_EQ(renderFileIngestionMethod(parseFileIngestionMethod(fimS)), fimS);
     }
+}
+
+/* Nix cannot compute a jj tree id; asking for one is a typed refusal, not a
+   walk that fails on the first file or, worse, a hash of the wrong thing. */
+TEST(FileIngestionMethod, jjTreeIsNotComputable)
+{
+    SourcePath root{makeEmptySourceAccessor()};
+    EXPECT_THAT(
+        [&]() { hashPath(root, FileIngestionMethod::JjTree, HashAlgorithm::BLAKE3); },
+        testing::ThrowsMessage<TreeIdNotComputable>(testing::HasSubstr("Jujutsu tree id")));
 }
 
 TEST(FileIngestionMethod, testParseFileIngestionMethodOptException)

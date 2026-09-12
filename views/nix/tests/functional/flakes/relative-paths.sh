@@ -10,7 +10,11 @@ subflake1="$rootFlake/sub1"
 subflake2="$rootFlake/sub2"
 
 rm -rf "$rootFlake"
-mkdir -p "$rootFlake" "$subflake0" "$subflake1" "$subflake2"
+# Only the root is a workspace. sub0, sub1 and sub2 are reached as relative
+# inputs inside its tree, which is the subject of this test; giving one of
+# them its own identity would stop exercising that path.
+jjFlakeDir "$rootFlake"
+mkdir -p "$subflake0" "$subflake1" "$subflake2"
 
 cat > "$rootFlake/flake.nix" <<EOF
 {
@@ -45,9 +49,7 @@ EOF
 
 [[ $(nix eval "$rootFlake?dir=sub1#y") = 6 ]]
 
-initGitRepo "$rootFlake"
-git -C "$rootFlake" add flake.nix sub0/flake.nix sub1/flake.nix
-
+# The same subflake reached by its own path rather than through the root.
 [[ $(nix eval "$subflake1#y") = 6 ]]
 
 cat > "$subflake2/flake.nix" <<EOF
@@ -61,12 +63,10 @@ cat > "$subflake2/flake.nix" <<EOF
 }
 EOF
 
-git -C "$rootFlake" add flake.nix sub2/flake.nix
-
 [[ $(nix eval "$subflake2#y") = 15 ]]
 
-# Make sure that this still works after commiting the lock file.
-git -C "$rootFlake" add sub2/flake.lock
+# Make sure that this still works once the lock file the previous evaluation
+# wrote is part of the tree.
 [[ $(nix eval "$subflake2#y") = 15 ]]
 
 [[ $(jq --indent 0 --compact-output . < "$subflake2/flake.lock") =~ ^'{"nodes":{"root":{"inputs":{"root":"root_2","sub1":"sub1"}},"root_2":{"inputs":{"sub0":"sub0"},"locked":{"path":"..","type":"path"},"original":{"path":"..","type":"path"},"parent":[]},"root_3":{"inputs":{"sub0":"sub0_2"},"locked":{"path":"../","type":"path"},"original":{"path":"../","type":"path"},"parent":["sub1"]},"sub0":{"locked":{"path":"sub0","type":"path"},"original":{"path":"sub0","type":"path"},"parent":["root"]},"sub0_2":{"locked":{"path":"sub0","type":"path"},"original":{"path":"sub0","type":"path"},"parent":["sub1","root"]},"sub1":{"inputs":{"root":"root_3"},"locked":{"path":"../sub1","type":"path"},"original":{"path":"../sub1","type":"path"},"parent":[]}},"root":"root","version":7}'$ ]]
@@ -78,11 +78,23 @@ if ! isTestOnNixOS; then
 fi
 (! grep narHash "$subflake2/flake.lock")
 
-# Test `nix flake archive` with relative path flakes.
-git -C "$rootFlake" add flake.lock
-git -C "$rootFlake" commit -a -m Foo
+# A '..' that stays inside the tree is legal and lands where lexical
+# normalisation says: the escape guard counts descents as well as climbs,
+# and only a climb above the tree's root is refused.
+cat > "$subflake2/flake.nix" <<EOF
+{
+  inputs.sub0.url = "path:../sub1/../sub0";
+  outputs = { self, sub0 }: {
+    z = sub0.x + 1;
+  };
+}
+EOF
+[[ $(nix eval "$subflake2#z") = 8 ]]
 
-json=$(nix flake archive --json "$rootFlake" --to "$TEST_ROOT/store2")
+# Test `nix flake archive` with relative path flakes. The root is a jj tree,
+# whose store object is not self-certifying, so the copy to another store
+# needs `--no-check-sigs` (jj-tree/lock.sh pins the refusal without it).
+json=$(nix flake archive --json "$rootFlake" --to "$TEST_ROOT/store2" --no-check-sigs)
 [[ $(echo "$json" | jq .inputs.sub0.inputs) = {} ]]
 [[ -n $(echo "$json" | jq .path) ]]
 
@@ -113,10 +125,10 @@ fi
 
 # https://github.com/NixOS/nix/pull/10089#discussion_r2041984987
 # https://github.com/NixOS/nix/issues/13018
+jjFlakeDir "$TEST_ROOT/issue-13018"
 mkdir -p "$TEST_ROOT/issue-13018/example"
 (
   cd "$TEST_ROOT/issue-13018"
-  git init
   echo '{ outputs = _: { }; }' >flake.nix
   cat >example/flake.nix <<EOF
 {
@@ -124,7 +136,6 @@ mkdir -p "$TEST_ROOT/issue-13018/example"
   outputs = { parent, ... }: builtins.seq parent { ok = null; };
 }
 EOF
-  git add -N .
   cd example
   # Important: the error does not trigger for an in-memory lock!
   nix flake lock
@@ -168,7 +179,11 @@ EOF
   git add .
   git commit -m "Initial commit"
 
-  # I don't understand why two calls are necessary to reproduce the issue.
-  nix eval --json .#nestedFlake1.nestedFlake2 --no-eval-cache
+  # The issue needed a lock file to exist for the second evaluation (the
+  # first wrote it). A git source takes its lock file only as a commit
+  # (flakes/lock-file-writes.sh), so the write is explicit and committed, and
+  # both roads are still walked: no lock file, then the committed one.
+  nix eval --json --no-write-lock-file .#nestedFlake1.nestedFlake2 --no-eval-cache
+  nix flake lock --commit-lock-file
   nix eval --json .#nestedFlake1.nestedFlake2 --no-eval-cache
 )

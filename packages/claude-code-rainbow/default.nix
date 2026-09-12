@@ -55,7 +55,9 @@
         {
           find = "Welcome to Claude Code";
           replace = "Rainbow!!! Claude Code";
-          expect = 10;
+          # 2.1.259 bundle: 7 (2.1.228 had 10); the nine colour rules below
+          # counted unchanged against the same bundle.
+          expect = 7;
         }
       ];
     }

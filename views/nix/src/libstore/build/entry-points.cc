@@ -46,9 +46,12 @@ void Store::buildPaths(const std::vector<DerivedPath> & reqs, BuildMode buildMod
 }
 
 std::vector<KeyedBuildResult> Store::buildPathsWithResults(
-    const std::vector<DerivedPath> & reqs, BuildMode buildMode, std::shared_ptr<Store> evalStore)
+    const std::vector<DerivedPath> & reqs,
+    BuildMode buildMode,
+    std::shared_ptr<Store> evalStore,
+    BuildFailureMode failureMode)
 {
-    Worker worker(*this, evalStore ? *evalStore : *this);
+    Worker worker(*this, evalStore ? *evalStore : *this, failureMode);
 
     Goals goals;
     std::vector<std::pair<const DerivedPath &, GoalPtr>> state;

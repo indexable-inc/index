@@ -3,7 +3,6 @@
   mkMesonLibrary,
 
   nix-store-c,
-  nix-expr-c,
   nix-fetchers-c,
   nix-flake,
 
@@ -16,7 +15,7 @@ let
   inherit (lib) fileset;
 in
 
-mkMesonLibrary (finalAttrs: {
+mkMesonLibrary (_: {
   pname = "nix-flake-c";
   inherit version;
 
@@ -34,7 +33,6 @@ mkMesonLibrary (finalAttrs: {
   ];
 
   propagatedBuildInputs = [
-    nix-expr-c
     nix-store-c
     nix-fetchers-c
     nix-flake

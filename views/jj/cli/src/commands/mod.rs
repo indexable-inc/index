@@ -64,8 +64,6 @@ mod undo;
 mod unsign;
 mod util;
 mod version;
-#[cfg(feature = "views")]
-mod views;
 mod workspace;
 
 use std::fmt::Debug;
@@ -168,9 +166,6 @@ enum Command {
     #[command(subcommand)]
     Util(util::UtilCommand),
     Version(version::VersionArgs),
-    #[cfg(feature = "views")]
-    #[command(subcommand)]
-    Views(views::ViewsCommand),
     #[command(subcommand)]
     Workspace(workspace::WorkspaceCommand),
 }
@@ -237,8 +232,6 @@ pub async fn run_command(ui: &mut Ui, command_helper: &CommandHelper) -> Result<
         Command::Unsign(args) => unsign::cmd_unsign(ui, command_helper, args).await,
         Command::Util(args) => util::cmd_util(ui, command_helper, args).await,
         Command::Version(args) => version::cmd_version(ui, command_helper, args).await,
-        #[cfg(feature = "views")]
-        Command::Views(args) => views::cmd_views(ui, command_helper, args).await,
         Command::Workspace(args) => workspace::cmd_workspace(ui, command_helper, args).await,
     }
 }

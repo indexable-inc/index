@@ -1,5 +1,7 @@
 use super::*;
 use crate::bottom_pane::preview_line_for_title_items;
+use crate::chatwidget::ThreadUsageOutcome;
+use codex_app_server_protocol::ThreadUsage;
 use pretty_assertions::assert_eq;
 use ratatui::text::Line;
 
@@ -65,6 +67,7 @@ fn cache_rate_limit_snapshot(chat: &mut ChatWidget) {
     chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 35,
             window_duration_mins: Some(30 * 24 * 60),
@@ -77,9 +80,20 @@ fn cache_rate_limit_snapshot(chat: &mut ChatWidget) {
         }),
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
+}
+
+#[tokio::test]
+async fn status_surface_hostname_preview_uses_current_machine_hostname() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    assert_eq!(
+        status_preview_line(&mut chat, &[StatusLineItem::Hostname]),
+        codex_config::os_host_name().expect("machine hostname")
+    );
 }
 
 #[tokio::test]
@@ -114,7 +128,7 @@ async fn status_line_setup_popup_live_only_snapshot() {
     cache_project_root(&mut chat, "preview-live-root");
     chat.status_line_branch = Some("feature/live-preview-branch".to_string());
     chat.thread_name = Some("Live preview thread".to_string());
-    chat.config.tui_status_line = Some(vec![
+    chat.local_settings.tui.status_line = Some(vec![
         "project-name".to_string(),
         "git-branch".to_string(),
         "thread-title".to_string(),
@@ -168,7 +182,7 @@ async fn thread_title_falls_back_to_thread_id_when_unnamed() {
 #[tokio::test]
 async fn status_line_setup_popup_hardcoded_only_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.config.tui_status_line = Some(vec![
+    chat.local_settings.tui.status_line = Some(vec![
         "project-name".to_string(),
         "git-branch".to_string(),
         "thread-title".to_string(),
@@ -184,7 +198,7 @@ async fn status_line_setup_popup_hardcoded_only_snapshot() {
 async fn status_line_setup_popup_workspace_headline_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.status_line_workspace_headline = Some("Workspace maintenance starts at 5pm".to_string());
-    chat.config.tui_status_line = Some(vec!["workspace-headline".to_string()]);
+    chat.local_settings.tui.status_line = Some(vec!["workspace-headline".to_string()]);
 
     assert_chatwidget_snapshot!(
         "status_line_setup_popup_workspace_headline",
@@ -233,12 +247,114 @@ async fn status_surface_preview_lines_rate_limits_snapshot() {
 }
 
 #[tokio::test]
+async fn status_surface_preview_lines_thread_usage_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.has_codex_backend_auth = true;
+    chat.plan_type = Some(PlanType::Business);
+    chat.local_settings.tui.status_line = Some(vec![
+        "thread-credits".to_string(),
+        "estimated-thread-cost".to_string(),
+    ]);
+    chat.local_settings.tui.terminal_title = Some(vec![
+        "thread-credits".to_string(),
+        "estimated-thread-cost".to_string(),
+    ]);
+    chat.refresh_status_surfaces();
+
+    let request_id = match rx.try_recv() {
+        Ok(AppEvent::RefreshThreadUsage { request_id, .. }) => request_id,
+        event => panic!("expected shared thread usage preview request, got {event:?}"),
+    };
+    assert!(chat.finish_thread_usage_refresh(
+        thread_id,
+        request_id,
+        Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            thread_id: thread_id.to_string(),
+            estimated_usage_credits_micros: 5_200_000,
+            estimated_usage_usd_micros: Some(210_000),
+            groups: Vec::new(),
+        })),
+    ));
+
+    let snapshot = combined_preview_snapshot(
+        &mut chat,
+        &[
+            StatusLineItem::ThreadCredits,
+            StatusLineItem::EstimatedThreadCost,
+        ],
+        &[
+            TerminalTitleItem::ThreadCredits,
+            TerminalTitleItem::EstimatedThreadCost,
+        ],
+    );
+
+    assert_chatwidget_snapshot!("status_surface_previews_thread_usage", snapshot);
+}
+
+#[tokio::test]
+async fn status_surface_thread_usage_previews_omit_unavailable_usd_estimates() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    chat.has_codex_backend_auth = true;
+    chat.plan_type = Some(PlanType::Business);
+    chat.local_settings.tui.status_line = Some(vec![
+        "thread-credits".to_string(),
+        "estimated-thread-cost".to_string(),
+    ]);
+    chat.local_settings.tui.terminal_title = Some(vec![
+        "thread-credits".to_string(),
+        "estimated-thread-cost".to_string(),
+    ]);
+    chat.refresh_status_surfaces();
+
+    let request_id = match rx.try_recv() {
+        Ok(AppEvent::RefreshThreadUsage { request_id, .. }) => request_id,
+        event => panic!("expected shared thread usage preview request, got {event:?}"),
+    };
+    assert!(chat.finish_thread_usage_refresh(
+        thread_id,
+        request_id,
+        Ok(ThreadUsageOutcome::Available(ThreadUsage {
+            thread_id: thread_id.to_string(),
+            estimated_usage_credits_micros: 5_200_000,
+            estimated_usage_usd_micros: None,
+            groups: Vec::new(),
+        })),
+    ));
+
+    assert_eq!(
+        status_preview_line(
+            &mut chat,
+            &[
+                StatusLineItem::ThreadCredits,
+                StatusLineItem::EstimatedThreadCost,
+            ],
+        ),
+        "5.2 credits"
+    );
+    assert_eq!(
+        title_preview_line(
+            &mut chat,
+            &[
+                TerminalTitleItem::ThreadCredits,
+                TerminalTitleItem::EstimatedThreadCost,
+            ],
+        ),
+        "5.2 credits"
+    );
+}
+
+#[tokio::test]
 async fn status_surface_preview_omits_unavailable_rate_limit_items() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 9,
             window_duration_mins: Some(7 * 24 * 60),
@@ -247,6 +363,7 @@ async fn status_surface_preview_omits_unavailable_rate_limit_items() {
         secondary: None,
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }));
@@ -278,7 +395,7 @@ async fn status_surface_preview_omits_unavailable_rate_limit_items() {
 async fn status_line_setup_popup_rate_limits_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     cache_rate_limit_snapshot(&mut chat);
-    chat.config.tui_status_line = Some(vec![
+    chat.local_settings.tui.status_line = Some(vec![
         "five-hour-limit".to_string(),
         "weekly-limit".to_string(),
     ]);
@@ -294,7 +411,7 @@ async fn status_line_setup_popup_mixed_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.status_line_branch = Some("feature/mixed-preview".to_string());
     chat.thread_name = Some("Mixed preview thread".to_string());
-    chat.config.tui_status_line = Some(vec![
+    chat.local_settings.tui.status_line = Some(vec![
         "project-name".to_string(),
         "git-branch".to_string(),
         "thread-title".to_string(),
@@ -313,7 +430,7 @@ async fn terminal_title_setup_popup_live_only_snapshot() {
     chat.status_line_branch = Some("feature/live-preview-branch".to_string());
     chat.thread_name = Some("Live preview thread".to_string());
     chat.transcript.last_plan_progress = Some((2, 5));
-    chat.config.tui_terminal_title = Some(vec![
+    chat.local_settings.tui.terminal_title = Some(vec![
         "project-name".to_string(),
         "thread-title".to_string(),
         "git-branch".to_string(),
@@ -329,7 +446,7 @@ async fn terminal_title_setup_popup_live_only_snapshot() {
 #[tokio::test]
 async fn terminal_title_setup_popup_hardcoded_only_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.config.tui_terminal_title = Some(vec![
+    chat.local_settings.tui.terminal_title = Some(vec![
         "thread-title".to_string(),
         "git-branch".to_string(),
         "task-progress".to_string(),
@@ -345,7 +462,7 @@ async fn terminal_title_setup_popup_hardcoded_only_snapshot() {
 async fn terminal_title_setup_popup_mixed_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_name = Some("Mixed preview thread".to_string());
-    chat.config.tui_terminal_title = Some(vec![
+    chat.local_settings.tui.terminal_title = Some(vec![
         "project-name".to_string(),
         "thread-title".to_string(),
         "task-progress".to_string(),
@@ -361,13 +478,27 @@ async fn terminal_title_setup_popup_mixed_snapshot() {
 async fn terminal_title_setup_popup_rate_limits_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     cache_rate_limit_snapshot(&mut chat);
-    chat.config.tui_terminal_title = Some(vec![
+    chat.local_settings.tui.terminal_title = Some(vec![
         "five-hour-limit".to_string(),
         "weekly-limit".to_string(),
     ]);
 
     assert_chatwidget_snapshot!(
         "terminal_title_setup_popup_rate_limits",
+        terminal_title_popup_snapshot(&mut chat)
+    );
+}
+
+#[tokio::test]
+async fn terminal_title_setup_popup_thread_usage_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.local_settings.tui.terminal_title = Some(vec![
+        "thread-credits".to_string(),
+        "estimated-thread-cost".to_string(),
+    ]);
+
+    assert_chatwidget_snapshot!(
+        "terminal_title_setup_popup_thread_usage",
         terminal_title_popup_snapshot(&mut chat)
     );
 }

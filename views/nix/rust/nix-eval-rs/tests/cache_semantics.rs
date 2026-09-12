@@ -21,7 +21,13 @@
 //! other's settings. [`serial`] takes one lock for the whole crate. It is a
 //! test-harness detail and not a claim about the evaluator, which is
 //! single-threaded per VM.
+#![expect(
+    clippy::expect_used,
+    reason = "an integration test crate: its helpers abort loudly like the tests they serve; clippy.toml's allow-expect-in-tests covers `#[test]` functions and `#[cfg(test)]` items, and a helper in `tests/` is neither"
+)]
+
 use nix_eval_rs::eval::{self, EvalError};
+use nix_eval_rs::modcache::ModuleCache;
 use nix_eval_rs::session;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -90,6 +96,8 @@ fn outcome(answer: &Result<String, EvalError>) -> Outcome {
                 nix_eval_rs::vm::ErrKind::Eval => "eval",
                 nix_eval_rs::vm::ErrKind::Thrown => "thrown",
                 nix_eval_rs::vm::ErrKind::Assertion => "assertion",
+                nix_eval_rs::vm::ErrKind::ImportFromDerivation => "import-from-derivation",
+                nix_eval_rs::vm::ErrKind::MissingArgument => "missing-argument",
             },
             text: message.clone(),
         },
@@ -104,7 +112,6 @@ fn uncached(source: &str) -> Outcome {
         source,
         "/base",
         nix_eval_rs::compile::Origin::String,
-        None,
         true,
         VERIFY_EVERY,
     );
@@ -116,19 +123,24 @@ fn uncached(source: &str) -> Outcome {
 }
 
 fn cached(source: &str, dir: &std::path::Path) -> Outcome {
-    let mut vm = nix_eval_rs::vm::Vm::from_process_settings();
+    // A store complaint is not an answer, but it means the run under test was
+    // not the run intended: reporting it beats silently comparing a fallback.
+    let (store, unopened) = session::open_cache(Some(dir), 0);
+    assert!(unopened.is_none(), "the cache did not open: {unopened:?}");
+    let store = store.expect("open_cache returns a store when it does not complain");
+    let mut vm = nix_eval_rs::vm::Vm::with_modules(
+        nix_eval_rs::eval::Settings::current(),
+        ModuleCache::persistent(store),
+    );
     let (answer, warnings) = session::evaluate_once(
         &mut vm,
         &nix_eval_rs::host::RealFs,
         source,
         "/base",
         nix_eval_rs::compile::Origin::String,
-        Some(dir),
         true,
         VERIFY_EVERY,
     );
-    // A store complaint is not an answer, but it means the run under test was
-    // not the run intended: reporting it beats silently comparing a fallback.
     assert!(warnings.is_empty(), "the cache complained: {warnings:?}");
     outcome(&answer)
 }
@@ -172,10 +184,8 @@ fn the_call_depth_ceiling_reaches_the_cached_path() {
 #[test]
 fn an_expression_that_interpolates_a_path_can_cache_hit() -> Result<(), Box<dyn core::error::Error>>
 {
-    use ix_kernel::cas::Cas;
     use nix_eval_rs::host::RealFs;
-    use nix_eval_rs::modcache::ModuleCache;
-    use nix_eval_rs::readset::{DirWitness, ResultCache};
+    use nix_eval_rs::readset::ResultCache;
     use nix_eval_rs::vm::Vm;
 
     let _guard = serial();
@@ -190,18 +200,15 @@ fn an_expression_that_interpolates_a_path_can_cache_hit() -> Result<(), Box<dyn 
     let source = format!("\"${{{}}}\"", file.display());
 
     let store = nix_eval_rs::store::Store::open(scratch.0.join("store"))?;
-    let cas = ix_kernel::cas::DirCas::open(store.objects_dir())?;
-    let rows = ix_kernel::rows::DirRows::open(store.index_dir())?;
-    let witness = DirWitness::open(store.witness_dir())?;
-    let cas: &dyn Cas = &cas;
 
     let go = || {
-        let mut modules = ModuleCache::persistent(cas, &rows);
-        let mut results = ResultCache::persistent(cas, &rows, &witness);
-        let mut vm = Vm::with_settings(nix_eval_rs::eval::Settings::default());
+        let mut results = ResultCache::persistent(&store);
+        let mut vm = Vm::with_modules(
+            nix_eval_rs::eval::Settings::default(),
+            ModuleCache::persistent(store.clone()),
+        );
         let (result, reuse) = session::evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &RealFs,
             &source,
@@ -248,16 +255,21 @@ fn two_store_directories_do_not_share_a_memo_key() {
     let base = eval::Settings {
         store_dir: Some("/nix/store".to_owned()),
         nix_version: Some("2.34.7".to_owned()),
+        host_build_identity: Some("/test/host-a".to_owned()),
         current_system: Some("x86_64-linux".to_owned()),
         max_call_depth: 10_000,
         pure_eval: false,
         restrict_eval: false,
-        cpp_builtin_names: Some("abort baseNameOf".to_owned()),
+        builtin_features: nix_eval_rs::eval::BuiltinFeatures::ALL,
         path_reads: nix_eval_rs::purity::PathReads::Direct,
         trace_verbose: false,
         abort_on_warn: false,
         home_dir: Some("/home/nixer".to_owned()),
         ca_derivations: false,
+        allow_import_from_derivation: true,
+        allowed_uris: None,
+        repair: false,
+        blake3_hashes: false,
         lint_url_literals: nix_eval_rs::eval::Diagnose::Ignore,
         lint_short_path_literals: nix_eval_rs::eval::Diagnose::Ignore,
         lint_absolute_path_literals: nix_eval_rs::eval::Diagnose::Ignore,
@@ -279,8 +291,8 @@ fn two_store_directories_do_not_share_a_memo_key() {
     // thing the cache actually uses.
     let module = ix_kernel::hash::tagged("module", &[b"same source"]);
     assert_ne!(
-        nix_eval_rs::readset::EvalId::of(&module, &base, &none(), &whole()),
-        nix_eval_rs::readset::EvalId::of(&module, &elsewhere, &none(), &whole()),
+        nix_eval_rs::readset::EvalId::of(&module, &base, &none(), &whole(),),
+        nix_eval_rs::readset::EvalId::of(&module, &elsewhere, &none(), &whole(),),
         "the same module under two store directories is one cache entry"
     );
 }
@@ -298,6 +310,343 @@ fn whole() -> nix_eval_rs::session::Question {
     nix_eval_rs::session::Question::Whole {
         render: nix_eval_rs::session::RenderMode::Plain,
     }
+}
+
+#[derive(Default)]
+struct DrvHostState {
+    write_derivation_calls: usize,
+    store_text_calls: usize,
+    writes: Vec<(String, String, Vec<String>)>,
+    present: std::collections::BTreeMap<String, String>,
+}
+
+static DRV_HOST_STATE: Mutex<Option<DrvHostState>> = Mutex::new(None);
+
+fn with_drv_host_state<T>(f: impl FnOnce(&mut DrvHostState) -> T) -> T {
+    let mut slot = DRV_HOST_STATE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    f(slot.get_or_insert_with(DrvHostState::default))
+}
+
+fn write_drv(name: &str, aterm: &str) -> Result<String, String> {
+    // As the embedder does: the reference set comes from the parsed ATerm.
+    let references = nix_eval_rs::drv::parse(aterm)
+        .map_err(|e| format!("unparseable ATerm: {e:?}"))?
+        .references();
+    let path = nix_eval_rs::drvpath::text_store_path(
+        "/nix/store",
+        &format!("{name}.drv"),
+        aterm,
+        &references,
+    );
+    with_drv_host_state(|state| {
+        state.write_derivation_calls += 1;
+        state
+            .writes
+            .push((name.to_owned(), aterm.to_owned(), references.to_vec()));
+        state.present.insert(path.clone(), aterm.to_owned());
+    });
+    Ok(path)
+}
+
+fn store_text(name: &str, contents: &str, references: &[String]) -> Result<String, String> {
+    with_drv_host_state(|state| state.store_text_calls += 1);
+    Ok(nix_eval_rs::drvpath::text_store_path(
+        "/nix/store",
+        name,
+        contents,
+        references,
+    ))
+}
+
+fn drv_host() -> nix_eval_rs::host::FnHost {
+    nix_eval_rs::host::FnHost {
+        write_drv: Some(write_drv),
+        store_text: Some(store_text),
+        ..nix_eval_rs::host::FnHost::default()
+    }
+}
+
+fn evaluate_in_store(
+    source: &str,
+    store: &nix_eval_rs::store::Store,
+    host: &dyn nix_eval_rs::host::Host,
+) -> Result<
+    (
+        nix_eval_rs::readset::EvalResult,
+        bool,
+        Vec<nix_eval_rs::readset::Complaint>,
+    ),
+    Box<dyn core::error::Error>,
+> {
+    use nix_eval_rs::readset::ResultCache;
+    use nix_eval_rs::vm::Vm;
+
+    let mut results = ResultCache::persistent(store);
+    let settings = eval::Settings {
+        store_dir: Some("/nix/store".to_owned()),
+        current_system: Some("x86_64-linux".to_owned()),
+        ..eval::Settings::default()
+    };
+    let mut vm = Vm::with_modules(settings, ModuleCache::persistent(store.clone()));
+    let (result, reuse) = session::evaluate(
+        &mut vm,
+        Some(&mut results),
+        host,
+        source,
+        "/base",
+        nix_eval_rs::compile::Origin::String,
+    );
+    Ok((result, reuse.memo_hit, results.take_corruption()))
+}
+
+fn one_derivation() -> &'static str {
+    r#"(builtins.derivationStrict {
+      name = "witness-one";
+      system = "x86_64-linux";
+      builder = "/bin/sh";
+      args = [];
+    }).drvPath"#
+}
+
+fn witness_questions(store: &nix_eval_rs::store::Store) -> Vec<nix_eval_rs::readset::Question> {
+    std::fs::read_dir(store.witness_dir())
+        .expect("read witness directory")
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let bytes = std::fs::read(entry.path()).ok()?;
+            let rows = nix_eval_rs::readset::witness_rows(&bytes)?;
+            Some(rows.into_iter().map(|(question, _)| question).collect())
+        })
+        .expect("one readable evaluation witness")
+}
+
+#[test]
+fn a_served_derivation_replays_write_derivation_without_store_text()
+-> Result<(), Box<dyn core::error::Error>> {
+    let _guard = serial();
+    let scratch = Scratch::new("write-drv-fidelity");
+    let store = nix_eval_rs::store::Store::open(scratch.0.join("store"))?;
+    with_drv_host_state(|state| *state = DrvHostState::default());
+
+    let (cold, cold_hit, cold_complaints) =
+        evaluate_in_store(one_derivation(), &store, &drv_host())?;
+    assert!(!cold_hit);
+    assert!(cold_complaints.is_empty(), "{cold_complaints:?}");
+    with_drv_host_state(|state| {
+        state.write_derivation_calls = 0;
+        state.store_text_calls = 0;
+        state.writes.clear();
+    });
+
+    let (served, served_hit, served_complaints) =
+        evaluate_in_store(one_derivation(), &store, &drv_host())?;
+    assert_eq!(served, cold);
+    assert!(served_hit, "the derivation was evaluated instead of served");
+    assert!(served_complaints.is_empty(), "{served_complaints:?}");
+    with_drv_host_state(|state| {
+        assert_eq!(state.write_derivation_calls, 1);
+        assert_eq!(state.store_text_calls, 0);
+    });
+    Ok(())
+}
+
+#[test]
+fn a_deleted_drv_is_rewritten_from_the_aterm_cas() -> Result<(), Box<dyn core::error::Error>> {
+    let _guard = serial();
+    let scratch = Scratch::new("write-drv-deleted");
+    let store = nix_eval_rs::store::Store::open(scratch.0.join("store"))?;
+    with_drv_host_state(|state| *state = DrvHostState::default());
+    let (_, hit, complaints) = evaluate_in_store(one_derivation(), &store, &drv_host())?;
+    assert!(!hit);
+    assert!(complaints.is_empty(), "{complaints:?}");
+    let original = with_drv_host_state(|state| {
+        let aterm = state
+            .writes
+            .first()
+            .expect("cold derivation write")
+            .1
+            .clone();
+        state.present.clear();
+        state.write_derivation_calls = 0;
+        state.writes.clear();
+        aterm
+    });
+
+    let (_, hit, complaints) = evaluate_in_store(one_derivation(), &store, &drv_host())?;
+    assert!(hit, "deleting the drv should be repaired during replay");
+    assert!(complaints.is_empty(), "{complaints:?}");
+    with_drv_host_state(|state| {
+        assert_eq!(state.write_derivation_calls, 1);
+        assert_eq!(state.writes.first().expect("replayed write").1, original);
+        assert_eq!(state.present.len(), 1);
+    });
+    Ok(())
+}
+
+#[test]
+fn repeated_read_file_questions_share_one_witness_row() -> Result<(), Box<dyn core::error::Error>> {
+    let _guard = serial();
+    let scratch = Scratch::new("read-file-dedup");
+    std::fs::create_dir_all(&scratch.0)?;
+    let input = scratch.0.join("input");
+    std::fs::write(&input, "a")?;
+    let source = format!(
+        "builtins.concatStringsSep \"\" (builtins.genList (_: builtins.readFile \"{}\") 1000)",
+        input.display()
+    );
+    let store = nix_eval_rs::store::Store::open(scratch.0.join("store"))?;
+    nix_eval_rs::perf::reset();
+
+    let (first, first_hit, complaints) =
+        evaluate_in_store(&source, &store, &nix_eval_rs::host::RealFs)?;
+    assert!(!first_hit);
+    assert!(complaints.is_empty(), "{complaints:?}");
+    let questions = witness_questions(&store);
+    assert_eq!(
+        questions.len(),
+        1,
+        "witness was not compacted: {questions:?}"
+    );
+    // `readFile` asks for the bytes, as cppnix's does (a Nix string is a byte
+    // string); the text question is `import`'s.
+    assert!(matches!(
+        questions.first(),
+        Some(nix_eval_rs::readset::Question::ReadFileBytes(_))
+    ));
+    if cfg!(feature = "perf") {
+        let stats = nix_eval_rs::perf::snapshot();
+        assert_eq!(stats.witness_rows, 1);
+        assert_eq!(stats.witness_rows_deduped, 999);
+    }
+
+    let (second, second_hit, complaints) =
+        evaluate_in_store(&source, &store, &nix_eval_rs::host::RealFs)?;
+    assert_eq!(second, first);
+    assert!(second_hit, "unchanged answers produced a different key");
+    assert!(complaints.is_empty(), "{complaints:?}");
+
+    std::fs::write(&input, "b")?;
+    let (changed, changed_hit, complaints) =
+        evaluate_in_store(&source, &store, &nix_eval_rs::host::RealFs)?;
+    assert!(!changed_hit, "changed file content hit the old key");
+    assert_ne!(changed, first);
+    assert!(complaints.is_empty(), "{complaints:?}");
+    Ok(())
+}
+
+#[test]
+fn aterms_are_content_addressed_and_counted() -> Result<(), Box<dyn core::error::Error>> {
+    let _guard = serial();
+    let distinct = r#"let mk = name: (builtins.derivationStrict {
+      inherit name;
+      system = "x86_64-linux";
+      builder = "/bin/sh";
+      args = [];
+    }).drvPath; in [ (mk "a") (mk "b") ]"#;
+    let repeated = distinct.replace("(mk \"b\")", "(mk \"a\")");
+
+    let distinct_scratch = Scratch::new("aterms-distinct");
+    let distinct_store = nix_eval_rs::store::Store::open(distinct_scratch.0.join("store"))?;
+    with_drv_host_state(|state| *state = DrvHostState::default());
+    nix_eval_rs::perf::reset();
+    let (_, hit, complaints) = evaluate_in_store(distinct, &distinct_store, &drv_host())?;
+    assert!(!hit);
+    assert!(complaints.is_empty(), "{complaints:?}");
+    let distinct_aterms: std::collections::BTreeSet<_> = witness_questions(&distinct_store)
+        .into_iter()
+        .filter_map(|question| match question {
+            nix_eval_rs::readset::Question::WriteDrv { aterm, .. } => Some(aterm),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(distinct_aterms.len(), 2);
+    assert!(distinct_aterms.iter().all(|id| {
+        distinct_store
+            .objects_dir()
+            .join(id.hash().to_hex())
+            .is_file()
+    }));
+    if cfg!(feature = "perf") {
+        let stats = nix_eval_rs::perf::snapshot();
+        assert_eq!(stats.aterms_stored, 2);
+        assert_eq!(stats.aterms_reused, 0);
+    }
+
+    // One evaluation building one derivation twice: the repeat never reaches
+    // the host (`Vm::note_drv_written`), so the witness holds one WriteDrv
+    // and the CAS stored one ATerm. Reuse is across evaluations: a second
+    // evaluation in the same store builds `a` again and finds its ATerm.
+    let repeated_scratch = Scratch::new("aterms-repeated");
+    let repeated_store = nix_eval_rs::store::Store::open(repeated_scratch.0.join("store"))?;
+    with_drv_host_state(|state| *state = DrvHostState::default());
+    nix_eval_rs::perf::reset();
+    let (_, hit, complaints) = evaluate_in_store(&repeated, &repeated_store, &drv_host())?;
+    assert!(!hit);
+    assert!(complaints.is_empty(), "{complaints:?}");
+    let repeated_aterms: std::collections::BTreeSet<_> = witness_questions(&repeated_store)
+        .into_iter()
+        .filter_map(|question| match question {
+            nix_eval_rs::readset::Question::WriteDrv { aterm, .. } => Some(aterm),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(repeated_aterms.len(), 1);
+    if cfg!(feature = "perf") {
+        let stats = nix_eval_rs::perf::snapshot();
+        assert_eq!(stats.aterms_stored, 1);
+        assert_eq!(stats.aterms_reused, 0);
+        assert_eq!(
+            stats.write_drv_skipped, 1,
+            "the repeat is skipped in the VM"
+        );
+    }
+
+    with_drv_host_state(|state| *state = DrvHostState::default());
+    nix_eval_rs::perf::reset();
+    let (_, hit, complaints) = evaluate_in_store(distinct, &repeated_store, &drv_host())?;
+    assert!(!hit, "a different expression hit the repeated one's key");
+    assert!(complaints.is_empty(), "{complaints:?}");
+    if cfg!(feature = "perf") {
+        let stats = nix_eval_rs::perf::snapshot();
+        assert_eq!(stats.aterms_stored, 1, "b's ATerm is new to the CAS");
+        assert_eq!(stats.aterms_reused, 1, "a's ATerm was already in the CAS");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_missing_aterm_object_is_a_counted_cache_miss() -> Result<(), Box<dyn core::error::Error>> {
+    let _guard = serial();
+    let scratch = Scratch::new("aterm-missing");
+    let store = nix_eval_rs::store::Store::open(scratch.0.join("store"))?;
+    with_drv_host_state(|state| *state = DrvHostState::default());
+    let (first, hit, complaints) = evaluate_in_store(one_derivation(), &store, &drv_host())?;
+    assert!(!hit);
+    assert!(complaints.is_empty(), "{complaints:?}");
+    let aterm = witness_questions(&store)
+        .into_iter()
+        .find_map(|question| match question {
+            nix_eval_rs::readset::Question::WriteDrv { aterm, .. } => Some(aterm),
+            _ => None,
+        })
+        .expect("WriteDrv witness row");
+    std::fs::remove_file(store.objects_dir().join(aterm.hash().to_hex()))?;
+
+    let (second, hit, complaints) = evaluate_in_store(one_derivation(), &store, &drv_host())?;
+    assert_eq!(second, first);
+    assert!(!hit, "a dangling ATerm address was served");
+    assert_eq!(
+        complaints.len(),
+        1,
+        "corruption was not counted: {complaints:?}"
+    );
+    assert!(
+        matches!(complaints.as_slice(), [complaint] if format!("{complaint:?}").contains("ATerm object")),
+        "wrong corruption report: {complaints:?}"
+    );
+    Ok(())
 }
 
 /// ENG-12541 part 2. The same expression under two purity regimes must be two
@@ -321,16 +670,21 @@ fn each_purity_configuration_is_its_own_memo_row() {
     let base = eval::Settings {
         store_dir: Some("/nix/store".to_owned()),
         nix_version: Some("2.34.7".to_owned()),
+        host_build_identity: Some("/test/host-a".to_owned()),
         current_system: Some("x86_64-linux".to_owned()),
         max_call_depth: 10_000,
         pure_eval: false,
         restrict_eval: false,
-        cpp_builtin_names: Some("abort baseNameOf".to_owned()),
+        builtin_features: nix_eval_rs::eval::BuiltinFeatures::ALL,
         path_reads: nix_eval_rs::purity::PathReads::Direct,
         trace_verbose: false,
         abort_on_warn: false,
         home_dir: Some("/home/nixer".to_owned()),
         ca_derivations: false,
+        allow_import_from_derivation: true,
+        allowed_uris: None,
+        repair: false,
+        blake3_hashes: false,
         lint_url_literals: nix_eval_rs::eval::Diagnose::Ignore,
         lint_short_path_literals: nix_eval_rs::eval::Diagnose::Ignore,
         lint_absolute_path_literals: nix_eval_rs::eval::Diagnose::Ignore,
@@ -440,4 +794,57 @@ fn cached_and_uncached_agree_on_every_shape() {
             "eval-cache-dir changed the meaning of `{source}`"
         );
     }
+}
+
+/// Host code can change without changing the language version, source or observed inputs.
+#[test]
+fn immutable_host_builds_have_separate_persistent_question_rows() -> Result<(), String> {
+    use nix_eval_rs::readset::{EvalId, EvalResult, ReadSet};
+    use nix_eval_rs::session::{QuestionCache, Served};
+    let scratch = Scratch::new("host-build-identity");
+    let mut vm = nix_eval_rs::vm::Vm::with_settings(eval::Settings::default());
+    let module = vm
+        .compile("1 + 2", "/base", nix_eval_rs::compile::Origin::String)
+        .map_err(|error| format!("{error:?}"))?;
+    let result = EvalResult {
+        status: "ok".to_owned(),
+        value: "3".to_owned(),
+        ..EvalResult::default()
+    };
+    for (host, expect_hit) in [
+        ("/host/a", false),
+        ("/host/b", false),
+        ("/host/a", true),
+        ("/host/b", true),
+    ] {
+        let settings = eval::Settings {
+            nix_version: Some("same-language-version".to_owned()),
+            host_build_identity: Some(host.to_owned()),
+            ..eval::Settings::default()
+        };
+        let identity = EvalId::of(module.id.hash(), &settings, &none(), &whole());
+        // Reopen for each request so this is persisted reuse, not an in-memory cache.
+        let mut cache = QuestionCache::open(&scratch.0, 0, 0)?;
+        match cache.serve(&identity, &nix_eval_rs::host::RealFs, &settings) {
+            Served::Answer(answer) => {
+                assert!(expect_hit, "{host} reused another host's answer");
+                assert_eq!(answer, result);
+            }
+            Served::Evaluate { verifying } => {
+                assert!(!expect_hit, "{host} lost its own persisted answer");
+                assert!(verifying.is_none());
+                cache.settle(
+                    &identity,
+                    &nix_eval_rs::host::RealFs,
+                    &settings,
+                    &ReadSet::default(),
+                    &result,
+                    None,
+                    false,
+                );
+            }
+        }
+        assert!(cache.take_complaints().is_empty());
+    }
+    Ok(())
 }

@@ -1,22 +1,19 @@
-#[cfg(unix)]
-use std::process::Command as StdCommand;
-#[cfg(unix)]
-use std::process::Stdio;
-#[cfg(unix)]
-use std::time::Duration;
+//! Installs updates, validates the server restart, then transfers updater ownership.
 
 #[cfg(unix)]
+use std::process::Command as StdCommand;
+use std::process::Stdio;
+use std::time::Duration;
+
 use anyhow::Context;
 use anyhow::Result;
-#[cfg(not(unix))]
-use anyhow::bail;
-#[cfg(unix)]
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
 use futures::FutureExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-#[cfg(unix)]
 use tokio::io::AsyncWriteExt;
-#[cfg(unix)]
 use tokio::process::Command;
 #[cfg(unix)]
 use tokio::signal::unix::Signal;
@@ -24,41 +21,57 @@ use tokio::signal::unix::Signal;
 use tokio::signal::unix::SignalKind;
 #[cfg(unix)]
 use tokio::signal::unix::signal;
-#[cfg(unix)]
 use tokio::time::sleep;
 
-#[cfg(unix)]
 use crate::Daemon;
-#[cfg(unix)]
 use crate::RestartIfRunningOutcome;
-#[cfg(unix)]
 use crate::RestartMode;
-#[cfg(unix)]
 use crate::UpdaterRefreshMode;
-#[cfg(unix)]
 use crate::managed_install::ExecutableIdentity;
-#[cfg(unix)]
 use crate::managed_install::executable_identity;
-#[cfg(unix)]
 use crate::managed_install::resolved_managed_codex_bin;
 
-#[cfg(unix)]
 const INITIAL_UPDATE_DELAY: Duration = Duration::from_secs(5 * 60);
-#[cfg(unix)]
 const RESTART_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-#[cfg(unix)]
 const UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
 #[cfg(unix)]
-pub(crate) async fn run() -> Result<()> {
+const INSTALL_URL: &str = "https://chatgpt.com/codex/install.sh";
+#[cfg(windows)]
+const INSTALL_URL: &str = "https://chatgpt.com/codex/install.ps1";
+
+pub(crate) async fn run(http_client_factory: HttpClientFactory) -> Result<()> {
+    #[cfg(unix)]
     let mut terminate =
         signal(SignalKind::terminate()).context("failed to install updater shutdown handler")?;
+    #[cfg(windows)]
+    let updater = {
+        let daemon = Daemon::from_environment()?;
+        crate::backend::pid_update_loop_backend(
+            daemon.backend_paths(&daemon.load_settings().await?),
+        )
+    };
+    #[cfg(windows)]
+    updater.wait_for_ownership().await?;
+    #[cfg(windows)]
+    let mut terminate = Signal;
+    #[cfg(windows)]
+    let _installer_job = crate::backend::windows::updater_job()?;
     let running_updater_identity = current_updater_identity().await?;
+    #[cfg(windows)]
+    updater.mark_ready().await?;
+    let http = RouteAwareClientPool::new_without_request_logging(
+        http_client_factory,
+        ClientRouteClass::Other,
+    );
     if sleep_or_terminate(INITIAL_UPDATE_DELAY, &mut terminate).await {
         return Ok(());
     }
     loop {
-        match update_once(&running_updater_identity, &mut terminate).await {
+        // Failed successor cleanup leaves its PID published. The predecessor
+        // must stop instead of installing again without ownership.
+        #[cfg(windows)]
+        updater.wait_for_ownership().await?;
+        match update_once(&http, &running_updater_identity, &mut terminate).await {
             Ok(UpdateLoopControl::Continue) | Err(_) => {}
             Ok(UpdateLoopControl::Stop) => return Ok(()),
         }
@@ -68,12 +81,6 @@ pub(crate) async fn run() -> Result<()> {
     }
 }
 
-#[cfg(not(unix))]
-pub(crate) async fn run() -> Result<()> {
-    bail!("pid-managed updater loop is unsupported on this platform")
-}
-
-#[cfg(unix)]
 async fn sleep_or_terminate(duration: Duration, terminate: &mut Signal) -> bool {
     tokio::select! {
         _ = sleep(duration) => false,
@@ -81,18 +88,23 @@ async fn sleep_or_terminate(duration: Duration, terminate: &mut Signal) -> bool 
     }
 }
 
-#[cfg(unix)]
 enum UpdateLoopControl {
     Continue,
     Stop,
 }
 
-#[cfg(unix)]
 async fn update_once(
+    http: &RouteAwareClientPool,
     running_updater_identity: &ExecutableIdentity,
     terminate: &mut Signal,
 ) -> Result<UpdateLoopControl> {
-    install_latest_standalone().await?;
+    #[cfg(unix)]
+    install_latest_standalone(http).await?;
+    #[cfg(windows)]
+    tokio::select! {
+        result = install_latest_standalone(http) => result?,
+        _ = terminate.recv() => return Ok(UpdateLoopControl::Stop),
+    }
 
     let daemon = Daemon::from_environment()?;
     let managed_codex_bin = resolved_managed_codex_bin(&daemon.managed_codex_bin).await?;
@@ -113,19 +125,26 @@ async fn update_once(
                     return Ok(UpdateLoopControl::Stop);
                 }
             }
-            _ => return Ok(UpdateLoopControl::Continue),
+            RestartIfRunningOutcome::Restarted => {
+                #[cfg(windows)]
+                if updater_refresh_mode == UpdaterRefreshMode::ReexecIfManagedBinaryChanged {
+                    return Ok(UpdateLoopControl::Stop);
+                }
+                return Ok(UpdateLoopControl::Continue);
+            }
+            RestartIfRunningOutcome::NotRunning
+            | RestartIfRunningOutcome::NotReady
+            | RestartIfRunningOutcome::AlreadyCurrent => return Ok(UpdateLoopControl::Continue),
         }
     }
 }
 
-#[cfg(unix)]
 async fn current_updater_identity() -> Result<ExecutableIdentity> {
     let current_exe =
         std::env::current_exe().context("failed to resolve current updater executable")?;
     executable_identity(&current_exe).await
 }
 
-#[cfg(unix)]
 fn update_modes_for_identities(
     running_updater_identity: &ExecutableIdentity,
     managed_identity: &ExecutableIdentity,
@@ -153,19 +172,25 @@ pub(crate) fn reexec_managed_updater(managed_codex_bin: &std::path::Path) -> Res
     })
 }
 
-#[cfg(unix)]
-async fn install_latest_standalone() -> Result<()> {
-    let script = reqwest::get("https://chatgpt.com/codex/install.sh")
-        .await
-        .context("failed to fetch standalone Codex updater")?
-        .error_for_status()
-        .context("standalone Codex updater request failed")?
-        .bytes()
-        .await
-        .context("failed to read standalone Codex updater")?;
+async fn install_latest_standalone(http: &impl InstallerHttp) -> Result<()> {
+    let script = fetch_installer_script(http).await?;
 
-    let mut child = Command::new("/bin/sh")
-        .arg("-s")
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-s");
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("powershell.exe");
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "try { Invoke-Expression ([Console]::In.ReadToEnd()) } catch { Write-Error $_; exit 1 }"])
+            .env("CODEX_NON_INTERACTIVE", "1")
+            .kill_on_drop(true);
+        command
+    };
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -192,6 +217,64 @@ async fn install_latest_standalone() -> Result<()> {
     }
 }
 
-#[cfg(all(test, unix))]
+async fn fetch_installer_script(http: &impl InstallerHttp) -> Result<Vec<u8>> {
+    match http.get(INSTALL_URL).await? {
+        InstallerResponse::Success(body) => Ok(body),
+        InstallerResponse::Unsuccessful { status } => {
+            anyhow::bail!("standalone Codex updater request failed with status {status}")
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InstallerResponse {
+    Success(Vec<u8>),
+    Unsuccessful { status: u16 },
+}
+
+/// HTTP boundary used to download the standalone installer.
+///
+/// Implementations must issue a GET for the supplied URL, return exact response bytes for a
+/// successful status, and report a non-success status without buffering its response body.
+trait InstallerHttp: Send + Sync {
+    fn get<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> impl std::future::Future<Output = Result<InstallerResponse>> + Send + 'a;
+}
+
+impl InstallerHttp for RouteAwareClientPool {
+    async fn get(&self, url: &str) -> Result<InstallerResponse> {
+        let response = RouteAwareClientPool::get(self, url)
+            .send()
+            .await
+            .context("failed to fetch standalone Codex updater")?;
+        if !response.status().is_success() {
+            return Ok(InstallerResponse::Unsuccessful {
+                status: response.status().as_u16(),
+            });
+        }
+        let body = response
+            .bytes()
+            .await
+            .context("failed to read standalone Codex updater")?
+            .to_vec();
+        Ok(InstallerResponse::Success(body))
+    }
+}
+
+#[cfg(test)]
 #[path = "update_loop_tests.rs"]
 mod tests;
+
+#[cfg(windows)]
+struct Signal;
+
+#[cfg(windows)]
+impl Signal {
+    async fn recv(&mut self) -> Option<()> {
+        // An unreadable control path must stop the updater rather than disable shutdown.
+        let _ = codex_app_server_transport::daemon_shutdown_signal().await;
+        Some(())
+    }
+}

@@ -29,6 +29,11 @@ fn exec_command_tool_matches_expected_spec() {
         "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
             .to_string()
     };
+    let yield_time_ms_description = if cfg!(windows) {
+        "Maximum time to wait before returning a session ID for a still-running command. Commands that finish sooner return immediately. For ordinary commands, omit this parameter to use the 10000 ms default. Effective range on Windows is 10000-30000 ms."
+    } else {
+        "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms."
+    };
 
     let mut properties = BTreeMap::from([
         (
@@ -57,9 +62,7 @@ fn exec_command_tool_matches_expected_spec() {
         ),
         (
             "yield_time_ms".to_string(),
-            JsonSchema::number(Some(
-                    "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms.".to_string(),
-                )),
+            JsonSchema::number(Some(yield_time_ms_description.to_string())),
         ),
         (
             "max_output_tokens".to_string(),
@@ -104,6 +107,7 @@ fn exec_command_tool_can_hide_shell_parameter() {
         },
         /*include_environment_id*/ false,
         /*include_shell_parameter*/ false,
+        /*include_windows_shell_guidance*/ cfg!(windows),
     );
 
     assert!(!has_parameter(&tool, "shell"));
@@ -192,80 +196,6 @@ fn request_permissions_tool_includes_full_permission_schema() {
             parameters: JsonSchema::object(
                 properties,
                 Some(vec!["permissions".to_string()]),
-                Some(false.into())
-            ),
-            output_schema: None,
-        })
-    );
-}
-
-#[test]
-fn shell_command_tool_matches_expected_spec() {
-    let tool = create_shell_command_tool(CommandToolOptions {
-        allow_login_shell: true,
-        exec_permission_approvals_enabled: false,
-    });
-
-    let description = if cfg!(windows) {
-        r#"Runs a Powershell command (Windows) and returns its output.
-
-Examples of valid command strings:
-
-- ls -a (show hidden): "Get-ChildItem -Force"
-- recursive find by name: "Get-ChildItem -Recurse -Filter *.py"
-- recursive grep: "Get-ChildItem -Path C:\\myrepo -Recurse | Select-String -Pattern 'TODO' -CaseSensitive"
-- ps aux | grep python: "Get-Process | Where-Object { $_.ProcessName -like '*python*' }"
-- setting an env var: "$env:FOO='bar'; echo $env:FOO"
-- running an inline Python script: "@'\\nprint('Hello, world!')\\n'@ | python -""#
-            .to_string()
-            + &windows_shell_guidance_description()
-    } else {
-        r#"Runs a shell command and returns its output.
-- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary."#
-            .to_string()
-    };
-
-    let mut properties = BTreeMap::from([
-        (
-            "command".to_string(),
-            JsonSchema::string(Some(
-                "Shell script to run in the user's default shell.".to_string(),
-            )),
-        ),
-        (
-            "workdir".to_string(),
-            JsonSchema::string(Some(
-                "Working directory for the command. Defaults to the turn cwd.".to_string(),
-            )),
-        ),
-        (
-            "timeout_ms".to_string(),
-            JsonSchema::number(Some(
-                "Maximum command runtime. Defaults to 10000 ms.".to_string(),
-            )),
-        ),
-        (
-            "login".to_string(),
-            JsonSchema::boolean(Some(
-                "True runs with login shell semantics; false disables them. Defaults to true."
-                    .to_string(),
-            )),
-        ),
-    ]);
-    properties.extend(create_approval_parameters(
-        /*exec_permission_approvals_enabled*/ false,
-    ));
-
-    assert_eq!(
-        tool,
-        ToolSpec::Function(ResponsesApiTool {
-            name: "shell_command".to_string(),
-            description,
-            strict: false,
-            defer_loading: None,
-            parameters: JsonSchema::object(
-                properties,
-                Some(vec!["command".to_string()]),
                 Some(false.into())
             ),
             output_schema: None,

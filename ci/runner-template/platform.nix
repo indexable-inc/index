@@ -41,16 +41,16 @@
   services.ix-runner = {
     # Ubuntu build-essential parity: what GitHub's hosted images preinstall
     # and no language installer provides on a NixOS guest.
-    extraPackages = with pkgs; [
-      gcc
-      gnumake
-      cmake
-      pkg-config
-      python3
-      perl # Ubuntu ships it; autotools/openssl-sys configure scripts run it
-      openssl
-      git-lfs
-      glibc.bin # mise-action probes `ldd` to pick its binary
+    extraPackages = [
+      pkgs.gcc
+      pkgs.gnumake
+      pkgs.cmake
+      pkgs.pkg-config
+      pkgs.python3
+      pkgs.perl # Ubuntu ships it; autotools/openssl-sys configure scripts run it
+      pkgs.openssl
+      pkgs.git-lfs
+      pkgs.glibc.bin # mise-action probes `ldd` to pick its binary
     ];
 
     # Parallelism honesty on 64-vCPU elastic guests: tools sizing off the

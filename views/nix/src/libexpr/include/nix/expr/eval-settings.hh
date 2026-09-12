@@ -9,7 +9,6 @@
 namespace nix {
 
 class EvalState;
-struct PrimOp;
 
 /**
  * A deprecated bool setting that migrates to a `Setting<Diagnose>`.
@@ -73,6 +72,12 @@ struct EvalSettings : Config
 
     bool & readOnlyMode;
 
+    /** Read-only evaluation is a ceiling that flake configuration cannot lift. */
+    bool isImportFromDerivationAllowed() const
+    {
+        return !readOnlyMode && enableImportFromDerivation;
+    }
+
     static Strings getDefaultNixPath();
 
     static bool isPseudoUrl(std::string_view s);
@@ -82,8 +87,6 @@ struct EvalSettings : Config
     static std::string resolvePseudoUrl(std::string_view url);
 
     LookupPathHooks lookupPathHooks;
-
-    std::vector<PrimOp> extraPrimOps;
 
     Setting<bool> enableNativeCode{this, false, "allow-unsafe-native-code-during-evaluation", R"(
         Enable built-in functions that allow executing native code.
@@ -362,43 +365,6 @@ struct EvalSettings : Config
             Intermediate results are not cached.
         )"};
 
-    Setting<bool> lazyTrees{
-        this,
-        false,
-        "lazy-trees",
-        R"(
-            If set to true, flake inputs are not copied to the Nix store
-            eagerly. Instead the evaluator computes the store path and NAR
-            hash of each input up front (so paths, hashes and lock files
-            are byte-identical to eager mode) and mounts the input's
-            source tree at that store path inside the evaluator. The
-            store object is only materialized on demand, when something
-            actually forces it: instantiating a derivation that
-            references the path, `builtins.storePath`, IFD, and similar.
-
-            This avoids the per-evaluation cost of copying whole source
-            trees (such as large monorepo checkouts) into the store.
-
-            Strings that carry a lazy store path but whose context has
-            been discarded (for example via `builtins.toString` on a
-            path followed by `builtins.unsafeDiscardStringContext`, or
-            other context-dropping tricks) refer to a path that may not
-            exist on disk until something forces the copy. Such
-            derivations were always unsound; with lazy trees the failure
-            can surface earlier, as a missing store path at build time.
-
-            This is off by default for now.
-        )"};
-
-    Setting<bool> ignoreExceptionsDuringTry{
-        this,
-        false,
-        "ignore-try",
-        R"(
-          If set to true, ignore exceptions inside 'tryEval' calls when evaluating Nix expressions in
-          debug mode (using the --debugger flag). By default the debugger pauses on all exceptions.
-        )"};
-
     Setting<bool> traceVerbose{
         this,
         false,
@@ -407,88 +373,6 @@ struct EvalSettings : Config
 
     Setting<unsigned int> maxCallDepth{
         this, 10000, "max-call-depth", "The maximum function call depth to allow before erroring."};
-
-    Setting<std::string> evalBackend{
-        this,
-        "cpp",
-        "eval-backend",
-        R"(
-          Which evaluator runs expressions: `cpp` (the built-in tree-walking
-          interpreter), `rust` (the in-tree Rust evaluator, requires the
-          `rust-eval` experimental feature), or `shadow`. The Rust backend
-          fails with `rust-eval unimplemented: <construct>` on anything it
-          does not cover yet; it never falls back silently.
-
-          `shadow` evaluates with **both** and serves the C++ answer. The
-          Rust arm runs afterwards with everything caught, so a construct it
-          cannot evaluate, a value it gets wrong and a crash inside it are
-          all recorded and none of them reaches the user. A divergence is one
-          `<4>`-prefixed line on stderr carrying a stable id, and the totals
-          land in the `shadow` block of `NIX_SHOW_STATS`. It is meant to be
-          safe to leave on: the overhead is bounded by
-          [`eval-shadow-budget`](#conf-eval-shadow-budget) and by a guard
-          against shadowing inside a shadow, and turning it off is this one
-          setting back to `cpp`.
-
-          The setting is honoured where an `EvalState` is constructed, so it
-          reaches every command rather than the one that happens to check it.
-          A command that cannot route to the selected backend refuses and says
-          so; it does not quietly evaluate with the other one. Today only
-          `nix-instantiate --eval` serves `rust`, so `nix eval` and the rest
-          report that refusal rather than returning a C++ answer to someone
-          who asked for Rust.
-
-          Under `shadow` an unwired command is not a refusal, because the C++
-          arm answers it: the evaluation is counted as skipped with the reason
-          `unservable-shape` and the command behaves exactly as it does under
-          `cpp`.
-
-          `cpp` is the default and stays the default in code. To opt a
-          consumer in, set it once in that consumer's Nix configuration:
-
-          ```
-          extra-experimental-features = rust-eval
-          eval-backend = rust
-          ```
-
-          and to roll back, remove those two lines. There is no second place
-          to change and no per-command override to hunt for, which is the
-          property that makes the eventual default flip, and its reversal, a
-          one-line operation.
-        )"};
-
-    Setting<unsigned int> evalShadowBudget{
-        this,
-        120,
-        "eval-shadow-budget",
-        R"(
-          Seconds of evaluation time `eval-backend = shadow` may spend in the
-          Rust arm across one process, after which further evaluations are
-          served by the C++ arm alone and counted as skipped with the reason
-          `budget`. `0` means no limit.
-
-          It bounds two different runaways, and it has to bound both. A
-          command that evaluates many small expressions is stopped between
-          attempts, by the aggregate: once the budget is spent, the next
-          evaluation is skipped. A command that evaluates one very large
-          expression -- `nix build .#darwinConfigurations.<host>.system` is
-          one attempt, not thousands -- is stopped *during* it, because what
-          is left of the budget becomes a deadline for that attempt and the
-          evaluator's interrupt hook is polled against it. Without the second,
-          the first setting would have read as a bound while placing none on
-          the one workload that most needs it.
-
-          A skip is never counted as an attempt, so a run that exhausts its
-          budget between attempts reports fewer attempts rather than more
-          agreements. An attempt stopped by the deadline is already counted,
-          so it reaches the verdict `timed-out` instead: not a divergence,
-          because the Rust arm failed only because this stopped it.
-
-          The deadline is checked where the evaluator polls for interrupts,
-          which is inside the VM. Time spent below that -- compiling a large
-          expression, or in a store or fetch callback -- is not interruptible,
-          so the cutoff is a floor rather than a hard ceiling.
-        )"};
 
     Setting<std::string> evalCacheDir{
         this,
@@ -499,15 +383,28 @@ struct EvalSettings : Config
           modules and evaluation results. Empty (the default) keeps those
           caches in memory, so every invocation starts cold.
 
-          Only the `rust` [eval backend](#conf-eval-backend) reads this; the
-          C++ evaluator ignores it. Entries are addressed by the content they
+          Entries are addressed by the content they
           were produced from, so an edit changes the address and misses rather
           than needing to be noticed: there is no invalidation pass and nothing
           to clear after changing a file. Removing the directory is always
           safe, and only ever costs recomputation.
 
-          The directory grows without bound. See `nix-instantiate --help` and
-          the store's own `--scrub`/cap controls for managing it.
+          Bounded by [`eval-cache-max-bytes`](#conf-eval-cache-max-bytes).
+        )"};
+
+    Setting<uint64_t> evalCacheMaxBytes{
+        this,
+        4ULL << 30,
+        "eval-cache-max-bytes",
+        R"(
+          Byte cap on [`eval-cache-dir`](#conf-eval-cache-dir). After each
+          evaluation result is published the cache is swept, least recently
+          used entries first, until it fits. `0` never sweeps.
+
+          The sweep reads directory metadata and one small sidecar per
+          witness, never a witness body, so its cost is the number of entries
+          in the cache and not their size. Eviction can only make a later
+          evaluation a miss, never change what one returns.
         )"};
 
     Setting<unsigned int> evalCacheVerifyRate{
@@ -545,62 +442,10 @@ struct EvalSettings : Config
           percent of the saving spent on the only evidence that the rest of it
           is honest -- and `0` is right where speed is the whole point.
 
-          Only the `rust` [eval backend](#conf-eval-backend) reads this, and
-          only when [`eval-cache-dir`](#conf-eval-cache-dir) names a
+          Verification runs only when [`eval-cache-dir`](#conf-eval-cache-dir) names a
           directory: with no cache on disk there is nothing to check. A
           disagreement is reported on stderr and names the memo key, so the
           row can be found and the inputs that differ identified.
-        )"};
-
-    Setting<unsigned int> evalCores{
-        this,
-        1,
-        "eval-cores",
-        R"(
-          The number of threads used to evaluate Nix expressions. Requires the
-          `parallel-eval` experimental feature for any value other than 1. This
-          currently affects the following commands:
-
-          * `nix search`
-          * `nix flake check`
-          * `nix flake show`
-          * `nix eval --json`
-          * Any evaluation that uses `builtins.parallel`
-
-          The value `0` causes Nix to use all available CPU cores in the system,
-          capped at 32.
-
-          Note that enabling the debugger (`--debugger`) or the evaluation
-          profiler disables multi-threaded evaluation.
-        )"};
-
-    Setting<bool> builtinsTraceDebugger{
-        this,
-        false,
-        "debugger-on-trace",
-        R"(
-          If set to true and the `--debugger` flag is given, the following functions
-          enter the debugger like [`builtins.break`](@docroot@/language/builtins.md#builtins-break):
-
-          * [`builtins.trace`](@docroot@/language/builtins.md#builtins-trace)
-          * [`builtins.traceVerbose`](@docroot@/language/builtins.md#builtins-traceVerbose)
-            if [`trace-verbose`](#conf-trace-verbose) is set to true.
-          * [`builtins.warn`](@docroot@/language/builtins.md#builtins-warn)
-
-          This is useful for debugging warnings in third-party Nix code.
-        )"};
-
-    Setting<bool> builtinsDebuggerOnWarn{
-        this,
-        false,
-        "debugger-on-warn",
-        R"(
-          If set to true and the `--debugger` flag is given, [`builtins.warn`](@docroot@/language/builtins.md#builtins-warn)
-          will enter the debugger like [`builtins.break`](@docroot@/language/builtins.md#builtins-break).
-
-          This is useful for debugging warnings in third-party Nix code.
-
-          Use [`debugger-on-trace`](#conf-debugger-on-trace) to also enter the debugger on legacy warnings that are logged with [`builtins.trace`](@docroot@/language/builtins.md#builtins-trace).
         )"};
 
     Setting<bool> builtinsAbortOnWarn{
@@ -612,9 +457,7 @@ struct EvalSettings : Config
 
           This will give you a stack trace that leads to the location of the warning.
 
-          This is useful for finding information about warnings in third-party Nix code when you can not start the interactive debugger, such as when Nix is called from a non-interactive script. See [`debugger-on-warn`](#conf-debugger-on-warn).
-
-          Currently, a stack trace can only be produced when the debugger is enabled, or when evaluation is aborted.
+          This is useful for finding the origin of warnings in third-party Nix code, including when Nix is called from a non-interactive script.
 
           This option can be enabled by setting `NIX_ABORT_ON_WARN=1` in the environment.
         )"};

@@ -20,6 +20,7 @@ const WorkerProto::Version WorkerProto::latest = {
             .major = 1,
             .minor = 38,
         },
+    .features = {WorkerProto::independentBuildResults},
 };
 
 const WorkerProto::Version WorkerProto::minimum = {

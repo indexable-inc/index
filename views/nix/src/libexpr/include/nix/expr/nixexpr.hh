@@ -23,7 +23,6 @@ class EvalState;
 class PosTable;
 struct Env;
 struct ExprWith;
-struct StaticEnv;
 struct Value;
 
 /**
@@ -94,11 +93,6 @@ std::string showAttrSelectionPath(const SymbolTable & symbols, std::span<const A
 
 struct Expr
 {
-    struct AstSymbols
-    {
-        Symbol sub, lessThan, mul, div, or_, findFile, nixPath, body;
-    };
-
     static Counter nrExprs;
 
     Expr()
@@ -108,9 +102,8 @@ struct Expr
 
     virtual ~Expr() {};
     virtual void show(const SymbolTable & symbols, std::ostream & str) const;
-    virtual void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env);
 
-    /** Normal evaluation, implemented directly by all subclasses. */
+    /** Reject evaluation of retained host expression metadata. */
     virtual void eval(EvalState & state, Env & env, Value & v);
 
     /**
@@ -127,16 +120,9 @@ struct Expr
     {
         return noPos;
     }
-
-    // These are temporary methods to be used only in parser.y
-    virtual void resetCursedOr() {};
-    virtual void warnIfCursedOr(const SymbolTable & symbols, const PosTable & positions) {};
 };
 
-#define COMMON_METHODS                                                         \
-    void show(const SymbolTable & symbols, std::ostream & str) const override; \
-    void eval(EvalState & state, Env & env, Value & v) override;               \
-    void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env) override;
+#define COMMON_METHODS void show(const SymbolTable & symbols, std::ostream & str) const override;
 
 struct ExprInt : Expr
 {
@@ -263,8 +249,6 @@ struct ExprInheritFrom : ExprVar
         this->displ = displ;
         this->fromWith = nullptr;
     }
-
-    void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env) override;
 };
 
 struct ExprSelect : Expr
@@ -424,10 +408,8 @@ struct ExprAttrs : Expr
 
     COMMON_METHODS
 
-    std::shared_ptr<const StaticEnv> bindInheritSources(EvalState & es, const std::shared_ptr<const StaticEnv> & env);
     Env * buildInheritFromEnv(EvalState & state, Env & up);
     void showBindings(const SymbolTable & symbols, std::ostream & str) const;
-    void moveDataToAllocator(std::pmr::polymorphic_allocator<char> & alloc);
 };
 
 struct ExprList : Expr
@@ -587,21 +569,11 @@ struct ExprCall : Expr
      */
     std::optional<std::pmr::vector<Expr *>> args;
     PosIdx pos;
-    std::optional<PosIdx> cursedOrEndPos; // used during parsing to warn about https://github.com/NixOS/nix/issues/11118
 
     ExprCall(const PosIdx & pos, Expr * fun, std::pmr::vector<Expr *> && args)
         : fun(fun)
         , args(args)
         , pos(pos)
-        , cursedOrEndPos({})
-    {
-    }
-
-    ExprCall(const PosIdx & pos, Expr * fun, std::pmr::vector<Expr *> && args, PosIdx && cursedOrEndPos)
-        : fun(fun)
-        , args(args)
-        , pos(pos)
-        , cursedOrEndPos(cursedOrEndPos)
     {
     }
 
@@ -610,9 +582,6 @@ struct ExprCall : Expr
         return pos;
     }
 
-    virtual void resetCursedOr() override;
-    virtual void warnIfCursedOr(const SymbolTable & symbols, const PosTable & positions) override;
-    void moveDataToAllocator(std::pmr::polymorphic_allocator<char> & alloc);
     COMMON_METHODS
 };
 
@@ -694,33 +663,27 @@ struct ExprOpNot : Expr
     COMMON_METHODS
 };
 
-#define MakeBinOpMembers(name, s)                                                        \
-    PosIdx pos;                                                                          \
-    Expr *e1, *e2;                                                                       \
-    name(Expr * e1, Expr * e2)                                                           \
-        : e1(e1)                                                                         \
-        , e2(e2){};                                                                      \
-    name(const PosIdx & pos, Expr * e1, Expr * e2)                                       \
-        : pos(pos)                                                                       \
-        , e1(e1)                                                                         \
-        , e2(e2){};                                                                      \
-    void show(const SymbolTable & symbols, std::ostream & str) const override            \
-    {                                                                                    \
-        str << "(";                                                                      \
-        e1->show(symbols, str);                                                          \
-        str << " " s " ";                                                                \
-        e2->show(symbols, str);                                                          \
-        str << ")";                                                                      \
-    }                                                                                    \
-    void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env) override \
-    {                                                                                    \
-        e1->bindVars(es, env);                                                           \
-        e2->bindVars(es, env);                                                           \
-    }                                                                                    \
-    void eval(EvalState & state, Env & env, Value & v) override;                         \
-    PosIdx getPos() const override                                                       \
-    {                                                                                    \
-        return pos;                                                                      \
+#define MakeBinOpMembers(name, s)                                             \
+    PosIdx pos;                                                               \
+    Expr *e1, *e2;                                                            \
+    name(Expr * e1, Expr * e2)                                                \
+        : e1(e1)                                                              \
+        , e2(e2){};                                                           \
+    name(const PosIdx & pos, Expr * e1, Expr * e2)                            \
+        : pos(pos)                                                            \
+        , e1(e1)                                                              \
+        , e2(e2){};                                                           \
+    void show(const SymbolTable & symbols, std::ostream & str) const override \
+    {                                                                         \
+        str << "(";                                                           \
+        e1->show(symbols, str);                                               \
+        str << " " s " ";                                                     \
+        e2->show(symbols, str);                                               \
+        str << ")";                                                           \
+    }                                                                         \
+    PosIdx getPos() const override                                            \
+    {                                                                         \
+        return pos;                                                           \
     }
 
 #define MakeBinOp(name, s)        \
@@ -791,126 +754,6 @@ struct ExprPos : Expr
     }
 
     COMMON_METHODS
-};
-
-class Exprs
-{
-    // FIXME: use std::pmr::monotonic_buffer_resource when parallel
-    // eval is disabled?
-    std::pmr::synchronized_pool_resource buffer;
-public:
-    std::pmr::polymorphic_allocator<char> alloc{&buffer};
-
-    /**
-     * When set, every string literal allocated is appended here, so that a
-     * parse can attribute the literals to the file being parsed. Set only
-     * around a single parse by `EvalState::parse` and only when a read-set
-     * tracker is active, which already requires single threaded evaluation.
-     * A literal's preallocated value is the one payload every use of that
-     * literal shares, which is what lets a value read record the file the
-     * literal came from without any per-thunk bookkeeping.
-     */
-    std::vector<ExprString *> * collectStrings = nullptr;
-
-    template<class C>
-    [[gnu::always_inline]]
-    C * add(auto &&... args)
-    {
-        C * e = alloc.new_object<C>(std::forward<decltype(args)>(args)...);
-        if constexpr (std::same_as<C, ExprString>)
-            if (collectStrings) [[unlikely]]
-                collectStrings->push_back(e);
-        return e;
-    }
-
-    // we define some calls to add explicitly so that the argument can be passed in as initializer lists
-    template<class C>
-    [[gnu::always_inline]]
-    C * add(const PosIdx & pos, Expr * fun, std::pmr::vector<Expr *> && args)
-        requires(std::same_as<C, ExprCall>)
-    {
-        return alloc.new_object<C>(pos, fun, std::move(args));
-    }
-
-    template<class C>
-    [[gnu::always_inline]]
-    C * add(const PosIdx & pos, Expr * fun, std::pmr::vector<Expr *> && args, PosIdx && cursedOrEndPos)
-        requires(std::same_as<C, ExprCall>)
-    {
-        return alloc.new_object<C>(pos, fun, std::move(args), std::move(cursedOrEndPos));
-    }
-
-    template<class C>
-    [[gnu::always_inline]]
-    C *
-    add(std::pmr::polymorphic_allocator<char> & alloc,
-        const PosIdx & pos,
-        bool forceString,
-        std::span<std::pair<PosIdx, Expr *>> es)
-        requires(std::same_as<C, ExprConcatStrings>)
-    {
-        return alloc.new_object<C>(alloc, pos, forceString, es);
-    }
-
-    template<class C>
-    [[gnu::always_inline]]
-    C *
-    add(std::pmr::polymorphic_allocator<char> & alloc,
-        const PosIdx & pos,
-        bool forceString,
-        std::initializer_list<std::pair<PosIdx, Expr *>> es)
-        requires(std::same_as<C, ExprConcatStrings>)
-    {
-        return alloc.new_object<C>(alloc, pos, forceString, es);
-    }
-};
-
-/* Static environments are used to map variable names onto (level,
-   displacement) pairs used to obtain the value of the variable at
-   runtime. */
-struct StaticEnv
-{
-    ExprWith * isWith;
-    std::shared_ptr<const StaticEnv> up;
-
-    // Note: these must be in sorted order.
-    typedef std::vector<std::pair<Symbol, Displacement>> Vars;
-    Vars vars;
-
-    StaticEnv(ExprWith * isWith, std::shared_ptr<const StaticEnv> up, size_t expectedSize = 0)
-        : isWith(isWith)
-        , up(std::move(up))
-    {
-        vars.reserve(expectedSize);
-    };
-
-    void sort()
-    {
-        std::stable_sort(vars.begin(), vars.end(), [](const Vars::value_type & a, const Vars::value_type & b) {
-            return a.first < b.first;
-        });
-    }
-
-    void deduplicate()
-    {
-        auto it = vars.begin(), jt = it, end = vars.end();
-        while (jt != end) {
-            *it = *jt++;
-            while (jt != end && it->first == jt->first)
-                *it = *jt++;
-            it++;
-        }
-        vars.erase(it, end);
-    }
-
-    Vars::const_iterator find(Symbol name) const
-    {
-        Vars::value_type key(name, 0);
-        auto i = std::lower_bound(vars.begin(), vars.end(), key);
-        if (i != vars.end() && i->first == name)
-            return i;
-        return vars.end();
-    }
 };
 
 } // namespace nix

@@ -84,23 +84,6 @@ NIX_DEPRECATED("use nix_value instead") typedef nix_value Value;
 nix_err nix_libexpr_init(nix_c_context * context);
 
 /**
- * @brief Parses and evaluates a Nix expression from a string.
- * @ingroup value_create
- *
- * @param[out] context Optional, stores error information
- * @param[in] state The state of the evaluation.
- * @param[in] expr The Nix expression to parse.
- * @param[in] path The file path to associate with the expression.
- * This is required for expressions that contain relative paths (such as `./.`) that are resolved relative to the given
- * directory.
- * @param[out] value The result of the evaluation. You must allocate this
- * yourself.
- * @return NIX_OK if the evaluation was successful, an error code otherwise.
- */
-nix_err nix_expr_eval_from_string(
-    nix_c_context * context, EvalState * state, const char * expr, const char * path, nix_value * value);
-
-/**
  * @brief Calls a Nix function with an argument.
  * @ingroup value_create
  *

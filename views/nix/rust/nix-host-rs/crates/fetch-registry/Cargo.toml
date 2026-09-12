@@ -1,0 +1,12 @@
+[package]
+name = "nix-fetch-registry"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1-or-later"
+description = "Safe indexed fetch registry resolution and reference overrides"
+
+[dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

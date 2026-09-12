@@ -45,6 +45,8 @@ nix path-info --json --json-format 1 "$selfRefOut" \
 nix path-info --json --json-format 1 "$selfRefOut" \
     | jq -e '.[].references | length >= 2'
 
+nix store verify "$selfRefOut"
+
 # A dependent BLAKE3 output resolves through the self-referential one.
 dependentOut=$(buildAttr dependent)
 [[ $(caOf "$dependentOut") == fixed:r:blake3:* ]]
@@ -58,3 +60,6 @@ substitutedOut=$(buildAttr --substitute --substituters "$REMOTE_STORE" --no-requ
 [[ $substitutedOut == "$dependentOut" ]]
 [[ $(caOf "$dependentOut") == fixed:r:blake3:* ]]
 [[ $(caOf "$selfRefOut") == fixed:r:blake3:* ]]
+
+# Verify the admitted CA itself as well as the transported NAR.
+nix store verify "$selfRefOut" "$dependentOut"

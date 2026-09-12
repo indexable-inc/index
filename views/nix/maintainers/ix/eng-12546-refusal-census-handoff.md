@@ -44,6 +44,8 @@ pos visible at -p warning: 1
 neg visible at -p warning: 0
 ```
 
+The two `command-apply` lines above are what the journal held on the day; the token was retired when `nix eval --apply` was served (rust-eval round 5), so a fresh census will not show it.
+
 The unprefixed line — the one that carefully says "warning" in its own text —
 is invisible to the severity filter. It is in the journal, it looks right to
 anyone reading raw output, and it does not exist to the query a census runs.
@@ -117,7 +119,7 @@ gained a kind.
 
 1. Include `rust-eval-refusal.hh` and convert the ~13 throw sites in
    `src/nix/eval.cc`, `src/nix/nix-instantiate/nix-instantiate.cc`,
-   `src/nix/nix-instantiate/rust-eval.cc` and `src/nix/rust-eval-session.cc`.
+   `src/nix/nix-instantiate/rust-eval.cc` and `src/libcmd/rust-eval-session.cc`.
 2. The phantom-key guard from design 2 above.
 3. The `nix-instantiate` scope guard so stats survive unwinding, break-tested
    by refusing and asserting stats now appear on stderr where they did not.

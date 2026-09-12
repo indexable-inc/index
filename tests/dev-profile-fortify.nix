@@ -9,7 +9,7 @@
 #    would otherwise find. So the test asserts the failure as well as the
 #    success, and turns red when the failure stops happening.
 #
-# 2. `wiringReachesUnits` -- a dev-profile cargo-unit graph actually carries
+# 2. `wiringReachesUnits` -- dev- and test-profile cargo-unit graphs actually carry
 #    `hardeningDisable`, and a release one does not. Eval-only, so it costs
 #    nothing and it fails the moment someone drops the `inherit` that carries
 #    the flag from cargo-unit.nix into the rendered units.
@@ -96,6 +96,7 @@
   hardeningOf = workspace: (someUnit workspace).hardeningDisable or [];
 
   devHardening = hardeningOf (workspaceForProfile "dev");
+  testHardening = hardeningOf (workspaceForProfile "test");
   releaseHardening = hardeningOf (workspaceForProfile null);
 
   wiringReachesUnits = assert lib.assertMsg (lib.elem "fortify" devHardening && lib.elem "fortify3" devHardening) ''
@@ -104,6 +105,10 @@
     The seam in lib/rust/cargo-unit.nix is not reaching the rendered units;
     check that `unitHardeningDisable` is still inherited into `importUnits`
     and still applied in `mkUnit` in the units.nix template.
+  '';
+  assert lib.assertMsg (lib.elem "fortify" testHardening && lib.elem "fortify3" testHardening) ''
+    a test-profile cargo-unit does not disable fortify for unoptimized C probes.
+    Got: ${lib.generators.toPretty {} testHardening}
   '';
   assert lib.assertMsg (!(lib.elem "fortify" releaseHardening)) ''
     a release-profile cargo-unit carries hardeningDisable = ${lib.generators.toPretty {} releaseHardening}.

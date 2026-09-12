@@ -2,10 +2,14 @@
 
 pub(crate) mod env;
 pub use env::is_wsl;
+mod system_commands;
+pub use system_commands::system_executable;
+pub use system_commands::system_path;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashSet;
 use std::io;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::NamedTempFile;
@@ -126,8 +130,8 @@ pub fn write_atomically(write_path: &Path, contents: &str) -> io::Result<()> {
         )
     })?;
     std::fs::create_dir_all(parent)?;
-    let tmp = NamedTempFile::new_in(parent)?;
-    std::fs::write(tmp.path(), contents)?;
+    let mut tmp = NamedTempFile::new_in(parent)?;
+    tmp.write_all(contents.as_bytes())?;
     tmp.persist(write_path)?;
     Ok(())
 }

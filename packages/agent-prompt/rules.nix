@@ -247,7 +247,7 @@
         repo" reads as a rule about entering a repo, so an agent already
         mid-session asked for a one-line fix does not see itself covered.
         No size or urgency exemption exists. Revised on 2026-08-03 for ix's
-        jj views migration at the operator's direction: a filtered Git clone
+        jj view migration at the operator's direction: a filtered Git clone
         loses the repo's jj operation history and view workspace state. A
         dedicated jj workspace keeps those owners intact. Task-scoped sparse
         patterns stop a one-file change from materializing unrelated view
@@ -291,28 +291,26 @@
   {
     jjViews = {
       text = ''
-        A jj repo can publish subtrees as repositories of their own via
-        `jj views` (status | fetch | push): the derived history's hashes
-        match the published repo's, so `jj views push -r <rev>` sends an
-        ordinary fast-forwardable branch there and prints the PR URL.
-        `jj git push` moves only the containing repo's bookmarks, so
-        landing subtree work upstream takes both, in that order. When
-        `jj views status` says diverged, run `jj views fetch`, integrate
-        with `jj new <main> <lifted-tip>` as a two-parent merge, and
-        never rebase the lifted commits: their hashes are already
-        published. The push refuses an undescribed tip, so describe the
-        revision (or push `-r` a described one) rather than reaching for
-        `--allow-empty-description`. `~/.config/nix` on the operator's
-        machines is such a repo, with `ix/` as a view of ix; work landed
-        only to its own origin has not reached ix until the view is
-        pushed and merged.
+        A jj repo can track a subtree from another repo by tree identity
+        via `jj view` (status | add | anchor | refresh | patches; every
+        host's `jj` is ix's native client, so the verb is always there):
+        the
+        subtree's blake3 id equals the root tree id of the tracked repo's
+        commit, and the manifest `views.toml` records that import.
+        `~/.config/nix` on the operator's machines is such a repo, with
+        `ix/` as a native view of the ix forge repo: it is refreshed from
+        ix and never pushed back, so work landed only in that repo's
+        `ix/` has not reached ix at all. Land ix work in an ix workspace
+        (`jj submit`), then `jj view refresh ix` in the tracking repo.
+        Never rebase or rewrite a tracked subtree's history to publish
+        it: a view has no push leg by design.
       '';
       reason = ''
         On 2026-08-02 a session landed a day of claude-html work to the
         personal repo's main and reported it done; the ix view was six
-        commits behind until the operator pointed at `jj views push`.
-        The tool's own hints cover the mechanics, but only once you know
-        it exists and that `jj git push` alone is half a landing.
+        commits behind because the tracking repo is not where ix work
+        lands. The push leg that once existed was deleted with the
+        git-based views mechanism, so the direction is now the only one.
       '';
     };
   }
@@ -950,7 +948,7 @@
     vendoredForks = {
       topics = ["architecture"];
       text = ''
-        Key upstreams are jj views in this repository. A bug in view code is
+        Key upstreams are jj views (`views.toml`) in this repository. A bug in view code is
         ours: fix it in the view, never work around it downstream. A defect
         in a compiler, an evaluator, a C library or a kernel is fixed at the
         layer that owns it. Adding a view is an ordinary edit.
@@ -968,16 +966,19 @@
     viewWorkflow = {
       topics = ["architecture" "workflow"];
       text = ''
-        Forks live as jj views, listed in the root `.jj-views.toml` and
-        checked in under `views/`, `vendored/` and `index/views/`. Make every
-        change in a jj workspace. Use `jj views status` to inspect drift,
-        `jj views anchor` to move the upstream base, and `jj views patches` to
-        inspect the local commits. The manifest owns each view's path, remote,
-        branch, upstream and anchor. Move a view's anchor in the same commit
-        that moves its tree: nothing checks that the checked tree is the tree
-        the anchor names, and the anchor is the only remaining record of which
-        upstream revision a build came from. Do not add a flake input, patch
-        directory or second metadata registry for a view.
+        Forks live as jj views, listed in the root `views.toml` and checked
+        in under `views/`, `vendored/` and `index/views/`. Make every change
+        in a jj workspace. The verbs are in `jj` itself, which is ix's
+        native client on every host: `jj view status`
+        compares ids, `jj view anchor` records the upstream base, `jj
+        view refresh` imports the upstream tip and merges local patches
+        forward, and `jj view patches` exports the local series
+        (docs/jj-view.md). The manifest owns each
+        view's path, transport, remote, ref and the recorded import; the
+        verbs write the import in the same commit that moves the tree, and
+        `status` reports `patched` whenever the subtree differs from it. Do
+        not add a flake input, patch directory or second metadata registry
+        for a view.
       '';
       reason = ''
         ENG-12220 moved maintained fork histories and their consumers into one

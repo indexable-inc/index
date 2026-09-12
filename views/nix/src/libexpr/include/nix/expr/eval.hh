@@ -13,8 +13,8 @@
 #include "nix/util/position.hh"
 #include "nix/util/pos-table.hh"
 #include "nix/util/source-accessor.hh"
+#include "nix/store/content-address.hh"
 #include "nix/expr/search-path.hh"
-#include "nix/expr/repl-exit-status.hh"
 #include "nix/util/ref.hh"
 #include "nix/expr/counter.hh"
 
@@ -51,14 +51,13 @@ struct SingleDerivedPath;
 enum RepairFlag : bool;
 struct MemorySourceAccessor;
 struct MountedSourceAccessor;
-struct Executor;
+struct InterruptCallback;
 
 namespace eval_cache {
 class EvalCache;
 }
 
 class ReadSetTracker;
-class RetainedEval;
 
 /**
  * Increments a count on construction and decrements on destruction.
@@ -138,52 +137,18 @@ struct PrimOp
 
     /**
      * Validity check to be performed by functions that introduce primops,
-     * such as RegisterPrimOp() and Value::mkPrimOp().
+     * such as Value::mkPrimOp().
      */
     void check();
 };
 
 std::ostream & operator<<(std::ostream & output, const PrimOp & primOp);
 
-/**
- * Info about a constant
- */
-struct Constant
-{
-    /**
-     * Optional type of the constant (known since it is a fixed value).
-     *
-     * @todo we should use an enum for this.
-     */
-    ValueType type = nThunk;
-
-    /**
-     * Optional free-form documentation about the constant.
-     */
-    const char * doc = nullptr;
-
-    /**
-     * Whether the constant is impure, and not available in pure mode.
-     */
-    bool impureOnly = false;
-};
-
-typedef std::
-    map<std::string, Value *, std::less<std::string>, traceable_allocator<std::pair<const std::string, Value *>>>
-        ValMap;
-
-typedef boost::unordered_flat_map<PosIdx, DocComment, std::hash<PosIdx>> DocCommentMap;
-
 struct Env
 {
     Env * up;
     Value * values[0];
 };
-
-void printEnvBindings(const EvalState & es, const Expr & expr, const Env & env);
-void printEnvBindings(const SymbolTable & st, const StaticEnv & se, const Env & env, int lvl = 0);
-
-std::unique_ptr<ValMap> mapStaticEnvBindings(const SymbolTable & st, const StaticEnv & se, const Env & env);
 
 void copyContext(
     const Value & v,
@@ -193,36 +158,6 @@ void copyContext(
 std::string printValue(EvalState & state, Value & v);
 std::ostream & operator<<(std::ostream & os, const ValueType t);
 
-struct RegexCache;
-
-ref<RegexCache> makeRegexCache();
-
-struct DebugTrace
-{
-    /* WARNING: Converting PosIdx -> Pos should be done with extra care. This is
-       due to the fact that operator[] of PosTable is incredibly expensive. */
-    std::variant<Pos, PosIdx> pos;
-    const Expr & expr;
-    const Env & env;
-    HintFmt hint;
-    bool isError;
-
-    Pos getPos(const PosTable & table) const
-    {
-        return std::visit(
-            overloaded{
-                [&](PosIdx idx) {
-                    // Prefer direct pos, but if noPos then try the expr.
-                    if (!idx)
-                        idx = expr.getPos();
-                    return table[idx];
-                },
-                [&](Pos pos) { return pos; },
-            },
-            pos);
-    }
-};
-
 struct StaticEvalSymbols
 {
     Symbol with, outPath, drvPath, type, meta, name, value, system, overrides, outputs, outputName, ignoreNulls, file,
@@ -230,8 +165,6 @@ struct StaticEvalSymbols
         disallowedReferences, disallowedRequisites, maxSize, maxClosureSize, builder, args, contentAddressed, impure,
         outputHash, outputHashAlgo, outputHashMode, recurseForDerivations, description, self, epsilon, startSet,
         operator_, key, path, prefix, outputSpecified, __meta;
-
-    Expr::AstSymbols exprSymbols;
 
     static constexpr auto preallocate()
     {
@@ -283,16 +216,7 @@ struct StaticEvalSymbols
             .prefix = alloc.create("prefix"),
             .outputSpecified = alloc.create("outputSpecified"),
             .__meta = alloc.create("__meta"),
-            .exprSymbols = {
-                .sub = alloc.create("__sub"),
-                .lessThan = alloc.create("__lessThan"),
-                .mul = alloc.create("__mul"),
-                .div = alloc.create("__div"),
-                .or_ = alloc.create("or"),
-                .findFile = alloc.create("__findFile"),
-                .nixPath = alloc.create("__nixPath"),
-                .body = alloc.create("body"),
-            }};
+        };
 
         return std::pair{staticSymbols, alloc};
     }
@@ -353,7 +277,6 @@ public:
     /**
      * Storage for the AST nodes
      */
-    Exprs exprs;
 
 private:
     Statistics stats;
@@ -394,15 +317,6 @@ public:
     const ref<MemorySourceAccessor> corepkgsFS;
 
     /**
-     * In-memory filesystem for internal, non-user-callable Nix
-     * expressions like `derivation.nix`.
-     */
-    const ref<MemorySourceAccessor> internalFS;
-
-    const SourcePath derivationInternal;
-    const SourcePath importedDrvToDerivation;
-
-    /**
      * Store used to materialise .drv files.
      */
     const ref<Store> store;
@@ -413,63 +327,6 @@ public:
     const ref<Store> buildStore;
 
     const ref<fetchers::InputCache> inputCache;
-
-    /**
-     * How `evalFile` resolved: how many times it was asked for a file, and
-     * how many of those the path keyed cache already held.
-     *
-     * These answer whether reusing evaluated files across evaluations is
-     * where the time is, which is the first thing anyone proposing to make
-     * that reuse survive an edit needs to know, and which cannot be inferred
-     * from a wall clock. Measured on one ix host, the second evaluation after
-     * a one character edit asked 32,278 times and was already answered 31,592
-     * times, so 97.9% of it was reused for free and the evaluation still cost
-     * more than the cold one. The remaining 686 files are the whole
-     * opportunity, and they bound it at about 3s of a 29s evaluation.
-     *
-     * Plain atomics rather than `Counter`, which counts only under
-     * `NIX_SHOW_STATS` and otherwise reads a constant zero. That is the right
-     * trade for the counters on the thunk path, which run 33M times per
-     * evaluation, and the wrong one here: these run 32 thousand times, and
-     * they are read precisely to tell "the cache did nothing" from "the
-     * counter was not counting", which a silent zero cannot do.
-     */
-    std::atomic<uint64_t> nrEvalFileCalls{0};
-    std::atomic<uint64_t> nrEvalFilePathHits{0};
-
-    /**
-     * Debugger
-     */
-    ReplExitStatus (*debugRepl)(ref<EvalState> es, const ValMap & extraEnv);
-    bool debugStop;
-    bool inDebugger = false;
-    int trylevel;
-    std::list<DebugTrace> debugTraces;
-    boost::unordered_flat_map<const Expr *, const std::shared_ptr<const StaticEnv>> exprEnvs;
-
-    const std::shared_ptr<const StaticEnv> getStaticEnv(const Expr & expr) const
-    {
-        auto i = exprEnvs.find(&expr);
-        if (i != exprEnvs.end())
-            return i->second;
-        else
-            return std::shared_ptr<const StaticEnv>();
-        ;
-    }
-
-    /** Whether a debug repl can be started. If `false`, `runDebugRepl(error)` will return without starting a repl. */
-    bool canDebug();
-
-    /** Use front of `debugTraces`; see `runDebugRepl(error,env,expr)` */
-    void runDebugRepl(const Error * error);
-
-    /**
-     * Run a debug repl with the given error, environment and expression.
-     * @param error The error to debug, may be nullptr.
-     * @param env The environment to debug, matching the expression.
-     * @param expr The expression to debug, matching the environment.
-     */
-    void runDebugRepl(const Error * error, const Env & env, const Expr & expr);
 
     template<class T, typename... Args>
     [[nodiscard, gnu::noinline]]
@@ -493,6 +350,20 @@ private:
     const ref<boost::concurrent_flat_map<SourcePath, SourcePath>> importResolutionCache;
 
     /**
+     * Source paths this evaluation has already copied to the store, keyed
+     * by the path as it was coerced (before symlink resolution), so a
+     * repeat coercion answers from memory instead of from the store.
+     *
+     * Without it every coercion of the same path reaches `fetchToStore`,
+     * which costs two daemon round trips (a temporary root and a validity
+     * check) even when the fingerprint cache spares the copy. One
+     * home-manager evaluation coerces 170k paths, nearly all of them
+     * repeats, and paid 12 s of its wall time in those round trips -- under
+     * both evaluators, since both come through here.
+     */
+    const ref<boost::concurrent_flat_map<SourcePath, StorePath>> srcToStore;
+
+    /**
      * A cache from resolved paths to values.
      */
     const ref<boost::concurrent_flat_map<
@@ -503,21 +374,10 @@ private:
         traceable_allocator<std::pair<const SourcePath, Value *>>>>
         fileEvalCache;
 
-    /**
-     * Associate source positions of certain AST nodes with their preceding doc comment, if they have one.
-     * Grouped by file.
-     */
-    const ref<boost::concurrent_flat_map<SourcePath, ref<DocCommentMap>>> positionToDocComment;
-
     LookupPath lookupPath;
 
     const ref<boost::concurrent_flat_map<std::string, std::optional<SourcePath>, StringViewHash, std::equal_to<>>>
         lookupPathResolved;
-
-    /**
-     * Cache used by prim_match().
-     */
-    const ref<RegexCache> regexCache;
 
 public:
 
@@ -602,31 +462,40 @@ public:
     StorePath mountInput(fetchers::Input & input, const fetchers::Input & originalInput, ref<SourceAccessor> accessor);
 
     /**
-     * Parse a Nix expression from the specified file.
+     * Serve `accessor` at `storePath` inside the evaluator without copying
+     * it: the store path was derived from the tree's id, and the bytes are
+     * written only when something forces them (`ensureLazyPathCopied`).
+     * The path is allowed under restricted evaluation. A second mount at a
+     * path already served keeps the first: one id, one object, so the two
+     * accessors serve the same bytes.
      */
-    Expr * parseExprFromFile(const SourcePath & path);
-    Expr * parseExprFromFile(const SourcePath & path, const std::shared_ptr<StaticEnv> & staticEnv);
+    void mountLazily(const StorePath & storePath, ref<SourceAccessor> accessor);
 
     /**
-     * Parse a Nix expression from the specified string.
+     * The store object for `path` as `builtins.path` denotes it: `name`d,
+     * ingested by `method` under `filter`, carrying `refs`, checked against
+     * `expectedHash` when one is given, allowed under restricted evaluation.
+     * Every road from a path value into the store (`builtins.path`,
+     * `builtins.filterSource`, a path coerced to a string, the Rust
+     * evaluator's host question) is this one call.
+     *
+     * A directory served from a jj object store is addressed by the id of
+     * the tree `filter` leaves (`SourceAccessor::getFilteredTree`) and
+     * mounted lazily at that store path, as a flake input is: no file is
+     * read or copied until a consumer forces it (`ensureLazyPathCopied`: a
+     * build input, an evaluation result carrying its context, `nix flake
+     * archive`); under `--repair` it is materialised at once, so that the
+     * bytes are compared and rewritten, at the same store path. A pinned
+     * `expectedHash` names a NAR hash, which only the NAR road can check,
+     * and `refs` have no tree-id form, so those keep the NAR road.
      */
-    Expr *
-    parseExprFromString(std::string s, const SourcePath & basePath, const std::shared_ptr<StaticEnv> & staticEnv);
-    Expr * parseExprFromString(std::string s, const SourcePath & basePath);
-
-    /**
-     * Parse REPL bindings from the specified string.
-     * Returns ExprAttrs with bindings to add to scope.
-     */
-    ExprAttrs *
-    parseReplBindings(std::string s, const SourcePath & basePath, const std::shared_ptr<StaticEnv> & staticEnv);
-    ExprAttrs * parseReplBindings(
-        std::string s,
-        std::string errorSource,
-        const SourcePath & basePath,
-        const std::shared_ptr<StaticEnv> & staticEnv);
-
-    Expr * parseStdin();
+    StorePath addPathToStore(
+        const SourcePath & path,
+        std::string_view name,
+        ContentAddressMethod method,
+        PathFilter * filter,
+        const std::optional<Hash> & expectedHash,
+        const StorePathSet & refs);
 
     /**
      * Evaluate an expression read from the given file to normal
@@ -636,6 +505,10 @@ public:
     void evalFile(const SourcePath & path, Value & v, bool mustBeTrivial = false);
 
     void resetFileCache();
+
+    /// Start a new request without retaining answers keyed by mutable paths.
+    /// Content-addressed input accessors remain cached. Returns entries evicted.
+    size_t prepareForNextRequest();
 
     /**
      * Look up a file in the search path.
@@ -659,99 +532,14 @@ public:
      */
     void eval(Expr * e, Value & v);
 
-    /**
-     * Throw if `eval-backend` names a backend this command cannot route to.
-     *
-     * Called from the one place every user expression passes through, so a
-     * command that does not implement the selected backend refuses by name
-     * rather than quietly evaluating with the other one.
-     */
-    void requireBackendCanServe();
+    /// Reject commands that still require C++ expression values.
+    [[noreturn]] void requireBackendCanServe();
 
-    /**
-     * Whether `eval-backend = rust` was selected. Set at the end of the
-     * constructor, so work the constructor does for itself does not count as
-     * the user's expression.
-     */
-    bool rustBackendRequested = false;
-
-    /**
-     * Depth of `EvalState::LockingFlake` scopes: while non-zero, the C++
-     * evaluator serves rather than refuses.
-     *
-     * **Not a fallback.** Locking a flake evaluates `flake.nix` to read its
-     * `inputs`, and that evaluation is cppnix's own -- it walks the input
-     * graph, consults the registry and writes `flake.lock`, none of which the
-     * VM decides and all of which stays here by design. What comes out is a
-     * lock file, never a value: the flake's `outputs` function is evaluated
-     * afterwards, by the selected backend, from `call-flake.nix`.
-     *
-     * The distinction is worth the field. A blanket exemption would let any
-     * C++ evaluation through under `eval-backend = rust`, which is the silent
-     * fallback the choke point exists to prevent; this one is opened by
-     * `rustEvaluandOf` around one call and closed on the way out, including
-     * on the exception path.
-     */
-    size_t lockingFlake = 0;
-
-    /**
-     * Open the exemption above for as long as this object lives.
-     */
-    struct LockingFlake
-    {
-        EvalState & state;
-
-        explicit LockingFlake(EvalState & state)
-            : state(state)
-        {
-            state.lockingFlake++;
-        }
-
-        ~LockingFlake()
-        {
-            state.lockingFlake--;
-        }
-
-        LockingFlake(const LockingFlake &) = delete;
-        LockingFlake & operator=(const LockingFlake &) = delete;
-    };
-
-    /**
-     * How many evaluations each backend actually served, which is what the
-     * `NIX_SHOW_STATS` `evaluator` field is derived from.
-     *
-     * The field used to be `settings.evalBackend.get()`, so it echoed the
-     * request. On a binary compiled without the Rust evaluator the setting
-     * still parses and nothing else happens, so the field read `rust` while
-     * the C++ evaluator did every bit of the work -- the inert-flag shape the
-     * differential harnesses exist to catch, and one lang-diff run reached
-     * `mismatch=249` against exactly such a stub (ENG-12542).
-     *
-     * Plain atomics rather than `Counter`, for the reason `nrEvalFileCalls`
-     * gives: `Counter` counts only under `NIX_SHOW_STATS` and otherwise reads
-     * a constant zero, and these are read precisely to tell "that backend
-     * evaluated nothing" from "the counter was not counting". They are
-     * incremented once or twice per process, so there is no contention to
-     * avoid.
-     */
-    std::atomic<uint64_t> nrCppEvals{0};
+    /// Count completed Rust questions, including memoized answers.
     std::atomic<uint64_t> nrRustEvals{0};
-
-    /**
-     * C++ evaluations performed while locking a flake, counted apart from
-     * `nrCppEvals`.
-     *
-     * Apart, because the `evaluator` field answers "which backend served the
-     * user's expression" and folding these in would make every flake run
-     * report `mixed` -- true about the process and useless as the flip check,
-     * which is exactly the reasoning that zeroes `nrCppEvals` at the end of
-     * the constructor. Counted rather than ignored, because an exemption
-     * nothing reports is an exemption nobody can see the size of: the stats
-     * block carries this as `evaluatorCalls.cppFlakeLock`, and a number that
-     * grows with the size of the *evaluated* attribute rather than with the
-     * number of flake inputs would say the exemption had escaped its scope.
-     */
-    std::atomic<uint64_t> nrCppFlakeLockEvals{0};
+    /// Successful commands that exec flush stats before replacing the
+    /// process. If exec then fails, the destructor must not write them twice.
+    std::atomic<bool> statsPrinted{false};
 
     /**
      * Record that the Rust backend is about to serve one evaluation.
@@ -896,6 +684,15 @@ public:
 
     StorePath copyPathToStore(NixStringContext & context, const SourcePath & path);
 
+private:
+    /**
+     * The store work behind `copyPathToStore`, done once per path per
+     * evaluation; the public method keeps the answer in `srcToStore`.
+     */
+    StorePath copyPathToStoreUncached(const SourcePath & path);
+
+public:
+
     /**
      * Path coercion.
      *
@@ -936,91 +733,6 @@ public:
      */
     SingleDerivedPath coerceToSingleDerivedPath(const PosIdx pos, Value & v, std::string_view errorCtx);
 
-#if NIX_USE_BOEHMGC
-    /** A GC root for the baseEnv reference. */
-    const std::shared_ptr<Env *> baseEnvP;
-#endif
-
-public:
-
-    /**
-     * The base environment, containing the builtin functions and
-     * values.
-     */
-    Env & baseEnv;
-
-    /**
-     * The same, but used during parsing to resolve variables.
-     */
-    const std::shared_ptr<StaticEnv> staticBaseEnv; // !!! should be private
-
-    /**
-     * Internal primops not exposed to the user.
-     */
-    boost::unordered_flat_map<
-        std::string,
-        Value *,
-        StringViewHash,
-        std::equal_to<>,
-        traceable_allocator<std::pair<const std::string, Value *>>>
-        internalPrimOps;
-
-    /**
-     * Name and documentation about every constant.
-     *
-     * Constants from primops are hard to crawl, and their docs will go
-     * here too.
-     */
-    std::vector<std::pair<std::string, Constant>> constantInfos;
-
-private:
-
-    unsigned int baseEnvDispl = 0;
-
-    void createBaseEnv(const EvalSettings & settings);
-
-    Value * addConstant(const std::string & name, Value & v, Constant info);
-
-    void addConstant(const std::string & name, Value * v, Constant info);
-
-    Value * addPrimOp(PrimOp && primOp);
-
-public:
-
-    /**
-     * Retrieve a specific builtin, equivalent to evaluating `builtins.${name}`.
-     * @param name The attribute name of the builtin to retrieve.
-     * @throws EvalError if the builtin does not exist.
-     */
-    Value & getBuiltin(const std::string & name);
-
-    /**
-     * Retrieve the `builtins` attrset, equivalent to evaluating the reference `builtins`.
-     * Always returns an attribute set value.
-     */
-    Value & getBuiltins();
-
-    struct Doc
-    {
-        Pos pos;
-        std::optional<std::string> name;
-        size_t arity;
-        std::vector<std::string> args;
-        /**
-         * Unlike the other `doc` fields in this file, this one should never be
-         * `null`.
-         */
-        const char * doc;
-    };
-
-    /**
-     * Retrieve the documentation for a value. This will evaluate the value if
-     * it is a thunk, and it will partially apply __functor if applicable.
-     *
-     * @param v The value to get the documentation for.
-     */
-    std::optional<Doc> getDoc(Value & v);
-
 private:
 
     inline Value * lookupVar(Env * env, const ExprVar & var, bool noEval);
@@ -1028,20 +740,6 @@ private:
     friend struct ExprVar;
     friend struct ExprAttrs;
     friend struct ExprLet;
-
-    Expr * parse(
-        char * text,
-        size_t length,
-        Pos::Origin origin,
-        const SourcePath & basePath,
-        const std::shared_ptr<StaticEnv> & staticEnv);
-
-    ExprAttrs * parseReplBindings(
-        char * text,
-        size_t length,
-        Pos::Origin origin,
-        const SourcePath & basePath,
-        const std::shared_ptr<StaticEnv> & staticEnv);
 
     /**
      * Current Nix call stack depth, used with `max-call-depth`
@@ -1102,9 +800,6 @@ public:
      * Return a boolean `Value *` without allocating.
      */
     Value * getBool(bool b);
-
-    void mkThunk_(Value & v, Expr * expr);
-    void mkPos(Value & v, PosIdx pos);
 
     /**
      * Create a string representing a store path.
@@ -1210,6 +905,10 @@ public:
     [[nodiscard]] StringMap realiseContextBuild(
         const std::vector<DerivedPath::Built> & drvs, StorePathSet * maybePaths, StorePathSet & outputsToAllow);
 
+    /** Resolve and copy outputs after a successful build, without starting another worker. */
+    [[nodiscard]] StringMap realiseContextOutputs(
+        const std::vector<DerivedPath::Built> & drvs, StorePathSet * maybePaths, StorePathSet & outputsToAllow);
+
     /**
      * Coerce `v` to a path and realise it, i.e. build anything in the value's string context using `realiseContext()`.
      * @param copyLazyPaths When encountering a lazy path (i.e. a string with Opaque context that's also "mounted" on
@@ -1231,11 +930,6 @@ public:
      */
     std::string
     realiseString(Value & str, StorePathSet * storePathsOutMaybe, bool isIFD = true, const PosIdx pos = noPos);
-
-    /* Call the binary path filter predicate used builtins.path etc. */
-    bool callPathFilter(Value * filterFun, const SourcePath & path, PosIdx pos);
-
-    DocComment getDocCommentForPos(PosIdx pos);
 
 private:
 
@@ -1292,14 +986,6 @@ public:
     std::unique_ptr<ReadSetTracker> readSetTracker;
 
     /**
-     * The retained graph a previous request in this process left behind,
-     * set by `nix eval-persistent --retain` for the duration of a request
-     * that may splice clean derivation results out of it. Null everywhere
-     * else, so ordinary evaluation never consults it.
-     */
-    std::shared_ptr<RetainedEval> retainedPrev;
-
-    /**
      * The string literal values of every file parsed while a tracker was
      * active, per file. The parse cache outlives a request but a tracker
      * does not, so each new tracker replays these registrations; without
@@ -1323,52 +1009,14 @@ private:
     friend struct ExprFloat;
     friend struct ExprPath;
     friend struct ExprSelect;
-    friend void prim_getAttr(EvalState & state, const PosIdx pos, Value ** args, Value & v);
-    friend void prim_match(EvalState & state, const PosIdx pos, Value ** args, Value & v);
-    friend void prim_split(EvalState & state, const PosIdx pos, Value ** args, Value & v);
 
     friend struct Value;
     friend class ListBuilder;
 
 public:
 
-    /**
-     * Add a work item to the given work vector.
-     */
-    template<typename WorkItems, typename T>
-    void addWork(WorkItems & work, uint8_t priority, T && t)
-    {
-        work.emplace_back(std::move(t), priority);
-    }
-
-    template<typename FuturesVector, typename T>
-    void spawn(FuturesVector & futures, uint8_t priority, T && t)
-    {
-        futures.spawn(priority, std::move(t));
-    }
-
-    /**
-     * Worker threads manager.
-     *
-     * Note: keep this last to ensure that it's destroyed first, so we
-     * don't have any background work items (e.g. from
-     * `builtins.parallel`) referring to a partially destroyed
-     * `EvalState`.
-     */
-    ref<Executor> executor;
-};
-
-struct DebugTraceStacker
-{
-    DebugTraceStacker(EvalState & evalState, DebugTrace t);
-
-    ~DebugTraceStacker()
-    {
-        evalState.debugTraces.pop_front();
-    }
-
-    EvalState & evalState;
-    DebugTrace trace;
+    /** Unregister value wait notifications before destroying host state. */
+    std::unique_ptr<InterruptCallback> valueInterruptCallback;
 };
 
 /**
@@ -1400,18 +1048,6 @@ bool isAllowedURI(std::string_view uri, const Strings & allowedPaths);
  * inherited by every child `nix` process.
  */
 extern std::optional<std::filesystem::path> evalStatsPath;
-
-/**
- * How many thunks have been allocated by this process so far.
- *
- * `printStatistics` reports this once at exit, which is enough for a process
- * that evaluates one thing and stops. An evaluator that serves several
- * evaluations in a row needs the difference across one of them, and the
- * counter it comes from is a file-static in `eval.cc`. Reading it is free
- * when statistics are off, because `Counter` only counts under
- * `NIX_SHOW_STATS`, in which case this reads a constant zero.
- */
-uint64_t getNrThunks();
 
 } // namespace nix
 

@@ -1,6 +1,5 @@
 #![cfg(not(debug_assertions))]
 
-use crate::history_cell::padded_emoji;
 use crate::key_hint;
 use crate::legacy_core::config::Config;
 use crate::render::Insets;
@@ -51,15 +50,17 @@ pub(crate) async fn run_update_prompt_if_needed(
         frame.render_widget_ref(&screen, frame.area());
     })?;
 
+    tui.discard_pending_input_before_interactive_screen()?;
     let events = tui.event_stream();
     tokio::pin!(events);
 
     while !screen.is_done() {
         if let Some(event) = events.next().await {
+            tui.screen_size_for_event(&event)?;
             match event {
                 TuiEvent::Key(key_event) => screen.handle_key(key_event),
-                TuiEvent::Paste(_) => {}
-                TuiEvent::Draw | TuiEvent::Resize => {
+                TuiEvent::Paste(_) | TuiEvent::FocusLost => {}
+                TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) | TuiEvent::FocusGained => {
                     tui.draw(u16::MAX, |frame| {
                         frame.render_widget_ref(&screen, frame.area());
                     })?;
@@ -192,7 +193,7 @@ impl WidgetRef for &UpdatePromptScreen {
 
         column.push("");
         column.push(Line::from(vec![
-            padded_emoji("  ✨").bold().cyan(),
+            "  ✨\u{200A}".bold().cyan(),
             "Update available!".bold(),
             " ".into(),
             format!(
@@ -249,6 +250,7 @@ mod tests {
     use crossterm::event::KeyEvent;
     use crossterm::event::KeyModifiers;
     use ratatui::Terminal;
+    use ratatui::widgets::FrameExt;
 
     fn new_prompt() -> UpdatePromptScreen {
         UpdatePromptScreen::new(

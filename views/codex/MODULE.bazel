@@ -2,7 +2,11 @@ module(name = "codex")
 
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
 bazel_dep(name = "platforms", version = "1.0.0")
-bazel_dep(name = "llvm", version = "0.7.9")
+
+# Expose the public protobuf rules already used transitively by rules_rs.
+bazel_dep(name = "protobuf", version = "34.0.bcr.1", repo_name = "com_google_protobuf")
+bazel_dep(name = "llvm", version = "0.8.11")
+bazel_dep(name = "windows_support", version = "0.2.0")
 
 # Patch hermetic LLVM for Codex's custom libc++ and Windows gnullvm runtime
 # needs that have not landed upstream.
@@ -15,6 +19,57 @@ single_version_override(
         "//patches:llvm_windows_mingw_compat.patch",
     ],
 )
+
+# Preserve case-only SDK aliases when native Windows repository setup feeds
+# case-sensitive remote executors.
+single_version_override(
+    module_name = "windows_support",
+    patch_strip = 1,
+    patches = [
+        "//patches:windows-support-remote-case-aliases.patch",
+    ],
+    version = "0.2.0",
+)
+
+# MSVC repository materialization fails closed until a user who has accepted
+# Microsoft's Visual Studio terms explicitly supplies
+# --repo_env=BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA=1. Do not configure that
+# acceptance globally: Linux, macOS, and Windows GNU do not require it.
+msvc_runtime = use_extension("@windows_support//windows:extensions.bzl", "msvc_runtime")
+msvc_runtime.configure(
+    architectures = [
+        "x64",
+        "arm64",
+    ],
+    msvc_version = "14.50.35717",
+    visual_studio_installer_manifest_integrity = "sha256-qOhU+p8/uurCfXME4pfxZg1xN0ATid61fPeYPzPBb+8=",
+    visual_studio_installer_manifest_url = "https://download.visualstudio.microsoft.com/download/pr/fdc37f6e-59f6-4054-838a-b476eeaa6ec3/1d82370739911457e0a2f6be15d8b5f569531b352b2eabb961429eea1e99e356/VisualStudio.vsman",
+)
+use_repo(msvc_runtime, "msvc_runtime")
+
+windows_sdk = use_extension("@windows_support//windows:extensions.bzl", "windows_sdk")
+windows_sdk.configure(
+    architectures = [
+        "x64",
+        "arm64",
+    ],
+    transformations = {
+        "base/c/Include/10.0.26100.0/shared/driverspecs.h": "base/c/Include/10.0.26100.0/shared/DriverSpecs.h",
+        "base/c/Include/10.0.26100.0/shared/specstrings.h": "base/c/Include/10.0.26100.0/shared/SpecStrings.h",
+        "base/c/Include/10.0.26100.0/um/ole2.h": "base/c/Include/10.0.26100.0/um/Ole2.h",
+        "base/c/Include/10.0.26100.0/um/olectl.h": "base/c/Include/10.0.26100.0/um/OleCtl.h",
+        "**/*.h": "lowercase",
+        "**/*.lib": "lowercase",
+        "**/*.Lib": "lowercase",
+    },
+    windows_sdk_integrity = {
+        "Microsoft.Windows.SDK.CPP": "sha256-/0VWYL7gcadEcVqWZWZvopwHaBV509gVlZqe7FpVZCQ=",
+        "Microsoft.Windows.SDK.CPP.x64": "sha256-rWzpD/lAEGmdKVSLPCseUsieuBFD4hmRVdmlw4ABtSs=",
+        "Microsoft.Windows.SDK.CPP.arm64": "sha256-A7wMA9Q5zvhQdLvNQl+dXTptO0Z5Z6zSHaO6bf7q+mc=",
+    },
+    windows_sdk_version = "10.0.26100.7705",
+)
+use_repo(windows_sdk, "windows_sdk")
 
 # Abseil picks a MinGW pthread TLS path that does not match our hermetic
 # windows-gnullvm toolchain; force it onto the portable C++11 thread-local path.
@@ -89,45 +144,41 @@ single_version_override(
 )
 
 bazel_dep(name = "rules_platform", version = "0.1.0")
-bazel_dep(name = "rules_rs", version = "0.0.58")
-
-# `rules_rs` still does not model `windows-gnullvm` as a distinct Windows exec
-# platform, so patch it until upstream grows that support for both x86_64 and
-# aarch64.
+bazel_dep(name = "aws-lc", version = "5.1.0.bcr.1")
+bazel_dep(name = "rules_rs", version = "0.0.96")
 single_version_override(
     module_name = "rules_rs",
     patch_strip = 1,
     patches = [
         "//patches:rules_rs_build_script_deps_annotation.patch",
-        "//patches:rules_rs_windows_gnullvm_exec.patch",
-        "//patches:rules_rs_windows_exec_linker.patch",
+        "//patches:rules_rs_windows_msvc_linker.patch",
+        "//patches:rules_rs_zlib_snapshot_urls.patch",
     ],
-    version = "0.0.58",
+    version = "0.0.96",
 )
 
-rules_rust = use_extension("@rules_rs//rs/experimental:rules_rust.bzl", "rules_rust")
-
-# Build-script probe binaries inherit CFLAGS/CXXFLAGS from Bazel's C++
-# toolchain. On `windows-gnullvm`, llvm-mingw does not ship
-# `libssp_nonshared`, so strip the forwarded stack-protector flags there.
+rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
 rules_rust.patch(
     patches = [
-        "//patches:rules_rust_windows_gnullvm_build_script.patch",
-        "//patches:rules_rust_windows_exec_msvc_build_script_env.patch",
-        "//patches:rules_rust_windows_bootstrap_process_wrapper_linker.patch",
-        "//patches:rules_rust_windows_build_script_runner_paths.patch",
+        # Carry the OpenAI setup fix that makes build-script tools available
+        # through their runfiles after the rules_rs upgrade.
+        "//patches:rules_rust_build_script_tools_transition.patch",
+        # Prefer Rust's direct linker for Windows/MSVC and keep hermetic
+        # LLVM's non-.lib runtime artifacts compatible with it.
         "//patches:rules_rust_windows_msvc_direct_link_args.patch",
+        # Skip transient native-Windows linker outputs while consolidating
+        # dependency search paths.
         "//patches:rules_rust_windows_process_wrapper_skip_temp_outputs.patch",
-        "//patches:rules_rust_windows_exec_bin_target.patch",
-        "//patches:rules_rust_windows_exec_std.patch",
-        "//patches:rules_rust_windows_exec_rustc_dev_rlib.patch",
     ],
     strip = 1,
 )
 use_repo(rules_rust, "rules_rust")
 
+# argument-comment-lint uses rustc_private and needs nightly rustc-dev
+# components. Keep that rules_rust-reexported toolchain separate from the
+# default rules_rs toolchains below, which do not expose dev_components.
 nightly_rust = use_extension(
-    "@rules_rs//rs/experimental:rules_rust_reexported_extensions.bzl",
+    "@rules_rs//rs:rules_rust_reexported_extensions.bzl",
     "rust",
 )
 nightly_rust.toolchain(
@@ -136,8 +187,8 @@ nightly_rust.toolchain(
     versions = ["nightly/2025-09-18"],
 )
 
-# Keep Windows exec tools on MSVC so Bazel helper binaries link correctly, but
-# lint crate targets as `windows-gnullvm` to preserve the repo's actual cfgs.
+# Keep the reexported extension's default Windows set constrained to MSVC so
+# it cannot also match the gnullvm host platform.
 nightly_rust.repository_set(
     name = "rust_windows_x86_64",
     dev_components = True,
@@ -145,29 +196,55 @@ nightly_rust.repository_set(
     exec_compatible_with = [
         "@platforms//cpu:x86_64",
         "@platforms//os:windows",
-        "@rules_rs//rs/experimental/platforms/constraints:windows_msvc",
+        "@llvm//constraints/windows/abi:msvc",
     ],
     exec_triple = "x86_64-pc-windows-msvc",
     target_compatible_with = [
         "@platforms//cpu:x86_64",
         "@platforms//os:windows",
-        "@rules_rs//rs/experimental/platforms/constraints:windows_msvc",
+        "@llvm//constraints/windows/abi:msvc",
     ],
     target_triple = "x86_64-pc-windows-msvc",
     versions = ["nightly/2025-09-18"],
 )
+
+# Also let that MSVC-exec set target gnullvm for existing cross lanes.
 nightly_rust.repository_set(
     name = "rust_windows_x86_64",
     target_compatible_with = [
         "@platforms//cpu:x86_64",
         "@platforms//os:windows",
-        "@rules_rs//rs/experimental/platforms/constraints:windows_gnullvm",
+        "@llvm//constraints/windows/abi:gnullvm",
+        "@llvm//constraints/windows/crt:msvcrt",
     ],
     target_triple = "x86_64-pc-windows-gnullvm",
 )
+
+# Give Windows lint a native gnullvm exec set so proc-macros link against the
+# same ABI as hermetic LLVM and BCR AWS-LC.
+nightly_rust.repository_set(
+    name = "rust_windows_x86_64_gnullvm",
+    dev_components = True,
+    edition = "2024",
+    exec_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:windows",
+        "@llvm//constraints/windows/abi:gnullvm",
+        "@llvm//constraints/windows/crt:msvcrt",
+    ],
+    exec_triple = "x86_64-pc-windows-gnullvm",
+    target_compatible_with = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:windows",
+        "@llvm//constraints/windows/abi:gnullvm",
+        "@llvm//constraints/windows/crt:msvcrt",
+    ],
+    target_triple = "x86_64-pc-windows-gnullvm",
+    versions = ["nightly/2025-09-18"],
+)
 use_repo(nightly_rust, "rust_toolchains")
 
-toolchains = use_extension("@rules_rs//rs/experimental/toolchains:module_extension.bzl", "toolchains")
+toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
 toolchains.toolchain(
     edition = "2024",
     version = "1.95.0",
@@ -177,6 +254,18 @@ use_repo(toolchains, "default_rust_toolchains")
 register_toolchains("@default_rust_toolchains//:all")
 
 register_toolchains("@rust_toolchains//:all")
+
+rules_rust_bindgen = use_extension(
+    "@rules_rs//rs:rules_rust_bindgen.bzl",
+    "rules_rust_bindgen",
+)
+use_repo(rules_rust_bindgen, "rules_rust_bindgen")
+
+register_toolchains("@rules_rust_bindgen//:all")
+
+# Generate Rust protobuf/gRPC libraries against the workspace's prost/tonic
+# versions instead of the versions bundled with rules_rs's default toolchain.
+register_toolchains("//bazel/toolchains/prost:toolchain")
 
 crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
 crate.from_cargo(
@@ -197,7 +286,6 @@ crate.from_cargo(
         "x86_64-pc-windows-msvc",
         "x86_64-pc-windows-gnullvm",
     ],
-    use_experimental_platforms = True,
 )
 crate.from_cargo(
     name = "argument_comment_lint_crates",
@@ -215,11 +303,17 @@ crate.from_cargo(
         "x86_64-pc-windows-msvc",
         "x86_64-pc-windows-gnullvm",
     ],
-    use_experimental_platforms = True,
 )
 
 bazel_dep(name = "zstd", version = "1.5.7")
 
+crate.annotation(
+    # The Windows lint toolchain cannot reliably materialize blake3's native x86 assembly archives.
+    crate = "blake3",
+    crate_features_select = {
+        "x86_64-pc-windows-gnullvm": ["pure"],
+    },
+)
 crate.annotation(
     crate = "zstd-sys",
     gen_build_script = "on",
@@ -236,22 +330,26 @@ crate.annotation(
     ],
 )
 crate.annotation(
-    build_script_env = {
-        "AWS_LC_SYS_NO_JITTER_ENTROPY": "1",
-    },
+    additive_build_file = "@rules_rs//3rd_party/aws-lc-sys:additive.BUILD.bazel",
     crate = "aws-lc-sys",
-    patch_args = ["-p1"],
-    patches = [
-        "//patches:aws-lc-sys_memcmp_check.patch",
-        "//patches:aws-lc-sys_windows_msvc_prebuilt_nasm.patch",
-        "//patches:aws-lc-sys_windows_msvc_memcmp_probe.patch",
-    ],
+    extra_aliased_targets = {"aws_lc_sys_build_info": "aws_lc_sys_build_info"},
+    gen_build_script = "off",
+    repositories = ["crates"],
+    rustc_flags = ["--cfg=use_bindgen_pregenerated"],
+    deps = ["@crates//:aws_lc_sys_build_info"],
+)
+crate.annotation(
+    crate = "aws-lc-rs",
+    gen_build_script = "off",
+    repositories = ["crates"],
 )
 crate.annotation(
     # The build script only validates embedded source/version metadata.
     crate = "rustc_apfloat",
     gen_build_script = "off",
 )
+
+inject_repo(crate, "aws-lc")
 
 inject_repo(crate, "zstd")
 
@@ -328,13 +426,65 @@ crate.annotation(
     workspace_cargo_toml = "rust/runfiles/Cargo.toml",
 )
 
+# MXC keeps its Rust workspace below the repository root.
+[
+    crate.annotation(
+        crate = name,
+        workspace_cargo_toml = "src/Cargo.toml",
+    )
+    for name in [
+        "appcontainer_common",
+        "learning_mode_core",
+        "learning_mode_windows",
+        "mxc_config_contract",
+        "mxc_telemetry",
+        "process_security_environment_spec",
+        "sandbox_spec",
+        "wxc_common",
+    ]
+]
+
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+codex_release_archive = use_extension(
+    "//bazel/extensions:codex_release_archive.bzl",
+    "codex_release_archive",
+)
+codex_release_archive.release(
+    sha256 = "00aba704f029f6dc0d948be407a756e0c97cc840132fd691353b2c6b0a505b17",
+    version = "0.150.1",
+)
+codex_release_archive.release(
+    sha256 = "71a28d362c96ac9829bf8203a2c71be451aeb726adb843167fdaf0eae8fe7dd9",
+    version = "0.145.0",
+)
+use_repo(
+    codex_release_archive,
+    "codex_release_0.145.0_linux_x86_64",
+    "codex_release_0.150.1_linux_x86_64",
+)
 
 http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
 
 new_local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "new_local_repository")
 
 include("//bazel/modules:wine.MODULE.bazel")
+
+voice_sources = use_extension("//third_party/voice:extensions.bzl", "voice_sources")
+use_repo(
+    voice_sources,
+    "voice_glib",
+    "voice_gst_plugins_base",
+    "voice_gst_plugins_good",
+    "voice_gstreamer",
+    "voice_libffi",
+    "voice_meson",
+    "voice_ninja",
+    "voice_opus",
+    "voice_pcre2",
+    "voice_proxy_libintl",
+    "voice_zlib",
+)
 
 new_local_repository(
     name = "v8_targets",
@@ -357,10 +507,12 @@ crate.annotation(
     crate_features_select = {
         "aarch64-apple-darwin": ["v8_enable_sandbox"],
         "aarch64-pc-windows-gnullvm": ["v8_enable_sandbox"],
+        "aarch64-pc-windows-msvc": ["v8_enable_sandbox"],
         "aarch64-unknown-linux-gnu": ["v8_enable_sandbox"],
         "aarch64-unknown-linux-musl": ["v8_enable_sandbox"],
         "x86_64-apple-darwin": ["v8_enable_sandbox"],
         "x86_64-pc-windows-gnullvm": ["v8_enable_sandbox"],
+        "x86_64-pc-windows-msvc": ["v8_enable_sandbox"],
         "x86_64-unknown-linux-gnu": ["v8_enable_sandbox"],
         "x86_64-unknown-linux-musl": ["v8_enable_sandbox"],
     },
@@ -432,36 +584,27 @@ crate.annotation(
 
 inject_repo(crate, "alsa_lib")
 
-bazel_dep(name = "v8", version = "14.9.207.2")
+bazel_dep(name = "v8", version = "15.0.245.2")
 archive_override(
     module_name = "v8",
-    integrity = "sha256-tflbZE5srqal6leMxJjK/ZQtwpF96OMGJ6avd5lice4=",
+    integrity = "sha256-Fk89PgqLTAKjhtOojRsRM9N+XCC+Ajn+zc3eQUpDQNU=",
     patch_strip = 3,
     patches = [
         "//patches:v8_module_deps.patch",
         "//patches:v8_bazel_rules.patch",
         "//patches:v8_source_portability.patch",
     ],
-    strip_prefix = "v8-14.9.207.2",
-    urls = ["https://github.com/v8/v8/archive/refs/tags/14.9.207.2.tar.gz"],
+    strip_prefix = "v8-15.0.245.2",
+    urls = ["https://github.com/v8/v8/archive/refs/tags/15.0.245.2.tar.gz"],
 )
 
 http_archive(
-    name = "v8_crate_146_4_0",
+    name = "v8_crate_150_4_0",
     build_file = "//third_party/v8:v8_crate.BUILD.bazel",
-    sha256 = "d97bcac5cdc5a195a4813f1855a6bc658f240452aac36caa12fd6c6f16026ab1",
-    strip_prefix = "v8-146.4.0",
+    sha256 = "42a978ff11f15b24e5c05a7123cf2b68f41e763546699781a924ef4e2cf43a49",
+    strip_prefix = "v8-150.4.0",
     type = "tar.gz",
-    urls = ["https://static.crates.io/crates/v8/v8-146.4.0.crate"],
-)
-
-http_archive(
-    name = "v8_crate_149_2_0",
-    build_file = "//third_party/v8:v8_crate.BUILD.bazel",
-    sha256 = "46dccf61a364b61bbaac70a8ba64a1a1006e87123b7d62eaeec999a3ba31ecdb",
-    strip_prefix = "v8-149.2.0",
-    type = "tar.gz",
-    urls = ["https://static.crates.io/crates/v8/v8-149.2.0.crate"],
+    urls = ["https://static.crates.io/crates/v8/v8-150.4.0.crate"],
 )
 
 git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
@@ -469,7 +612,7 @@ git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "g
 git_repository(
     name = "rusty_v8_libcxx",
     build_file = "//third_party/v8:libcxx.BUILD.bazel",
-    commit = "99457fa555797f8c5ac3c076ca288d8481d3b23a",
+    commit = "5abc7f839700f0f17338434e1c1c6a8c87c00c11",
     remote = "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libcxx.git",
 )
 
@@ -483,25 +626,25 @@ git_repository(
 git_repository(
     name = "rusty_v8_llvm_libc",
     build_file = "//third_party/v8:llvm_libc.BUILD.bazel",
-    commit = "cb952785ccee13811f293f3c419958d1e3ddafbf",
+    commit = "9309c117ebae84dd2f9df1ef99de4782162527d5",
     remote = "https://chromium.googlesource.com/external/github.com/llvm/llvm-project/libc.git",
 )
 
 http_file(
-    name = "rusty_v8_149_2_0_aarch64_pc_windows_msvc_archive",
+    name = "rusty_v8_150_4_0_aarch64_pc_windows_msvc_archive",
     downloaded_file_path = "rusty_v8_release_aarch64-pc-windows-msvc.lib.gz",
-    sha256 = "923f2b6ccdc14526b814e171e34c9aafd7969f12304948857c6696d022f0fb3c",
+    sha256 = "54722842af36b74248c403ff531254efac6ff65d281198bab0c6350fc1188ad4",
     urls = [
-        "https://github.com/denoland/rusty_v8/releases/download/v149.2.0/rusty_v8_release_aarch64-pc-windows-msvc.lib.gz",
+        "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/rusty_v8_ptrcomp_sandbox_release_aarch64-pc-windows-msvc.lib.gz",
     ],
 )
 
 http_file(
-    name = "rusty_v8_149_2_0_x86_64_pc_windows_msvc_archive",
+    name = "rusty_v8_150_4_0_x86_64_pc_windows_msvc_archive",
     downloaded_file_path = "rusty_v8_release_x86_64-pc-windows-msvc.lib.gz",
-    sha256 = "12b5a791b54e92f748738ad8d0d12dad8d281a2d836638ad1aa6678e3b855d9a",
+    sha256 = "732ec5da4243aa166799780c8519a5eea6f32f6e47657a323342794dc3c239d6",
     urls = [
-        "https://github.com/denoland/rusty_v8/releases/download/v149.2.0/rusty_v8_release_x86_64-pc-windows-msvc.lib.gz",
+        "https://github.com/openai/codex/releases/download/rusty-v8-v150.4.0/rusty_v8_ptrcomp_sandbox_release_x86_64-pc-windows-msvc.lib.gz",
     ],
 )
 

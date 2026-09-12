@@ -23,41 +23,41 @@ struct MountedSourceAccessorImpl : MountedSourceAccessor
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
     {
-        auto [accessor, subpath] = resolve(path);
+        auto [accessor, subpath] = lookup(path);
         return accessor->readFile(subpath, sink, sizeCallback);
     }
 
     Stat lstat(const CanonPath & path) override
     {
-        auto [accessor, subpath] = resolve(path);
+        auto [accessor, subpath] = lookup(path);
         return accessor->lstat(subpath);
     }
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override
     {
-        auto [accessor, subpath] = resolve(path);
+        auto [accessor, subpath] = lookup(path);
         return accessor->maybeLstat(subpath);
     }
 
     DirEntries readDirectory(const CanonPath & path) override
     {
-        auto [accessor, subpath] = resolve(path);
+        auto [accessor, subpath] = lookup(path);
         return accessor->readDirectory(subpath);
     }
 
     std::string readLink(const CanonPath & path) override
     {
-        auto [accessor, subpath] = resolve(path);
+        auto [accessor, subpath] = lookup(path);
         return accessor->readLink(subpath);
     }
 
     std::string showPath(const CanonPath & path) override
     {
-        auto [accessor, subpath] = resolve(path);
+        auto [accessor, subpath] = lookup(path);
         return displayPrefix + accessor->showPath(subpath) + displaySuffix;
     }
 
-    std::pair<ref<SourceAccessor>, CanonPath> resolve(CanonPath path)
+    std::pair<ref<SourceAccessor>, CanonPath> lookup(CanonPath path)
     {
         // Find the nearest parent of `path` that is a mount point.
         std::vector<std::string> subpath;
@@ -75,7 +75,7 @@ struct MountedSourceAccessorImpl : MountedSourceAccessor
 
     std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
     {
-        auto [accessor, subpath] = resolve(path);
+        auto [accessor, subpath] = lookup(path);
         return accessor->getPhysicalPath(subpath);
     }
 
@@ -92,18 +92,39 @@ struct MountedSourceAccessorImpl : MountedSourceAccessor
             return nullptr;
     }
 
+    std::optional<CanonPath> findMount(const SourceAccessor & accessor) override
+    {
+        std::optional<CanonPath> found;
+        bool ambiguous = false;
+        mounts.cvisit_all([&](const auto & entry) {
+            if (&*entry.second != &accessor)
+                return;
+            if (found && *found != entry.first)
+                ambiguous = true;
+            else
+                found = entry.first;
+        });
+        return ambiguous ? std::nullopt : found;
+    }
+
     std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
     {
         if (fingerprint)
             return {path, fingerprint};
-        auto [accessor, subpath] = resolve(path);
+        auto [accessor, subpath] = lookup(path);
         return accessor->getFingerprint(subpath);
     }
 
     std::string_view identityClass(const CanonPath & path) override
     {
-        auto [accessor, subpath] = resolve(path);
+        auto [accessor, subpath] = lookup(path);
         return accessor->identityClass(subpath);
+    }
+
+    std::shared_ptr<SourceAccessor> getSubtree(const CanonPath & path) override
+    {
+        auto [accessor, subpath] = lookup(path);
+        return accessor->getSubtree(subpath);
     }
 
     /* The path-taking overrides below would otherwise hide the
@@ -113,13 +134,13 @@ struct MountedSourceAccessorImpl : MountedSourceAccessor
 
     std::optional<Hash> getRev(const CanonPath & path) override
     {
-        auto [accessor, subpath] = resolve(path);
+        auto [accessor, subpath] = lookup(path);
         return accessor->getRev(subpath);
     }
 
     std::optional<time_t> getLastModified(const CanonPath & path) override
     {
-        auto [accessor, subpath] = resolve(path);
+        auto [accessor, subpath] = lookup(path);
         /* A mount that does not know its own time (e.g. a plain
            filesystem accessor for a dirty workdir) falls back to the
            whole tree's value. */
@@ -130,7 +151,7 @@ struct MountedSourceAccessorImpl : MountedSourceAccessor
 
     void invalidateCache(const CanonPath & path) override
     {
-        auto [accessor, subpath] = resolve(path);
+        auto [accessor, subpath] = lookup(path);
         accessor->invalidateCache(subpath);
     }
 };

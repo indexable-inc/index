@@ -184,16 +184,34 @@ struct ValidPathInfo : virtual UnkeyedValidPathInfo
     std::optional<ContentAddressWithReferences> contentAddressWithReferences() const;
 
     /**
-     * @return true iff the path is verifiably content-addressed.
+     * @return true iff the path is content-addressed: `ca` is set and the
+     * store path is the one `ca` derives. Says nothing about whether the
+     * bytes match `ca`; see `isSelfCertifying` for that.
      */
     bool isContentAddressed(const StoreDirConfig & store) const;
 
-    static const size_t maxSigs = std::numeric_limits<size_t>::max();
+    /**
+     * @return true iff the path is content-addressed by a method Nix can
+     * recompute from the bytes, so that the address itself certifies the
+     * content and no signature is needed. False for
+     * `ContentAddressMethod::Raw::JjTree`: its BLAKE3 tree id is minted by
+     * jj's object store and Nix cannot check a claimed id against the
+     * files, so such an object is trusted only on a signature or a trusted
+     * registrant, like an input-addressed path.
+     */
+    bool isSelfCertifying(const StoreDirConfig & store) const;
+
+    /* `constexpr`, which is implicitly an inline DEFINITION: tests compare
+       against it by const reference (gtest's EXPECT_EQ), which ODR-uses it,
+       and a `static const` with an in-class initializer is only a
+       declaration -- the link then fails with an undefined reference the
+       first time anything takes its address. */
+    static constexpr size_t maxSigs = std::numeric_limits<size_t>::max();
 
     /**
      * Return the number of signatures on this .narinfo that were
      * produced by one of the specified keys, or maxSigs if the path
-     * is content-addressed.
+     * is self-certifying (`isSelfCertifying`).
      */
     size_t checkSignatures(const StoreDirConfig & store, const PublicKeys & publicKeys) const;
 

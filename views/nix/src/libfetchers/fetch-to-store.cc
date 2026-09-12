@@ -2,7 +2,6 @@
 #include "nix/fetchers/fetchers.hh"
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/util/environment-variables.hh"
-#include "nix/util/configuration.hh"
 
 namespace nix {
 
@@ -27,6 +26,22 @@ StorePath fetchToStore(
     return fetchToStore2(settings, store, path, mode, name, method, filter, repair).first;
 }
 
+std::shared_ptr<SourceAccessor> treeObjectAt(const SourcePath & path, PathFilter * filter)
+{
+    auto st = path.accessor->maybeLstat(path.path);
+    if (!st || st->type != SourceAccessor::tDirectory)
+        return nullptr;
+    if (!filter && path.path.isRoot())
+        return path.accessor->knownTreeRoot ? path.accessor.get_ptr() : nullptr;
+    auto tree = filter ? path.accessor->getFilteredTree(path.path, *filter) : path.accessor->getSubtree(path.path);
+    /* The contract (`SourceAccessor::getSubtree`): an accessor that names a
+       tree object announces its id. One that does not is a defect in that
+       accessor, not a licence to address the bytes another way. */
+    if (tree && !tree->knownTreeRoot)
+        throw Error("accessor for '%s' named a tree object without announcing its id", path);
+    return tree;
+}
+
 std::pair<StorePath, Hash> fetchToStore2(
     const fetchers::Settings & settings,
     Store & store,
@@ -43,29 +58,45 @@ std::pair<StorePath, Hash> fetchToStore2(
                                          : path.accessor->getFingerprint(path.path);
 
     /* An accessor reading out of a content-addressed object store (the jj
-       workdir fetcher) knows its root's tree id a priori: the VCS
-       maintained it incrementally, Merkle-fashion, while snapshotting. When
-       the id's family is one nix also ingests, that id IS the content
-       address, so the store path follows from it with zero file reads --
-       where the NAR method's flat hash has to re-read the whole tree on
-       every content change. A family nix does not ingest is not an address
-       here and falls through to reading the tree. */
+       fetcher) knows its trees' ids a priori: the VCS maintained them
+       incrementally, Merkle-fashion, while snapshotting. `Raw::JjTree`
+       ingests a tree by exactly that id, so the store path follows from it
+       with zero file reads -- where the NAR method's flat hash has to
+       re-read the whole tree on every content change. A subtree is its own
+       object and a filtered view is one too (`treeObjectAt`), each with an
+       id of its own; what has no id is a path INTO a tree, which is why the
+       object, not the path, is what gets ingested below. */
+    std::shared_ptr<SourceAccessor> treeObject;
     std::optional<Hash> knownHash;
-    if (method == ContentAddressMethod::Raw::Git && !filter && path.path.isRoot() && path.accessor->knownTreeRoot
-        && path.accessor->knownTreeRoot->family == KnownTreeRoot::Family::Git
-        && experimentalFeatureSettings.isEnabled(Xp::GitHashing))
-        knownHash = path.accessor->knownTreeRoot->id;
+    if (method == ContentAddressMethod::Raw::JjTree) {
+        treeObject = treeObjectAt(path, filter);
+        /* `JjTree` has no other source of a hash: nothing in Nix can compute
+           one, so a tree nobody announces cannot be ingested this way.
+           Refuse here, naming the gap, rather than in a walk that would fail
+           on the first file. */
+        if (!treeObject)
+            throw TreeIdNotComputable(
+                "cannot content-address '%s' by Jujutsu tree id: it is not a directory of a tree that announces "
+                "its id",
+                path);
+        knownHash = treeObject->knownTreeRoot->id;
+    }
 
     std::optional<Hash> trustedHash;
     bool trustedFromCache = false;
 
-    if (fingerprint) {
+    /* The fingerprint-to-hash cache exists to spare the NAR walk; a
+       tree-addressed accessor has nothing to spare, so it is neither
+       consulted nor seeded for one. */
+    if (knownHash) {
+        /* nothing to look up */
+    } else if (fingerprint) {
         cacheKey = makeSourcePathToHashCacheKey(*fingerprint, method, subpath);
         if (auto res = settings.getCache()->lookup(*cacheKey)) {
             trustedHash = Hash::parseSRI(fetchers::getStrAttr(*res, "hash"));
             trustedFromCache = true;
         }
-    } else if (!knownHash) {
+    } else {
         static auto barf = getEnv("_NIX_TEST_BARF_ON_UNCACHEABLE").value_or("") == "1";
         if (barf && !filter)
             throw Error("source path '%s' is uncacheable (filter=%d)", path, (bool) filter);
@@ -85,21 +116,37 @@ std::pair<StorePath, Hash> fetchToStore2(
         if (mode != FetchMode::DryRun)
             store.addTempRoot(storePath);
 
-        if (mode == FetchMode::DryRun || store.isValidPath(storePath)) {
-            /* Seed the cache when the hash came from the accessor rather
-               than the cache, so a later process without the announcing
-               fetcher still hits. */
-            if (cacheKey && !trustedFromCache)
-                settings.getCache()->upsert(*cacheKey, {{"hash", trustedHash->to_string(HashFormat::SRI, true)}});
+        /* Under `repair` a valid path is not an answer: the bytes must be
+           read and compared, which only the copy below does. */
+        if (mode == FetchMode::DryRun || (repair == NoRepair && store.isValidPath(storePath))) {
             debug(
                 "source path '%s' %s in '%s' (hash '%s')",
                 path,
-                trustedFromCache ? "cache hit" : "resolved by announced git tree hash",
+                trustedFromCache ? "cache hit" : "resolved by its announced tree id",
                 store.printStorePath(storePath),
                 trustedHash->to_string(HashFormat::SRI, true));
             return {storePath, *trustedHash};
         }
         debug("source path '%s' not in store", path);
+    }
+
+    /* Forced materialization of a jj tree: write the tree object's bytes
+       under the id it announced. The id is the address and is trusted (it
+       came from an immutable object store); the store's own record of the
+       bytes is the NAR hash libstore computes on write. That costs one read
+       of the forced tree, paid only here, never on the evaluation path that
+       derived the store path above. The object is dumped, not `path`: for a
+       filtered view the two differ, and the id names the object. */
+    if (method == ContentAddressMethod::Raw::JjTree) {
+        Activity act(*logger, lvlChatty, actUnknown, fmt("copying '%s' to the store", path));
+        auto storePath = store.addToStoreWithKnownCA(
+            name, SourcePath{ref(treeObject)}, ContentAddress{.method = method, .hash = *knownHash}, repair);
+        debug(
+            "copied '%s' to '%s' (tree id '%s')",
+            path,
+            store.printStorePath(storePath),
+            knownHash->to_string(HashFormat::SRI, true));
+        return {storePath, *knownHash};
     }
 
     Activity act(
@@ -110,9 +157,9 @@ std::pair<StorePath, Hash> fetchToStore2(
 
     auto filter2 = filter ? *filter : defaultPathFilter;
 
-    /* The walk must agree with an announced hash's algorithm (git object
-       hashes are SHA-1 in every repo jj creates today). */
-    auto hashAlgo = knownHash ? knownHash->algo : HashAlgorithm::SHA256;
+    /* Only NAR (or flat) ingestion reaches here: `JjTree` returned above
+       with its id, and no other method knows a hash a priori. */
+    auto hashAlgo = HashAlgorithm::SHA256;
 
     auto [storePath, hash] =
         mode == FetchMode::DryRun
@@ -144,14 +191,6 @@ std::pair<StorePath, Hash> fetchToStore2(
                       hash.to_string(HashFormat::SRI, true));
                   return std::make_pair(storePath, hash);
               }();
-
-    if (knownHash && hash != *knownHash)
-        warn(
-            "accessor for '%s' announced git tree hash '%s' but its content hashed to '%s'; "
-            "a dry-run mount derived from the announced hash will fail with a store path mismatch",
-            path,
-            knownHash->to_string(HashFormat::SRI, true),
-            hash.to_string(HashFormat::SRI, true));
 
     if (cacheKey)
         settings.getCache()->upsert(*cacheKey, {{"hash", hash.to_string(HashFormat::SRI, true)}});

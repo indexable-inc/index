@@ -71,6 +71,8 @@ struct CmdHashBase : Command
             return "print cryptographic hash of the NAR serialisation of a path";
         case FileIngestionMethod::Git:
             return "print cryptographic hash of the Git serialisation of a path";
+        case FileIngestionMethod::JjTree:
+            return "refuse: a Jujutsu tree id is read from a jj object store, never computed";
         default:
             assert(false);
         };
@@ -125,6 +127,11 @@ struct CmdHashBase : Command
                 h = hook(sourcePath).hash;
                 break;
             }
+            case FileIngestionMethod::JjTree:
+                throw TreeIdNotComputable(
+                    "cannot compute a Jujutsu tree id for '%s': Nix does not serialize trees the way jj does; "
+                    "the id is read from the jj object store that minted it",
+                    path);
             }
 
             if (truncate && h.hashSize > 20)

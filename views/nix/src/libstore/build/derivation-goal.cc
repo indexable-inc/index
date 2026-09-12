@@ -370,7 +370,7 @@ Goal::Co DerivationGoal::repairClosure()
 
     /* Check each path (slow!). */
     for (auto & i : outputClosure) {
-        if (worker.pathContentsGood(i))
+        if (worker.checkPathContents(i) == PathContentStatus::Valid)
             continue;
         printError(
             "found corrupted or missing path '%s' in the output closure of '%s'",
@@ -438,10 +438,15 @@ std::optional<std::pair<UnkeyedRealisation, PathStatus>> DerivationGoal::checkPa
            for CA outputs found via a realisation this is the only root
            protecting the path until the caller consumes it. */
         worker.store.addTempRoot(outputPath);
-        bool checkHash = buildMode == bmRepair;
-        PathStatus status = !worker.store.isValidPath(outputPath)               ? PathStatus::Absent
-                            : !checkHash || worker.pathContentsGood(outputPath) ? PathStatus::Valid
-                                                                                : PathStatus::Corrupt;
+        // A registered CA realisation can predate the canonical producer.
+        // NAR integrity alone does not prove that its content identity is valid.
+        bool checkHash =
+            buildMode == bmRepair
+            || (worker.store.isValidPath(outputPath) && worker.store.queryPathInfo(outputPath)->ca.has_value());
+        PathStatus status = !worker.store.isValidPath(outputPath) ? PathStatus::Absent
+                            : !checkHash || worker.checkPathContents(outputPath) == PathContentStatus::Valid
+                                ? PathStatus::Valid
+                                : PathStatus::Corrupt;
 
         if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations) && status == PathStatus::Valid) {
             // We know the output because it's a static output of the

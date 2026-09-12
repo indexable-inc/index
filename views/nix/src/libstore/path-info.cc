@@ -79,6 +79,7 @@ std::optional<ContentAddressWithReferences> ValidPathInfo::contentAddressWithRef
     case ContentAddressMethod::Raw::Flat:
     case ContentAddressMethod::Raw::NixArchive:
     case ContentAddressMethod::Raw::Git:
+    case ContentAddressMethod::Raw::JjTree:
     default: {
         auto refs = references;
         bool hasSelfReference = false;
@@ -116,9 +117,14 @@ bool ValidPathInfo::isContentAddressed(const StoreDirConfig & store) const
     return res;
 }
 
+bool ValidPathInfo::isSelfCertifying(const StoreDirConfig & store) const
+{
+    return isContentAddressed(store) && ca->method != ContentAddressMethod::Raw::JjTree;
+}
+
 size_t ValidPathInfo::checkSignatures(const StoreDirConfig & store, const PublicKeys & publicKeys) const
 {
-    if (isContentAddressed(store))
+    if (isSelfCertifying(store))
         return maxSigs;
 
     size_t good = 0;

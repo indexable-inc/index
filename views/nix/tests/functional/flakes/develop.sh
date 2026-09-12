@@ -7,11 +7,18 @@ TODO_NixOS
 clearStore
 rm -rf "$TEST_HOME/.cache" "$TEST_HOME/.config" "$TEST_HOME/.local"
 
+jjFlakeDir "$TEST_HOME"
+
 # Create flake under test.
 cp ../shell-hello.nix "$config_nix" "$TEST_HOME/"
 cat <<EOF >"$TEST_HOME/flake.nix"
 {
-    inputs.nixpkgs.url = "$TEST_HOME/nixpkgs";
+    # The fake nixpkgs below is a subdirectory of this flake's own source,
+    # so it is named relatively: that resolves to this flake's own subtree
+    # and is locked by this flake, rather than becoming a second input whose
+    # identity is the whole surrounding directory (which every ./result
+    # symlink this test drops would then change).
+    inputs.nixpkgs.url = "path:./nixpkgs";
     outputs = {self, nixpkgs}: {
       packages.$system.hello = (import ./config.nix).mkDerivation {
         name = "hello";

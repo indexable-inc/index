@@ -28,8 +28,8 @@ in
     }";
 
     # Named rather than left to default, so the fake editors the test suite
-    # builds do not get installed. jj-views is a real tool and is listed.
-    cargoBuildFlags = ["--bin" "jj" "--bin" "jj-views"];
+    # builds do not get installed.
+    cargoBuildFlags = ["--bin" "jj"];
     useNextest = true;
     cargoTestFlags = ["--profile" "ci"];
     src = filterSrc ./. [
@@ -67,10 +67,9 @@ in
     postInstall = ''
       # `cargoBuildFlags` names the binaries rather than leaving them to the
       # default, and the failure mode of editing that list is silent: the
-      # package builds, installs one binary, and the missing tool is discovered
-      # by whoever reached for it, which for `jj-views` is somebody already
-      # part-way through a hand integration. Check here instead.
-      for bin in jj jj-views; do
+      # package builds and the missing binary is discovered by whoever reached
+      # for it. Check here instead.
+      for bin in jj; do
         test -x "$out/bin/$bin" || {
           echo "$bin was not installed; check cargoBuildFlags" >&2
           exit 1

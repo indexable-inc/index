@@ -4,7 +4,12 @@ source common.sh
 
 clearStoreIfPossible
 
-cd "$TEST_HOME"
+# A flake source needs an identity a lock file can name: `path:` serves store
+# objects only (src/libfetchers/path.cc), so a plain directory is refused.
+flakeDir=$TEST_HOME/flake
+jjFlakeDir "$flakeDir"
+
+cd "$flakeDir"
 
 cat <<EOF > flake.nix
 {
@@ -37,7 +42,11 @@ NIX_BUILD_STDERR_WITH_NO_CLOSE_SUGGESTION=$(! nix build .\#bar 2>&1 1>/dev/null)
 [[ ! "$NIX_BUILD_STDERR_WITH_NO_CLOSE_SUGGESTION" =~ "Did you mean" ]] || \
     fail "The nix build stderr shouldn’t suggest anything if there’s nothing relevant to suggest"
 
-NIX_EVAL_STDERR_WITH_SUGGESTIONS=$(! nix build --impure --expr '(builtins.getFlake (builtins.toPath ./.)).packages.'"$system"'.fob' 2>&1 1>/dev/null)
+# `builtins.getFlake` parses its argument with no base directory
+# (src/libflake/flake-primops.cc), so a bare path stays a `path:` input instead
+# of being routed by what the directory holds. Hence the flake ref is spelled
+# out; the suggestion is what this line asserts.
+NIX_EVAL_STDERR_WITH_SUGGESTIONS=$(! nix build --impure --expr "(builtins.getFlake \"jj+file://$flakeDir\").packages.$system.fob" 2>&1 1>/dev/null)
 [[ "$NIX_EVAL_STDERR_WITH_SUGGESTIONS" =~ "Did you mean one of fo1, fo2, foo or fooo?" ]] || \
     fail "The evaluator should suggest the three closest possiblities"
 

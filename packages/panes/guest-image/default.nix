@@ -87,7 +87,7 @@
   # (`nix run .#update`); bumping the LWJGL version is the human edit.
   updateScript = ix.pins.mkOptionalUpdater {
     writeNushellApplication = updateScriptWriter;
-    nix = repoPackages.nix-ix;
+    nix = ix.nixPackageFor "packages/panes/guest-image: updateScript";
     pname = "panes-guest-image";
     relPath = "packages/panes/guest-image/pins.json";
   };

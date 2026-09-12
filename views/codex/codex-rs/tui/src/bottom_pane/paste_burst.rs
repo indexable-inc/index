@@ -9,8 +9,9 @@
 //! - Avoid flicker caused by inserting a typed prefix and then immediately reclassifying it as
 //!   paste once enough chars have arrived.
 //!
-//! This module provides the `PasteBurst` state machine. `ChatComposer` feeds it only "plain"
-//! character events (no Ctrl/Alt) and uses the full buffering decisions to either:
+//! This module provides the `PasteBurst` state machine. `ChatComposer` feeds it only
+//! text-producing character events (plain, Shift, or Windows AltGr) and uses the full buffering
+//! decisions to either:
 //!
 //! - briefly hold a first ASCII char (flicker suppression),
 //! - buffer a burst as a single pasted string, or
@@ -21,14 +22,17 @@
 //! `PasteBurst` is a pure state machine: it never mutates the textarea directly. The caller feeds
 //! it events and then applies the chosen action:
 //!
-//! - For each plain `KeyCode::Char`, call [`PasteBurst::on_plain_char`] (ASCII) or
+//! - For each text-producing `KeyCode::Char`, call [`PasteBurst::on_plain_char`] (ASCII) or
 //!   [`PasteBurst::on_plain_char_no_hold`] (non-ASCII/IME).
 //! - If the decision indicates buffering, the caller appends to `PasteBurst.buffer` via
 //!   [`PasteBurst::append_char_to_buffer`].
+//! - On Enter, [`PasteBurst::append_newline_if_active`] promotes a held first character into
+//!   the active buffer before appending the newline.
 //! - On a UI tick, call [`PasteBurst::flush_if_due`]. If it returns [`FlushResult::Typed`], insert
 //!   that char as normal typing. If it returns [`FlushResult::Paste`], treat the returned string as
 //!   an explicit paste.
-//! - Before applying non-char input (arrow keys, Ctrl/Alt modifiers, etc.), use
+//! - Before applying non-text input (arrow keys; Ctrl/Alt shortcuts other than Windows AltGr;
+//!   or Super, Hyper, and Meta modifiers), use
 //!   [`PasteBurst::flush_before_modified_input`] to avoid leaving buffered text "stuck", and then
 //!   [`PasteBurst::clear_window_after_non_char`] so subsequent typing does not get grouped into a
 //!   previous burst.
@@ -45,8 +49,8 @@
 //! - `buffer`: accumulated burst text that will eventually flush as a single `Paste(String)`.
 //!   A non-empty buffer is treated as "in burst context" even if `active` has been cleared.
 //! - `pending_first_char`: a single held ASCII char used for flicker suppression. The caller must
-//!   not render this char until it either becomes part of a burst (`BeginBufferFromPending`) or
-//!   flushes as a normal typed char (`FlushResult::Typed`).
+//!   not render this char until it joins a burst through `BeginBufferFromPending` or
+//!   `append_newline_if_active`, or flushes as a normal typed char (`FlushResult::Typed`).
 //! - `last_plain_char_time`/`consecutive_plain_char_burst`: the timing/count heuristic for
 //!   "paste-like" streams.
 //! - `burst_window_until`: the Enter suppression window ("Enter inserts newline") that outlives the
@@ -142,7 +146,8 @@
 //!   - [`FlushResult::Typed`]: insert that single char as normal typing.
 //!   - [`FlushResult::Paste`]: treat the returned string as an explicit paste.
 //!
-//! - When a non-plain key is pressed (Ctrl/Alt-modified input, arrows, etc.), callers should use
+//! - When non-text input is pressed (Ctrl/Alt shortcuts other than Windows AltGr; Super, Hyper,
+//!   and Meta modifiers; arrows; etc.), callers should use
 //!   [`PasteBurst::clear_window_after_non_char`] to prevent the next keystroke from being
 //!   incorrectly grouped into a previous burst.
 
@@ -323,6 +328,10 @@ impl PasteBurst {
     /// false otherwise.
     pub fn append_newline_if_active(&mut self, now: Instant) -> bool {
         if self.is_active() {
+            if let Some((held, _)) = self.pending_first_char.take() {
+                self.buffer.push(held);
+            }
+            self.active = true;
             self.buffer.push('\n');
             self.burst_window_until = Some(now + PASTE_ENTER_SUPPRESS_WINDOW);
             true

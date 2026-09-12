@@ -6,30 +6,75 @@
 use super::*;
 
 impl ChatWidget {
+    /// Flush prior activity and preserve its separator before live or replayed assistant text.
+    pub(super) fn prepare_assistant_message(&mut self) {
+        // Before starting an agent stream, flush any active exec cell group.
+        self.flush_unified_exec_wait_streak();
+        self.flush_active_cell();
+        // If the previous turn inserted non-stream history (exec output, patch status, MCP
+        // calls), render a separator before starting the next streamed assistant message.
+        if self.transcript.needs_final_message_separator && self.transcript.had_work_activity {
+            self.add_to_history(history_cell::FinalMessageSeparator::new(
+                /*elapsed_seconds*/ None, /*runtime_metrics*/ None,
+            ));
+            self.transcript.needs_final_message_separator = false;
+        } else if self.transcript.needs_final_message_separator {
+            // Reset the flag even if we don't show separator (no work was done)
+            self.transcript.needs_final_message_separator = false;
+        }
+    }
+
     /// Replay a subset of initial events into the UI to seed the transcript when
     /// resuming an existing session. This approximates the live event flow and
     /// is intentionally conservative: only safe-to-replay items are rendered to
     /// avoid triggering side effects. Event ids are passed as `None` to
     /// distinguish replayed events from live ones.
     pub(crate) fn replay_thread_turns(&mut self, turns: Vec<Turn>, replay_kind: ReplayKind) {
-        for turn in turns {
+        if matches!(replay_kind, ReplayKind::ThreadSnapshot) && !turns.is_empty() {
+            self.warning_display_state.startup_complete = true;
+        }
+        let latest_turn_id = turns.last().map(|turn| turn.id.clone());
+        let hidden_nested_review_turns = std::iter::once(/*value*/ false)
+            .chain(turns.windows(/*size*/ 2).map(|turns| {
+                crate::app_backtrack::is_hidden_nested_review_turn(&turns[0], &turns[1])
+            }))
+            .collect::<Vec<_>>();
+        for (turn, hidden_nested_review_turn) in turns.into_iter().zip(hidden_nested_review_turns) {
             let Turn {
                 id: turn_id,
                 items_view: _,
                 items,
                 status,
-                error,
+                mut error,
                 started_at,
                 completed_at,
                 duration_ms,
             } = turn;
             if matches!(status, TurnStatus::InProgress) {
+                self.warning_display_state.startup_complete = true;
                 self.turn_lifecycle.last_turn_id = Some(turn_id.clone());
                 self.last_non_retry_error = None;
                 self.on_task_started();
             }
             for item in items {
+                if hidden_nested_review_turn && matches!(item, ThreadItem::UserMessage { .. }) {
+                    continue;
+                }
                 self.replay_thread_item(item, turn_id.clone(), replay_kind);
+            }
+            let status = if hidden_nested_review_turn {
+                TurnStatus::Completed
+            } else {
+                status
+            };
+            // A resolved historical precaution must not clear the restored draft or input queue.
+            if Some(&turn_id) != latest_turn_id.as_ref()
+                && error.as_ref().is_some_and(|error| {
+                    error.codex_error_info
+                        == Some(AppServerCodexErrorInfo::MisalignmentPolicyViolation)
+                })
+            {
+                error = None;
             }
             if matches!(
                 status,
@@ -73,14 +118,19 @@ impl ChatWidget {
         let from_replay = render_source.is_replay();
         let replay_kind = render_source.replay_kind();
         match item {
-            ThreadItem::UserMessage { content, .. } => {
-                self.on_committed_user_message(&content, from_replay);
+            ThreadItem::UserMessage {
+                content, client_id, ..
+            } => {
+                self.on_committed_user_message(&content, client_id.as_deref(), from_replay);
             }
             ThreadItem::AgentMessage {
                 id,
                 text,
                 phase,
                 memory_citation,
+                delivery,
+                questions,
+                ..
             } => {
                 self.on_agent_message_item_completed(
                     AgentMessageItem {
@@ -104,7 +154,10 @@ impl ChatWidget {
                                 rollout_ids: citation.thread_ids,
                             }
                         }),
+                        delivery,
+                        questions,
                     },
+                    &turn_id,
                     from_replay,
                 );
             }
@@ -133,6 +186,13 @@ impl ChatWidget {
                 status: codex_app_server_protocol::CommandExecutionStatus::InProgress,
                 ..
             } => self.on_command_execution_started(item),
+            item @ ThreadItem::CommandExecution {
+                source: ExecCommandSource::Agent | ExecCommandSource::UnifiedExecStartup,
+                status:
+                    codex_app_server_protocol::CommandExecutionStatus::Completed
+                    | codex_app_server_protocol::CommandExecutionStatus::Failed,
+                ..
+            } if from_replay => self.handle_command_execution_completed_now(item),
             item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_completed(item),
             ThreadItem::FileChange {
                 status: codex_app_server_protocol::PatchApplyStatus::InProgress,
@@ -172,8 +232,28 @@ impl ChatWidget {
             ThreadItem::ExitedReviewMode { .. } => {
                 self.exit_review_mode_after_item();
             }
-            ThreadItem::ContextCompaction { .. } => {
-                self.add_info_message("Context compacted".to_string(), /*hint*/ None);
+            ThreadItem::ContextCompaction { id } => {
+                self.on_context_compaction_completed(&id, from_replay);
+            }
+            ThreadItem::FunctionCallOutput {
+                name,
+                namespace,
+                output,
+                ..
+            } => {
+                if let Some((source_thread_id, prompt)) =
+                    crate::dynamic_tools::parse_delegated_tool_output(
+                        &name,
+                        namespace.as_deref(),
+                        &output,
+                    )
+                {
+                    self.add_to_history(history_cell::PrefixedWrappedHistoryCell::new(
+                        format!("Sent by Codex from task {source_thread_id}\n{prompt}"),
+                        "• ".dim(),
+                        "  ",
+                    ));
+                }
             }
             ThreadItem::HookPrompt { .. } => {}
             ThreadItem::CollabAgentToolCall {
@@ -199,7 +279,7 @@ impl ChatWidget {
             }),
             item @ ThreadItem::SubAgentActivity { .. } => self.on_sub_agent_activity(item),
             ThreadItem::DynamicToolCall { .. } => {}
-            ThreadItem::Sleep { .. } => {}
+            ThreadItem::Sleep(_) => {}
         }
 
         if matches!(replay_kind, Some(ReplayKind::ThreadSnapshot)) && turn_id.is_empty() {

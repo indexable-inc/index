@@ -922,53 +922,6 @@ fn test_aliases_are_completed(shell: Shell) {
     );
 }
 
-/// The keys of the `views` config table complete, described by the prefix each
-/// one publishes.
-#[test]
-fn test_views_are_completed() {
-    let test_env = TestEnvironment::default();
-    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
-    let work_dir = test_env.work_dir("repo");
-
-    test_env.add_config(indoc! {r#"
-        [views.upstream]
-        path = "vendor/upstream"
-        remote = "git@github.com:indexable-inc/upstream.git"
-        branch = "main"
-
-        [views.sidecar]
-        path = "vendor/sidecar"
-        remote = "git@github.com:indexable-inc/sidecar.git"
-        branch = "main"
-
-        [views.sidecar-docs]
-        path = "vendor/sidecar/docs"
-        remote = "git@github.com:indexable-inc/sidecar-docs.git"
-        branch = "main"
-    "#});
-
-    // Sorted, so the list is the same on every machine, and each entry carries
-    // the prefix it publishes rather than only its key.
-    let output = work_dir.complete_fish(["views", "push", "side"]);
-    insta::assert_snapshot!(output, @"
-    sidecar	vendor/sidecar
-    sidecar-docs	vendor/sidecar/docs
-    [EOF]
-    ");
-
-    let output = work_dir.complete_fish(["views", "fetch", "up"]);
-    insta::assert_snapshot!(output, @"
-    upstream	vendor/upstream
-    [EOF]
-    ");
-
-    let output = work_dir.complete_fish(["views", "status", "up"]);
-    insta::assert_snapshot!(output, @"
-    upstream	vendor/upstream
-    [EOF]
-    ");
-}
-
 #[test]
 fn test_alias_descriptions_in_completions() {
     let test_env = TestEnvironment::default();
@@ -1666,8 +1619,6 @@ fn test_template_alias() {
     builtin_op_log_node_ascii
     builtin_op_log_oneline
     builtin_op_log_redacted
-    builtin_views_tree
-    builtin_views_tree_detailed
     builtin_workspace_list
     commit_summary_separator
     default_commit_description

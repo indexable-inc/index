@@ -42,13 +42,20 @@ let
       hasOverride = overrides ? ${key};
       isRelative = node.locked.type or null == "path" && builtins.substring 0 1 node.locked.path != "/";
 
-      parentNode = allNodes.${getInputByPath lockFile.root node.parent};
-
       sourceInfo =
         if hasOverride then
           overrides.${key}.sourceInfo
         else if isRelative then
-          parentNode.sourceInfo
+          # lockFlake() resolves every relative input on every evaluation
+          # (it is a directory of its parent's tree, free to resolve) and
+          # records the tree it mounted in `overrides`. A relative node with
+          # no record means that resolution did not run for it. The tree
+          # could be invented here as parentNode.outPath + "/" + path, and
+          # once was; that is a second identity for the directory beside
+          # the subtree object lockFlake() mounts at its own store path, so
+          # the same input would evaluate at two outPaths depending on
+          # which road ran. Refuse instead.
+          throw "flake input '${key}' is a relative path but no tree was resolved for it; this is a bug in Nix"
         else
           # FIXME: remove obsolete node.info.
           # Note: lock file entries are always final.
@@ -56,11 +63,7 @@ let
 
       subdir = overrides.${key}.dir or node.locked.dir or "";
 
-      outPath =
-        if !hasOverride && isRelative then
-          parentNode.outPath + (if node.locked.path == "" then "" else "/" + node.locked.path)
-        else
-          sourceInfo.outPath + (if subdir == "" then "" else "/" + subdir);
+      outPath = sourceInfo.outPath + (if subdir == "" then "" else "/" + subdir);
 
       flake = import (outPath + "/flake.nix");
 

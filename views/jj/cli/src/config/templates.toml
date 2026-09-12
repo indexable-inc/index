@@ -47,8 +47,6 @@ concat(
 
 tag_list = 'format_commit_ref(self, "tag") ++ "\n"'
 
-views_tree = 'builtin_views_tree'
-
 workspace_list = 'builtin_workspace_list'
 
 op_summary = '''
@@ -96,28 +94,6 @@ builtin_config_list_detailed = '''
 label(if(overridden, "overridden"),
   format_config_item(self) ++ " # " ++ separate(" ", source, path) ++ "\n"
 )
-'''
-
-'format_views_tree_markers(view)' = '''
-if(view.tracked(),
-  concat(
-    if(view.ahead() > 0, label("ahead", " ⇡" ++ view.ahead())),
-    if(view.behind() > 0, label("behind", " ⇣" ++ view.behind())),
-  )
-)
-'''
-
-builtin_views_tree = '''
-label("name", name) ++ format_views_tree_markers(self)
-'''
-
-builtin_views_tree_detailed = '''
-label("name", name)
-++ " (" ++ label("path", path) ++ ") → "
-++ label("remote", remote)
-++ " [" ++ label("branch", branch) ++ "]"
-++ if(upstream_remote, " ⇠ " ++ label("upstream", upstream_remote))
-++ format_views_tree_markers(self)
 '''
 
 builtin_draft_commit_description = '''

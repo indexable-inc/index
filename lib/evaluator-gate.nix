@@ -4,7 +4,8 @@
 # fork-syntax island, and this file itself must stay parseable by every
 # evaluator: frozen syntax only, the same trick as nixpkgs' `lib/minver.nix`.
 #
-# Detection reads the `+ix.` suffix out of `builtins.nixVersion` instead of
+# Detection reads the `+ix` fork suffix (optionally followed by a revision)
+# out of `builtins.nixVersion` instead of
 # feature-detecting a fork-added builtin: a new builtin exists only in fork
 # builds the fleet is not running yet, so a `builtins ? ixVersion` gate would
 # reject every currently deployed evaluator until a nix upgrade rolls out
@@ -19,7 +20,7 @@
   after the check passes.
   */
   require = surface: value:
-    if builtins ? nixVersion && builtins.match ".*[+]ix[.].*" builtins.nixVersion != null
+    if builtins ? nixVersion && builtins.match ".*[+]ix([.].+)?" builtins.nixVersion != null
     then value
     else
       throw ''
@@ -28,9 +29,15 @@
         underscore digit separators) that this evaluator
         (Nix ${builtins.nixVersion or "unknown"}) cannot parse.
 
-        Stock Nix can still build the fork; install it, then re-run:
+        Stock Nix can still build the fork, but this flake cannot hand it to
+        you: the jj tree ABI archive the fork links lives in the ix
+        repository, which is not public. With ix repository access, install
+        it from there:
 
-            nix profile install github:indexable-inc/index#nix-ix
+            nix profile install github:indexable-inc/ix/warmed-main#nix-ix
+
+        Without that access there is no install route for the fork today, so
+        the surfaces behind this gate are team-only until one exists.
 
         The bootstrap surface stays stock-parseable by policy, enforced by
         `checks.<system>.stock-nix-parse-*` (index#3635).

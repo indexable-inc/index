@@ -13,7 +13,7 @@ defmodule IxMcp.Forge.Verdicts do
 
   `IxMcp.Forge.Runs` owns reading the reconciler's per-run `progress.json`
   records and pulling detail out of a gate's `log_tail`; it also documents
-  why `queue.json` and `ix forge dump` are the wrong instruments and how the
+  why `queue.json` and `jj forge dump` are the wrong instruments and how the
   read fails closed. This module is one of its two consumers: it sweeps by
   file mtime, because a record is rewritten when its status changes, so the
   mtime IS the moment the verdict was reached and a run that started two

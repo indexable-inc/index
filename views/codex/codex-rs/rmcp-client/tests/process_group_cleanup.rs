@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -85,21 +86,22 @@ async fn drop_kills_wrapper_process_group() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let child_pid_file = temp_dir.path().join("child.pid");
     let child_pid_file_str = child_pid_file.to_string_lossy().into_owned();
+    let wrapper = temp_dir.path().join("wrapper");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\nsleep 300 & child_pid=$!; echo \"$child_pid\" > \"$CHILD_PID_FILE\"; cat >/dev/null\n",
+    )?;
+    fs::set_permissions(wrapper, fs::Permissions::from_mode(0o755))?;
 
     let client = RmcpClient::new_stdio_client(
-        OsString::from("/bin/sh"),
-        vec![
-            OsString::from("-c"),
-            OsString::from(
-                "sleep 300 & child_pid=$!; echo \"$child_pid\" > \"$CHILD_PID_FILE\"; cat >/dev/null",
-            ),
-        ],
+        OsString::from("./wrapper"),
+        vec![],
         Some(HashMap::from([(
             OsString::from("CHILD_PID_FILE"),
             OsString::from(child_pid_file_str),
         )])),
         &[],
-        /*cwd*/ None,
+        Some(temp_dir.path().to_string_lossy().into_owned()),
         Arc::new(LocalStdioServerLauncher::new(std::env::current_dir()?)),
     )
     .await?;
@@ -150,7 +152,6 @@ async fn shutdown_kills_initialized_stdio_server_with_in_flight_operation() -> R
                 }
                 .boxed()
             }),
-            Box::new(|_| async { Ok(()) }.boxed()),
         )
         .await?;
 

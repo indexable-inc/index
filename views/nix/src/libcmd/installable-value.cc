@@ -1,4 +1,6 @@
 #include "nix/cmd/installable-value.hh"
+#include "nix/cmd/rust-eval-session.hh"
+#include "nix/expr/rust-eval-refusal.hh"
 #include "nix/expr/eval-cache.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 
@@ -18,16 +20,23 @@ ref<eval_cache::AttrCursor> InstallableValue::getCursor(EvalState & state)
     return getCursors(state).at(0);
 }
 
-static UsageError nonValueInstallable(Installable & installable)
+[[noreturn]] static void nonValueInstallable(Installable & installable)
 {
-    return UsageError("installable '%s' does not correspond to a Nix language value", installable.what());
+    // Value-inspection commands need a Rust value question of their own.
+    if (dynamic_cast<InstallableRustDerivation *>(&installable))
+        refuseWithAdvice(
+            refusalTokens::unsupported,
+            RefusingCommand::get(),
+            "This command needs a value handle, but received derivations: "
+            "value inspection is not implemented for this command.");
+    throw UsageError("installable '%s' does not correspond to a Nix language value", installable.what());
 }
 
 InstallableValue & InstallableValue::require(Installable & installable)
 {
     auto * castedInstallable = dynamic_cast<InstallableValue *>(&installable);
     if (!castedInstallable)
-        throw nonValueInstallable(installable);
+        nonValueInstallable(installable);
     return *castedInstallable;
 }
 
@@ -35,7 +44,7 @@ ref<InstallableValue> InstallableValue::require(ref<Installable> installable)
 {
     auto castedInstallable = installable.dynamic_pointer_cast<InstallableValue>();
     if (!castedInstallable)
-        throw nonValueInstallable(*installable);
+        nonValueInstallable(*installable);
     return ref{castedInstallable};
 }
 

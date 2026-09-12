@@ -27,24 +27,28 @@
     # there; extraPackages is a list option that concatenates across
     # modules, so restating them would put duplicate store paths on the
     # job PATH).
-    extraPackages = with pkgs; [
-      rustup # jobs run `rustup show` to pull the repo-pinned toolchain
+    extraPackages = [
+      pkgs.rustup # jobs run `rustup show` to pull the repo-pinned toolchain
       # DEVIATION from the pool-mode-v2 source, which did not bake sccache
       # (mise.toml pinned it, so it arrived with the seed snapshot's HOME):
       # baked here because the first live baml lanes on the platform
       # template died "sccache: command not found" before any
       # mise-installed copy existed. A HOME-installed mise shim still wins
       # on PATH order when present.
-      sccache
-      ninja # cmake generator some engine builds select
-      ruby # release-metadata packaging tests
-      go # sdkgen_go's build script shells out to gofmt
-      nodejs_22 # pyright runs on the PATH node
+      pkgs.sccache
+      pkgs.ninja # cmake generator some engine builds select
+      pkgs.ruby # release-metadata packaging tests
+      pkgs.go # sdkgen_go's build script shells out to gofmt
+      pkgs.nodejs_22 # pyright runs on the PATH node
       # musl leg: the full cross gcc, under the name setup-musl-cross
       # probes for (the thin musl libc wrapper links broken static-PIE
-      # binaries).
-      (writeShellScriptBin "musl-gcc" ''
-        exec ${pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc "$@"
+      # binaries). A symlink, not a wrapper script: nixpkgs' cc-wrapper
+      # resolves its compiler by an absolute path baked at build time, so
+      # the name it is invoked under changes nothing.
+      (pkgs.runCommand "musl-gcc" {__structuredAttrs = true;} ''
+        # shell
+        mkdir -p "$out/bin"
+        ln -s ${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc "$out/bin/musl-gcc"
       '')
     ];
 

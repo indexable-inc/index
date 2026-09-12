@@ -82,7 +82,6 @@ impl PendingInteractiveReplayState {
                 | AppCommand::ResolveElicitation { .. }
                 | AppCommand::RequestPermissionsResponse { .. }
                 | AppCommand::UserInputAnswer { .. }
-                | AppCommand::Shutdown
         )
     }
 
@@ -164,7 +163,6 @@ impl PendingInteractiveReplayState {
                     self.request_user_input_call_ids_by_turn_id.remove(id);
                 }
             }
-            AppCommand::Shutdown => self.clear(),
             _ => {}
         }
     }
@@ -597,6 +595,7 @@ mod tests {
                 turn_id: turn_id.to_string(),
                 item_id: call_id.to_string(),
                 questions: Vec::new(),
+                is_blocking: true,
                 auto_resolution_ms: None,
             },
         }
@@ -610,6 +609,7 @@ mod tests {
         ServerRequest::CommandExecutionRequestApproval {
             request_id: AppServerRequestId::Integer(2),
             params: CommandExecutionRequestApprovalParams {
+                kind: Default::default(),
                 thread_id: "thread-1".to_string(),
                 turn_id: turn_id.to_string(),
                 item_id: call_id.to_string(),
@@ -704,8 +704,12 @@ mod tests {
         assert_eq!(snapshot.events.len(), 1);
         assert!(matches!(
             snapshot.events.first(),
-            Some(ThreadBufferedEvent::Request(ServerRequest::ToolRequestUserInput { params, .. }))
-                if params.item_id == "call-1"
+            Some(ThreadBufferedEvent::Request(request))
+                if matches!(
+                    request.as_ref(),
+                    ServerRequest::ToolRequestUserInput { params, .. }
+                        if params.item_id == "call-1"
+                )
         ));
     }
 
@@ -740,7 +744,11 @@ mod tests {
             snapshot.events.iter().all(|event| {
                 !matches!(
                     event,
-                    ThreadBufferedEvent::Request(ServerRequest::ToolRequestUserInput { .. })
+                    ThreadBufferedEvent::Request(request)
+                        if matches!(
+                            request.as_ref(),
+                            ServerRequest::ToolRequestUserInput { .. }
+                        )
                 )
             }),
             "server-resolved request_user_input prompt should not replay on thread switch"
@@ -785,9 +793,11 @@ mod tests {
             snapshot.events.iter().all(|event| {
                 !matches!(
                     event,
-                    ThreadBufferedEvent::Request(
-                        ServerRequest::CommandExecutionRequestApproval { .. }
-                    )
+                    ThreadBufferedEvent::Request(request)
+                        if matches!(
+                            request.as_ref(),
+                            ServerRequest::CommandExecutionRequestApproval { .. }
+                        )
                 )
             }),
             "server-resolved exec approval prompt should not replay on thread switch"
@@ -812,8 +822,12 @@ mod tests {
         assert_eq!(snapshot.events.len(), 1);
         assert!(matches!(
             snapshot.events.first(),
-            Some(ThreadBufferedEvent::Request(ServerRequest::ToolRequestUserInput { params, .. }))
-                if params.item_id == "call-2"
+            Some(ThreadBufferedEvent::Request(request))
+                if matches!(
+                    request.as_ref(),
+                    ServerRequest::ToolRequestUserInput { params, .. }
+                        if params.item_id == "call-2"
+                )
         ));
     }
 
@@ -834,8 +848,12 @@ mod tests {
         assert_eq!(snapshot.events.len(), 1);
         assert!(matches!(
             snapshot.events.first(),
-            Some(ThreadBufferedEvent::Request(ServerRequest::ToolRequestUserInput { params, .. }))
-                if params.item_id == "call-2"
+            Some(ThreadBufferedEvent::Request(request))
+                if matches!(
+                    request.as_ref(),
+                    ServerRequest::ToolRequestUserInput { params, .. }
+                        if params.item_id == "call-2"
+                )
         ));
     }
 
@@ -871,8 +889,12 @@ mod tests {
         assert!(snapshot.events.iter().all(|event| {
             !matches!(
                 event,
-                ThreadBufferedEvent::Request(ServerRequest::CommandExecutionRequestApproval { .. })
-                    | ThreadBufferedEvent::Request(ServerRequest::FileChangeRequestApproval { .. })
+                ThreadBufferedEvent::Request(request)
+                    if matches!(
+                        request.as_ref(),
+                        ServerRequest::CommandExecutionRequestApproval { .. }
+                            | ServerRequest::FileChangeRequestApproval { .. }
+                    )
             )
         }));
     }
@@ -937,7 +959,11 @@ mod tests {
         assert!(store.snapshot().events.iter().all(|event| {
             !matches!(
                 event,
-                ThreadBufferedEvent::Request(ServerRequest::CommandExecutionRequestApproval { .. })
+                ThreadBufferedEvent::Request(request)
+                    if matches!(
+                        request.as_ref(),
+                        ServerRequest::CommandExecutionRequestApproval { .. }
+                    )
             )
         }));
     }

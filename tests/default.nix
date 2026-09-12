@@ -4234,8 +4234,15 @@
         message = "base profile should route Nix through cache.ix.dev before fallback substituters";
       }
       {
-        assertion = base.config.nix.package == repoPackages.nix-ix;
-        message = "base images must use IX's wasm-enabled Nix so ix apply can evaluate the default ix2nix-wasm scaffold";
+        # Pinned to the INJECTED binding, not to `repoPackages.nix-ix`: the
+        # guest Nix is chosen once, at `import ./lib { nixPackage = ...; }`,
+        # so a consumer that hands in its own assembled fork must see that
+        # one reach the image. Comparing against index's own package set
+        # would instead pin the module to a reach-around this profile
+        # deliberately no longer has, and would pass for a build that
+        # ignored the injection.
+        assertion = base.config.nix.package == ix.nixPackage;
+        message = "base images must use the injected wasm-enabled Nix (ix.nixPackage) so ix apply can evaluate the default ix2nix-wasm scaffold";
       }
       {
         assertion = let
@@ -7710,6 +7717,10 @@
     inherit lib pkgs ix;
   };
 
+  cargoUnitBuildScriptClosureTest = import ./cargo-unit-build-script-closure.nix {
+    inherit lib pkgs ix;
+  };
+
   # Guard for `ix.dev.profiles.rust` being reachable from a consumer's module.
   # Eval-only; forced by the `eval` aggregate below.
   devProfilesRustTest = import ./dev-profiles-rust.nix {
@@ -7756,6 +7767,7 @@ in {
   imageRegistryPin = imageRegistryPinTest;
   dev-profile-fortify = devProfileFortifyTest.premiseStillHolds;
   cargo-unit-dylib = cargoUnitDylibTest;
+  cargo-unit-build-script-closure = cargoUnitBuildScriptClosureTest;
 
   # Aggregate. Pulls every group test into one derivation so
   # `nix flake check` covers the whole suite.

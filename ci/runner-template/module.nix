@@ -47,27 +47,27 @@
   # runner UNIT's PATH - on image-booted template guests
   # /run/current-system/sw/bin is empty (ix platform, see https://github.com/indexable-inc/ix-runners/issues/1), so
   # systemPackages alone never reaches job steps.
-  baseUserland = with pkgs; [
-    bashInteractive
-    coreutils
-    git
-    gnutar
-    gzip
-    findutils
-    gnugrep
-    gnused
-    gawk
-    which
-    file
-    curl
-    wget
-    jq
-    rsync
-    unzip
-    zip
-    zstd
-    xz
-    bzip2
+  baseUserland = [
+    pkgs.bashInteractive
+    pkgs.coreutils
+    pkgs.git
+    pkgs.gnutar
+    pkgs.gzip
+    pkgs.findutils
+    pkgs.gnugrep
+    pkgs.gnused
+    pkgs.gawk
+    pkgs.which
+    pkgs.file
+    pkgs.curl
+    pkgs.wget
+    pkgs.jq
+    pkgs.rsync
+    pkgs.unzip
+    pkgs.zip
+    pkgs.zstd
+    pkgs.xz
+    pkgs.bzip2
   ];
 
   # nix-ld exports these through environment.sessionVariables, which rides
@@ -145,91 +145,101 @@ in {
       shell = pkgs.bashInteractive;
     };
 
-    systemd.tmpfiles.rules = [
-      # Root-owned drop directory: the reconcile writes the credential here
-      # over the platform's file API, and only the consume step below (root)
-      # may move it. Job code must never be able to read a fresh one.
-      "d /var/lib/ix-runner 0700 root root -"
-    ];
-
-    systemd.paths.ix-runner = {
-      description = "watch for a single-job runner credential";
-      wantedBy = ["multi-user.target"];
-      pathConfig.PathExists = jitconfigPath;
-    };
-
-    systemd.services.ix-runner = {
-      description = "GitHub Actions runner (single JIT job)";
-      wants = ["network-online.target"];
-      after = [
-        "network.target"
-        "network-online.target"
+    systemd = {
+      tmpfiles.rules = [
+        # Root-owned drop directory: the reconcile writes the credential here
+        # over the platform's file API, and only the consume step below (root)
+        # may move it. Job code must never be able to read a fresh one.
+        "d /var/lib/ix-runner 0700 root root -"
       ];
 
-      environment =
-        {
-          HOME = "/home/runner";
-          # Where the runner keeps _diag and its default _work folder; the
-          # nixpkgs runner honors it, which is what lets the package run from
-          # the read-only store.
-          RUNNER_ROOT = "/var/lib/ix-runner-state";
-        }
-        // nixLdEnvironment
-        // cfg.jobEnvironment;
-
-      path = baseUserland ++ cfg.extraPackages ++ [config.nix.package];
-
-      serviceConfig = {
-        User = "runner";
-        Group = "users";
-        StateDirectory = "ix-runner-state";
-        StateDirectoryMode = "0700";
-        RuntimeDirectory = "ix-runner";
-        WorkingDirectory = "/var/lib/ix-runner-state";
-
-        # CONSUME the credential before anything runs: move it out of the
-        # watched location so a spent blob can never ride into a seed
-        # snapshot and trigger a ghost start on restore. Root ("+"): the
-        # drop directory is deliberately unreadable to the runner user.
-        ExecStartPre = "+${pkgs.writeShellScript "ix-runner-consume" ''
-          set -euo pipefail
-          install -m 0400 -o runner ${jitconfigPath} /run/ix-runner/jitconfig
-          rm ${jitconfigPath}
-        ''}";
-        # The blob rides argv, visible in-guest via /proc/PID/cmdline.
-        # Accepted: the machine is single-tenant, and by the time job code
-        # runs here the single-use credential is already spent.
-        ExecStart = pkgs.writeShellScript "ix-runner-run" ''
-          set -euo pipefail
-          exec ${runnerPackage}/bin/Runner.Listener run --jitconfig "$(< /run/ix-runner/jitconfig)"
-        '';
-        # One job, one life. The reconcile deletes the machine once the
-        # registration disappears; nothing restarts here.
-        Restart = "no";
-
-        # The kernel OOM-killing one compiler process must not kill the
-        # runner with it: the job must FAIL on GitHub, not hang as a zombie
-        # the reconcile cannot distinguish from work.
-        OOMPolicy = "continue";
-        # Hosted-runner parity: jobs get 65536 there; systemd defaults 1024.
-        LimitNOFILE = 1048576;
-        UMask = "0022";
+      paths.ix-runner = {
+        description = "watch for a single-job runner credential";
+        wantedBy = ["multi-user.target"];
+        pathConfig.PathExists = jitconfigPath;
       };
-    };
 
-    # /tmp is a tmpfs sized off BOOT-time RAM (1.5G observed, 100% full
-    # under real jobs) and closure tmpfs settings do not reach image boots -
-    # a live remount does (ix platform, see https://github.com/indexable-inc/ix-runners/issues/2). 16G virtual is safe:
-    # tmpfs pages only cost when used, and virtio-mem plugs RAM on demand.
-    systemd.services.ix-runner-tmp-resize = {
-      description = "resize the boot-path /tmp tmpfs";
-      wantedBy = ["multi-user.target"];
-      before = ["ix-runner.service"];
-      unitConfig.ConditionPathIsMountPoint = "/tmp";
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        ExecStart = "${pkgs.util-linux}/bin/mount -o remount,size=16G /tmp";
+      services.ix-runner = {
+        description = "GitHub Actions runner (single JIT job)";
+        wants = ["network-online.target"];
+        after = [
+          "network.target"
+          "network-online.target"
+        ];
+
+        environment =
+          {
+            HOME = "/home/runner";
+            # Where the runner keeps _diag and its default _work folder; the
+            # nixpkgs runner honors it, which is what lets the package run from
+            # the read-only store.
+            RUNNER_ROOT = "/var/lib/ix-runner-state";
+          }
+          // nixLdEnvironment
+          // cfg.jobEnvironment;
+
+        path = baseUserland ++ cfg.extraPackages ++ [config.nix.package];
+
+        serviceConfig = {
+          User = "runner";
+          Group = "users";
+          StateDirectory = "ix-runner-state";
+          StateDirectoryMode = "0700";
+          RuntimeDirectory = "ix-runner";
+          WorkingDirectory = "/var/lib/ix-runner-state";
+
+          # CONSUME the credential before anything runs: move it out of the
+          # watched location so a spent blob can never ride into a seed
+          # snapshot and trigger a ghost start on restore. Root ("+"): the
+          # drop directory is deliberately unreadable to the runner user, and
+          # the copy stays root-only, because systemd (not the runner) reads
+          # it. Three commands, no shell: each must succeed for the next to
+          # run, which is the `set -e` a script would have spelled. The sed
+          # turns the blob into the one-line environment file ExecStart reads.
+          ExecStartPre = [
+            "+${pkgs.coreutils}/bin/install -m 0400 ${jitconfigPath} /run/ix-runner/jitconfig"
+            "+${pkgs.gnused}/bin/sed -i 's/^/JITCONFIG=/' /run/ix-runner/jitconfig"
+            "+${pkgs.coreutils}/bin/rm ${jitconfigPath}"
+          ];
+          # The dash is load-bearing: systemd loads environment files before
+          # EVERY command of the unit, the first ExecStartPre included, and the
+          # file does not exist until that command has run. Without it the
+          # unit fails on "Failed to load environment files" before install
+          # ever runs. By ExecStart the file exists, or install has already
+          # failed the unit.
+          EnvironmentFile = "-/run/ix-runner/jitconfig";
+          # The blob rides argv, visible in-guest via /proc/PID/cmdline.
+          # Accepted: the machine is single-tenant, and by the time job code
+          # runs here the single-use credential is already spent.
+          ExecStart = "${runnerPackage}/bin/Runner.Listener run --jitconfig \${JITCONFIG}";
+          # One job, one life. The reconcile deletes the machine once the
+          # registration disappears; nothing restarts here.
+          Restart = "no";
+
+          # The kernel OOM-killing one compiler process must not kill the
+          # runner with it: the job must FAIL on GitHub, not hang as a zombie
+          # the reconcile cannot distinguish from work.
+          OOMPolicy = "continue";
+          # Hosted-runner parity: jobs get 65536 there; systemd defaults 1024.
+          LimitNOFILE = 1048576;
+          UMask = "0022";
+        };
+      };
+
+      # /tmp is a tmpfs sized off BOOT-time RAM (1.5G observed, 100% full
+      # under real jobs) and closure tmpfs settings do not reach image boots -
+      # a live remount does (ix platform, see https://github.com/indexable-inc/ix-runners/issues/2). 16G virtual is safe:
+      # tmpfs pages only cost when used, and virtio-mem plugs RAM on demand.
+      services.ix-runner-tmp-resize = {
+        description = "resize the boot-path /tmp tmpfs";
+        wantedBy = ["multi-user.target"];
+        before = ["ix-runner.service"];
+        unitConfig.ConditionPathIsMountPoint = "/tmp";
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = "${pkgs.util-linux}/bin/mount -o remount,size=16G /tmp";
+        };
       };
     };
 
@@ -260,101 +270,101 @@ in {
       # nix-ld module already concatenates in on its own. The cost is image
       # closure size only; the list dies when nixpkgs#354513 (nix-ld
       # resolves against the whole system closure) lands.
-      libraries = with pkgs; [
+      libraries = [
         # Core toolchain and compression
-        libgcc
-        libxcrypt
-        libxcrypt-legacy
-        gmp
-        libelf
+        pkgs.libgcc
+        pkgs.libxcrypt
+        pkgs.libxcrypt-legacy
+        pkgs.gmp
+        pkgs.libelf
         # Crypto, TLS, network
-        expat
-        libgcrypt
-        libgpg-error
-        krb5
+        pkgs.expat
+        pkgs.libgcrypt
+        pkgs.libgpg-error
+        pkgs.krb5
         # System plumbing
-        dbus
-        libcap
-        libusb1
-        fuse # AppImages
-        e2fsprogs
-        icu
+        pkgs.dbus
+        pkgs.libcap
+        pkgs.libusb1
+        pkgs.fuse # AppImages
+        pkgs.e2fsprogs
+        pkgs.icu
         # dotnet-based tools (the Actions runner itself, omnisharp class)
-        lttng-ust
-        libsecret
+        pkgs.lttng-ust
+        pkgs.libsecret
         # X11
-        libx11
-        libxext
-        libxcomposite
-        libxdamage
-        libxfixes
-        libxrandr
-        libxcursor
-        libxi
-        libxinerama
-        libxrender
-        libxscrnsaver
-        libxtst
-        libxt
-        libxmu
-        libxft
-        libsm
-        libice
-        libxshmfence
-        libxxf86vm
-        libxcb
-        libxcb-util
-        libxcb-wm
-        libxcb-image
-        libxcb-keysyms
-        libxcb-render-util
-        libxcb-cursor
-        libxkbcommon
+        pkgs.libx11
+        pkgs.libxext
+        pkgs.libxcomposite
+        pkgs.libxdamage
+        pkgs.libxfixes
+        pkgs.libxrandr
+        pkgs.libxcursor
+        pkgs.libxi
+        pkgs.libxinerama
+        pkgs.libxrender
+        pkgs.libxscrnsaver
+        pkgs.libxtst
+        pkgs.libxt
+        pkgs.libxmu
+        pkgs.libxft
+        pkgs.libsm
+        pkgs.libice
+        pkgs.libxshmfence
+        pkgs.libxxf86vm
+        pkgs.libxcb
+        pkgs.libxcb-util
+        pkgs.libxcb-wm
+        pkgs.libxcb-image
+        pkgs.libxcb-keysyms
+        pkgs.libxcb-render-util
+        pkgs.libxcb-cursor
+        pkgs.libxkbcommon
         # Graphics and rendering
-        libGL
-        libGLU
-        vulkan-loader
-        mesa
+        pkgs.libGL
+        pkgs.libGLU
+        pkgs.vulkan-loader
+        pkgs.mesa
         # libgbm was split out of mesa in nixpkgs; chromium's headless shell
         # dlopens libgbm.so.1.
-        libgbm
-        libdrm
-        libva
-        libvdpau
-        pixman
-        libjpeg
-        libpng
-        libtiff
-        librsvg
-        fontconfig
-        freetype
-        harfbuzz
-        fribidi
-        gdk-pixbuf
+        pkgs.libgbm
+        pkgs.libdrm
+        pkgs.libva
+        pkgs.libvdpau
+        pkgs.pixman
+        pkgs.libjpeg
+        pkgs.libpng
+        pkgs.libtiff
+        pkgs.librsvg
+        pkgs.fontconfig
+        pkgs.freetype
+        pkgs.harfbuzz
+        pkgs.fribidi
+        pkgs.gdk-pixbuf
         # GUI toolkits (electron, prebuilt GUI test tools)
-        glib
-        gtk3
-        pango
-        cairo
-        atk
-        at-spi2-atk
-        at-spi2-core
-        gsettings-desktop-schemas
-        libnotify
+        pkgs.glib
+        pkgs.gtk3
+        pkgs.pango
+        pkgs.cairo
+        pkgs.atk
+        pkgs.at-spi2-atk
+        pkgs.at-spi2-core
+        pkgs.gsettings-desktop-schemas
+        pkgs.libnotify
         # Playwright-downloaded chromium/firefox/webkit runtime set
-        nss
-        nspr
-        cups
-        alsa-lib
+        pkgs.nss
+        pkgs.nspr
+        pkgs.cups
+        pkgs.alsa-lib
         # Audio and media
-        libpulseaudio
-        pipewire
-        flac
-        libvorbis
-        libogg
-        speex
-        libsamplerate
-        ffmpeg
+        pkgs.libpulseaudio
+        pkgs.pipewire
+        pkgs.flac
+        pkgs.libvorbis
+        pkgs.libogg
+        pkgs.speex
+        pkgs.libsamplerate
+        pkgs.ffmpeg
       ];
     };
     services.envfs.enable = true;

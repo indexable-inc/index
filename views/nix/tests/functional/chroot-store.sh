@@ -67,7 +67,9 @@ nix --store "$TEST_ROOT/x" store info --json | jq -e '.trusted'
 if canUseSandbox; then
 
     flakeDir=$TEST_ROOT/flake
-    mkdir -p "$flakeDir"
+    # A plain directory is not a flake source any more: `path:` serves store
+    # objects only (src/libfetchers/path.cc).
+    jjFlakeDir "$flakeDir"
 
     cat > "$flakeDir"/flake.nix <<EOF
 {
@@ -82,7 +84,7 @@ EOF
     TODO_NixOS
     requiresUnprivilegedUserNamespaces
 
-    outPath=$(nix build --print-out-paths --no-link --sandbox-paths '/nix? /bin? /lib? /lib64? /usr?' --store "$TEST_ROOT/x" path:"$flakeDir")
+    outPath=$(nix build --print-out-paths --no-link --sandbox-paths '/nix? /bin? /lib? /lib64? /usr?' --store "$TEST_ROOT/x" "jj+file://$flakeDir")
 
     [[ $outPath =~ ^/nix2/store/.*-simple$ ]]
 

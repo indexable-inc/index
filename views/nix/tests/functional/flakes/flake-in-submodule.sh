@@ -60,11 +60,14 @@ flakeref=git+file://$rootRepo\?submodules=1\&dir=submodule
 # The flake can access content outside of the submodule
 [[ $(nix eval --json "$flakeref#root" ) = '"expression in root repo"' ]]
 
-# Check that dirtying a submodule makes the entire thing dirty.
+# A submodule is fetched at the revision the superproject records, so editing
+# its working tree does not change what the flake is, and does not take the
+# superproject's own revision away either.
 [[ $(nix flake metadata --json "$flakeref" | jq -r .locked.rev) != null ]]
 echo '"foo"' > "$rootRepo"/submodule/sub.nix
-[[ $(_NIX_TEST_BARF_ON_UNCACHEABLE='' nix eval --json "$flakeref#sub" ) = '"foo"' ]]
-[[ $(_NIX_TEST_BARF_ON_UNCACHEABLE='' nix flake metadata --json "$flakeref" | jq -r .locked.rev) = null ]]
+[[ $(nix eval --json "$flakeref#sub" ) = '"expression in submodule"' ]]
+[[ $(nix flake metadata --json "$flakeref" | jq -r .locked.rev) != null ]]
+git -C "$rootRepo"/submodule checkout -- sub.nix
 
 # Test that `nix flake metadata` parses `submodule` correctly.
 cat > "$rootRepo"/flake.nix <<EOF
@@ -105,9 +108,15 @@ cat > "$otherRepo"/flake.nix <<EOF
 }
 EOF
 git -C "$otherRepo" add flake.nix
+git -C "$otherRepo" commit -m "Add flake.nix"
 
 # The first call should refetch the root repo...
-expectStderr 0 nix eval --raw "$otherRepo#foo" -vvvvv | grepQuiet "refetching"
+# It also has to produce otherRepo's lock file, which the assertion below
+# reads. That write goes into otherRepo's own Git source, so it is only
+# allowed as part of a commit. Committing is also what leaves otherRepo with a
+# revision for the second call to fetch it by.
+expectStderr 0 nix eval --raw "$otherRepo#foo" --commit-lock-file -vvvvv | grepQuiet "refetching"
+[[ -z "$(git -C "$otherRepo" status --porcelain)" ]]
 
 [[ $(jq .nodes.root_2.locked.submodules "$otherRepo/flake.lock") == true ]]
 
@@ -134,6 +143,10 @@ git -C "$rootRepo" commit -m "Add subRepo input"
 (
   cd "$rootRepo"
   # The submodule must be locked to the relative path,
-  # _not_ the absolute path:
-  [[ $(nix flake metadata --json | jq -r .locks.nodes.subRepo.locked.url) = "file:./submodule" ]]
+  # _not_ the absolute path. rootRepo now has a real input, so producing that
+  # lock writes flake.lock into rootRepo's own Git source and needs the commit
+  # flag; `git commit`'s own output is captured by the fetcher, so it cannot
+  # reach the JSON on stdout.
+  [[ $(nix flake metadata --json --commit-lock-file | jq -r .locks.nodes.subRepo.locked.url) = "file:./submodule" ]]
+  [[ -z "$(git status --porcelain)" ]]
 )

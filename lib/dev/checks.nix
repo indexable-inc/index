@@ -20,7 +20,7 @@
     # source that legitimately spans it; every other check takes a scoped
     # fileset (#3896).
     # astlog-ignore: no-whole-repo-fileset-source
-    fileset = fs.gitTracked paths.root;
+    fileset = paths.root;
   };
 
   # Every tracked `.nix` outside the tests/ fork-syntax island and outside
@@ -36,7 +36,7 @@
   # under the gate when #9905 moved the forks into views/ and turned main
   # red (run 30997137503).
   stockParseFileset = fs.difference (
-    fs.intersection (fs.gitTracked paths.root) (fs.fileFilter (file: file.hasExt "nix") paths.root)
+    fs.fileFilter (file: file.hasExt "nix") paths.root
   ) (fs.unions ([(paths.root + "/tests")] ++ viewTestDirs));
 
   # The views themselves stay in the gate: bootstrap builds

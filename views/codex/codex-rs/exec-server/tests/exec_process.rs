@@ -9,31 +9,47 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_exec_server::Environment;
 use codex_exec_server::ExecBackend;
+#[cfg(unix)]
+use codex_exec_server::ExecEnvPolicy;
 use codex_exec_server::ExecOutputStream;
 use codex_exec_server::ExecParams;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEvent;
-#[cfg(target_os = "linux")]
+#[cfg(any(unix, windows))]
 use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::ProcessId;
 use codex_exec_server::ProcessSignal;
 use codex_exec_server::ReadResponse;
+#[cfg(unix)]
+use codex_exec_server::ShellInfo;
+#[cfg(unix)]
+use codex_exec_server::ShellSnapshotRequest;
 use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteStatus;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
+use codex_network_proxy::NetworkProxyConfig;
+#[cfg(unix)]
+use codex_network_proxy::RemoteNetworkProxyConfig;
+#[cfg(unix)]
+use codex_network_proxy::RemoteNetworkProxyLaunchConfig;
+#[cfg(unix)]
+use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
+use codex_protocol::config_types::WindowsSandboxLevel;
+#[cfg(unix)]
 use codex_protocol::models::PermissionProfile;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use codex_protocol::permissions::FileSystemAccessMode;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use codex_protocol::permissions::FileSystemPath;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use codex_protocol::permissions::FileSystemSandboxEntry;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use codex_protocol::permissions::FileSystemSandboxPolicy;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use codex_protocol::permissions::FileSystemSpecialPath;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -86,14 +102,458 @@ async fn create_process_context(use_remote: bool) -> Result<ProcessContext> {
     }
 }
 
+#[cfg(unix)]
+#[test_case(false, false, false, false, "bash"; "local_pipe")]
+#[test_case(false, true, false, false, "bash"; "local_tty")]
+#[test_case(true, false, false, false, "bash"; "remote_pipe")]
+#[test_case(true, true, false, false, "bash"; "remote_tty")]
+#[test_case(true, false, true, false, "bash"; "remote_sandbox")]
+#[test_case(false, false, false, false, "sh"; "local_sh_pipe")]
+#[test_case(false, false, false, true, "bash"; "local_bash_env")]
+#[test_case(true, false, false, true, "bash"; "remote_bash_env")]
+#[cfg_attr(
+    target_os = "macos",
+    test_case(false, false, false, false, "zsh"; "local_zsh_pipe")
+)]
+#[cfg_attr(
+    target_os = "macos",
+    test_case(false, false, false, true, "zsh"; "local_zshenv")
+)]
+#[cfg_attr(
+    target_os = "macos",
+    test_case(true, false, false, true, "zsh"; "remote_zshenv")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Serialize tests that launch a real exec-server process through the full CLI.
+#[serial_test::serial(remote_exec_server)]
+async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
+    use_remote: bool,
+    tty: bool,
+    use_sandbox: bool,
+    automatic_startup: bool,
+    shell_name: &str,
+) -> Result<()> {
+    if use_sandbox
+        && let Some(warning) =
+            codex_sandboxing::system_bwrap_warning(&PermissionProfile::read_only())
+    {
+        eprintln!("skipping sandbox test: {warning}");
+        return Ok(());
+    }
+    let context = create_process_context(use_remote).await?;
+    let home = TempDir::new()?;
+    let cwd = PathUri::from_host_native_path(home.path())?;
+    let (shell_path, profile_name) = match shell_name {
+        "bash" if automatic_startup => ("/bin/bash", ".bash-env"),
+        "bash" => ("/bin/bash", ".bashrc"),
+        "sh" => ("/bin/sh", ".snapshot-env"),
+        "zsh" if automatic_startup => ("/bin/zsh", ".zshenv"),
+        "zsh" => ("/bin/zsh", ".zshrc"),
+        name => anyhow::bail!("unsupported test shell {name}"),
+    };
+    let profile_path = home.path().join(profile_name);
+    let profile_path_entry = home.path().join("profile-bin");
+    let runtime_path_entry = home.path().join("runtime-bin");
+    let padding = if !use_remote && !tty && shell_name == "bash" {
+        format!(
+            "snapshot_padding() {{ printf '%s' '{}'; }}\n",
+            "🦀".repeat(20_000)
+        )
+    } else {
+        String::new()
+    };
+    let shadowed_builtins = if shell_name == "sh" {
+        ""
+    } else {
+        "unset() { exit 41; }\nbuiltin() { :; }\n"
+    };
+    std::fs::write(
+        &profile_path,
+        format!(
+            "printf x >> \"$HOME/captures\"\nexport PATH=\"$HOME/profile-bin:/usr/bin:/bin\"\nexport PROFILE_ALLOWED=profile\nexport PROFILE_SECRET=secret\nexport PROFILE_DENIED=denied\nprofile_helper() {{ printf helper; }}\n{shadowed_builtins}{padding}"
+        ),
+    )?;
+    if shell_name == "zsh" && automatic_startup {
+        std::fs::write(
+            home.path().join(".zshrc"),
+            "export PATH=\"$HOME/profile-bin:/usr/bin:/bin\"\n",
+        )?;
+    }
+    let mut configured_environment = HashMap::from([(
+        "HOME".to_string(),
+        home.path().to_string_lossy().into_owned(),
+    )]);
+    if shell_name == "sh" {
+        configured_environment.insert(
+            "ENV".to_string(),
+            profile_path.to_string_lossy().into_owned(),
+        );
+    }
+    if shell_name == "bash" && automatic_startup {
+        configured_environment.insert(
+            "BASH_ENV".to_string(),
+            profile_path.to_string_lossy().into_owned(),
+        );
+    }
+    let policy = ExecEnvPolicy {
+        inherit: ShellEnvironmentPolicyInherit::All,
+        ignore_default_excludes: false,
+        exclude: vec!["PROFILE_DENIED".to_string()],
+        r#set: configured_environment,
+        include_only: vec![
+            "BASH_ENV".to_string(),
+            "ENV".to_string(),
+            "HOME".to_string(),
+            "PATH".to_string(),
+            "PROFILE_*".to_string(),
+        ],
+    };
+    let (command_prefix, expected_prefix) = if shell_name == "sh" {
+        ("", "")
+    } else {
+        ("profile_helper; ", "helper")
+    };
+    let command = format!(
+        "export PATH='{}':\"$PATH\"; {command_prefix}printf '|%s|%s|%s|%s|%s|%s' \"$PROFILE_ALLOWED\" \"${{PROFILE_SECRET-missing}}\" \"${{PROFILE_DENIED-missing}}\" \"$PATH\" \"${{__CODEX_SHELL_SNAPSHOT_STATE_0-missing}}\" \"${{__CODEX_SHELL_SNAPSHOT_STATE_1-missing}}\"",
+        runtime_path_entry.display(),
+    );
+    let expected_stdout = format!(
+        "{expected_prefix}|profile|missing|missing|{}:{}:/usr/bin:/bin|missing|missing",
+        runtime_path_entry.display(),
+        profile_path_entry.display(),
+    );
+
+    for attempt in 0..2 {
+        let started = context
+            .backend
+            .start(ExecParams {
+                metadata: Default::default(),
+                process_id: ProcessId::from(format!("snapshot-{attempt}")),
+                argv: vec![shell_path.to_string(), "-lc".to_string(), command.clone()],
+                cwd: cwd.clone(),
+                env_policy: Some(policy.clone()),
+                shell_snapshot: Some(ShellSnapshotRequest {
+                    scope_id: "attachment-1".to_string(),
+                    shell: ShellInfo {
+                        name: shell_name.to_string(),
+                        path: shell_path.to_string(),
+                    },
+                }),
+                env: HashMap::new(),
+                tty,
+                pipe_stdin: false,
+                arg0: None,
+                sandbox: (use_sandbox && attempt == 0).then(|| {
+                    FileSystemSandboxContext::from_permission_profile_with_cwd(
+                        PermissionProfile::read_only(),
+                        cwd.clone(),
+                    )
+                }),
+                enforce_managed_network: false,
+                managed_network: None,
+                network_proxy: None,
+            })
+            .await?;
+        let (stdout, stderr, status, closed) =
+            collect_process_output_from_events(started.process).await?;
+        assert_eq!(
+            (stdout, stderr, status, closed),
+            (expected_stdout.clone(), String::new(), Some(0), true,)
+        );
+    }
+
+    assert_eq!(std::fs::read_to_string(home.path().join("captures"))?, "x");
+    if let Some(server) = context._server {
+        assert!(!server.codex_home().join("shell_snapshots").exists());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(remote_exec_server)]
+async fn shell_snapshot_v2_remote_managed_proxy_uses_prepared_execution_context() -> Result<()> {
+    let context = create_process_context(/*use_remote*/ true).await?;
+    let home = TempDir::new()?;
+    let cwd = PathUri::from_host_native_path(home.path())?;
+    std::fs::write(
+        home.path().join(".bashrc"),
+        "printf '%s\\n' \"$HTTP_PROXY\" >> \"$HOME/captures\"\ntest \"$CODEX_NETWORK_PROXY_ACTIVE\" = 1 || exit 41\nexport PROFILE_ALLOWED=profile\nprofile_helper() { printf helper; }\n",
+    )?;
+    let policy = ExecEnvPolicy {
+        inherit: ShellEnvironmentPolicyInherit::All,
+        ignore_default_excludes: false,
+        exclude: Vec::new(),
+        r#set: HashMap::from([(
+            "HOME".to_string(),
+            home.path().to_string_lossy().into_owned(),
+        )]),
+        include_only: vec![
+            "HOME".to_string(),
+            "PATH".to_string(),
+            "PROFILE_*".to_string(),
+        ],
+    };
+    let proxy_config = RemoteNetworkProxyConfig::from_effective_config(&NetworkProxyConfig {
+        enabled: true,
+        ..NetworkProxyConfig::default()
+    })?;
+    let mut proxy_addresses = Vec::new();
+
+    for attempt in 0..2 {
+        let started = context
+            .backend
+            .start(ExecParams {
+                metadata: Default::default(),
+                process_id: ProcessId::from(format!("managed-snapshot-{attempt}")),
+                argv: vec![
+                    "/bin/bash".to_string(),
+                    "-lc".to_string(),
+                    "profile_helper; printf '|%s|%s|%s' \"$PROFILE_ALLOWED\" \"$CODEX_NETWORK_PROXY_ACTIVE\" \"$HTTP_PROXY\"".to_string(),
+                ],
+                cwd: cwd.clone(),
+                env_policy: Some(policy.clone()),
+                shell_snapshot: Some(ShellSnapshotRequest {
+                    scope_id: "managed-attachment".to_string(),
+                    shell: ShellInfo {
+                        name: "bash".to_string(),
+                        path: "/bin/bash".to_string(),
+                    },
+                }),
+                env: HashMap::new(),
+                tty: false,
+                pipe_stdin: false,
+                arg0: None,
+                sandbox: None,
+                enforce_managed_network: true,
+                managed_network: None,
+                network_proxy: Some(
+                    RemoteNetworkProxyLaunchConfig::new(proxy_config.clone()).for_execution(
+                        "remote-environment".to_string(),
+                        format!("managed-snapshot-{attempt}"),
+                    ),
+                ),
+            })
+            .await?;
+        let (stdout, stderr, status, closed) =
+            collect_process_output_from_events(started.process).await?;
+        let proxy_address = stdout
+            .strip_prefix("helper|profile|1|")
+            .context("snapshot should restore profile functions and live proxy state")?;
+        assert!(proxy_address.starts_with("http://127.0.0.1:"));
+        assert_eq!((stderr, status, closed), (String::new(), Some(0), true));
+        proxy_addresses.push(proxy_address.to_string());
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("captures"))?,
+        format!("{}\n", proxy_addresses[0])
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test_case(false, false, "bash", 1; "local_pipe_recovery")]
+#[test_case(false, true, "bash", 1; "local_tty_recovery")]
+#[test_case(true, false, "bash", 1; "remote_pipe_recovery")]
+#[test_case(true, true, "bash", 1; "remote_tty_recovery")]
+#[test_case(false, false, "bash", 3; "local_retry_budget_exhausted")]
+#[test_case(true, false, "bash", 3; "remote_retry_budget_exhausted")]
+#[cfg_attr(target_os = "macos", test_case(false, false, "zsh", 1; "local_zsh_recovery"))]
+#[cfg_attr(target_os = "macos", test_case(true, false, "zsh", 1; "remote_zsh_recovery"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(remote_exec_server)]
+async fn shell_snapshot_v2_capture_failure_falls_back_and_retries(
+    use_remote: bool,
+    tty: bool,
+    shell_name: &str,
+    failures_before_repair: usize,
+) -> Result<()> {
+    if use_remote
+        && let Some(warning) =
+            codex_sandboxing::system_bwrap_warning(&PermissionProfile::workspace_write())
+    {
+        eprintln!("skipping sandbox test: {warning}");
+        return Ok(());
+    }
+    let context = create_process_context(use_remote).await?;
+    let home = TempDir::new()?;
+    let cwd = PathUri::from_host_native_path(home.path())?;
+    let (shell_path, profile_name) = match shell_name {
+        "bash" => ("/bin/bash", ".bashrc"),
+        "zsh" => ("/bin/zsh", ".zshrc"),
+        name => anyhow::bail!("unsupported test shell {name}"),
+    };
+    std::fs::write(
+        home.path().join(profile_name),
+        "printf x >> \"$HOME/captures\"\nexit 7\n",
+    )?;
+    let policy = ExecEnvPolicy {
+        inherit: ShellEnvironmentPolicyInherit::All,
+        ignore_default_excludes: false,
+        exclude: Vec::new(),
+        r#set: HashMap::from([(
+            "HOME".to_string(),
+            home.path().to_string_lossy().into_owned(),
+        )]),
+        include_only: vec!["HOME".to_string(), "PATH".to_string()],
+    };
+    let mut params = ExecParams {
+        metadata: Default::default(),
+        process_id: ProcessId::from("snapshot-first"),
+        argv: vec![
+            shell_path.to_string(),
+            "-lc".to_string(),
+            "if command -v profile_helper >/dev/null; then profile_helper; else printf original; fi".to_string(),
+        ],
+        cwd: cwd.clone(),
+        env_policy: Some(policy),
+        shell_snapshot: Some(ShellSnapshotRequest {
+            scope_id: "attachment-1".to_string(),
+            shell: ShellInfo {
+                name: shell_name.to_string(),
+                path: shell_path.to_string(),
+            },
+        }),
+        env: HashMap::new(),
+        tty,
+        pipe_stdin: false,
+        arg0: None,
+        sandbox: use_remote.then(|| {
+            FileSystemSandboxContext::from_permission_profile_with_cwd(
+                PermissionProfile::workspace_write(),
+                cwd,
+            )
+        }),
+        enforce_managed_network: false,
+        managed_network: None,
+        network_proxy: None,
+    };
+
+    for attempt in 0..failures_before_repair {
+        params.process_id = ProcessId::from(format!("snapshot-fallback-{attempt}"));
+        let fallback = context.backend.start(params.clone()).await?;
+        let fallback_output = collect_process_output_from_events(fallback.process).await?;
+        assert_eq!(
+            fallback_output,
+            ("original".to_string(), String::new(), Some(0), true)
+        );
+        // A real remote executor has its own clock; the unit test uses a
+        // paused clock to check requests made during the one-second backoff.
+        sleep(Duration::from_millis(1100)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("captures"))?,
+        "x".repeat(failures_before_repair)
+    );
+
+    std::fs::write(
+        home.path().join(profile_name),
+        "printf x >> \"$HOME/captures\"\nprofile_helper() { printf recovered; }\n",
+    )?;
+    let (expected_output, expected_captures) = if failures_before_repair == 3 {
+        ("original", "xxx")
+    } else {
+        ("recovered", "xx")
+    };
+    for attempt in 0..2 {
+        params.process_id = ProcessId::from(format!("snapshot-after-repair-{attempt}"));
+        let started = context.backend.start(params.clone()).await?;
+        assert_eq!(
+            collect_process_output_from_events(started.process).await?,
+            (expected_output.to_string(), String::new(), Some(0), true)
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("captures"))?,
+        expected_captures
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_sandboxed_process_preserves_custom_arg0() -> Result<()> {
+    if let Some(warning) = codex_sandboxing::system_bwrap_warning(&PermissionProfile::read_only()) {
+        eprintln!("skipping bwrap test: {warning}");
+        return Ok(());
+    }
+
+    let context = create_process_context(/*use_remote*/ true).await?;
+    let workspace = TempDir::new()?;
+    let outside_workspace = TempDir::new()?;
+    let denied_file = outside_workspace.path().join("denied.txt");
+    std::fs::write(&denied_file, b"denied")?;
+    let cwd = PathUri::from_host_native_path(workspace.path())?;
+    let policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Minimal,
+            },
+            access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
+        },
+        FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+            },
+            access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
+        },
+    ]);
+    let sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+        cwd.clone(),
+    );
+    let session = context
+        .backend
+        .start(ExecParams {
+            metadata: Default::default(),
+            process_id: ProcessId::from("proc-custom-arg0"),
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf '%s' \"$0\"; if /bin/cat \"$CODEX_TEST_DENIED_FILE\" >/dev/null 2>&1; then exit 42; fi"
+                    .to_string(),
+            ],
+            cwd,
+            shell_snapshot: None,
+            env_policy: None,
+            env: HashMap::from([
+                ("PATH".to_string(), std::env::var("PATH")?),
+                (
+                    "CODEX_TEST_DENIED_FILE".to_string(),
+                    denied_file.to_string_lossy().into_owned(),
+                ),
+            ]),
+            tty: false,
+            pipe_stdin: false,
+            arg0: Some("custom-arg0".to_string()),
+            sandbox: Some(sandbox),
+            enforce_managed_network: false,
+            managed_network: None,
+            network_proxy: None,
+        })
+        .await?;
+    let output = collect_process_output_from_events(session.process).await?;
+
+    assert_eq!(
+        output,
+        ("custom-arg0".to_string(), String::new(), Some(0), true)
+    );
+    Ok(())
+}
+
 async fn assert_exec_process_starts_and_exits(use_remote: bool) -> Result<()> {
     let context = create_process_context(use_remote).await?;
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-1"),
             argv: vec!["true".to_string()],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+            shell_snapshot: None,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
@@ -102,6 +562,7 @@ async fn assert_exec_process_starts_and_exits(use_remote: bool) -> Result<()> {
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), "proc-1");
@@ -133,12 +594,14 @@ async fn remote_process_keeps_sandbox_helper_visible_with_restricted_reads() -> 
                 value: FileSystemSpecialPath::Minimal,
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
     ]);
     let sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
@@ -149,10 +612,12 @@ async fn remote_process_keeps_sandbox_helper_visible_with_restricted_reads() -> 
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-restricted-helper"),
             argv: vec!["/bin/cat".to_string(), file.to_string_lossy().into_owned()],
             cwd,
-            env_policy: None,
+            shell_snapshot: None,
+            env_policy: /*env_policy*/ None,
             env: HashMap::from([("PATH".to_string(), std::env::var("PATH")?)]),
             tty: false,
             pipe_stdin: false,
@@ -160,6 +625,7 @@ async fn remote_process_keeps_sandbox_helper_visible_with_restricted_reads() -> 
             sandbox: Some(sandbox),
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     let output = collect_process_output_from_events(session.process).await?;
@@ -199,12 +665,14 @@ async fn remote_tty_process_uses_configured_sandbox_helper_with_hostile_path() -
                 value: FileSystemSpecialPath::Minimal,
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
     ]);
     let sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
@@ -215,10 +683,12 @@ async fn remote_tty_process_uses_configured_sandbox_helper_with_hostile_path() -
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-hostile-helper-path"),
             argv: vec!["/bin/cat".to_string(), file.to_string_lossy().into_owned()],
             cwd,
-            env_policy: None,
+            shell_snapshot: None,
+            env_policy: /*env_policy*/ None,
             env: HashMap::from([(
                 "PATH".to_string(),
                 hostile_path.to_string_lossy().into_owned(),
@@ -229,6 +699,7 @@ async fn remote_tty_process_uses_configured_sandbox_helper_with_hostile_path() -
             sandbox: Some(sandbox),
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     let output = collect_process_output_from_events(session.process).await?;
@@ -237,6 +708,60 @@ async fn remote_tty_process_uses_configured_sandbox_helper_with_hostile_path() -
         output,
         ("allowed".to_string(), String::new(), Some(0), true)
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_process_preserves_empty_workspace_roots() -> Result<()> {
+    if let Some(warning) = codex_sandboxing::system_bwrap_warning(&PermissionProfile::read_only()) {
+        eprintln!("skipping bwrap test: {warning}");
+        return Ok(());
+    }
+
+    let context = create_process_context(/*use_remote*/ true).await?;
+    let tmp = TempDir::new()?;
+    let file = tmp.path().join("excluded.txt");
+    std::fs::write(&file, b"excluded")?;
+    let cwd = PathUri::from_host_native_path(tmp.path())?;
+    let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+        path: FileSystemPath::Special {
+            value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+        },
+        access: FileSystemAccessMode::Read,
+        missing_path_behavior: None,
+    }]);
+    let mut sandbox = FileSystemSandboxContext::from_permission_profile_with_cwd(
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted),
+        cwd.clone(),
+    );
+    sandbox.workspace_roots.clear();
+
+    let session = context
+        .backend
+        .start(ExecParams {
+            metadata: Default::default(),
+            process_id: ProcessId::from("proc-empty-workspace-roots"),
+            argv: vec!["/bin/cat".to_string(), file.to_string_lossy().into_owned()],
+            cwd,
+            shell_snapshot: None,
+            env_policy: None,
+            env: HashMap::new(),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: Some(sandbox),
+            enforce_managed_network: false,
+            managed_network: None,
+            network_proxy: None,
+        })
+        .await?;
+    let (stdout, _stderr, exit_code, closed) =
+        collect_process_output_from_events(session.process).await?;
+
+    assert!(!stdout.contains("excluded"), "unexpected stdout: {stdout}");
+    assert_ne!(exit_code, Some(0));
+    assert!(closed);
     Ok(())
 }
 
@@ -358,6 +883,7 @@ async fn assert_exec_process_streams_output(use_remote: bool) -> Result<()> {
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -365,6 +891,7 @@ async fn assert_exec_process_streams_output(use_remote: bool) -> Result<()> {
                 "sleep 0.05; printf 'session output\\n'".to_string(),
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+            shell_snapshot: None,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
@@ -373,6 +900,7 @@ async fn assert_exec_process_streams_output(use_remote: bool) -> Result<()> {
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -392,6 +920,7 @@ async fn assert_exec_process_pushes_events(use_remote: bool) -> Result<()> {
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -399,6 +928,7 @@ async fn assert_exec_process_pushes_events(use_remote: bool) -> Result<()> {
                 "printf 'event output\\n'; sleep 0.1; printf 'event err\\n' >&2; sleep 0.1; exit 7".to_string(),
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+            shell_snapshot: None,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
@@ -407,6 +937,7 @@ async fn assert_exec_process_pushes_events(use_remote: bool) -> Result<()> {
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -442,6 +973,7 @@ async fn assert_exec_process_replays_events_after_close(use_remote: bool) -> Res
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -449,6 +981,7 @@ async fn assert_exec_process_replays_events_after_close(use_remote: bool) -> Res
                 "printf 'late one\\n'; printf 'late two\\n'".to_string(),
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+            shell_snapshot: None,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
@@ -457,6 +990,7 @@ async fn assert_exec_process_replays_events_after_close(use_remote: bool) -> Res
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -493,6 +1027,7 @@ async fn assert_exec_process_retains_output_after_exit_until_streams_close(
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 helper_binary.to_string_lossy().into_owned(),
@@ -500,6 +1035,7 @@ async fn assert_exec_process_retains_output_after_exit_until_streams_close(
                 release_path.to_string_lossy().into_owned(),
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+            shell_snapshot: None,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
@@ -508,6 +1044,7 @@ async fn assert_exec_process_retains_output_after_exit_until_streams_close(
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -566,6 +1103,7 @@ async fn assert_exec_process_write_then_read(use_remote: bool) -> Result<()> {
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 // Use `/bin/sh` instead of Python so this stdin round-trip test
@@ -576,6 +1114,7 @@ async fn assert_exec_process_write_then_read(use_remote: bool) -> Result<()> {
                 "IFS= read line; printf 'from-stdin:%s\\n' \"$line\"".to_string(),
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+            shell_snapshot: None,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: true,
@@ -584,6 +1123,7 @@ async fn assert_exec_process_write_then_read(use_remote: bool) -> Result<()> {
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -609,6 +1149,7 @@ async fn assert_exec_process_write_then_read_without_tty(use_remote: bool) -> Re
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -616,6 +1157,7 @@ async fn assert_exec_process_write_then_read_without_tty(use_remote: bool) -> Re
                 "IFS= read line; printf 'from-stdin:%s\\n' \"$line\"".to_string(),
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+            shell_snapshot: None,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
@@ -624,6 +1166,7 @@ async fn assert_exec_process_write_then_read_without_tty(use_remote: bool) -> Re
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -639,12 +1182,74 @@ async fn assert_exec_process_write_then_read_without_tty(use_remote: bool) -> Re
     Ok(())
 }
 
+async fn assert_remote_windows_sandbox_process_write() -> Result<()> {
+    let context = create_process_context(/*use_remote*/ true).await?;
+    let workspace = TempDir::new()?;
+    let blocked_file = workspace.path().join("blocked.txt");
+    let cwd = PathUri::from_host_native_path(workspace.path())?;
+    let mut sandbox = FileSystemSandboxContext::from_legacy_sandbox_policy(
+        SandboxPolicy::new_read_only_policy(),
+        cwd.clone(),
+    )?;
+    sandbox.windows_sandbox_level = WindowsSandboxLevel::RestrictedToken;
+
+    let session = match context
+        .backend
+        .start(ExecParams {
+            metadata: Default::default(),
+            process_id: ProcessId::from("proc-windows-sandbox-stdin"),
+            argv: vec![
+                r"C:\Windows\System32\cmd.exe".to_string(),
+                "/D".to_string(),
+                "/V:ON".to_string(),
+                "/S".to_string(),
+                "/C".to_string(),
+                format!(
+                    "set /P line= & echo blocked > \"{}\" & echo from-stdin:!line!",
+                    blocked_file.display()
+                ),
+            ],
+            cwd,
+            shell_snapshot: None,
+            env_policy: /*env_policy*/ None,
+            env: Default::default(),
+            tty: false,
+            pipe_stdin: true,
+            arg0: None,
+            sandbox: Some(sandbox),
+            enforce_managed_network: false,
+            managed_network: None,
+            network_proxy: None,
+        })
+        .await
+    {
+        Ok(session) => session,
+        Err(err) => return Err(err.into()),
+    };
+
+    let write_response = session.process.write(b"hello\n".to_vec()).await?;
+    assert_eq!(write_response.status, WriteStatus::Accepted);
+    let StartedExecProcess { process, .. } = session;
+    let wake_rx = process.subscribe_wake();
+    let (output, exit_code, closed) = collect_process_output_from_reads(process, wake_rx).await?;
+
+    assert!(
+        output.contains("from-stdin:hello"),
+        "unexpected output: {output:?}"
+    );
+    assert_eq!(exit_code, Some(0));
+    assert!(closed);
+    assert!(!blocked_file.exists());
+    Ok(())
+}
+
 async fn assert_exec_process_rejects_write_without_pipe_stdin(use_remote: bool) -> Result<()> {
     let context = create_process_context(use_remote).await?;
     let process_id = "proc-stdin-closed".to_string();
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -652,6 +1257,7 @@ async fn assert_exec_process_rejects_write_without_pipe_stdin(use_remote: bool) 
                 "sleep 0.3; if IFS= read -r line; then printf 'read:%s\\n' \"$line\"; else printf 'eof\\n'; fi".to_string(),
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+            shell_snapshot: None,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
@@ -660,6 +1266,7 @@ async fn assert_exec_process_rejects_write_without_pipe_stdin(use_remote: bool) 
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -682,6 +1289,7 @@ async fn assert_exec_process_signal_interrupts_process(use_remote: bool) -> Resu
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: process_id.clone().into(),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -689,6 +1297,7 @@ async fn assert_exec_process_signal_interrupts_process(use_remote: bool) -> Resu
                 "trap 'printf \"signal:2\\n\"; exit 7' INT; printf 'ready\\n'; while :; do :; done".to_string(),
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+            shell_snapshot: None,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
@@ -697,6 +1306,7 @@ async fn assert_exec_process_signal_interrupts_process(use_remote: bool) -> Resu
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
     assert_eq!(session.process.process_id().as_str(), process_id);
@@ -733,11 +1343,12 @@ async fn assert_exec_process_signal_interrupts_process(use_remote: bool) -> Resu
     Ok(())
 }
 
-async fn assert_exec_process_signal_reports_unsupported_on_windows(use_remote: bool) -> Result<()> {
+async fn assert_exec_process_signal_terminates_on_windows(use_remote: bool) -> Result<()> {
     let context = create_process_context(use_remote).await?;
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-windows-signal"),
             argv: vec![
                 "cmd".to_string(),
@@ -745,6 +1356,7 @@ async fn assert_exec_process_signal_reports_unsupported_on_windows(use_remote: b
                 "echo ready && ping -n 30 127.0.0.1 >NUL".to_string(),
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+            shell_snapshot: None,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
@@ -753,24 +1365,17 @@ async fn assert_exec_process_signal_reports_unsupported_on_windows(use_remote: b
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
 
-    let err = match session.process.signal(ProcessSignal::Interrupt).await {
-        Ok(()) => anyhow::bail!("Windows non-TTY signal should report unsupported"),
-        Err(err) => err,
-    };
-    let message = err.to_string();
-    assert!(
-        message.contains("failed to signal process"),
-        "unexpected signal error: {message}"
-    );
-    assert!(
-        message.contains("process interrupt is not supported by this process backend"),
-        "unexpected signal error: {message}"
-    );
+    let StartedExecProcess { process, .. } = session;
+    let wake_rx = process.subscribe_wake();
+    process.signal(ProcessSignal::Interrupt).await?;
+    let (_output, exit_code, closed) = collect_process_output_from_reads(process, wake_rx).await?;
 
-    session.process.terminate().await?;
+    assert_eq!(exit_code, Some(1));
+    assert!(closed);
     Ok(())
 }
 
@@ -781,6 +1386,7 @@ async fn assert_exec_process_preserves_queued_events_before_subscribe(
     let session = context
         .backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-queued"),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -788,6 +1394,7 @@ async fn assert_exec_process_preserves_queued_events_before_subscribe(
                 "printf 'queued output\\n'".to_string(),
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+            shell_snapshot: None,
             env_policy: /*env_policy*/ None,
             env: Default::default(),
             tty: false,
@@ -796,6 +1403,7 @@ async fn assert_exec_process_preserves_queued_events_before_subscribe(
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
 
@@ -824,6 +1432,7 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
     let emitted_path = temp_dir.path().join("output-emitted");
     let session = backend
         .start(ExecParams {
+            metadata: Default::default(),
             process_id: ProcessId::from("proc-recover"),
             argv: vec![
                 "/bin/sh".to_string(),
@@ -840,6 +1449,7 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
                 .to_string(),
             ],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+            shell_snapshot: None,
             env_policy: /*env_policy*/ None,
             env: HashMap::from([
                 (
@@ -857,6 +1467,7 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
             sandbox: None,
             enforce_managed_network: false,
             managed_network: None,
+            network_proxy: None,
         })
         .await?;
 
@@ -1033,6 +1644,13 @@ async fn exec_process_write_then_read_without_tty(use_remote: bool) -> Result<()
     assert_exec_process_write_then_read_without_tty(use_remote).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(not(windows), ignore = "Windows-only exec-server sandbox process test")]
+#[serial_test::serial(remote_exec_server)]
+async fn remote_windows_sandbox_process_accepts_process_write() -> Result<()> {
+    assert_remote_windows_sandbox_process_write().await
+}
+
 #[test_case(false ; "local")]
 #[test_case(true ; "remote")]
 #[cfg_attr(not(unix), ignore = "Unix-only exec-server process test")]
@@ -1059,8 +1677,8 @@ async fn exec_process_signal_interrupts_process(use_remote: bool) -> Result<()> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Serialize tests that launch a real exec-server process through the full CLI.
 #[serial_test::serial(remote_exec_server)]
-async fn exec_process_signal_reports_unsupported_on_windows(use_remote: bool) -> Result<()> {
-    assert_exec_process_signal_reports_unsupported_on_windows(use_remote).await
+async fn exec_process_signal_terminates_on_windows(use_remote: bool) -> Result<()> {
+    assert_exec_process_signal_terminates_on_windows(use_remote).await
 }
 
 #[test_case(false ; "local")]

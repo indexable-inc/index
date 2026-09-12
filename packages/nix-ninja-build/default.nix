@@ -20,7 +20,15 @@
 # in-derivation mode this lane deliberately avoids.
 let
   inherit (ix) pkgs;
-  inherit (repoPackages) nix-ninja nix-ix;
+  inherit (repoPackages) nix-ninja;
+
+  # The ASSEMBLED fork client, not `repoPackages.nix-ix`: that recipe throws
+  # un-overridden (its jjTree archive lives in ix), and this lane exists to
+  # rebuild exactly the client the fleet runs, which is the assembled one.
+  # Same consumer class as packages/nix-eval-jobs (the accessor's doc in
+  # lib/default.nix has the story), so this package only evaluates with the
+  # guest Nix injected and sits in `needsGuestNix` (lib/per-system.nix).
+  forkClient = ix.nixPackageFor "packages/nix-ninja-build";
 
   # The identical view the fork package builds. There is no patch application
   # step, so this lane cannot drift from packages/nix.
@@ -30,7 +38,7 @@ let
   # are dynamic derivations, which need a >= 2.30 master-based client, and the
   # fork is the one client guaranteed protocol-compatible with the fleet
   # daemons this lane builds against.
-  nixClient = lib.getExe nix-ix;
+  nixClient = lib.getExe forkClient;
 
   inner = ix.writeBashApplication pkgs {
     name = "nix-ninja-build-nix-inner";
@@ -95,7 +103,7 @@ in
         # Same version marker the fork package compiles in (see
         # packages/nix/default.nix): meson reads .version, so the lane's
         # binary identifies the exact patch series it was built from.
-        printf '%s\n' ${lib.escapeShellArg nix-ix.version} > "$workdir/src/.version"
+        printf '%s\n' ${lib.escapeShellArg forkClient.version} > "$workdir/src/.version"
         printf '%s\n' ${patchedSrc} > "$workdir/.base"
       elif [ "$(cat "$workdir/.base" 2>/dev/null)" != ${patchedSrc} ]; then
         echo "nix-ninja-build-nix: warning: $workdir/src was materialized from an older patch series; rerun with --fresh to rebase it" >&2

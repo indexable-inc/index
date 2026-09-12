@@ -6,19 +6,11 @@
 
 #include "nix/util/configuration.hh"
 
-namespace nix {
-// Forward declarations
-struct EvalSettings;
-
-} // namespace nix
-
 namespace nix::flake {
 
 struct Settings : public Config
 {
     Settings();
-
-    void configureEvalSettings(nix::EvalSettings & evalSettings) const;
 
     Setting<bool> useRegistries{
         this,

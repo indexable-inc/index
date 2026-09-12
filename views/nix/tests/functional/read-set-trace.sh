@@ -221,11 +221,12 @@ git -C "$TEST_ROOT/readsetflake" init --quiet
 git -C "$TEST_ROOT/readsetflake" add flake.nix
 git -C "$TEST_ROOT/readsetflake" -c user.email=t@t -c user.name=t commit --quiet -m init
 
-# Dirty the tree. A committed tree fingerprints as the bare revision, so the
-# `;d=` split below would have nothing to bite on and would pass with the split
-# deleted; a dirty tree fingerprints as `<rev>;d=<digest of what differs>`,
-# which is the state an operator edits in and the one the split exists for.
+# Give the flake a second revision, so its version is not simply its first.
+# The edit is committed because it has to be: a Git working tree with
+# uncommitted changes to tracked files has no revision to lock to and is
+# refused before an accessor is built (git.cc, pinCheckedOutCommit).
 echo '# edited' >> "$TEST_ROOT/readsetflake/flake.nix"
+git -C "$TEST_ROOT/readsetflake" -c user.email=t@t -c user.name=t commit --quiet -am edit
 
 nix eval --raw \
   --option read-set-trace-file "$traceRev" \
@@ -247,18 +248,16 @@ if grep '"t":"in"' "$traceRev" | jq -e 'select(.kind == "tree-attr" and has("tre
   exit 1
 fi
 
-# The dirty tree's fingerprint carries `;d=<digest>`, and its identity must not:
-# keeping the digest makes the same tree at two edits look like two unrelated
-# trees, which is the defect this whole split exists to remove. Checked here
-# rather than on the main trace because only this fixture has a dirty tree.
-grep '"t":"tree"' "$traceRev" | jq -e 'select(.fp // "" | test(";d="))' > /dev/null || {
-  echo "no tree in the rev trace has a dirty fingerprint, so the check below is vacuous"
-  exit 1
-}
-if grep '"t":"tree"' "$traceRev" | jq -e 'select(.identity | test(";d="))' > /dev/null; then
-  echo "a tree identity still carries the ;d= dirty digest, which is the version"
-  exit 1
-fi
+# Nothing here asserts that a fingerprint's version component is kept out of
+# its identity, because no fetcher builds a fingerprint with one any more. A
+# Git working tree with uncommitted changes is refused before an accessor
+# exists, so git.cc fingerprints a commit and its content flags and nothing
+# else, and a jj fingerprint is `jj-tree:<treeHash>` in full. Recognising the
+# same tree across an edit relied on the version being a separable suffix;
+# under tree identity the version IS the identity, so that recognition is gone
+# for both fetchers rather than expressible in some other form. What survives
+# of it is `identityOfFingerprint` in src/libexpr/eval-readset.cc, which now
+# strips a suffix nothing writes.
 
 revId=$(grep '"t":"in"' "$traceRev" | jq -r 'select(.kind == "tree-attr" and (.rel | endswith("#lastModified"))) | .id' | head -n 1)
 [[ -n "$revId" ]] || { echo "no lastModified input recorded"; exit 1; }

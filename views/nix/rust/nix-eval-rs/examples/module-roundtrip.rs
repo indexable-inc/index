@@ -13,7 +13,6 @@
 //! Usage: module-roundtrip <base-dir> <file>...
 //! Emits: name, verdict, cache outcome, detail.
 
-use ix_kernel::cas::MemoryCas;
 use nix_eval_rs::eval::drive;
 use nix_eval_rs::host::RealFs;
 use nix_eval_rs::ir::Module;
@@ -41,8 +40,6 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
     let base = args
         .next()
         .ok_or("usage: module-roundtrip <base-dir> <file>...")?;
-    let cas = MemoryCas::new();
-
     for path in args {
         let Ok(source) = std::fs::read_to_string(&path) else {
             println!("{path}\tskip\t-\tunreadable");
@@ -65,7 +62,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
         // A cache of its own per file, so the first call is always a miss and
         // the second always a hit: this checks both paths return the same
         // module, not just that the store accepted one.
-        let mut cache = ModuleCache::new(&cas);
+        let mut cache = ModuleCache::in_memory();
         let stored = match cache.compile(
             &source,
             &base,

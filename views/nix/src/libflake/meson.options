@@ -1,0 +1,13 @@
+option(
+  'rust-eval-prefix',
+  type : 'string',
+  value : '',
+  description : 'prefix of a shared nix-eval-rs runtime; empty builds it once with Cargo',
+)
+
+option(
+  'rust-eval-cargo-features',
+  type : 'string',
+  value : '',
+  description : 'space-separated Cargo feature flags for the standalone Rust runtime build',
+)

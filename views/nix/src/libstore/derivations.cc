@@ -303,6 +303,17 @@ static StringSet parseStrings(StringViewStream & str, bool arePaths)
     return res;
 }
 
+/* A builder's output is hashed by Nix after the build, and Nix cannot
+   compute a jj tree id (`TreeIdNotComputable`), so no derivation can be
+   checked against one: an output declared that way could never be built.
+   Both readers refuse it, the ATerm one and the JSON one, so that no
+   derivation one format admits is unrepresentable in the other. */
+static void checkOutputMethodBuildable(const ContentAddressMethod & method)
+{
+    if (method == ContentAddressMethod::Raw::JjTree)
+        throw FormatError("derivation output uses the 'jj-tree' content address method, which no build can produce");
+}
+
 static DerivationOutput parseDerivationOutput(
     const StoreDirConfig & store,
     std::string_view pathS,
@@ -314,6 +325,7 @@ static DerivationOutput parseDerivationOutput(
         ContentAddressMethod method = ContentAddressMethod::parsePrefix(hashAlgoStr);
         if (method == ContentAddressMethod::Raw::Text)
             xpSettings.require(Xp::DynamicDerivations, "text-hashed derivation output");
+        checkOutputMethodBuildable(method);
         const auto hashAlgo = parseHashAlgo(hashAlgoStr);
         if (hashS == "impure"sv) {
             xpSettings.require(Xp::ImpureDerivations);
@@ -1471,6 +1483,7 @@ adl_serializer<DerivationOutput>::from_json(const json & _json, const Experiment
         ContentAddressMethod method = ContentAddressMethod::parse(getString(valueAt(json, "method")));
         if (method == ContentAddressMethod::Raw::Text)
             xpSettings.require(Xp::DynamicDerivations, "text-hashed derivation output in JSON");
+        checkOutputMethodBuildable(method);
 
         auto hashAlgo = parseHashAlgo(getString(valueAt(json, "hashAlgo")));
         return {std::move(method), std::move(hashAlgo)};
@@ -1488,6 +1501,7 @@ adl_serializer<DerivationOutput>::from_json(const json & _json, const Experiment
         };
         if (dof.ca.method == ContentAddressMethod::Raw::Text)
             xpSettings.require(Xp::DynamicDerivations, "text-hashed derivation output in JSON");
+        checkOutputMethodBuildable(dof.ca.method);
         /* We no longer produce this (denormalized) field (for the
            reasons described above), so we don't need to check it. */
 #if 0

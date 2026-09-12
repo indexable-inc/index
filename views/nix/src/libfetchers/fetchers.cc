@@ -185,18 +185,6 @@ bool Input::operator==(const Input & other) const noexcept
     return attrs == other.attrs;
 }
 
-bool Input::contains(const Input & other) const
-{
-    if (*this == other)
-        return true;
-    auto other2(other);
-    other2.attrs.erase("ref");
-    other2.attrs.erase("rev");
-    if (*this == other2)
-        return true;
-    return false;
-}
-
 // FIXME: remove
 std::pair<StorePath, Input> Input::fetchToStore(const Settings & settings, Store & store) const
 {
@@ -207,11 +195,22 @@ std::pair<StorePath, Input> Input::fetchToStore(const Settings & settings, Store
         try {
             auto [accessor, result] = getAccessorUnchecked(settings, store);
 
-            auto storePath =
-                nix::fetchToStore(settings, store, SourcePath(accessor), FetchMode::Copy, result.getName());
+            /* A tree read out of jj's object store is addressed by the id
+               it announces and locked by `treeHash`; every other tree is
+               NAR-copied and locked by `narHash`. One identity per input:
+               a jj input never carries `narHash` (its scheme rejects the
+               attribute). */
+            bool byTreeId = accessor->knownTreeRoot.has_value();
 
-            auto narHash = store.queryPathInfo(storePath)->narHash;
-            result.attrs.insert_or_assign("narHash", narHash.to_string(HashFormat::SRI, true));
+            auto [storePath, hash] = nix::fetchToStore2(
+                settings,
+                store,
+                SourcePath(accessor),
+                FetchMode::Copy,
+                result.getName(),
+                byTreeId ? ContentAddressMethod::Raw::JjTree : ContentAddressMethod::Raw::NixArchive);
+
+            result.attrs.insert_or_assign(byTreeId ? "treeHash" : "narHash", hash.to_string(HashFormat::SRI, true));
 
             result.attrs.insert_or_assign("__final", Explicit<bool>(true));
 
@@ -279,6 +278,15 @@ void Input::checkLocks(Input specified, Input & result)
                     prevNarHash->to_string(HashFormat::SRI, true));
         }
     }
+
+    /* No `treeHash` comparison here: a tree id is checked where the tree is
+       resolved, by the scheme. A `jj` input's scheme compares the `treeHash`
+       it was given against the tree the resolved revision names before it
+       hands out an accessor (jj.cc, "is locked to tree ... but revision ...
+       has tree"), which is the only place both the claim and the fact are at
+       hand; and a final input (every lock-file entry) is held to all of its
+       attributes by the field comparison above. A third comparison here was
+       reachable by neither road. */
 
     if (auto prevLastModified = specified.getLastModified()) {
         if (result.getLastModified() != prevLastModified)
@@ -364,6 +372,12 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
         }
     }
 
+    /* No store shortcut for a `treeHash` lock here. The jj scheme serves a
+       registered store object itself, and only when the repository the lock
+       names is absent (jj.cc, `getAccessor`): a store object cannot name its
+       subtrees, so serving it while the repository is at hand would make a
+       relative input's identity depend on whether something had forced the
+       parent's copy. */
     auto [accessor, result] = scheme->getAccessor(settings, store, *this);
 
     if (!accessor->fingerprint)
@@ -372,13 +386,6 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
         result.cachedFingerprint = accessor->fingerprint;
 
     return {accessor, std::move(result)};
-}
-
-Input Input::applyOverrides(std::optional<std::string> ref, std::optional<Hash> rev) const
-{
-    if (!scheme)
-        return *this;
-    return scheme->applyOverrides(*this, ref, rev);
 }
 
 void Input::clone(const Settings & settings, Store & store, const std::filesystem::path & destDir) const
@@ -399,6 +406,12 @@ void Input::putFile(const CanonPath & path, std::string_view contents, std::opti
     return scheme->putFile(*this, path, contents, commitMsg);
 }
 
+bool Input::putFileRequiresCommit() const
+{
+    assert(scheme);
+    return scheme->putFileRequiresCommit();
+}
+
 std::string Input::getName() const
 {
     return maybeGetStrAttr(attrs, "name").value_or("source");
@@ -406,6 +419,14 @@ std::string Input::getName() const
 
 StorePath Input::computeStorePath(Store & store) const
 {
+    if (auto treeHash = getTreeHash())
+        return store.makeFixedOutputPath(
+            getName(),
+            FixedOutputInfo{
+                .method = FileIngestionMethod::JjTree,
+                .hash = *treeHash,
+                .references = {},
+            });
     auto narHash = getNarHash();
     if (!narHash)
         throw Error("cannot compute store path for unlocked input '%s'", to_string());
@@ -434,6 +455,35 @@ std::optional<Hash> Input::getNarHash() const
     return {};
 }
 
+std::optional<Hash> Input::getTreeHash() const
+{
+    /* An input no scheme claims cannot say what its attributes mean. */
+    if (!scheme)
+        return std::nullopt;
+    return scheme->getTreeHash(*this);
+}
+
+std::optional<Hash> InputScheme::getTreeHash(const Input & input) const
+{
+    auto s = maybeGetStrAttr(input.attrs, "treeHash");
+    if (!s)
+        return std::nullopt;
+    /* The id is jj's, not a user's algorithm choice: see `nativeIdXpSettings`. */
+    auto hash = Hash::parseSRI(*s, nativeIdXpSettings());
+    if (hash.algo != HashAlgorithm::BLAKE3)
+        throw UsageError(
+            "treeHash of input '%s' must be a BLAKE3 Jujutsu tree id, but '%s' uses %s",
+            /* From the attrs, not `input.to_string()`: this runs from
+               `inputFromAttrs`, where the Input has no scheme attached yet,
+               and `to_string()` on such an Input throws ("cannot show
+               unsupported input") WHILE THIS MESSAGE IS BEING FORMATTED,
+               replacing the refusal the caller was meant to read. */
+            maybeGetStrAttr(input.attrs, "url").value_or(attrsToJSON(input.attrs).dump()),
+            *s,
+            printHashAlgo(hash.algo));
+    return hash;
+}
+
 std::optional<std::string> Input::getRef() const
 {
     if (auto s = maybeGetStrAttr(attrs, "ref"))
@@ -441,34 +491,14 @@ std::optional<std::string> Input::getRef() const
     return {};
 }
 
-/* `Hash` gates constructing a BLAKE3 hash on the `blake3-hashes` experimental
-   feature. That gate governs BLAKE3 as a *store* content address, which is a
-   thing a user chooses; a commit id is not. It is an opaque identifier minted
-   by whichever backend the repository already uses, so honouring the gate here
-   would make an unrelated experimental feature a prerequisite for reading a
-   repository whose ids the user cannot change anyway -- and would say so with
-   an error naming a feature they never asked for. Parse revisions against a
-   local settings object that has it on instead of the global one. */
-static const ExperimentalFeatureSettings & revXpSettings()
-{
-    struct RevSettings : ExperimentalFeatureSettings
-    {
-        RevSettings()
-        {
-            set("experimental-features", "blake3-hashes");
-        }
-    };
-
-    static const RevSettings settings;
-    return settings;
-}
-
 Hash parseRev(std::string_view s)
 {
     constexpr size_t blake3RevLength = 2 * regularHashSize(HashAlgorithm::BLAKE3);
 
+    /* A commit id is minted by the repository's backend, not chosen by the
+       user: see `nativeIdXpSettings`. */
     if (s.size() == blake3RevLength)
-        return Hash::parseExplicitFormatUnprefixed(s, HashAlgorithm::BLAKE3, HashFormat::Base16, revXpSettings());
+        return Hash::parseExplicitFormatUnprefixed(s, HashAlgorithm::BLAKE3, HashFormat::Base16, nativeIdXpSettings());
 
     try {
         return Hash::parseAny(s, HashAlgorithm::SHA1);
@@ -525,15 +555,6 @@ std::optional<std::string> Input::getHistoryJson(const Settings & settings, Stor
 ParsedURL InputScheme::toURL(const Input & input) const
 {
     throw Error("don't know how to convert input '%s' to a URL", attrsToJSON(input.attrs));
-}
-
-Input InputScheme::applyOverrides(const Input & input, std::optional<std::string> ref, std::optional<Hash> rev) const
-{
-    if (ref)
-        throw Error("don't know how to set branch/tag name of input '%s' to '%s'", input.to_string(), *ref);
-    if (rev)
-        throw Error("don't know how to set revision of input '%s' to '%s'", input.to_string(), rev->gitRev());
-    return input;
 }
 
 std::optional<std::filesystem::path> InputScheme::getSourcePath(const Input & input) const

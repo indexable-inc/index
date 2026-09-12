@@ -49,7 +49,7 @@
 //! gate builds, and every unit test -- and there `RealFs` reads the world
 //! with `std::fs`, which consults no allow list.
 //!
-//! So the five rows are not a constant. [`PathReads`] is which of the two
+//! So the six rows are not a constant. [`PathReads`] is which of the two
 //! configurations is in force, read from whether the hooks are installed, and
 //! it is an argument to [`verdict`] beside the settings. Bridged, the five are
 //! served. Standalone, they still refuse by name, because answering from
@@ -212,7 +212,8 @@ pub fn verdict(need: &NeedPath, purity: Purity, reads: PathReads) -> Verdict {
         | NeedPath::HashFile { .. }
         | NeedPath::Exists(_)
         // The trailing-slash spelling of the same read: it is served by the
-        // `file_type_resolved` hook, which also goes through `rootFS`, and
+        // dedicated full-resolution directory-existence hook, which also
+        // goes through `rootFS`, and
         // `prim_pathExists`'s catch makes a forbidden path `false` for both
         // spellings alike.
         | NeedPath::DirExists(_)
@@ -232,6 +233,18 @@ pub fn verdict(need: &NeedPath, purity: Purity, reads: PathReads) -> Verdict {
         // `RestrictedPathError` comes back as the failure text
         // (`rust-eval-session.cc:67`, `:233`).
         NeedPath::StorePath(_) | NeedPath::StoreFiltered(_) => Verdict::Ask,
+
+        // `prim_storePath` rejects only pure evaluation. Restrict evaluation
+        // still asks through rootFS, whose allow list owns the path decision.
+        NeedPath::UseStorePath(_) => {
+            if purity.pure_eval {
+                Verdict::Error(
+                    "'builtins.storePath' is not allowed in pure evaluation mode".to_owned(),
+                )
+            } else {
+                Verdict::Ask
+            }
+        }
 
         // `builtins.toFile` has no purity check in cppnix at all
         // (`prim_toFile`, `primops.cc:2789`): the path is a function of the
@@ -254,7 +267,7 @@ pub fn verdict(need: &NeedPath, purity: Purity, reads: PathReads) -> Verdict {
         // already built, so whatever is in it arrived through some earlier
         // question. Under `ThroughEmbedder` those questions went through
         // `rootFS` and the allow list already decided. Under `Direct` the
-        // five plain reads are `Refuse`, so an evaluation cannot have read a
+        // six plain reads are `Refuse`, so an evaluation cannot have read a
         // forbidden file to put in the aterm in the first place. Either way
         // the content is policy-clean before this row is consulted, and this
         // row adds no channel of its own: no URI for `restrict-eval` to
@@ -431,6 +444,21 @@ macro_rules! question_kinds {
                 $($pattern => $name,)+
             }
         }
+
+        /// The question's position in [`QUESTION_KINDS`], from the same list,
+        /// so a counter indexed by it cannot land in a bucket the list does
+        /// not have: this is what a name lookup with a fallback could not say.
+        #[must_use]
+        pub fn question_kind_index(need: &NeedPath) -> usize {
+            let mut index = 0;
+            $(
+                if matches!(need, $pattern) {
+                    return index;
+                }
+                index += 1;
+            )+
+            unreachable!("question_kind is exhaustive over NeedPath")
+        }
     };
 }
 
@@ -445,6 +473,7 @@ question_kinds! {
     NeedPath::MaybeKind(_) => "MaybeKind",
     NeedPath::Env(_) => "Env",
     NeedPath::StorePath(_) => "StorePath",
+    NeedPath::UseStorePath(_) => "UseStorePath",
     NeedPath::StoreText { .. } => "StoreText",
     NeedPath::WriteDrv { .. } => "WriteDrv",
     NeedPath::StoreFiltered(_) => "StoreFiltered",
@@ -601,19 +630,19 @@ mod tests {
         // Two expected tuples per row, one per `PathReads`: `Direct` is the
         // standalone embedding reading with `std::fs`, `ThroughEmbedder` is
         // the `nix` binary reading through `rootFS`. They differ on exactly
-        // the five rows ENG-12792 moved, and writing both out is what says
+        // the six rows ENG-12792 moved, and writing both out is what says
         // so -- a single column would leave "this row does not depend on who
         // answers" as an unstated claim about thirteen of the eighteen.
         vec![
             // Refused when this crate reads with std::fs and served when the
             // embedder's rootFS answers. primops.cc:2201, :2081, :2508, :2490.
             (
-                NeedPath::Import("/tmp/a.nix".to_owned()),
+                NeedPath::Import(crate::value2::ambient_path("/tmp/a.nix")),
                 refuse_when_set.clone(),
                 ask.clone(),
             ),
             (
-                NeedPath::Contents("/tmp/a.txt".to_owned()),
+                NeedPath::Contents(crate::value2::ambient_path("/tmp/a.txt")),
                 refuse_when_set.clone(),
                 ask.clone(),
             ),
@@ -623,31 +652,31 @@ mod tests {
             // and only the answer type differs.
             (
                 NeedPath::HashFile {
-                    path: "/tmp/a.txt".to_owned(),
+                    path: crate::value2::ambient_path("/tmp/a.txt"),
                     algo: crate::nixhash::HashAlgo::Sha256,
                 },
                 refuse_when_set.clone(),
                 ask.clone(),
             ),
             (
-                NeedPath::Exists("/tmp/a.txt".to_owned()),
+                NeedPath::Exists(crate::value2::ambient_path("/tmp/a.txt")),
                 refuse_when_set.clone(),
                 ask.clone(),
             ),
             // The trailing-slash spelling rides the same hook and the same
             // catch (primops.cc:2116), so its row is `Exists`'s row.
             (
-                NeedPath::DirExists("/tmp/a.txt".to_owned()),
+                NeedPath::DirExists(crate::value2::ambient_path("/tmp/a.txt")),
                 refuse_when_set.clone(),
                 ask.clone(),
             ),
             (
-                NeedPath::Entries("/tmp".to_owned()),
+                NeedPath::Entries(crate::value2::ambient_path("/tmp")),
                 refuse_when_set.clone(),
                 ask.clone(),
             ),
             (
-                NeedPath::Kind("/tmp/a.txt".to_owned()),
+                NeedPath::Kind(crate::value2::ambient_path("/tmp/a.txt")),
                 refuse_when_set.clone(),
                 ask.clone(),
             ),
@@ -656,7 +685,7 @@ mod tests {
             // asker wanted a missing path to be an error. cppnix has one
             // `maybeLstat` behind both.
             (
-                NeedPath::MaybeKind("/tmp/a.txt".to_owned()),
+                NeedPath::MaybeKind(crate::value2::ambient_path("/tmp/a.txt")),
                 refuse_when_set.clone(),
                 ask.clone(),
             ),
@@ -672,13 +701,38 @@ mod tests {
             // the embedder -- there is no std::fs branch for it to fall back
             // to. That is why these rows do not move with `PathReads`.
             (
-                NeedPath::StorePath("/tmp/a.txt".to_owned()),
+                NeedPath::StorePath(crate::value2::ambient_path("/tmp/a.txt")),
                 ask.clone(),
                 ask.clone(),
             ),
             (
+                NeedPath::UseStorePath(crate::value2::ambient_path(
+                    "/nix/store/00000000000000000000000000000000-a",
+                )),
+                [
+                    Verdict::Ask,
+                    Verdict::Error(
+                        "'builtins.storePath' is not allowed in pure evaluation mode".to_owned(),
+                    ),
+                    Verdict::Ask,
+                    Verdict::Error(
+                        "'builtins.storePath' is not allowed in pure evaluation mode".to_owned(),
+                    ),
+                ],
+                [
+                    Verdict::Ask,
+                    Verdict::Error(
+                        "'builtins.storePath' is not allowed in pure evaluation mode".to_owned(),
+                    ),
+                    Verdict::Ask,
+                    Verdict::Error(
+                        "'builtins.storePath' is not allowed in pure evaluation mode".to_owned(),
+                    ),
+                ],
+            ),
+            (
                 NeedPath::StoreFiltered(Box::new(FilteredCopy {
-                    root: "/tmp/tree".to_owned(),
+                    root: crate::value2::ambient_path("/tmp/tree"),
                     name: "tree".to_owned(),
                     method: PathMethod::NixArchive,
                     accepted: None,
@@ -718,7 +772,6 @@ mod tests {
                 NeedPath::WriteDrv {
                     name: "x".to_owned(),
                     aterm: "Derive([],[],[],\"x86_64-linux\",\"/bin/sh\",[],[])".to_owned(),
-                    references: Vec::new(),
                     expected: "/nix/store/aaa-x.drv".to_owned(),
                 },
                 ask.clone(),
@@ -833,35 +886,34 @@ mod tests {
     /// The five ENG-12792 moved, spelled out on their own rather than only
     /// inside the table, because the table asserts a shape and this asserts
     /// the claim: with an embedder attached there is no `Refuse` left, and
-    /// without one every one of the five still refuses.
+    /// without one every one of the six still refuses.
     #[test]
     fn write_drv_leans_on_the_plain_reads_refusing_under_direct() {
         // `WriteDrv` is `Ask` in both columns, and the reason it is safe under
         // `Direct` is not that a write reads nothing. It is that nothing a
         // forbidden read could have produced can be in the aterm, because
-        // under `Direct` the five plain reads refuse. That is a dependency on
+        // under `Direct` the six plain reads refuse. That is a dependency on
         // another row, and a comment saying so is a comment somebody can edit
         // past. This fails instead.
         //
         // It deliberately overlaps
-        // `the_five_plain_reads_are_served_only_when_the_embedder_answers`.
+        // `the_six_plain_reads_are_served_only_when_the_embedder_answers`.
         // That test asserts the read policy for its own sake; this one
         // asserts that `WriteDrv`'s justification still rests on something
         // true, and the two would be changed for different reasons.
         let reads = [
-            NeedPath::Import("/tmp/a.nix".to_owned()),
-            NeedPath::Contents("/tmp/a.txt".to_owned()),
-            NeedPath::Exists("/tmp/a.txt".to_owned()),
-            // Not a sixth read: the trailing-slash spelling of `Exists`,
-            // which rides the same policy row.
-            NeedPath::DirExists("/tmp/a.txt".to_owned()),
-            NeedPath::Entries("/tmp".to_owned()),
-            NeedPath::Kind("/tmp/a.txt".to_owned()),
+            NeedPath::Import(crate::value2::ambient_path("/tmp/a.nix")),
+            NeedPath::Contents(crate::value2::ambient_path("/tmp/a.txt")),
+            NeedPath::Exists(crate::value2::ambient_path("/tmp/a.txt")),
+            // A separate host operation because canonicalisation has already
+            // removed the slash that selected it.
+            NeedPath::DirExists(crate::value2::ambient_path("/tmp/a.txt")),
+            NeedPath::Entries(crate::value2::ambient_path("/tmp")),
+            NeedPath::Kind(crate::value2::ambient_path("/tmp/a.txt")),
         ];
         let write = NeedPath::WriteDrv {
             name: "x".to_owned(),
             aterm: "Derive([],[],[],\"x86_64-linux\",\"/bin/sh\",[],[])".to_owned(),
-            references: Vec::new(),
             expected: "/nix/store/aaa-x.drv".to_owned(),
         };
         for (label, purity) in &CONFIGS {
@@ -890,18 +942,18 @@ mod tests {
     }
 
     #[test]
-    fn the_five_plain_reads_are_served_only_when_the_embedder_answers() {
-        let five = [
-            NeedPath::Import("/tmp/a.nix".to_owned()),
-            NeedPath::Contents("/tmp/a.txt".to_owned()),
-            NeedPath::Exists("/tmp/a.txt".to_owned()),
-            // Not a sixth read: the trailing-slash spelling of `Exists`,
-            // which rides the same policy row.
-            NeedPath::DirExists("/tmp/a.txt".to_owned()),
-            NeedPath::Entries("/tmp".to_owned()),
-            NeedPath::Kind("/tmp/a.txt".to_owned()),
+    fn the_six_plain_reads_are_served_only_when_the_embedder_answers() {
+        let six = [
+            NeedPath::Import(crate::value2::ambient_path("/tmp/a.nix")),
+            NeedPath::Contents(crate::value2::ambient_path("/tmp/a.txt")),
+            NeedPath::Exists(crate::value2::ambient_path("/tmp/a.txt")),
+            // A separate host operation because canonicalisation has already
+            // removed the slash that selected it.
+            NeedPath::DirExists(crate::value2::ambient_path("/tmp/a.txt")),
+            NeedPath::Entries(crate::value2::ambient_path("/tmp")),
+            NeedPath::Kind(crate::value2::ambient_path("/tmp/a.txt")),
         ];
-        for need in &five {
+        for need in &six {
             for (label, purity) in &CONFIGS {
                 assert_eq!(
                     verdict(need, *purity, PathReads::ThroughEmbedder),

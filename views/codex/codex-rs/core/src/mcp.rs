@@ -2,42 +2,67 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::Config;
+use crate::environment_selection::ThreadEnvironments;
+use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
 use codex_config::McpServerConfig;
+use codex_connectors::ConnectorRuntimeManager;
 use codex_connectors::ConnectorSnapshot;
 use codex_connectors::PluginConnectorSource;
 use codex_core_plugins::PluginsManager;
+use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::McpServerContribution;
 use codex_extension_api::McpServerContributionContext;
+use codex_extension_api::SelectedPluginIdentity;
+use codex_extension_api::SelectedPluginSnapshot;
+use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
-use codex_mcp::CodexAppsToolsCache;
 use codex_mcp::EffectiveMcpServer;
 use codex_mcp::McpConfig;
+use codex_mcp::McpEnvironmentAuthority;
 use codex_mcp::McpPluginAttribution;
 use codex_mcp::McpServerRegistration;
+use codex_mcp::McpToolCatalogCache;
+use codex_mcp::ToolInfo;
 use codex_mcp::codex_apps_mcp_server_config;
 use codex_mcp::configured_mcp_servers;
 use codex_mcp::effective_mcp_servers;
 use codex_plugin::AppConnectorId;
+use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::protocol::EnvironmentConfigState;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 
 const LEGACY_CODEX_APPS_REGISTRATION_ID: &str = "legacy_codex_apps";
 
 /// MCP configuration and capability availability derived from the same inputs.
+#[derive(Clone)]
 pub(crate) struct McpRuntimeProjection {
     pub(crate) config: McpConfig,
     pub(crate) plugins_available: bool,
+    pub(crate) selected_plugins: SelectedPluginSnapshot,
+}
+
+pub(crate) enum McpEnvironmentScope<'a> {
+    /// Controller-level operations without an associated thread.
+    HostOnly,
+    /// Initial thread selections before the live environment store exists.
+    Initial(&'a [TurnEnvironmentSelection]),
+    /// Current attachment state for an existing thread.
+    Live(&'a ThreadEnvironments),
+}
+
+pub(crate) struct McpThreadIdentity<'a> {
+    pub(crate) session_source: &'a SessionSource,
+    pub(crate) originator: &'a str,
+    pub(crate) environments: McpEnvironmentScope<'a>,
 }
 
 enum OrderedMcpOverlay {
-    Set {
-        contributor_id: &'static str,
-        contribution_order: usize,
-        name: String,
-        config: Box<McpServerConfig>,
-    },
+    Set(Box<McpServerRegistration>),
     Remove {
         contributor_id: &'static str,
         contribution_order: usize,
@@ -49,7 +74,8 @@ enum OrderedMcpOverlay {
 pub struct McpManager {
     plugins_manager: Arc<PluginsManager>,
     extensions: Arc<ExtensionRegistry<Config>>,
-    codex_apps_tools_cache: CodexAppsToolsCache,
+    codex_apps_tools_cache: ConnectorRuntimeManager<ToolInfo>,
+    tool_catalog_cache: McpToolCatalogCache,
 }
 
 impl McpManager {
@@ -57,6 +83,7 @@ impl McpManager {
         Self::new_with_extensions(
             plugins_manager,
             codex_extension_api::empty_extension_registry(),
+            ConnectorRuntimeManager::default(),
         )
     }
 
@@ -64,16 +91,22 @@ impl McpManager {
     pub fn new_with_extensions(
         plugins_manager: Arc<PluginsManager>,
         extensions: Arc<ExtensionRegistry<Config>>,
+        codex_apps_tools_cache: ConnectorRuntimeManager<ToolInfo>,
     ) -> Self {
         Self {
             plugins_manager,
             extensions,
-            codex_apps_tools_cache: CodexAppsToolsCache::default(),
+            codex_apps_tools_cache,
+            tool_catalog_cache: McpToolCatalogCache::default(),
         }
     }
 
-    pub fn codex_apps_tools_cache(&self) -> CodexAppsToolsCache {
+    pub fn codex_apps_tools_cache(&self) -> ConnectorRuntimeManager<ToolInfo> {
         self.codex_apps_tools_cache.clone()
+    }
+
+    pub fn tool_catalog_cache(&self) -> McpToolCatalogCache {
+        self.tool_catalog_cache.clone()
     }
 
     /// Returns the MCP config after applying compatibility built-ins and
@@ -85,28 +118,34 @@ impl McpManager {
             // originator; active-thread tool calls use runtime_config_for_step below.
             /*originator*/
             None,
+            McpEnvironmentScope::HostOnly,
         )
         .await
         .config
     }
 
+    #[tracing::instrument(name = "mcp.runtime_config.project_for_step", skip_all)]
     pub(crate) async fn runtime_config_for_step(
         &self,
         config: &Config,
         thread_init: &ExtensionDataInit,
         thread_store: &ExtensionData,
-        originator: &str,
-        available_environment_ids: &[String],
+        identity: McpThreadIdentity<'_>,
+        ready_selected_capability_roots: &[SelectedCapabilityRoot],
+        executor_capability_discovery: Option<&ExecutorCapabilityDiscoverySnapshot>,
     ) -> McpRuntimeProjection {
         self.runtime_config_with_context(
             McpServerContributionContext::for_step(
                 config,
                 thread_init,
                 thread_store,
-                originator,
-                available_environment_ids,
-            ),
-            Some(originator),
+                identity.originator,
+                ready_selected_capability_roots,
+                executor_capability_discovery,
+            )
+            .with_session_source(identity.session_source),
+            Some(identity.originator),
+            identity.environments,
         )
         .await
     }
@@ -115,11 +154,14 @@ impl McpManager {
         &self,
         context: McpServerContributionContext<'_, Config>,
         originator: Option<&str>,
+        environment_scope: McpEnvironmentScope<'_>,
     ) -> McpRuntimeProjection {
         let config = context.config();
         let mut selected_plugin_available = false;
         let mut selected_plugin_connector_sources = Vec::new();
         let mut selected_plugin_registrations = Vec::new();
+        let mut selected_plugins = Vec::new();
+        let mut disabled_plugin_roots = Vec::new();
         let mut overlays = Vec::new();
         // A contributor can emit multiple ordered actions, so order each action globally rather
         // than enumerating contributors.
@@ -128,12 +170,23 @@ impl McpManager {
             for contribution in contributor.contribute(context).await {
                 match contribution {
                     McpServerContribution::Set { name, config } => {
-                        overlays.push(OrderedMcpOverlay::Set {
-                            contributor_id: contributor.id(),
-                            contribution_order,
-                            name,
-                            config,
-                        });
+                        overlays.push(OrderedMcpOverlay::Set(Box::new(
+                            McpServerRegistration::from_extension(
+                                name,
+                                contributor.id(),
+                                contribution_order,
+                                *config,
+                            ),
+                        )));
+                    }
+                    McpServerContribution::HostedApps { config } => {
+                        overlays.push(OrderedMcpOverlay::Set(Box::new(
+                            McpServerRegistration::from_hosted_apps(
+                                contributor.id(),
+                                contribution_order,
+                                *config,
+                            ),
+                        )));
                     }
                     McpServerContribution::SelectedPlugin {
                         name,
@@ -150,11 +203,21 @@ impl McpManager {
                         ),
                     ),
                     McpServerContribution::SelectedPluginPackage {
+                        selected_root_id, ..
+                    } if !config.features.enabled(Feature::Plugins) => {
+                        disabled_plugin_roots.push(selected_root_id);
+                    }
+                    McpServerContribution::SelectedPluginPackage {
+                        selected_root_id,
                         plugin_id,
                         plugin_display_name,
                         connector_ids,
                     } => {
                         selected_plugin_available = true;
+                        selected_plugins.push(SelectedPluginIdentity {
+                            selected_root_id,
+                            plugin_id: plugin_id.clone(),
+                        });
                         if !connector_ids.is_empty() {
                             selected_plugin_connector_sources.push(
                                 PluginConnectorSource::from_connector_ids(
@@ -205,17 +268,7 @@ impl McpManager {
 
         for overlay in overlays {
             match overlay {
-                OrderedMcpOverlay::Set {
-                    contributor_id,
-                    contribution_order,
-                    name,
-                    config,
-                } => catalog.register(McpServerRegistration::from_extension(
-                    name,
-                    contributor_id,
-                    contribution_order,
-                    *config,
-                )),
+                OrderedMcpOverlay::Set(registration) => catalog.register(*registration),
                 OrderedMcpOverlay::Remove {
                     contributor_id,
                     contribution_order,
@@ -223,7 +276,39 @@ impl McpManager {
                 } => catalog.remove_extension(name, contributor_id, contribution_order),
             }
         }
-        let catalog = catalog.build();
+        let selections = match environment_scope {
+            McpEnvironmentScope::HostOnly => None,
+            McpEnvironmentScope::Initial(selections) => Some(selections.to_vec()),
+            McpEnvironmentScope::Live(environments) => Some(environments.selections()),
+        };
+        let catalog = catalog.build_with_environment_authority(|environment_id| {
+            let Some(selections) = selections.as_ref() else {
+                return McpEnvironmentAuthority::Unrestricted;
+            };
+            let Some(selection) = selections
+                .iter()
+                .find(|selection| selection.environment_id == environment_id)
+            else {
+                return if environment_id == DEFAULT_MCP_SERVER_ENVIRONMENT_ID {
+                    McpEnvironmentAuthority::Unrestricted
+                } else {
+                    McpEnvironmentAuthority::SelectedPluginsOnly
+                };
+            };
+
+            match &selection.config {
+                EnvironmentConfigState::FromThread => McpEnvironmentAuthority::Unrestricted,
+                EnvironmentConfigState::Pending | EnvironmentConfigState::Failed(_) => {
+                    McpEnvironmentAuthority::Unavailable
+                }
+                EnvironmentConfigState::Ready(config) => config
+                    .mcp_policy
+                    .as_ref()
+                    .map_or(McpEnvironmentAuthority::Unrestricted, |policy| {
+                        McpEnvironmentAuthority::Restricted(policy)
+                    }),
+            }
+        });
         for conflict in catalog.conflicts() {
             tracing::warn!(
                 server = conflict.name,
@@ -242,6 +327,10 @@ impl McpManager {
         McpRuntimeProjection {
             config: mcp_config,
             plugins_available,
+            selected_plugins: SelectedPluginSnapshot {
+                plugins: selected_plugins,
+                disabled_plugin_roots,
+            },
         }
     }
 

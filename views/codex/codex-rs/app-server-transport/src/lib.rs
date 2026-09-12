@@ -1,3 +1,9 @@
+#[cfg(any(windows, test))]
+mod daemon_shutdown;
+#[cfg(windows)]
+pub use daemon_shutdown::DAEMON_SHUTDOWN_FILE_ENV;
+#[cfg(windows)]
+pub use daemon_shutdown::daemon_shutdown_signal;
 mod outgoing_message;
 mod transport;
 

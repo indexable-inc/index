@@ -5,20 +5,31 @@ use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::time::Instant;
+use tokio::time::sleep;
 use tokio::time::timeout;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::connect_async_with_config;
+use tokio::time::timeout_at;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::debug;
 use tracing::warn;
 
+use codex_http_client::HttpClientFactory;
+use codex_protocol::shell_environment::scrub_non_inheritable_env_vars;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
+use codex_websocket_client::WebSocketConnector;
+use codex_websocket_client::WebSocketTlsMode;
+use http::HeaderMap;
 
 use crate::ExecServerClient;
 use crate::ExecServerError;
+use crate::client::accepted::AcceptedConnectionSource;
+use crate::client::is_retryable_registry_error;
+use crate::client::registry_recovery_retry_delay;
 use crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT;
 use crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_INITIALIZE_TIMEOUT;
 use crate::client_api::ExecServerClientConnectOptions;
+use crate::client_api::ExecServerTransportParams;
 use crate::client_api::NoiseRendezvousConnectArgs;
 use crate::client_api::NoiseRendezvousConnectBundle;
 use crate::client_api::NoiseRendezvousConnectProvider;
@@ -31,9 +42,57 @@ use crate::noise_relay::NoiseHarnessConnectionArgs;
 use crate::noise_relay::noise_harness_connection_from_websocket;
 use crate::noise_relay::noise_relay_websocket_config;
 use crate::relay::harness_connection_from_websocket;
-use crate::trace_context::current_trace_context_headers;
+use crate::trace_context::current_rendezvous_headers;
 
 const ENVIRONMENT_CLIENT_NAME: &str = "codex-environment";
+const INITIAL_REGISTRY_MAX_RETRIES: u32 = 4;
+const INITIAL_REGISTRY_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+const INITIAL_REGISTRY_OPERATION_TIMEOUT: Duration = Duration::from_secs(14);
+
+/// Everything the recovery loop needs for one connection attempt.
+///
+/// An attempt may also carry a permit whose lifetime must extend until the
+/// attempt finishes.
+pub(crate) struct ReconnectAttempt {
+    connection: JsonRpcConnection,
+    options: ExecServerClientConnectOptions,
+    attempt_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl ReconnectAttempt {
+    pub(crate) fn new(
+        connection: JsonRpcConnection,
+        options: ExecServerClientConnectOptions,
+    ) -> Self {
+        Self {
+            connection,
+            options,
+            attempt_permit: None,
+        }
+    }
+
+    pub(crate) fn with_attempt_permit(
+        connection: JsonRpcConnection,
+        options: ExecServerClientConnectOptions,
+        attempt_permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            connection,
+            options,
+            attempt_permit: Some(attempt_permit),
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        JsonRpcConnection,
+        ExecServerClientConnectOptions,
+        Option<OwnedSemaphorePermit>,
+    ) {
+        (self.connection, self.options, self.attempt_permit)
+    }
+}
 
 /// Reopens the transport for one logical exec-server client session.
 ///
@@ -42,13 +101,20 @@ const ENVIRONMENT_CLIENT_NAME: &str = "codex-environment";
 /// every physical connection attempt.
 #[derive(Clone)]
 pub(crate) enum ExecServerReconnectStrategy {
-    WebSocket(RemoteExecServerConnectArgs),
+    Accepted(AcceptedConnectionSource),
+    WebSocket {
+        args: RemoteExecServerConnectArgs,
+        http_headers: HeaderMap,
+    },
     NoiseRendezvous {
+        // The executor that created the session, not the latest recovery lookup.
+        executor_public_key: crate::NoiseChannelPublicKey,
         provider: Arc<dyn NoiseRendezvousConnectProvider>,
         identity: NoiseChannelIdentity,
         client_name: String,
         connect_timeout: Duration,
         initialize_timeout: Duration,
+        http_client_factory: HttpClientFactory,
     },
 }
 
@@ -56,31 +122,39 @@ impl ExecServerReconnectStrategy {
     pub(crate) async fn resume(
         &self,
         session_id: &str,
-    ) -> Result<(JsonRpcConnection, ExecServerClientConnectOptions), ExecServerError> {
+    ) -> Result<ReconnectAttempt, ExecServerError> {
         match self {
-            Self::WebSocket(args) => {
+            Self::Accepted(source) => source.next_connection(session_id).await,
+            Self::WebSocket { args, http_headers } => {
                 let mut args = args.clone();
                 args.resume_session_id = Some(session_id.to_string());
-                let connection = ExecServerClient::open_websocket_connection(&args).await?;
-                Ok((connection, args.into()))
+                let connection =
+                    ExecServerClient::open_websocket_connection(&args, http_headers).await?;
+                Ok(ReconnectAttempt::new(connection, args.into()))
             }
             Self::NoiseRendezvous {
+                executor_public_key: _,
                 provider,
                 identity,
                 client_name,
                 connect_timeout,
                 initialize_timeout,
+                http_client_factory,
             } => {
                 let bundle = provider.connect_bundle(identity.public_key()).await?;
-                ExecServerClient::open_noise_rendezvous_connection(NoiseRendezvousConnectArgs {
-                    bundle,
-                    harness_identity: identity.clone(),
-                    client_name: client_name.clone(),
-                    connect_timeout: *connect_timeout,
-                    initialize_timeout: *initialize_timeout,
-                    resume_session_id: Some(session_id.to_string()),
-                })
-                .await
+                let (connection, options) = ExecServerClient::open_noise_rendezvous_connection(
+                    NoiseRendezvousConnectArgs {
+                        bundle,
+                        harness_identity: identity.clone(),
+                        client_name: client_name.clone(),
+                        connect_timeout: *connect_timeout,
+                        initialize_timeout: *initialize_timeout,
+                        resume_session_id: Some(session_id.to_string()),
+                        http_client_factory: http_client_factory.clone(),
+                    },
+                )
+                .await?;
+                Ok(ReconnectAttempt::new(connection, options))
             }
         }
     }
@@ -91,57 +165,114 @@ impl ExecServerClient {
     /// Noise connection details are fetched here so reconnects get a fresh URL
     /// and authorization without replacing the harness identity.
     pub(crate) async fn connect_for_transport(
-        transport_params: crate::client_api::ExecServerTransportParams,
+        transport_params: ExecServerTransportParams,
+        http_client_factory: HttpClientFactory,
     ) -> Result<Self, ExecServerError> {
-        match transport_params {
-            crate::client_api::ExecServerTransportParams::WebSocketUrl {
+        let (transport_params, deferred_readiness) = match transport_params {
+            ExecServerTransportParams::Deferred(deferred) => {
+                (deferred.transport, Some(deferred.readiness))
+            }
+            transport_params => (transport_params, None),
+        };
+
+        if let Some(mut readiness) = deferred_readiness {
+            let provisioning_result = readiness
+                .wait_for(Option::is_some)
+                .await
+                .map_err(|_| {
+                    ExecServerError::Disconnected(
+                        "environment unavailable: environment provisioning ended before completion"
+                            .to_string(),
+                    )
+                })?
+                .clone()
+                .ok_or_else(|| {
+                    ExecServerError::Disconnected(
+                        "environment unavailable: provisioning remained pending after completion"
+                            .to_string(),
+                    )
+                })?;
+            provisioning_result.map_err(ExecServerError::ProvisioningFailed)?;
+        }
+
+        let websocket = match transport_params {
+            ExecServerTransportParams::Deferred(_) => {
+                return Err(ExecServerError::Protocol(
+                    "nested deferred exec-server transports are unsupported".to_string(),
+                ));
+            }
+            ExecServerTransportParams::WebSocketUrl {
                 websocket_url,
                 connect_timeout,
                 initialize_timeout,
-            } => {
-                Self::connect_websocket(RemoteExecServerConnectArgs {
-                    websocket_url,
-                    client_name: ENVIRONMENT_CLIENT_NAME.to_string(),
-                    connect_timeout,
-                    initialize_timeout,
-                    resume_session_id: None,
-                })
-                .await
-            }
-            crate::client_api::ExecServerTransportParams::NoiseRendezvous {
-                provider,
-                identity,
-            } => {
+                http_headers,
+            } => (
+                websocket_url,
+                connect_timeout,
+                initialize_timeout,
+                http_headers,
+            ),
+            ExecServerTransportParams::NoiseRendezvous { provider, identity } => {
+                let (connection, options, executor_public_key) =
+                    Self::open_initial_noise_rendezvous_connection(
+                        &provider,
+                        &identity,
+                        http_client_factory.clone(),
+                    )
+                    .await?;
                 let reconnect_strategy = ExecServerReconnectStrategy::NoiseRendezvous {
-                    provider: Arc::clone(&provider),
-                    identity: identity.clone(),
+                    executor_public_key,
+                    provider,
+                    identity,
                     client_name: ENVIRONMENT_CLIENT_NAME.to_string(),
                     connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
                     initialize_timeout: DEFAULT_REMOTE_EXEC_SERVER_INITIALIZE_TIMEOUT,
+                    http_client_factory,
                 };
-                let (connection, options) =
-                    Self::open_initial_noise_rendezvous_connection(&provider, &identity).await?;
-                Self::connect_with_recovery(connection, options, Some(reconnect_strategy)).await
+                return Self::connect_with_recovery(connection, options, Some(reconnect_strategy))
+                    .await;
             }
-            crate::client_api::ExecServerTransportParams::StdioCommand {
+            ExecServerTransportParams::StdioCommand {
                 command,
                 initialize_timeout,
             } => {
-                Self::connect_stdio_command(StdioExecServerConnectArgs {
+                return Self::connect_stdio_command(StdioExecServerConnectArgs {
                     command,
                     client_name: ENVIRONMENT_CLIENT_NAME.to_string(),
                     initialize_timeout,
                     resume_session_id: None,
                 })
-                .await
+                .await;
             }
-        }
+        };
+        let (websocket_url, connect_timeout, initialize_timeout, http_headers) = websocket;
+        Self::connect_websocket_with_headers(
+            RemoteExecServerConnectArgs {
+                websocket_url,
+                client_name: ENVIRONMENT_CLIENT_NAME.to_string(),
+                connect_timeout,
+                initialize_timeout,
+                resume_session_id: None,
+                http_client_factory,
+            },
+            http_headers,
+        )
+        .await
     }
 
+    #[tracing::instrument(name = "codex.exec_server.remote.noise.connect", skip_all)]
     async fn open_initial_noise_rendezvous_connection(
         provider: &Arc<dyn NoiseRendezvousConnectProvider>,
         identity: &NoiseChannelIdentity,
-    ) -> Result<(JsonRpcConnection, ExecServerClientConnectOptions), ExecServerError> {
+        http_client_factory: HttpClientFactory,
+    ) -> Result<
+        (
+            JsonRpcConnection,
+            ExecServerClientConnectOptions,
+            crate::NoiseChannelPublicKey,
+        ),
+        ExecServerError,
+    > {
         let open_connection = |bundle: NoiseRendezvousConnectBundle| {
             Self::open_noise_rendezvous_connection(NoiseRendezvousConnectArgs {
                 bundle,
@@ -150,48 +281,127 @@ impl ExecServerClient {
                 connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
                 initialize_timeout: DEFAULT_REMOTE_EXEC_SERVER_INITIALIZE_TIMEOUT,
                 resume_session_id: None,
+                http_client_factory: http_client_factory.clone(),
             })
         };
-        let bundle = provider.connect_bundle(identity.public_key()).await?;
-        match open_connection(bundle).await {
-            Err(error)
-                if matches!(
-                    &error,
-                    ExecServerError::WebSocketConnect { source, .. }
-                        if matches!(
-                            source,
-                            tokio_tungstenite::tungstenite::Error::Http(response)
-                                if response.status().as_u16() == 401
-                        )
-                ) =>
-            {
-                let bundle = provider.connect_bundle(identity.public_key()).await?;
-                open_connection(bundle).await
+        let mut deadline = Instant::now() + INITIAL_REGISTRY_OPERATION_TIMEOUT;
+        let retry_key = uuid::Uuid::new_v4().to_string();
+        let mut retries = 0;
+        let mut refreshed_unauthorized_bundle = false;
+        let connect_bundle = || async {
+            timeout(
+                INITIAL_REGISTRY_REQUEST_TIMEOUT,
+                provider.connect_bundle(identity.public_key()),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(ExecServerError::EnvironmentRegistryRequest(
+                    codex_http_client::RouteAwareRequestError::Timeout,
+                ))
+            })
+        };
+        let mut result = connect_bundle().await;
+        loop {
+            let bundle = match result {
+                Ok(bundle) => bundle,
+                Err(error)
+                    if is_retryable_registry_error(&error)
+                        && retries < INITIAL_REGISTRY_MAX_RETRIES =>
+                {
+                    // Session resumption owns its separate recovery deadline.
+                    let delay = registry_recovery_retry_delay(&retry_key, retries);
+                    retries += 1;
+                    result = match timeout_at(deadline, async {
+                        sleep(delay).await;
+                        connect_bundle().await
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => return Err(error),
+                    };
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let executor_public_key = bundle.executor_public_key.clone();
+            match open_connection(bundle).await {
+                Err(error)
+                    if !refreshed_unauthorized_bundle
+                        && matches!(
+                            &error,
+                            ExecServerError::WebSocketConnect { source, .. }
+                                if matches!(
+                                    source,
+                                    tokio_tungstenite::tungstenite::Error::Http(response)
+                                        if response.status().as_u16() == 401
+                                )
+                        ) =>
+                {
+                    refreshed_unauthorized_bundle = true;
+                    deadline = Instant::now() + INITIAL_REGISTRY_OPERATION_TIMEOUT;
+                    retries = 0;
+                    result = connect_bundle().await;
+                }
+                result => {
+                    return result
+                        .map(|(connection, options)| (connection, options, executor_public_key));
+                }
             }
-            result => result,
         }
     }
 
     pub async fn connect_websocket(
         args: RemoteExecServerConnectArgs,
     ) -> Result<Self, ExecServerError> {
-        let connection = Self::open_websocket_connection(&args).await?;
+        Self::connect_websocket_with_headers(args, HeaderMap::new()).await
+    }
+
+    async fn connect_websocket_with_headers(
+        args: RemoteExecServerConnectArgs,
+        http_headers: HeaderMap,
+    ) -> Result<Self, ExecServerError> {
+        let connection = Self::open_websocket_connection(&args, &http_headers).await?;
         let options = args.clone().into();
         Self::connect_with_recovery(
             connection,
             options,
-            Some(ExecServerReconnectStrategy::WebSocket(args)),
+            Some(ExecServerReconnectStrategy::WebSocket { args, http_headers }),
         )
         .await
     }
 
     pub(crate) async fn open_websocket_connection(
         args: &RemoteExecServerConnectArgs,
+        http_headers: &HeaderMap,
     ) -> Result<JsonRpcConnection, ExecServerError> {
         ensure_rustls_crypto_provider();
         let websocket_url = args.websocket_url.clone();
         let connect_timeout = args.connect_timeout;
-        let (stream, _) = timeout(connect_timeout, connect_async(websocket_url.as_str()))
+        let mut request = websocket_url
+            .as_str()
+            .into_client_request()
+            .map_err(|source| ExecServerError::WebSocketConnect {
+                url: websocket_url.clone(),
+                source,
+            })?;
+        request.headers_mut().extend(http_headers.clone());
+        let connector = WebSocketConnector::new_with_tls_mode(
+            &args.http_client_factory,
+            WebSocketTlsMode::TungsteniteDefault,
+        )
+        .map_err(|error| ExecServerError::WebSocketConfiguration(error.to_string()))?;
+        let websocket_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+        let connect = async {
+            if !http_headers.is_empty() && request.uri().scheme_str() == Some("ws") {
+                connector
+                    .connect_loopback_direct(request, websocket_config)
+                    .await
+            } else {
+                connector.connect(request, websocket_config).await
+            }
+        };
+        let (stream, _) = timeout(connect_timeout, connect)
             .await
             .map_err(|_| ExecServerError::WebSocketConnectTimeout {
                 url: websocket_url.clone(),
@@ -233,6 +443,16 @@ impl ExecServerClient {
         Self::connect(connection, options).await
     }
 
+    #[tracing::instrument(
+        name = "codex.exec_server.remote.noise.websocket_connect",
+        skip_all,
+        fields(
+            otel.kind = "client",
+            otel.name = "codex.exec_server.remote.noise.websocket_connect",
+            environment_id = %args.bundle.environment_id,
+            executor_registration_id = %args.bundle.executor_registration_id,
+        )
+    )]
     pub(crate) async fn open_noise_rendezvous_connection(
         args: NoiseRendezvousConnectArgs,
     ) -> Result<(JsonRpcConnection, ExecServerClientConnectOptions), ExecServerError> {
@@ -246,6 +466,7 @@ impl ExecServerClient {
             connect_timeout,
             initialize_timeout,
             resume_session_id,
+            http_client_factory,
         } = args;
         let NoiseRendezvousConnectBundle {
             websocket_url,
@@ -266,18 +487,16 @@ impl ExecServerClient {
                 url: diagnostic_url.clone(),
                 source,
             })?;
-        request
-            .headers_mut()
-            .extend(current_trace_context_headers());
+        request.headers_mut().extend(current_rendezvous_headers());
         let (stream, _) = timeout(
             connect_timeout,
-            connect_async_with_config(
-                request,
-                Some(noise_relay_websocket_config()),
-                // Rendezvous sends small, latency-sensitive frames, so avoid Nagle's coalescing delay.
-                /*disable_nagle*/
-                true,
-            ),
+            WebSocketConnector::new_with_tls_mode(
+                &http_client_factory,
+                WebSocketTlsMode::TungsteniteDefault,
+            )
+            .map_err(|error| ExecServerError::WebSocketConfiguration(error.to_string()))?
+            .with_tcp_nodelay()
+            .connect(request, noise_relay_websocket_config()),
         )
         .await
         .map_err(|_| ExecServerError::WebSocketConnectTimeout {
@@ -366,6 +585,7 @@ fn stdio_command_process(stdio_command: &StdioExecServerCommand) -> Command {
     let mut command = Command::new(&stdio_command.program);
     command.args(&stdio_command.args);
     command.envs(&stdio_command.env);
+    scrub_non_inheritable_env_vars(command.as_std_mut());
     if let Some(cwd) = &stdio_command.cwd {
         command.current_dir(cwd);
     }

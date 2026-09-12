@@ -2,6 +2,7 @@ use super::*;
 use crate::app_event::HistoryLookupResponse;
 use codex_app_server_protocol::NetworkAccess;
 use codex_app_server_protocol::SandboxPolicy;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -76,6 +77,92 @@ async fn resumed_initial_messages_render_history() {
 }
 
 #[tokio::test]
+async fn replayed_failed_turns_preserve_overload_warnings_between_retries() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let prompt = "The workspace also looks super confusing with its separator.";
+    let error_message = "Selected model is at capacity. Please try a different model.";
+    let failed_turn = |turn_id: &str, item_id: &str| AppServerTurn {
+        items: vec![AppServerThreadItem::UserMessage {
+            id: item_id.to_string(),
+            client_id: None,
+            content: vec![AppServerUserInput::Text {
+                text: prompt.to_string(),
+                text_elements: Vec::new(),
+            }],
+        }],
+        ..app_server_turn(
+            turn_id,
+            AppServerTurnStatus::Failed,
+            /*duration_ms*/ None,
+            /*error*/
+            Some(AppServerTurnError {
+                misalignment: None,
+                message: error_message.to_string(),
+                codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
+                additional_details: None,
+            }),
+        )
+    };
+
+    chat.replay_thread_turns(
+        vec![
+            failed_turn("turn-1", "user-1"),
+            failed_turn("turn-2", "user-2"),
+        ],
+        ReplayKind::ResumeInitialMessages,
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<String>();
+
+    assert_eq!(rendered.matches(prompt).count(), 2);
+    assert_eq!(rendered.matches(error_message).count(), 2);
+    insta::assert_snapshot!(
+        "replayed_failed_turns_preserve_overload_warnings_between_retries",
+        rendered
+    );
+}
+
+#[tokio::test]
+async fn restored_conversation_ultra_remains_selected_after_switching_to_plan() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+    chat.set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::High));
+
+    chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        thread_id: ThreadId::new(),
+        forked_from_id: None,
+        fork_parent_title: None,
+        thread_name: None,
+        model: "gpt-5.4".to_string(),
+        model_provider_id: "test-provider".to_string(),
+        service_tier: None,
+        approval_policy: AskForApproval::Never,
+        approvals_reviewer: ApprovalsReviewer::User,
+        permission_profile: PermissionProfile::read_only(),
+        active_permission_profile: None,
+        cwd: test_path_buf("/home/user/project").abs(),
+        runtime_workspace_roots: Vec::new(),
+        instruction_source_paths: Vec::new(),
+        reasoning_effort: Some(ReasoningEffortConfig::Ultra),
+        collaboration_mode: None,
+        personality: None,
+        message_history: None,
+        network_proxy: None,
+        rollout_path: None,
+    });
+    chat.handle_key_event(KeyEvent::from(KeyCode::BackTab));
+
+    assert_eq!(chat.active_collaboration_mode_kind(), ModeKind::Plan);
+    assert_eq!(
+        chat.current_reasoning_effort(),
+        Some(ReasoningEffortConfig::Ultra)
+    );
+}
+
+#[tokio::test]
 async fn replayed_user_messages_seed_composer_history() {
     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.bottom_pane.set_history_metadata(
@@ -145,7 +232,7 @@ async fn replayed_user_messages_seed_composer_history() {
         };
         offset
     };
-    let response = |offset, entry: &str| HistoryLookupResponse {
+    let response = |offset, entry: &str| HistoryLookupResponse::Entry {
         offset,
         log_id: 1,
         entry: Some(entry.to_string()),
@@ -187,6 +274,134 @@ async fn replayed_review_prompt_does_not_seed_composer_history() {
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     assert_eq!(chat.bottom_pane.composer_text(), "");
+}
+
+#[tokio::test]
+async fn replayed_delegated_tool_output_is_attributed_without_seeding_composer_history() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    let item = AppServerThreadItem::FunctionCallOutput {
+        id: "delegation-1".to_string(),
+        name: "send_message_to_thread".to_string(),
+        namespace: Some("codex_tui".to_string()),
+        output: FunctionCallOutputBody::Text(
+            "<codex_delegation>\n  <source_thread_id>source-task</source_thread_id>\n  <input>Follow &lt;up&gt; &amp; report</input>\n</codex_delegation>".to_string(),
+        ),
+    };
+    chat.replay_thread_item(
+        item.clone(),
+        "turn-1".to_string(),
+        ReplayKind::ResumeInitialMessages,
+    );
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    assert_chatwidget_snapshot!(
+        "replayed_delegated_tool_output",
+        lines_to_single_string(&cells[0])
+    );
+    let projected = crate::thread_transcript::thread_items_to_transcript_cells(
+        /*thread_id*/ None,
+        &chat.config.cwd,
+        [item],
+        crate::thread_transcript::RawReasoningVisibility::Hidden,
+        /*config*/ None,
+    );
+    assert_eq!(
+        projected
+            .iter()
+            .map(|cell| lines_to_single_string(&cell.transcript_lines(/*width*/ 80)))
+            .collect::<Vec<_>>(),
+        vec![lines_to_single_string(&cells[0])]
+    );
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(chat.bottom_pane.composer_text(), "");
+}
+
+#[tokio::test]
+async fn replayed_nested_review_prompts_do_not_render_or_seed_composer_history() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let review_hint = "current changes";
+    let review_prompt = "Review the current code changes (staged, unstaged, and untracked files).";
+    let user_message = |id: &str, text: &str| AppServerThreadItem::UserMessage {
+        id: id.to_string(),
+        client_id: None,
+        content: vec![AppServerUserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }],
+    };
+    let review_marker = |turn_id: &str| AppServerTurn {
+        items: vec![
+            AppServerThreadItem::EnteredReviewMode {
+                id: format!("{turn_id}-start"),
+                review: review_hint.to_string(),
+            },
+            AppServerThreadItem::ExitedReviewMode {
+                id: format!("{turn_id}-end"),
+                review: "review complete".to_string(),
+            },
+        ],
+        ..app_server_turn(
+            turn_id,
+            AppServerTurnStatus::Completed,
+            /*duration_ms*/ None,
+            /*error*/ None,
+        )
+    };
+
+    chat.replay_thread_turns(
+        vec![
+            review_marker("turn-review-before-steer"),
+            AppServerTurn {
+                items: vec![
+                    user_message("interrupted-prompt", review_hint),
+                    user_message("interrupted-steer", review_hint),
+                ],
+                completed_at: Some(1),
+                ..app_server_turn(
+                    "turn-interrupted",
+                    AppServerTurnStatus::Interrupted,
+                    /*duration_ms*/ None,
+                    /*error*/ None,
+                )
+            },
+            review_marker("turn-review"),
+            AppServerTurn {
+                items: vec![
+                    user_message("review-prompt-1", review_prompt),
+                    user_message("review-prompt-2", review_prompt),
+                    AppServerThreadItem::AgentMessage {
+                        id: "review-result".to_string(),
+                        text: "review result is retained".to_string(),
+                        phase: Some(MessagePhase::FinalAnswer),
+                        memory_citation: None,
+                        delivery: None,
+                        questions: None,
+                    },
+                ],
+                ..app_server_turn(
+                    "turn-review-child",
+                    AppServerTurnStatus::Interrupted,
+                    /*duration_ms*/ None,
+                    /*error*/ None,
+                )
+            },
+        ],
+        ReplayKind::ResumeInitialMessages,
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<String>();
+    assert!(!rendered.contains(review_prompt));
+    assert_eq!(rendered.matches(review_hint).count(), 4);
+    insta::assert_snapshot!("replayed_nested_review_prompts", rendered);
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(chat.bottom_pane.composer_text(), review_hint);
 }
 
 #[tokio::test]
@@ -361,12 +576,14 @@ async fn session_configured_syncs_widget_config_permissions_and_cwd() {
                         value: FileSystemSpecialPath::Root,
                     },
                     access: FileSystemAccessMode::Read,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::GlobPattern {
                         pattern: "**/.secret".to_string(),
                     },
                     access: FileSystemAccessMode::Deny,
+                    missing_path_behavior: None,
                 },
             ],
             glob_scan_max_depth: None,
@@ -706,6 +923,28 @@ async fn forked_thread_history_line_without_name_shows_id_once_snapshot() {
 }
 
 #[tokio::test]
+async fn prompt_edit_thread_history_line_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.emit_prompt_edit_thread_event();
+
+    let history_cell = tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 2), async {
+        loop {
+            match rx.recv().await {
+                Some(AppEvent::InsertHistoryCell(cell)) => break cell,
+                Some(_) => continue,
+                None => panic!("app event channel closed before prompt edit history was emitted"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for prompt edit history");
+    let combined = lines_to_single_string(&history_cell.display_lines(/*width*/ 80));
+
+    assert_chatwidget_snapshot!("prompt_edit_thread_history_line", combined);
+}
+
+#[tokio::test]
 async fn app_server_forked_thread_history_line_uses_app_server_title_snapshot() {
     let (chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let mut chat = chat;
@@ -831,6 +1070,7 @@ async fn replayed_retryable_app_server_error_keeps_turn_running() {
     chat.handle_server_notification(
         ServerNotification::Error(ErrorNotification {
             error: AppServerTurnError {
+                misalignment: None,
                 message: "Reconnecting... 1/5".to_string(),
                 codex_error_info: None,
                 additional_details: Some("Idle timeout waiting for SSE".to_string()),
@@ -979,6 +1219,7 @@ async fn replayed_in_progress_mcp_tool_call_stays_active() {
             app_context: None,
             mcp_app_resource_uri: None,
             plugin_id: None,
+            read_only_hint: None,
             result: None,
             error: None,
             duration_ms: None,
@@ -991,6 +1232,130 @@ async fn replayed_in_progress_mcp_tool_call_stays_active() {
     let active = active_blob(&chat);
     assert!(active.contains("Calling"));
     assert!(!active.contains("MCP tool call completed without a result"));
+}
+
+#[tokio::test]
+async fn failed_repl_mcp_tool_call_preserves_status_and_result() {
+    for server in ["node_repl", "cua_repl"] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        let _ = drain_insert_history(&mut rx);
+
+        chat.handle_server_notification(
+            ServerNotification::ItemCompleted(ItemCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                completed_at_ms: 0,
+                item: AppServerThreadItem::McpToolCall {
+                    id: "mcp-failed".to_string(),
+                    server: server.to_string(),
+                    tool: "js".to_string(),
+                    status: codex_app_server_protocol::McpToolCallStatus::Failed,
+                    arguments: json!({"title": "Inspect workspace"}),
+                    app_context: None,
+                    mcp_app_resource_uri: None,
+                    plugin_id: None,
+                    read_only_hint: None,
+                    result: Some(Box::new(codex_app_server_protocol::McpToolCallResult {
+                        content: vec![
+                            json!({"type": "text", "text": "Script failed"}),
+                            json!({"type": "text", "text": r#"{"exit_code":0,"output":"ready","chunk_id":"chunk-1"}"#}),
+                            json!({"type": "text", "text": "Script error:\npermission denied"}),
+                        ],
+                        structured_content: None,
+                        meta: None,
+                    })),
+                    error: None,
+                    duration_ms: Some(5),
+                },
+            }),
+            /*replay_kind*/ None,
+        );
+
+        let cells = drain_insert_history(&mut rx);
+        let [lines] = cells.as_slice() else {
+            panic!("expected one completed MCP tool call for {server}");
+        };
+        insta::allow_duplicates! {
+            insta::assert_snapshot!(lines_to_single_string(lines), @r#"
+            • Called Inspect workspace
+              └ Script failed
+                {"exit_code": 0, "output": "ready", "chunk_id": "chunk-1"}
+                Script error:
+                permission denied
+            "#);
+        }
+        assert_eq!(
+            lines.first(),
+            Some(&Line::from(vec![
+                "•".red().bold(),
+                " ".into(),
+                "Called".bold(),
+                " ".into(),
+                "Inspect workspace".cyan(),
+            ])),
+            "{server}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn deferred_mcp_lifecycle_events_keep_fifo_after_stream_finishes() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let cwd = chat.config.cwd.to_path_buf();
+    chat.stream_controller = Some(crate::streaming::controller::StreamController::new(
+        /*width*/ Some(80),
+        cwd.as_path(),
+        chat.history_render_mode(),
+    ));
+
+    chat.on_mcp_tool_call_started(AppServerThreadItem::McpToolCall {
+        id: "mcp-deferred".to_string(),
+        server: "copilot-bridge".to_string(),
+        tool: "copilot".to_string(),
+        status: codex_app_server_protocol::McpToolCallStatus::InProgress,
+        arguments: json!({"action": "wait"}),
+        app_context: None,
+        mcp_app_resource_uri: None,
+        plugin_id: None,
+        read_only_hint: None,
+        result: None,
+        error: None,
+        duration_ms: None,
+    });
+    assert!(!chat.interrupts.is_empty());
+
+    chat.stream_controller = None;
+    chat.on_mcp_tool_call_completed(AppServerThreadItem::McpToolCall {
+        id: "mcp-deferred".to_string(),
+        server: "copilot-bridge".to_string(),
+        tool: "copilot".to_string(),
+        status: codex_app_server_protocol::McpToolCallStatus::Completed,
+        arguments: json!({"action": "wait"}),
+        app_context: None,
+        mcp_app_resource_uri: None,
+        plugin_id: None,
+        read_only_hint: None,
+        result: Some(Box::new(codex_app_server_protocol::McpToolCallResult {
+            content: vec![json!({"type": "text", "text": "deferred result"})],
+            structured_content: None,
+            meta: None,
+        })),
+        error: None,
+        duration_ms: Some(5),
+    });
+
+    assert!(!chat.interrupts.is_empty());
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.flush_interrupt_queue();
+
+    assert!(chat.interrupts.is_empty());
+    assert!(chat.transcript.active_cell.is_none());
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<String>();
+    assert!(rendered.contains("deferred result"), "{rendered}");
 }
 
 #[tokio::test]

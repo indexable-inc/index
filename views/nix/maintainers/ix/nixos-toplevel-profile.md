@@ -347,7 +347,7 @@ nixpkgs   /nix/store/llgwlxshmy0ifvxh7f8wq53vk5x7vd13-source
 expr      the same one this document opens with
 config    extra-experimental-features = rust-eval, eval-backend = rust,
           lint-{url,short-path,absolute-path}-literals = warn
-build     -Dnix:rust-eval-cargo-features='--features perf-ops'
+build     -Dnix-cmd:rust-eval-cargo-features='--features perf-ops'
 answer    /nix/store/hhng3cfvzlypji8zmhg13pwrwjmis12a-nixos-system-nixos-26.11pre-git.drv
           which is the same store path the two arms agree on above
 ```
@@ -568,6 +568,17 @@ site can be fixed with a per-module symbol cache, which is contained. Making
 `Op::MkAttrs` stop interning needs the compiler to emit symbols where it
 currently emits string constants, which is a new op or an op variant, so the
 smaller two thirds of an already small number is also the cheap two thirds.
+
+*Done 2026-09-04, once the number stopped being small.* A larger question
+(`nixosConfigurations.hil-compute-1...toplevel.drvPath`, 78 s edit run on
+dev-compute-4) showed 50.7M interns, `insert_attr_pairs` the top interner and
+`memcmp` under `Vm::intern` at 0.7% by itself. `Op::MkAttrs { statics,
+dynamics }` now pops `statics` bare values and takes their names from the op's
+`AttrSite` (module symbols in emission order, through the link table); only
+`dynamics` (name, value) pairs are on the stack and only those names are
+interned. The formals path went through the link table the same day. The
+static-name `Op::Const` pushes are gone from the compiler, so the
+`attr_name_interns` counter now counts dynamic names only.
 
 **A draft of this section put the `MkAttrs` share at 5,495,491, by subtracting
 the intern sites a `vm.rs` grep found from `interns`.** The measured figure is

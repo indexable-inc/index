@@ -3,17 +3,20 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::TurnInput;
+use crate::session::session::Session;
+use crate::session::turn::McpStartupRequirements;
+use crate::session::turn::run_hooks_and_record_inputs;
 use crate::session::turn::run_turn;
 use crate::session::turn_context::TurnContext;
 use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
 use crate::state::TaskKind;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_thread_store::PersistContext;
 use tracing::Instrument;
 use tracing::trace_span;
 
 use super::SessionTask;
-use super::SessionTaskContext;
 use super::SessionTaskResult;
 
 #[derive(Default)]
@@ -36,13 +39,11 @@ impl SessionTask for RegularTask {
 
     async fn run(
         self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
+        sess: Arc<Session>,
         ctx: Arc<TurnContext>,
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
-        let sess = session.clone_session();
-        let turn_extension_data = session.turn_extension_data();
         let run_turn_span = trace_span!("run_turn");
         // Regular turns emit `TurnStarted` inline so first-turn lifecycle does
         // not wait on startup prewarm resolution.
@@ -52,7 +53,7 @@ impl SessionTask for RegularTask {
                 trace_id: ctx.trace_id.clone(),
                 started_at: ctx.turn_timing_state.started_at_unix_secs().await,
                 model_context_window: ctx.model_context_window(),
-                collaboration_mode_kind: ctx.collaboration_mode.mode,
+                collaboration_mode_kind: ctx.mode(),
             });
             sess.send_event(ctx.as_ref(), event).await;
             sess.set_server_reasoning_included(/*included*/ false).await;
@@ -62,7 +63,10 @@ impl SessionTask for RegularTask {
         .instrument(trace_span!("regular_task.prepare_run_turn"))
         .await;
         let prewarmed_client_session = match prewarmed_client_session {
-            SessionStartupPrewarmResolution::Cancelled => return Ok(None),
+            SessionStartupPrewarmResolution::Cancelled => {
+                run_hooks_and_record_inputs(&sess, &ctx, &input, PersistContext::Standard).await;
+                return Ok(None);
+            }
             SessionStartupPrewarmResolution::Unavailable { .. } => None,
             SessionStartupPrewarmResolution::Ready(prewarmed_client_session) => {
                 Some(*prewarmed_client_session)
@@ -70,17 +74,23 @@ impl SessionTask for RegularTask {
         };
         let mut next_input = input;
         let mut prewarmed_client_session = prewarmed_client_session;
+        let mut mcp_startup_requirements = McpStartupRequirements::default();
         loop {
             let last_agent_message = run_turn(
                 Arc::clone(&sess),
                 Arc::clone(&ctx),
-                Arc::clone(&turn_extension_data),
                 next_input,
+                &mut mcp_startup_requirements,
                 prewarmed_client_session.take(),
                 cancellation_token.child_token(),
             )
             .instrument(run_turn_span.clone())
             .await?;
+            // Terminal errors are already reported. Let task completion preserve pending
+            // input instead of restarting the failed turn for that same input.
+            if ctx.terminal_error.lock().await.is_some() {
+                return Ok(last_agent_message);
+            }
             if !sess.input_queue.has_pending_input(&sess.active_turn).await {
                 return Ok(last_agent_message);
             }

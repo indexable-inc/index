@@ -185,14 +185,77 @@ requireGit() {
     [[ $(type -p git) ]] || skipTest "Git not installed"
 }
 
-# Unlike requireGit and the hg tests, this fails instead of skipping. jj is
-# declared in tests/functional/package.nix, so under any Nix-driven run it is on
-# PATH; a missing binary means that closure regressed rather than that the
-# environment is unsupported. The jj fetcher is a fork-local patch series with no
-# upstream coverage behind it, so a skip here is what lets a broken fetcher
-# report itself as a passing suite.
+# Unlike requireGit and the hg tests, this fails instead of skipping. Under any
+# Nix-driven run `jj` is on PATH, so a missing binary means that closure
+# regressed rather than that the environment is unsupported. The jj fetcher is
+# a fork-local patch series with no upstream coverage behind it, so a skip here
+# is what lets a broken fetcher report itself as a passing suite.
+#
+# The `jj` this finds is ix's native client -- the `packages/jj-ix` package,
+# which installs `bin/jj` -- the only jj that creates the native ix-local
+# stores the fetcher reads. There is no stock jj to reach by accident: the
+# closure names exactly one, and the fork's own binary is not packaged.
+#
+# This tree does not declare it. nixpkgs' modular packaging vendors its own
+# tests/functional/package.nix and only the source crosses the
+# `overrideSource` boundary, so the client is appended to `nativeBuildInputs`
+# by the ix package scope (index/packages/nix/default.nix,
+# `nix-functional-tests`).
 requireJj() {
-    [[ $(type -p jj) ]] || fail "jj not found in PATH, but tests/functional/package.nix declares it: the test closure is broken"
+    if [[ $(type -p jj) ]]; then
+        return 0
+    fi
+
+    # Two environments can get here, and they need different fixes, so the
+    # message names both rather than leaving whoever hits it to guess.
+    # `tests/nixos/functional/common.nix` builds its own PATH out of a short
+    # list (meson, ninja, jq, git, bash, coreutils) instead of taking this
+    # suite's own build closure, so jj is missing there even though every
+    # other runner has it.
+    if isTestOnNixOS; then
+        fail "jj not found in PATH: pass the ix jj client (packages/jj-ix) as the 'jjClient' module argument of tests/nixos/functional/common.nix, whose runtimeInputs take it from there; nothing sets it by default, and upstream jujutsu is not a substitute (these fixtures use the ix client's surface and its ix-local stores)"
+    fi
+    fail "jj not found in PATH: the ix package scope (index/packages/nix/default.nix, nix-functional-tests) appends packages/jj-ix to this derivation's nativeBuildInputs, so either that override was dropped or this suite was built from the fork's standalone flake, which has no jj to give it"
+}
+
+# Give jj a deterministic identity and keep it away from the user's config.
+# Call from the test body, after common.sh has set TEST_ROOT.
+jjConfig() {
+    export JJ_CONFIG=$TEST_ROOT/jjconfig.toml
+    cat > "$JJ_CONFIG" <<EOF
+[user]
+name = "Nix Test"
+email = "test@example.org"
+EOF
+}
+
+# Create a native jj repository at $1. THE one spelling of the init command
+# for the whole suite. `--allow-case-insensitive`: TEST_ROOT is
+# case-insensitive on macOS and no fixture carries case-colliding paths.
+jjInit() {
+    jj init --allow-case-insensitive --repo "$(basename "$1")" "$1" > /dev/null
+}
+
+# Create a directory that can be used as a flake source.
+#
+# A plain directory cannot be one. `path:` serves store objects only
+# (src/libfetchers/path.cc): a mutable directory has no identity a lock file
+# can name, so it is refused rather than copied. jj supplies an identity for
+# the price of an init, and it costs the fixture nothing else -- jj has no
+# dirty state, so the test goes on writing files whenever it likes and every
+# fetch snapshots whatever is on disk at that moment. That is the same
+# behaviour these fixtures had while they were plain directories, which is
+# why migrating one is a single call and never a commit.
+#
+# A *bare* path to the result needs no prefix: flakeref.cc routes a directory
+# holding `.jj` to `jj+file://` by itself. Only a flake URL written out in
+# full -- an `inputs.<name>.url` inside a generated flake.nix, or a `path:`
+# a test spells literally -- has to say `jj+file://$dir`.
+jjFlakeDir() {
+    requireJj
+    jjConfig
+    mkdir -p "$1"
+    jjInit "$1"
 }
 
 fail() {
@@ -281,7 +344,7 @@ onError() {
 # functions like expectStderr won't mistake them for expected Nix CLI errors.
 # Suggestion: -101 (negative to indicate very abnormal, and beyond the normal
 #             range of signals)
-# Example (showns as string): 'repl.sh:123: in call to grepQuiet: '
+# Example: 'eval.sh:123: in call to grepQuiet: '
 # This function is inefficient, so it should only be used in error messages.
 callerPrefix() {
   # Find the closest caller that's not from this file

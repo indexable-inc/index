@@ -1,55 +1,16 @@
 # vim: filetype=meson
 
+option(
+  'host-build-identity',
+  type : 'string',
+  value : '',
+  description : 'immutable CLI and host dependency identity for persistent evaluation caching',
+)
+
 # A relative path means it gets appended to prefix.
 option(
   'profile-dir',
   type : 'string',
   value : 'etc/profile.d',
   description : 'the path to install shell profile files',
-)
-
-option(
-  'rust-eval',
-  type : 'feature',
-  value : 'disabled',
-  description : 'link the in-tree Rust evaluator (rust/nix-eval-rs) behind eval-backend = rust',
-)
-
-# Exists because `build_always_stale` makes the cargo custom_target re-run on
-# every ninja invocation, so hand-copying a differently-configured
-# libnix_eval_rs.a into the build directory does not survive the next link. A
-# measurement that built the crate one way and then relinked was comparing the
-# default build to itself, which is how an on/off perf pair came to report a
-# 1.3% difference between one binary and that same binary (ENG-12859). It also
-# made the `perf-ops` cargo feature unreachable from the only build that links
-# the crate.
-#
-#   -Dnix:rust-eval-cargo-features=--no-default-features   counters compiled out
-#   -Dnix:rust-eval-cargo-features=--features perf-ops     per-op counter on
-#
-# Empty is the shipping configuration.
-option(
-  'rust-eval-cargo-features',
-  type : 'string',
-  value : '',
-  description : 'extra cargo flags for the nix-eval-rs build, verbatim (see the comment above)',
-)
-
-# Link an already-built libnix_eval_rs.a instead of running cargo. Set this and
-# the cargo custom_target below is skipped entirely.
-#
-# It exists because a packaged build cannot always run cargo from here.
-# nixpkgs' modular nix packaging vendors its OWN copy of src/nix/package.nix,
-# so a `withRustEval` argument added to the in-tree one never executes on that
-# path, and the fileset it would have extended -- which is what puts ../../rust
-# and the derivation.nix that build.rs fingerprints into the derivation --
-# never gets extended either. Building the archive in its own derivation, where
-# the fileset is under the packager's control, and handing the result in here is
-# the seam that works for both. The in-tree cargo path stays the default for
-# `nix build path:.#nix-cli` and for an ordinary developer build.
-option(
-  'rust-eval-prefix',
-  type : 'string',
-  value : '',
-  description : 'prefix holding a prebuilt lib/libnix_eval_rs.a and include/; empty means build it with cargo',
 )

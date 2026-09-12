@@ -7,7 +7,6 @@
   lib,
   pkgs,
   ix,
-  paths,
   mkCheck,
   nushell,
 }: let
@@ -22,7 +21,7 @@
   # whatever untracked state sits next to it in a working checkout.
   nushellConfig = fs.toSource {
     root = ./config/nushell;
-    fileset = fs.intersection (fs.gitTracked paths.root) ./config/nushell;
+    fileset = ./config/nushell;
   };
 in {
   zellij-config = mkCheck "zellij-config" {

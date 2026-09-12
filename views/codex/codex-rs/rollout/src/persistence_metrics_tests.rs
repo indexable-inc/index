@@ -10,7 +10,6 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ReviewTarget;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
@@ -25,9 +24,11 @@ use super::TurnSizeTotals;
 use super::is_thread_sampled;
 use super::measure_and_filter_rollout_items;
 use super::update_turn_measurements;
+use crate::ResponseItemEnvelope;
+use crate::RolloutItem;
 
 fn retained_message(text: &str) -> RolloutItem {
-    RolloutItem::ResponseItem(ResponseItem::Message {
+    RolloutItem::ResponseItem(ResponseItemEnvelope::new(ResponseItem::Message {
         id: None,
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
@@ -35,7 +36,7 @@ fn retained_message(text: &str) -> RolloutItem {
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
-    })
+    }))
 }
 
 fn turn_started(turn_id: &str) -> RolloutItem {
@@ -51,7 +52,9 @@ fn turn_started(turn_id: &str) -> RolloutItem {
 fn turn_complete(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
         turn_id: turn_id.to_string(),
+        started_at: None,
         last_agent_message: None,
+        error: None,
         completed_at: None,
         duration_ms: None,
         time_to_first_token_ms: None,
@@ -61,6 +64,7 @@ fn turn_complete(turn_id: &str) -> RolloutItem {
 fn turn_aborted(turn_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
         turn_id: Some(turn_id.to_string()),
+        started_at: None,
         reason: TurnAbortReason::Interrupted,
         completed_at: None,
         duration_ms: None,
@@ -103,7 +107,7 @@ fn thread_sampling_is_stable_and_selects_whole_threads() {
 #[test]
 fn mixed_batch_reports_exact_policy_counts_and_bytes() {
     let kept = retained_message("hello");
-    let dropped = RolloutItem::ResponseItem(ResponseItem::Other);
+    let dropped = RolloutItem::ResponseItem(ResponseItemEnvelope::new(ResponseItem::Other));
     let items = vec![kept.clone(), dropped.clone()];
 
     let (persisted, measurement) =
@@ -154,7 +158,7 @@ fn turn_measurements_span_batches_and_include_items_before_start() {
         retained_message("first prompt"),
         turn_started("turn-1"),
         retained_message("first response"),
-        RolloutItem::ResponseItem(ResponseItem::Other),
+        RolloutItem::ResponseItem(ResponseItemEnvelope::new(ResponseItem::Other)),
         turn_complete("turn-1"),
     ];
     let second_turn = vec![
@@ -255,6 +259,7 @@ fn item_completion_persistence_depends_on_history_mode() {
             client_id: None,
             content: Vec::new(),
         }),
+        started_at_ms: Some(0),
         completed_at_ms: 0,
     }));
 
@@ -296,6 +301,7 @@ fn review_mode_persistence_depends_on_history_mode() {
                 },
                 user_facing_hint: "Review requested.".to_string(),
             }),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
         })),
         RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
@@ -305,6 +311,7 @@ fn review_mode_persistence_depends_on_history_mode() {
                 id: "exited-review".to_string(),
                 review_output: None,
             }),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
         })),
     ];

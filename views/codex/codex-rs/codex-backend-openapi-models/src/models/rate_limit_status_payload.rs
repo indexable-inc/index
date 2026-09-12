@@ -112,10 +112,16 @@ pub enum PlanType {
     FreeWorkspace,
     #[serde(rename = "team")]
     Team,
+    #[serde(rename = "self_serve_business_prolite")]
+    SelfServeBusinessProLite,
     #[serde(rename = "self_serve_business_usage_based")]
     SelfServeBusinessUsageBased,
     #[serde(rename = "business")]
     Business,
+    #[serde(rename = "ent26")]
+    Ent26,
+    #[serde(rename = "enterprise_cbp_automation")]
+    EnterpriseCbpAutomation,
     #[serde(rename = "enterprise_cbp_usage_based")]
     EnterpriseCbpUsageBased,
     #[serde(rename = "education")]
@@ -128,6 +134,10 @@ pub enum PlanType {
     Enterprise,
     #[serde(rename = "edu")]
     Edu,
+    #[serde(rename = "edu_plus")]
+    EduPlus,
+    #[serde(rename = "edu_pro")]
+    EduPro,
     #[serde(rename = "unknown", other)]
     Unknown,
 }

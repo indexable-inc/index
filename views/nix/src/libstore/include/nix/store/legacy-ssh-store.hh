@@ -73,6 +73,11 @@ struct LegacySSHStore : public virtual Store
 
     ref<Connection> openConnection();
 
+    bool isValidPath(const StorePath & path) override
+    {
+        return queryValidPaths({path}).contains(path);
+    }
+
     void queryPathInfoUncached(
         const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept override;
 

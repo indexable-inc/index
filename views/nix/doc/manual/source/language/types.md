@@ -74,9 +74,6 @@ Operations such as [`import`] can also expect a path to resolve to a readable fi
 > **Note**
 >
 > The Nix language assumes that all input files will remain _unchanged_ while evaluating a Nix expression.
-> For example, assume you used a file path in an interpolated string during a `nix repl` session.
-> Later in the same session, after having changed the file contents, evaluating the interpolated string with the file path again might not return a new [store path], since Nix might not re-read the file contents.
-> Use `:r` to reset the repl as needed.
 
 [store path]: @docroot@/store/store-path.md
 

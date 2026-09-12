@@ -4,9 +4,12 @@ use rmcp::ClientHandler;
 use rmcp::RoleClient;
 use rmcp::model::CancelledNotificationParam;
 use rmcp::model::ClientInfo;
-use rmcp::model::CreateElicitationRequestParams;
-use rmcp::model::CreateElicitationResult;
+use rmcp::model::CustomNotification;
+use rmcp::model::ElicitRequestParams;
+use rmcp::model::ElicitResult;
+#[allow(deprecated)]
 use rmcp::model::LoggingLevel;
+#[allow(deprecated)]
 use rmcp::model::LoggingMessageNotificationParam;
 use rmcp::model::ProgressNotificationParam;
 use rmcp::model::ResourceUpdatedNotificationParam;
@@ -25,19 +28,21 @@ use crate::rmcp_client::SendNotification;
 pub(crate) struct LoggingClientHandler {
     client_info: ClientInfo,
     send_elicitation: Arc<SendElicitation>,
-    send_notification: Arc<SendNotification>,
+    /// Sink for the server's custom notifications; `None` drops them (logged at
+    /// debug level).
+    send_notification: Option<Arc<SendNotification>>,
 }
 
 impl LoggingClientHandler {
     pub(crate) fn new(
         client_info: ClientInfo,
         send_elicitation: SendElicitation,
-        send_notification: SendNotification,
+        send_notification: Option<SendNotification>,
     ) -> Self {
         Self {
             client_info,
             send_elicitation: Arc::new(send_elicitation),
-            send_notification: Arc::new(send_notification),
+            send_notification: send_notification.map(Arc::new),
         }
     }
 }
@@ -45,9 +50,9 @@ impl LoggingClientHandler {
 impl ClientHandler for LoggingClientHandler {
     async fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParams,
+        request: ElicitRequestParams,
         context: RequestContext<RoleClient>,
-    ) -> Result<CreateElicitationResult, rmcp::ErrorData> {
+    ) -> Result<ElicitResult, rmcp::ErrorData> {
         (self.send_elicitation)(context.id, Elicitation::Mcp(request))
             .await
             .map(Into::into)
@@ -60,7 +65,7 @@ impl ClientHandler for LoggingClientHandler {
         _context: NotificationContext<RoleClient>,
     ) {
         info!(
-            "MCP server cancelled request (request_id: {}, reason: {:?})",
+            "MCP server cancelled request (request_id: {:?}, reason: {:?})",
             params.request_id, params.reason
         );
     }
@@ -100,6 +105,7 @@ impl ClientHandler for LoggingClientHandler {
         self.client_info.clone()
     }
 
+    #[allow(deprecated)]
     async fn on_logging_message(
         &self,
         params: LoggingMessageNotificationParam,
@@ -109,6 +115,7 @@ impl ClientHandler for LoggingClientHandler {
             level,
             logger,
             data,
+            ..
         } = params;
         let logger = logger.as_deref();
         match level {
@@ -144,11 +151,18 @@ impl ClientHandler for LoggingClientHandler {
 
     async fn on_custom_notification(
         &self,
-        notification: rmcp::model::CustomNotification,
+        notification: CustomNotification,
         _context: NotificationContext<RoleClient>,
     ) {
+        let Some(send_notification) = &self.send_notification else {
+            debug!(
+                "MCP server custom notification dropped (method: {}): no notification sink",
+                notification.method
+            );
+            return;
+        };
         let method = notification.method.clone();
-        if let Err(error) = (self.send_notification)(notification).await {
+        if let Err(error) = send_notification(notification).await {
             warn!("MCP server custom notification handler failed (method: {method}): {error}");
         }
     }

@@ -14,6 +14,8 @@
 #include <future>
 #include <thread>
 
+struct IxeBuildScheduler;
+
 namespace nix {
 
 /* Forward definition. */
@@ -41,6 +43,12 @@ GoalPtr upcast_goal(std::shared_ptr<PathSubstitutionGoal> subGoal);
 GoalPtr upcast_goal(std::shared_ptr<DrvOutputSubstitutionGoal> subGoal);
 GoalPtr upcast_goal(std::shared_ptr<DerivationGoal> subGoal);
 
+enum class PathContentStatus {
+    Valid,
+    InvalidArchive,
+    InvalidContentAddress,
+};
+
 typedef std::chrono::time_point<std::chrono::steady_clock> steady_time_point;
 
 /**
@@ -51,15 +59,9 @@ typedef std::chrono::time_point<std::chrono::steady_clock> steady_time_point;
 struct Child
 {
     WeakGoalPtr goal;
-    Goal * goal2; // ugly hackery
+    Goal * identity;
+    uint64_t schedulerId;
     std::set<MuxablePipePollState::CommChannel> channels;
-    bool respectTimeouts;
-    bool inBuildSlot;
-    /**
-     * Time we last got output on stdout/stderr
-     */
-    steady_time_point lastOutput;
-    steady_time_point timeStarted;
 };
 
 #ifndef _WIN32 // TODO Enable building on Windows
@@ -73,6 +75,13 @@ struct HookInstance;
 class Worker
 {
 private:
+
+    /** Rust owns child lifetimes, slot accounting and deadline policy. It must
+     * outlive the goal/channel bindings whose destructors unregister children. */
+    std::unique_ptr<IxeBuildScheduler, void (*)(IxeBuildScheduler *)> childScheduler;
+    const steady_time_point schedulerEpoch = steady_time_point::clock::now();
+
+    uint64_t schedulerTime(steady_time_point now) const;
 
     /* Note: the worker should only have strong pointers to the
        top-level goals. */
@@ -88,7 +97,7 @@ private:
     WeakGoals awake;
 
     /**
-     * Goals waiting for a build slot.
+     * Weak host bindings for goals Rust has told us to suspend for a build slot.
      */
     WeakGoals wantingToBuild;
 
@@ -96,17 +105,6 @@ private:
      * Child processes currently running.
      */
     std::list<Child> children;
-
-    /**
-     * Number of build slots occupied.  This includes local builds but does not
-     * include substitutions or remote builds via the build hook.
-     */
-    size_t nrLocalBuilds;
-
-    /**
-     * Number of substitution slots occupied.
-     */
-    size_t nrSubstitutions;
 
     /**
      * Maps used to prevent multiple instantiations of a goal for the
@@ -132,14 +130,9 @@ private:
     WeakGoals waitingForAWhile;
 
     /**
-     * Last time the goals in `waitingForAWhile` were woken up.
+     * Cache for checkPathContents().
      */
-    steady_time_point lastWokenUp;
-
-    /**
-     * Cache for pathContentsGood().
-     */
-    std::map<StorePath, bool> pathContentsGoodCache;
+    std::map<StorePath, PathContentStatus> pathContentsCache;
 
 #ifndef _WIN32
     /**
@@ -182,6 +175,10 @@ public:
     Store & evalStore;
     const WorkerSettings & settings;
 
+    /** Failure policy belongs to this worker, without changing process settings. */
+    const bool keepGoing;
+    const bool independentRequests;
+
     /**
      * Function to get the substituters to use for path substitution.
      *
@@ -214,7 +211,7 @@ public:
      */
     bool tryBuildHook = true;
 
-    Worker(Store & store, Store & evalStore);
+    Worker(Store & store, Store & evalStore, BuildFailureMode failureMode = BuildFailureMode::Configured);
     ~Worker();
 
     /**
@@ -290,6 +287,9 @@ public:
      */
     size_t getNrSubstitutions();
 
+    /** The single admission policy for local builds and substitutions. */
+    bool buildSlotAvailable(JobCategory category);
+
     /**
      * Registers a running child process.  `inBuildSlot` means that
      * the process counts towards the jobs limit.
@@ -306,19 +306,10 @@ public:
      * because they can't run yet (e.g., there is no free build slot,
      * or the hook would still say `postpone`).
      *
-     * This overload requires `goal` to point to a fully constructed,
-     * valid goal object, as it calls `goal->jobCategory()`.
+     * Uses `goal` only for identity comparison. Rust retains the registered
+     * category, so cleanup is safe even while the goal is being destroyed.
      */
     void childTerminated(Goal * goal, bool wakeSleepers = true);
-
-    /**
-     * Unregisters a running child process, like the other overload.
-     *
-     * This overload only uses `goal` as a pointer for comparison with
-     * weak goal references, so it is safe to call from destructors
-     * where the goal object may be partially destroyed.
-     */
-    void childTerminated(Goal * goal, JobCategory jobCategory, bool wakeSleepers = true);
 
     /**
      * Put `goal` to sleep until a build slot becomes available (which
@@ -348,13 +339,13 @@ public:
     /**
      * Wait for input to become available.
      */
-    void waitForInput();
+    void waitForInput(bool block = true);
 
     /**
      * Check whether the given valid path exists and has the right
      * contents.
      */
-    bool pathContentsGood(const StorePath & path);
+    PathContentStatus checkPathContents(const StorePath & path);
 
     void markContentsGood(const StorePath & path);
 

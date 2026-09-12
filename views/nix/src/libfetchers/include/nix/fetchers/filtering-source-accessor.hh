@@ -54,6 +54,8 @@ struct FilteringSourceAccessor : SourceAccessor
 
     std::string_view identityClass(const CanonPath & path) override;
 
+    std::shared_ptr<SourceAccessor> getSubtree(const CanonPath & path) override;
+
     void invalidateCache(const CanonPath & path) override;
 
     /**

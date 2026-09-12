@@ -112,16 +112,34 @@ impl core::error::Error for HexError {}
 /// back to exactly one input. This is the only place blake3 is called.
 #[must_use]
 pub fn tagged(tag: &str, fields: &[&[u8]]) -> Hash {
-    let mut hasher = blake3::Hasher::new();
-    let mut push = |bytes: &[u8]| {
-        hasher.update(&(bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-    };
-    push(tag.as_bytes());
+    let mut hasher = TaggedHasher::new(tag);
     for field in fields {
-        push(field);
+        hasher.field(field);
     }
-    Hash(*hasher.finalize().as_bytes())
+    hasher.finish()
+}
+
+/// Incrementally hash the same length-prefixed fields as [`tagged`].
+/// Callers can release each field after feeding it to the hasher.
+pub struct TaggedHasher(blake3::Hasher);
+
+impl TaggedHasher {
+    #[must_use]
+    pub fn new(tag: &str) -> Self {
+        let mut hasher = Self(blake3::Hasher::new());
+        hasher.field(tag.as_bytes());
+        hasher
+    }
+
+    pub fn field(&mut self, bytes: &[u8]) {
+        self.0.update(&(bytes.len() as u64).to_le_bytes());
+        self.0.update(bytes);
+    }
+
+    #[must_use]
+    pub fn finish(self) -> Hash {
+        Hash(*self.0.finalize().as_bytes())
+    }
 }
 
 /// Tag for [`crate::Domain`]. Bump when the field list changes.

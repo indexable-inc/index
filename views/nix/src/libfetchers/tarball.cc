@@ -396,6 +396,22 @@ struct CurlInputScheme : InputScheme
     {
         return (bool) input.getNarHash();
     }
+
+    /* For every scheme over a URL, `file` included: both serve a store
+       object whose NAR hash the fetch recorded (`narHash`), and that hash
+       is a content address, so it is a sound key for the source-path cache
+       (`fetchToStore`). A `file` input without one had no fingerprint at
+       all, which made its every mount "uncacheable": the NAR walk on each
+       evaluation, and a refusal under the functional suite's barf mode. */
+    std::optional<std::string> getFingerprint(Store & store, const Input & input) const override
+    {
+        if (auto narHash = input.getNarHash())
+            return narHash->to_string(HashFormat::SRI, true);
+        else if (auto rev = input.getRev())
+            return rev->gitRev();
+        else
+            return std::nullopt;
+    }
 };
 
 struct FileInputScheme : CurlInputScheme
@@ -513,15 +529,6 @@ struct TarballInputScheme : CurlInputScheme
         return {result.accessor, input};
     }
 
-    std::optional<std::string> getFingerprint(Store & store, const Input & input) const override
-    {
-        if (auto narHash = input.getNarHash())
-            return narHash->to_string(HashFormat::SRI, true);
-        else if (auto rev = input.getRev())
-            return rev->gitRev();
-        else
-            return std::nullopt;
-    }
 };
 
 static auto rTarballInputScheme = OnStartup([] { registerInputScheme(std::make_unique<TarballInputScheme>()); });

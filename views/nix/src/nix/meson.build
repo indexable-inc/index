@@ -38,6 +38,7 @@ configdata = configuration_data()
 
 # The CLI has a more detailed version string than the libraries; see `nixVersion`
 configdata.set_quoted('NIX_CLI_VERSION', meson.project_version())
+configdata.set_quoted('NIX_HOST_BUILD_IDENTITY', get_option('host-build-identity'))
 
 fs = import('fs')
 prefix = get_option('prefix')
@@ -60,7 +61,6 @@ subdir('nix-meson-build-support/generate-header')
 
 nix_sources = [ config_priv_h ] + files(
   'add-to-store.cc',
-  'app.cc',
   'build.cc',
   'bundle.cc',
   'cat.cc',
@@ -74,13 +74,11 @@ nix_sources = [ config_priv_h ] + files(
   'develop.cc',
   'diff-closures.cc',
   'dump-path.cc',
-  'edit.cc',
+  'rust-edit.cc',
   'env.cc',
-  'eval-persistent.cc',
-  'eval.cc',
   'flake-prefetch-inputs.cc',
   'flake.cc',
-  'formatter.cc',
+  'rust-formatter.cc',
   'hash.cc',
   'invocation-record.cc',
   'invocation.cc',
@@ -97,9 +95,10 @@ nix_sources = [ config_priv_h ] + files(
   'profile.cc',
   'realisation.cc',
   'registry.cc',
-  'repl.cc',
   'run.cc',
-  'search.cc',
+  'rust-command.cc',
+  'rust-persistent.cc',
+  'rust-search.cc',
   'self-exe.cc',
   'sigs.cc',
   'store-builds.cc',
@@ -151,7 +150,6 @@ nix_collect_garbage_sources = files(
 nix_copy_closure_sources = files(
   'nix-copy-closure/nix-copy-closure.cc',
 )
-nix_env_buildenv_gen = gen_header.process('nix-env/buildenv.nix')
 nix_env_sources = files(
   'nix-env/nix-env.cc',
   'nix-env/user-env.cc',
@@ -160,10 +158,6 @@ nix_instantiate_sources = files(
   'nix-instantiate/nix-instantiate.cc',
   'nix-instantiate/rust-eval.cc',
 )
-# The handle API's C++ side, shared by `nix eval` and nix-instantiate. Listed
-# beside nix_sources rather than under nix-instantiate because it is not that
-# command's any more.
-rust_eval_session_sources = files('rust-eval-session.cc')
 nix_store_sources = files(
   'nix-store/dotgraph.cc',
   'nix-store/graphml.cc',
@@ -177,11 +171,9 @@ sources = [
   unpack_channel_gen,
   nix_collect_garbage_sources,
   nix_copy_closure_sources,
-  nix_env_buildenv_gen,
   nix_env_sources,
   nix_instantiate_sources,
   nix_store_sources,
-  rust_eval_session_sources,
 ]
 
 if host_machine.system() != 'windows'
@@ -193,89 +185,6 @@ endif
 
 include_dirs = [ include_directories('.') ]
 
-# The Rust evaluator links in as a staticlib built by cargo. Cargo owns the
-# incremental story (its no-op rebuild is ~0.1s), so the target is always
-# stale from meson's point of view and cargo decides what to do.
-rust_eval = get_option('rust-eval')
-rust_eval_prefix = ''
-if rust_eval.enabled()
-  rust_eval_prefix = get_option('rust-eval-prefix')
-endif
-
-if rust_eval.enabled() and rust_eval_prefix != ''
-  # Prebuilt: another derivation compiled the archive and installed its header.
-  # `include_directories()` is not used because meson rejects absolute paths
-  # there, and this prefix is outside the source tree by construction.
-  nix_eval_rs_lib = rust_eval_prefix / 'lib' / 'libnix_eval_rs.a'
-  rust_eval_sources = []
-  rust_eval_incdirs = []
-  rust_eval_cargs = [ '-DHAVE_RUST_EVAL=1', '-I' + rust_eval_prefix / 'include' ]
-elif rust_eval.enabled()
-  cargo = find_program('cargo', required : true)
-  rust_dir = meson.project_source_root() / '..' / '..' / 'rust'
-  # `--target-dir` into the build directory rather than letting cargo default
-  # to `<rust_dir>/target`, which is inside the source tree. This is what an
-  # out-of-tree meson build is supposed to do anyway, and it is required for a
-  # packaged build: a Nix derivation unpacks the source read-only apart from
-  # the work directory, so the default made cargo die with
-  # `Permission denied (os error 13) at path ".../source/rust/target..."`
-  # before it compiled anything. Incrementality is unaffected -- cargo still
-  # owns it, just keyed to a build directory instead of the source.
-  cargo_target_dir = meson.current_build_dir() / 'rust-target'
-  nix_eval_rs = custom_target(
-    'nix-eval-rs',
-    output : 'libnix_eval_rs.a',
-    command : [
-      'sh',
-      '-c',
-      '@0@ build --release --manifest-path @1@/Cargo.toml -p nix-eval-rs --target-dir @3@ @2@ && cp @3@/release/libnix_eval_rs.a "$1"'.format(
-        cargo.full_path(),
-        rust_dir,
-        get_option('rust-eval-cargo-features'),
-        cargo_target_dir,
-      ),
-      'ignored',
-      '@OUTPUT@',
-    ],
-    build_always_stale : true,
-  )
-  nix_eval_rs_lib = nix_eval_rs.full_path()
-  # A custom_target must be declared as a source so ninja orders the link
-  # after it. A prebuilt archive already exists, so it needs no ordering.
-  rust_eval_sources = [ nix_eval_rs ]
-  rust_eval_incdirs = include_directories(
-    '..' / '..' / 'rust' / 'nix-eval-rs' / 'include',
-  )
-  rust_eval_cargs = [ '-DHAVE_RUST_EVAL=1' ]
-endif
-
-if rust_eval.enabled()
-  deps_other += declare_dependency(
-    sources : rust_eval_sources,
-    # link_with cannot take a custom_target; pass the archive as link args.
-    link_args : [ nix_eval_rs_lib ],
-    include_directories : rust_eval_incdirs,
-    compile_args : rust_eval_cargs,
-  )
-endif
-
-# The phantom-token guard. Its own executable because it needs both the
-# command layer's constants and the evaluator's ABI vocabulary linked, and the
-# Rust archive is only pulled into targets that ask for it.
-if rust_eval.enabled()
-  refusal_vocabulary_test = executable(
-    'nix-refusal-vocabulary-test',
-    files('rust-eval-refusal-vocabulary-test.cc'),
-    dependencies : deps_private_subproject + deps_private + deps_other,
-    include_directories : include_dirs,
-  )
-  test(
-    'refusal-vocabulary',
-    refusal_vocabulary_test,
-    suite : 'nix',
-    protocol : 'exitcode',
-  )
-endif
 
 this_exe = executable(
   meson.project_name(),

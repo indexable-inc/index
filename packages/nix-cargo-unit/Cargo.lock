@@ -525,6 +525,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "object",
+ "proc-macro2",
  "serde",
  "serde_json",
  "sha2",

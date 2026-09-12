@@ -25,6 +25,7 @@ use codex_app_server_protocol::RemoteControlPairingStartParams;
 use codex_app_server_protocol::RemoteControlPairingStatusParams;
 use codex_app_server_protocol::RemoteControlStatusChangedNotification;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ServerNotificationEnvelope;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::test_support::auth_manager_from_auth;
 use codex_core::test_support::auth_manager_from_auth_with_home;
@@ -38,6 +39,7 @@ use codex_login::token_data::parse_chatgpt_jwt_claims;
 use codex_protocol::auth::AuthMode;
 use codex_state::RemoteControlEnrollmentRecord;
 use codex_state::StateRuntime;
+use codex_utils_absolute_path::test_support::PathExt;
 use futures::SinkExt;
 use futures::StreamExt;
 use gethostname::gethostname;
@@ -121,13 +123,17 @@ fn remote_control_auth_dot_json(account_id: Option<&str>) -> AuthDotJson {
         agent_identity: None,
         personal_access_token: None,
         bedrock_api_key: None,
+        bedrock_access_keys: None,
     }
 }
 
 async fn remote_control_state_runtime(codex_home: &TempDir) -> Arc<StateRuntime> {
-    StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
-        .await
-        .expect("state runtime should initialize")
+    StateRuntime::init(
+        codex_state::SqliteConfig::new_for_testing(codex_home.path().abs()),
+        "test-provider".to_string(),
+    )
+    .await
+    .expect("state runtime should initialize")
 }
 
 #[tokio::test]
@@ -736,14 +742,15 @@ async fn remote_control_transport_manages_virtual_clients_and_routes_messages() 
 
     writer
         .send(QueuedOutgoingMessage::new(
-            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
+            OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+                notification: ServerNotification::ConfigWarning(ConfigWarningNotification {
                     summary: "test".to_string(),
                     details: None,
                     path: None,
                     range: None,
-                },
-            )),
+                }),
+                emitted_at_ms: Some(1_234),
+            }),
         ))
         .await
         .expect("remote writer should accept outgoing message");
@@ -758,7 +765,8 @@ async fn remote_control_transport_manages_virtual_clients_and_routes_messages() 
                 "params": {
                     "summary": "test",
                     "details": null,
-                }
+                },
+                "emittedAtMs": 1_234,
             }
         })
     );
@@ -1042,7 +1050,7 @@ async fn remote_control_start_allows_missing_auth_when_enabled() {
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let (transport_event_tx, _transport_event_rx) =
@@ -1344,14 +1352,15 @@ async fn remote_control_transport_clears_outgoing_buffer_when_backend_acks() {
 
     writer
         .send(QueuedOutgoingMessage::new(
-            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
+            OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+                notification: ServerNotification::ConfigWarning(ConfigWarningNotification {
                     summary: "stale".to_string(),
                     details: None,
                     path: None,
                     range: None,
-                },
-            )),
+                }),
+                emitted_at_ms: Some(1_234),
+            }),
         ))
         .await
         .expect("remote writer should accept outgoing message");
@@ -1367,7 +1376,8 @@ async fn remote_control_transport_clears_outgoing_buffer_when_backend_acks() {
                 "params": {
                     "summary": "stale",
                     "details": null,
-                }
+                },
+                "emittedAtMs": 1_234,
             }
         })
     );
@@ -1610,9 +1620,16 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
         .send(QueuedOutgoingMessage::new(OutgoingMessage::Response(
             crate::outgoing_message::OutgoingResponse {
                 id: codex_app_server_protocol::RequestId::Integer(11),
-                result: json!({
-                    "userAgent": "codex-test-agent"
-                }),
+                result: Box::new(
+                    codex_app_server_protocol::ClientResponsePayload::Initialize(
+                        codex_app_server_protocol::InitializeResponse {
+                            user_agent: "codex-test-agent".to_string(),
+                            codex_home: codex_home.path().abs(),
+                            platform_family: "test-family".to_string(),
+                            platform_os: "test-os".to_string(),
+                        },
+                    ),
+                ),
             },
         )))
         .await
@@ -1627,6 +1644,9 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
                 "id": 11,
                 "result": {
                     "userAgent": "codex-test-agent",
+                    "codexHome": codex_home.path(),
+                    "platformFamily": "test-family",
+                    "platformOs": "test-os",
                 }
             }
         })
@@ -1634,14 +1654,15 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
 
     writer
         .send(QueuedOutgoingMessage::new(
-            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
+            OutgoingMessage::AppServerNotification(ServerNotificationEnvelope {
+                notification: ServerNotification::ConfigWarning(ConfigWarningNotification {
                     summary: "backend".to_string(),
                     details: None,
                     path: None,
                     range: None,
-                },
-            )),
+                }),
+                emitted_at_ms: Some(1_234),
+            }),
         ))
         .await
         .expect("remote writer should accept outgoing message");
@@ -1656,7 +1677,8 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
                 "params": {
                     "summary": "backend",
                     "details": null,
-                }
+                },
+                "emittedAtMs": 1_234,
             }
         })
     );
@@ -1888,7 +1910,7 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let expected_server_name = gethostname().to_string_lossy().trim().to_string();
@@ -1986,7 +2008,7 @@ async fn persisted_enable_does_not_follow_auth_to_an_account_without_a_preferenc
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let remote_control_target =

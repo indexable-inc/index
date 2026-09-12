@@ -1,10 +1,10 @@
 ## Retrieve the live GPT-5.6 prompting guidance
 
-Use the OpenAI Docs MCP to fetch the live GPT-5.6 prompting guidance from:
+Use already-callable official documentation search and fetch, or immediately use official-domain web search and fetch, to retrieve the live GPT-5.6 prompting guidance from:
 
 https://developers.openai.com/api/docs/guides/model-guidance?model=gpt-5.6#prompting-best-practices
 
-Read only the `## Prompting Best Practices` section, stopping at the next H2 heading. The URL anchor points to the section visually, but the Docs MCP may return the full page, so explicitly extract only that section.
+Read only the `## Prompting Best Practices` section, stopping at the next H2 heading. The URL anchor points to the section visually, but a documentation fetch may return the full page, so explicitly extract only that section.
 
 Treat the live section as the canonical model-specific prompting guidance. Use the local guidance below only for skill-specific migration judgment: deciding what to preserve, remove, rewrite, or test when adapting an existing prompt stack to GPT-5.6.
 

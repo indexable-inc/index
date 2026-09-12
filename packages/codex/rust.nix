@@ -6,9 +6,13 @@
 #   - a Codex view update rebuilds only the crates whose sources changed, not the
 #     whole vendored world (the fork bumps constantly).
 #
-# The C/C++ heavy dependencies (`webrtc-sys`, the `v8` crate) get their prebuilt
-# archives from ./prebuilt.nix through the env vars their build scripts read;
-# nothing is downloaded at build time. `target = null` builds for the host.
+# The one dependency whose build script would download prebuilts (the `v8`
+# crate: a static archive and its bindgen output) gets them from ./prebuilt.nix
+# through the two env vars the script reads, scoped to that crate via
+# `packageBuildEnv.v8`; nothing is downloaded at build time. Other native code
+# (aws-lc-sys, ...) is
+# compiled from source with the clang/cmake inputs below. `target = null`
+# builds for the host.
 {
   lib,
   pkgs,
@@ -40,7 +44,7 @@
       )
     else throw "codex rust.nix: unsupported cross target ${target}";
 
-  prebuilt = import ./prebuilt.nix {inherit (pkgs) fetchurl runCommand unzip;} targetSystem;
+  prebuilt = import ./prebuilt.nix {inherit (pkgs) fetchurl runCommand;} targetSystem;
 
   # The Apple cross toolchain (zig cc + macOS SDK), or null for a native build.
   # Same wiring as lib/rust/workspace.nix `mkUnits`.
@@ -56,15 +60,17 @@
 
   # Git dependencies pinned in codex-rs/Cargo.lock, keyed by the exact Cargo.lock
   # source string (cargoUnit's vendorer keys by source, not name-version like
-  # rustPlatform.importCargoLock). The five rust-sdks crates share one source
-  # (one locked rev), so one hash covers them. Refresh after a view update by
-  # rebuilding and copying the corrected hashes from the fetchgit mismatch errors.
+  # rustPlatform.importCargoLock). Refresh after a view update: list the
+  # `source = "git+..."` lines of the new Cargo.lock, then
+  # `nix flake prefetch --json "git+<url>?rev=<rev>"` for each new one (its
+  # NAR hash is the fetchgit hash the vendorer checks; verified against an
+  # unchanged pin as the control). vendor.nix fails the eval on any missing or
+  # stale key, so a wrong list cannot build.
   outputHashes = {
     "git+https://github.com/dzbarsky/rules_rust?rev=b56cbaa8465e74127f1ea216f813cd377295ad81#b56cbaa8465e74127f1ea216f813cd377295ad81" = "sha256-uJpVLcQh8wWZA3GPv9D8Nt43EOirajfDJ7eq/FB+tek=";
     "git+https://github.com/helix-editor/nucleo.git?rev=4253de9faabb4e5c6d81d946a5e35a90f87347ee#4253de9faabb4e5c6d81d946a5e35a90f87347ee" = "sha256-Hm4SxtTSBrcWpXrtSqeO0TACbUxq3gizg1zD/6Yw/sI=";
-    "git+https://github.com/juberti-oai/rust-sdks.git?rev=e2d1d1d230c6fc9df171ccb181423f957bb3c1f0#e2d1d1d230c6fc9df171ccb181423f957bb3c1f0" = "sha256-0HPuwaGcqpuG+Pp6z79bCuDu/DyE858VZSYr3DKZD9o=";
-    "git+https://github.com/nornagon/crossterm?rev=87db8bfa6dc99427fd3b071681b07fc31c6ce995#87db8bfa6dc99427fd3b071681b07fc31c6ce995" = "sha256-6qCtfSMuXACKFb9ATID39XyFDIEMFDmbx6SSmNe+728=";
-    "git+https://github.com/nornagon/ratatui?rev=9b2ad1298408c45918ee9f8241a6f95498cdbed2#9b2ad1298408c45918ee9f8241a6f95498cdbed2" = "sha256-HBvT5c8GsiCxMffNjJGLmHnvG77A6cqEL+1ARurBXho=";
+    "git+https://github.com/microsoft/mxc?rev=6cd3d58f05d3447e67109cfb75e042803b843ca4#6cd3d58f05d3447e67109cfb75e042803b843ca4" = "sha256-XUkT2R+RYk9WIqgKnmIAagNW4xOTyp4bWHmQL1iznHw=";
+    "git+https://github.com/openai-oss-forks/crossterm?rev=45fecb9508105988f42fe6ff0441783ed3717f92#45fecb9508105988f42fe6ff0441783ed3717f92" = "sha256-cQxQQuV+YEutuQiPurXVISq6F/99vCEk8qe5PU8BCSo=";
     "git+https://github.com/openai-oss-forks/tokio-tungstenite?rev=0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186#0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" = "sha256-V1xmnrfRWOcZZogelZEA4vvyMj2awCfHVA5/glQ6KAI=";
     "git+https://github.com/openai-oss-forks/tungstenite-rs?rev=4fffad30fe373adbdcffab9545e9e9bf4f2fc19f#4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" = "sha256-VVHhk7l9J/sEmG3q/UuV/sQ3f+fGsmq5vumSy8vbMvw=";
   };
@@ -79,10 +85,15 @@
       src = workspaceRoot;
       inherit workspaceRoot outputHashes;
       cargoLock.lockFile = workspaceRoot + "/Cargo.lock";
-      # Match upstream's release build: the codex binary only, not the whole
-      # workspace of test/support crates.
-      cargoArgs = ["--package" "codex-cli"];
-      cargoTargets = [["--package" "codex-cli"]];
+      # Match upstream's release build (scripts/codex_package/cargo.py): the
+      # codex binary plus `codex-code-mode-host`, not the whole workspace of
+      # test/support crates. codex spawns the host as a sibling of its own
+      # executable (install-context `code_mode_host_program`) and
+      # `features.code_mode_host` is default-enabled upstream (features/src/
+      # lib.rs, Stage::Stable), so a codex shipped without the host fails every
+      # session with "failed to spawn code-mode host".
+      cargoArgs = ["--package" "codex-cli" "--package" "codex-code-mode-host"];
+      cargoTargets = [["--package" "codex-cli" "--package" "codex-code-mode-host"]];
       cargoTargetNames = ["build"];
       # codex is an external vendored build, not our own linted workspace, so
       # skip clippy/audit/machete (also what the cross graph does).
@@ -109,15 +120,9 @@
         ++ lib.optionals (appleToolchain != null) appleToolchain.runtimeInputs;
       env =
         {
-          # bindgen (webrtc-sys, others) dlopens libclang and needs the header
-          # search paths the Linux sandbox does not provide by default.
+          # bindgen users dlopen libclang and need the header search paths the
+          # Linux sandbox does not provide by default.
           LIBCLANG_PATH = "${lib.getLib pkgs.llvmPackages.libclang}/lib";
-          # webrtc-sys/build reads this and links `static=webrtc` from the
-          # prebuilt bundle (include/, lib/libwebrtc.a, *.ninja).
-          LK_CUSTOM_WEBRTC = "${prebuilt.libwebrtc}";
-          # The v8 crate's build script consumes this prebuilt static archive
-          # instead of downloading it.
-          RUSTY_V8_ARCHIVE = "${prebuilt.librustyV8}";
           # openssl-sys finds the system openssl through pkg-config. Host
           # (Linux) scope only, so it stays correct under cross: openssl only
           # enters codex's graph via native-tls (openssl on Linux,
@@ -149,12 +154,19 @@
       extraLinkRustcArgsForPlatform = _platform:
         ["-L" "native=${pkgs.openssl.out}/lib"]
         ++ lib.optionals stdenv.hostPlatform.isLinux ["-L" "native=${pkgs.libcap.lib}/lib"];
+      # The v8 crate's build script consumes these prebuilts (./prebuilt.nix)
+      # instead of downloading them: the static archive and the bindgen output
+      # generated against it. Scoped to `v8` (its build-script-run unit and its
+      # compile unit) so the store paths do not perturb the rest of the closure.
+      packageBuildEnv.v8 = {
+        RUSTY_V8_ARCHIVE = "${prebuilt.librustyV8}";
+        RUSTY_V8_SRC_BINDING_PATH = "${prebuilt.srcBinding}";
+      };
       # The v8 crate links rusty_v8 as a `+bundle` static lib, so rustc must
       # find librusty_v8.a at the *crate compile* to embed it into the v8 rlib
       # (this is where the build fails without it, not at the final link). The
       # build script's own copy lands under build_dir() and never crosses the
       # per-unit boundary; hand the compile the decompressed archive directly.
-      # Scoped to `v8` so it does not perturb the rest of the closure.
       packageRustcArgs.v8 = ["-L" "native=${prebuilt.librustyV8Lib}"];
     }
     // lib.optionalAttrs isCross {
@@ -177,4 +189,5 @@
 in {
   inherit workspace;
   binary = workspace.binaries.${binName};
+  hostBinary = workspace.binaries.codex-code-mode-host;
 }

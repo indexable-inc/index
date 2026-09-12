@@ -48,9 +48,10 @@ nothing is recreated.
 ## Fork it
 
 Copy this directory into your own repo and keep `flake.nix` as the
-entrypoint; its `index` input pulls `github:indexable-inc/index` for you. The
-switch path needs no admin rights: it builds and activates your own system
-onto your own VM.
+entrypoint; its `ix` input pulls `github:indexable-inc/ix` for you, and
+`ix.index` is index instantiated with the guest Nix an image needs (the bare
+`github:indexable-inc/index` flake cannot evaluate one). The switch path needs
+no admin rights: it builds and activates your own system onto your own VM.
 
 ## Scope
 

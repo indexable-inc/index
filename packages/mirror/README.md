@@ -9,8 +9,8 @@
 
 How does one crate in a monorepo get its own GitHub repo that a stranger can clone and `cargo build`, without the repo drifting from the source? mirror generates opt-in standalone repos from this monorepo and keeps them equal to it in CI: a package under `packages/` opts in via its `package.nix` and gets a self-contained, read-only GitHub repo that a visitor can clone and `cargo build` without ever seeing the monorepo. The monorepo stays the single source of truth; CI keeps the mirror equal to it.
 
-Maintained forks are jj views in this repository. This tool does not publish
-or update them.
+Maintained forks are jj views (`views.toml`) in this repository. This tool
+does not publish or update them.
 
 Rust packages are what the generator understands today, but the interface
 (the `mirror` manifest attr, `.#lib.mirrorPackages`, the sync workflow) is

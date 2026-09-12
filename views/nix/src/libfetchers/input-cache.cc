@@ -8,42 +8,53 @@ namespace nix::fetchers {
 InputCache::CachedResult InputCache::getAccessor(
     const Settings & settings, Store & store, const Input & originalInput, UseRegistries useRegistries)
 {
-    auto fetched = lookup(originalInput);
     Input resolvedInput = originalInput;
+    /* Attributes of the registry RESOLUTION (`dir`, for an entry that points
+       into a subdirectory of a tree), not of the fetched tree. They belong
+       to this call's original -> resolved mapping, so they come from this
+       call's registry lookup and are never taken from, or stored in, the
+       cache. The same resolved input is routinely cached first by a road
+       with no registry mapping at all -- `--inputs-from` locks the
+       referenced flake, which caches each of its inputs under that input's
+       own ref -- and returning such an entry's (empty) attributes in place
+       of the lookup's dropped the `dir`: the flake at the workspace ROOT
+       evaluated in place of the subdirectory flake the registry entry
+       named, with rc=0 and a missing-attribute error naming the wrong
+       flake. Flag-registry entries can also change between calls in one
+       process, which is one more reason the mapping is not memoisable. */
+    Attrs extraAttrs;
+
+    if (!originalInput.isDirect()) {
+        if (useRegistries == UseRegistries::No)
+            throw Error(
+                "'%s' is an indirect flake reference, but registry lookups are not allowed",
+                originalInput.to_string());
+        auto [res, extraAttrs2] = lookupInRegistries(settings, store, originalInput, useRegistries);
+        resolvedInput = std::move(res);
+        extraAttrs = std::move(extraAttrs2);
+    }
+
+    auto fetched = lookup(resolvedInput);
 
     if (!fetched) {
-        if (originalInput.isDirect()) {
-            auto [accessor, lockedInput] = originalInput.getAccessor(settings, store);
-            fetched.emplace(CachedInput{.lockedInput = lockedInput, .accessor = accessor});
-        } else {
-            if (useRegistries != UseRegistries::No) {
-                auto [res, extraAttrs] = lookupInRegistries(settings, store, originalInput, useRegistries);
-                resolvedInput = std::move(res);
-                fetched = lookup(resolvedInput);
-                if (!fetched) {
-                    auto [accessor, lockedInput] = resolvedInput.getAccessor(settings, store);
-                    fetched.emplace(
-                        CachedInput{.lockedInput = lockedInput, .accessor = accessor, .extraAttrs = extraAttrs});
-                }
-                upsert(resolvedInput, *fetched);
-            } else {
-                throw Error(
-                    "'%s' is an indirect flake reference, but registry lookups are not allowed",
-                    originalInput.to_string());
-            }
-        }
+        auto [accessor, lockedInput] = resolvedInput.getAccessor(settings, store);
+        fetched.emplace(CachedInput{.lockedInput = lockedInput, .accessor = accessor});
+        upsert(resolvedInput, *fetched);
         /* Also cache under the locked input, so a later lookup by the
            locked ref (e.g. relative-input metadata stamping during lock
            computation) reuses this accessor instead of refetching or
            taking the substitution shortcut, which returns a store
-           accessor stripped of the fetcher's tree metadata. */
+           accessor stripped of the fetcher's tree metadata. An indirect
+           original is deliberately NOT a key: it does not name a tree
+           (`evictUnlocked` would drop it as unlocked anyway), and a hit on
+           it would skip the registry lookup the attributes above must come
+           from. */
         upsert(fetched->lockedInput, *fetched);
-        upsert(originalInput, *fetched);
     }
 
     debug("got tree '%s' from '%s'", fetched->accessor, fetched->lockedInput.to_string());
 
-    return {fetched->accessor, resolvedInput, fetched->lockedInput, fetched->extraAttrs};
+    return {fetched->accessor, resolvedInput, fetched->lockedInput, extraAttrs};
 }
 
 struct InputCacheImpl : InputCache

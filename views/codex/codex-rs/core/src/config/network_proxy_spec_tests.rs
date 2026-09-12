@@ -1,7 +1,11 @@
 use super::*;
 use codex_config::NetworkDomainPermissionToml;
 use codex_config::NetworkDomainPermissionsToml;
+use codex_execpolicy::Decision::Allow;
+use codex_execpolicy::NetworkRuleProtocol::Https;
 use codex_network_proxy::NetworkDomainPermission;
+use codex_network_proxy::NetworkUnixSocketPermission;
+use codex_network_proxy::NetworkUnixSocketPermissions;
 use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
@@ -38,6 +42,149 @@ fn build_state_with_audit_metadata_threads_metadata_to_state() {
         .build_state_with_audit_metadata(metadata.clone())
         .expect("state should build");
     assert_eq!(state.audit_metadata(), &metadata);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_sandbox_proxy_listeners_preserve_effective_protocol_roles() {
+    let spec = NetworkProxySpec::from_config_and_constraints(
+        NetworkProxyConfig {
+            enabled: true,
+            proxy_url: "http://127.0.0.1:48081".to_string(),
+            socks_url: "socks5h://127.0.0.1:3128".to_string(),
+            allow_local_binding: true,
+            ..NetworkProxyConfig::default()
+        },
+        /*requirements*/ None,
+        &PermissionProfile::workspace_write(),
+    )
+    .expect("effective network configuration should be valid");
+
+    assert_eq!(
+        spec.windows_sandbox_proxy_listeners()
+            .expect("effective proxy listeners should resolve"),
+        (
+            codex_windows_sandbox::WindowsSandboxProvisioningSettings {
+                proxy_ports: vec![3128, 48081],
+                allow_local_binding: true,
+            },
+            codex_windows_sandbox::WindowsSandboxProxyListeners {
+                http_ports: vec![48081],
+                socks_ports: vec![3128],
+            },
+        )
+    );
+}
+
+#[test]
+fn environment_policy_replaces_soft_controller_allowlist_and_preserves_denials() {
+    let requirements = NetworkConstraints {
+        domains: Some(domain_permissions([
+            ("controller.example", NetworkDomainPermissionToml::Allow),
+            ("blocked.example", NetworkDomainPermissionToml::Deny),
+        ])),
+        ..Default::default()
+    };
+    let profile = PermissionProfile::workspace_write();
+    let spec = NetworkProxySpec::from_config_and_constraints(
+        NetworkProxyConfig {
+            enabled: true,
+            allow_upstream_proxy: false,
+            unix_sockets: Some(NetworkUnixSocketPermissions {
+                entries: [
+                    (
+                        "/tmp/controller.sock".to_string(),
+                        NetworkUnixSocketPermission::Deny,
+                    ),
+                    (
+                        "/tmp/allowed.sock".to_string(),
+                        NetworkUnixSocketPermission::Allow,
+                    ),
+                ]
+                .into(),
+            }),
+            ..NetworkProxyConfig::default()
+        },
+        Some(requirements),
+        &profile,
+    )
+    .expect("controller policy should be valid");
+    let mut owner = NetworkProxyConfig::default();
+    owner.set_allowed_domains(vec!["owner.example".to_string()]);
+    owner.set_denied_domains(vec!["owner-blocked.example".to_string()]);
+    owner.set_allow_unix_sockets(vec![
+        "/tmp/controller.sock".to_string(),
+        "/private/tmp/controller.sock".to_string(),
+        "/tmp/allowed.sock".to_string(),
+    ]);
+    owner.dangerously_allow_all_unix_sockets = true;
+    owner.allow_local_binding = true;
+    let owner_policy =
+        EnvironmentNetworkPolicy::from_config(&owner, /*managed_allowed_domains_only*/ false);
+    let compose = NetworkProxySpec::for_environment;
+    let empty = Policy::empty();
+    let disabled_controller = NetworkProxySpec::from_config_and_constraints(
+        NetworkProxyConfig::default(),
+        /*requirements*/ None,
+        &profile,
+    )
+    .expect("disabled controller policy should be valid");
+    assert!(compose(Some(&disabled_controller), &owner_policy, &profile, &empty).is_err());
+    let restricted = compose(Some(&spec), &owner_policy, &profile, &empty)
+        .expect("owner policy should replace soft controller grants");
+    let mut saved = Policy::empty();
+    for host in ["saved.example", "owner-blocked.example"] {
+        saved
+            .add_network_rule(host, Https, Allow, /*justification*/ None)
+            .expect("saved network grant should be valid");
+    }
+    let rootless = compose(/*controller*/ None, &owner_policy, &profile, &saved)
+        .expect("an owner policy can create executor-side proxy state");
+    assert_eq!(
+        rootless.config.allowed_domains().unwrap(),
+        ["owner.example", "saved.example"]
+    );
+
+    owner.upsert_domain_permission(
+        "blocked.example".to_string(),
+        NetworkDomainPermission::Deny,
+        normalize_host,
+    );
+    owner.unix_sockets.clone_from(&spec.config.unix_sockets);
+    owner.allow_upstream_proxy = false;
+    owner.dangerously_allow_all_unix_sockets = false;
+    owner.allow_local_binding = false;
+    assert_eq!(
+        restricted.environment_policy(),
+        EnvironmentNetworkPolicy::from_config(&owner, /*managed_allowed_domains_only*/ false)
+    );
+    let external = PermissionProfile::External {
+        network: NetworkSandboxPolicy::Enabled,
+    };
+    let external_rootless = compose(/*controller*/ None, &owner_policy, &external, &saved)
+        .expect("an externally sandboxed owner policy should remain strict");
+    assert_eq!(
+        external_rootless.environment_policy(),
+        EnvironmentNetworkPolicy {
+            managed_allowed_domains_only: true,
+            ..owner_policy.clone()
+        }
+    );
+    let controller_policy = spec.environment_policy();
+    let external_rooted = compose(Some(&spec), &controller_policy, &external, &saved)
+        .expect("an externally sandboxed owner policy may retain its controller allowlist");
+    assert_eq!(
+        external_rooted.environment_policy(),
+        EnvironmentNetworkPolicy {
+            managed_allowed_domains_only: true,
+            ..controller_policy
+        }
+    );
+    assert!(compose(Some(&spec), &owner_policy, &external, &empty).is_err());
+    owner.set_allowed_domains(vec!["*".to_string()]);
+    let wildcard_policy =
+        EnvironmentNetworkPolicy::from_config(&owner, /*managed_allowed_domains_only*/ false);
+    assert!(compose(Some(&spec), &wildcard_policy, &profile, &empty).is_err());
 }
 
 #[test]

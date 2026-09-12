@@ -7,8 +7,14 @@
 //! resolve, so it silently loses the source and reports column `offset + 1`
 //! on line 1 for everything. See `maintainers/ix/positions.md`.
 
+#![expect(
+    clippy::expect_used,
+    reason = "an integration test crate: its helpers abort loudly like the tests they serve; clippy.toml's allow-expect-in-tests covers `#[test]` functions and `#[cfg(test)]` items, and a helper in `tests/` is neither"
+)]
+
 use nix_eval_rs::compile::Origin;
-use nix_eval_rs::eval::{eval_str, eval_str_at};
+use nix_eval_rs::eval::{Settings, eval_str, eval_str_at, eval_str_with};
+use std::path::PathBuf;
 
 /// Evaluate `src` as if it were the file at `path`.
 fn at_file(src: &str, path: &str) -> String {
@@ -33,10 +39,34 @@ fn col(c: u32) -> String {
     format!(r#"{{ column = {c}; file = "{F}"; line = 1; }}"#)
 }
 
+fn position(path: &str, line: u32, column: u32) -> String {
+    format!(r#"{{ column = {column}; file = "{path}"; line = {line}; }}"#)
+}
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/positions")
+        .join(name)
+}
+
+fn eval_fixture(name: &str) -> String {
+    let path = fixture(name);
+    let source = std::fs::read_to_string(&path).expect("position fixture is readable");
+    let path = path.to_str().expect("fixture path is UTF-8");
+    let base = std::path::Path::new(path)
+        .parent()
+        .and_then(std::path::Path::to_str)
+        .expect("fixture directory is UTF-8");
+    match eval_str_at(&source, base, Origin::File(path)) {
+        Ok(text) => text,
+        Err(error) => format!("{error:?}"),
+    }
+}
+
 // -- the base case ----------------------------------------------------------
 
 /// `builtins.unsafeGetAttrPos "b" ({ a = 1; b = 2; })` in a one-line file:
-/// `b`'s name token is at byte offset 42, so column 43.
+/// `b`'s name token is at byte offset 40, so column 41.
 #[test]
 fn a_literal_attribute_answers_where_its_name_was_written() {
     let src = "builtins.unsafeGetAttrPos \"b\" ({ a = 1; b = 2; })";
@@ -68,16 +98,29 @@ fn a_multi_line_file_answers_the_right_line() {
     );
 }
 
-/// A `\r\n` file. cppnix's `Pos::LinesIterator` ends a line at `\n`, `\r\n`
-/// or a bare `\r`; counting only `\n` would report line 3 column 4 here.
+/// A `\r\n` file. cppnix's `Pos::LinesIterator` treats the pair as one line
+/// ending rather than counting the carriage return into the next column.
 #[test]
-fn carriage_returns_end_a_line() {
+fn crlf_ends_a_line() {
     assert_eq!(
         at_file(
             "builtins.unsafeGetAttrPos \"b\" {\r\n  a = 1;\r\n  b = 2;\r\n}",
             F
         ),
         format!(r#"{{ column = 3; file = "{F}"; line = 3; }}"#)
+    );
+}
+
+/// Bare `\r` is independently a line ending. A scanner that recognizes only
+/// `\n` passes the CRLF fixture above and reports this binding on line 1.
+#[test]
+fn a_bare_carriage_return_ends_a_line() {
+    assert_eq!(
+        at_file(
+            "builtins.unsafeGetAttrPos \"b\" {\r  a = 1;\r  b = 2;\r}",
+            F
+        ),
+        position(F, 3, 3)
     );
 }
 
@@ -113,40 +156,92 @@ fn an_absent_attribute_answers_null() {
     assert_eq!(pos_of("zz", "{ a = 1; }"), "null");
 }
 
-/// A dynamic name is not known until the op runs, so no source token can be
-/// attributed to it.
 /// A dynamic name is not in the source as text, but the `${` token that
 /// produces it is, and that is what cppnix records (`ExprAttrs::eval` inserts
 /// each `dynamicAttrs` entry with its own `i.pos`).
 #[test]
-fn a_dynamic_attribute_answers_its_interpolation() {
-    assert_eq!(pos_of("a", r#"{ ${"a"} = 1; }"#), col(34));
-    assert_eq!(pos_of("a", r#"{ ${"z"} = 0; ${"a"} = 1; }"#), col(46));
+fn a_runtime_computed_attribute_answers_its_interpolation() {
+    let src = r#"let
+  mk = first: second: {
+    ${first} = 1;
+    ${second} = 2;
+  };
+  first = mk "a" "b";
+  second = mk "b" "a";
+in builtins.seq first (builtins.seq second [
+  (builtins.unsafeGetAttrPos "a" first)
+  (builtins.unsafeGetAttrPos "a" second)
+])"#;
+    assert_eq!(
+        at_file(src, F),
+        format!(
+            r#"[ {{ column = 5; file = "{F}"; line = 3; }} {{ column = 5; file = "{F}"; line = 4; }} ]"#
+        )
+    );
 }
 
-/// A KNOWN DIVERGENCE, pinned so it cannot change silently. cppnix answers
-/// column 69 here -- `prim_listToAttrs` copies each element's `value`
-/// attribute along with that attribute's own position, and a set assembled
-/// out of N elements therefore carries N unrelated positions. This crate
-/// keeps one origin per set (see `maintainers/ix/positions.md`), so it has
-/// nowhere to put them and answers `null`, which is a missing answer rather
-/// than a wrong one.
+/// The original mismatch: adding one dynamic binding must not make the
+/// literal's static position disappear when the set switches to a runtime
+/// origin.
 #[test]
-fn a_set_a_builtin_assembled_answers_null() {
+fn static_and_runtime_computed_names_keep_their_own_positions() {
+    let src = r#"let
+  key = "dyn";
+  set = {
+    static = 1;
+    ${key} = 2;
+  };
+in [
+  (builtins.unsafeGetAttrPos "static" set)
+  (builtins.unsafeGetAttrPos "dyn" set)
+]"#;
+    assert_eq!(
+        at_file(src, F),
+        format!(
+            r#"[ {{ column = 5; file = "{F}"; line = 4; }} {{ column = 5; file = "{F}"; line = 5; }} ]"#
+        )
+    );
+}
+
+/// Every component of an attrpath has the path's starting position. Runtime
+/// name capture must retain that parser position, not replace it with the
+/// later `${` component's offset.
+#[test]
+fn a_runtime_computed_attrpath_component_answers_the_paths_start() {
+    let set = r#"let k = "b"; in { a.${k} = 1; }.a"#;
+    let src = format!("builtins.unsafeGetAttrPos \"b\" ({set})");
+    let expected = src.find("a.${k}").expect("the fixture moved") + 1;
+    assert_eq!(at_file(&src, F), col(expected as u32));
+}
+
+/// cppnix's `prim_listToAttrs` copies the winning input pair's `value`
+/// attribute position to the result attribute. Column 69 is the `value` name,
+/// not the pair's `name` or the result's runtime name.
+#[test]
+fn list_to_attrs_keeps_the_winning_pairs_value_position() {
     assert_eq!(
         pos_of(
             "a",
             r#"builtins.listToAttrs [ { name = "a"; value = 1; } ]"#
         ),
-        "null"
+        col(69)
     );
+}
+
+/// Duplicate names do not replace either the first value or its provenance.
+#[test]
+fn list_to_attrs_duplicate_keeps_the_first_pairs_value_position() {
+    let set = r#"builtins.listToAttrs [ { name = "a"; value = 1; } { name = "a"; value = 2; } ]"#;
+    let src = format!("builtins.unsafeGetAttrPos \"a\" ({set})");
+    let expected = src.find("value = 1").expect("the fixture moved") + 1;
+    assert_eq!(at_file(&src, F), col(expected as u32));
 }
 
 // -- derived sets: the origin follows the values -----------------------------
 
-/// `//` takes the right operand's values where they collide, so it takes the
-/// right operand's origin. Answering with the left's would report a position
-/// for an attribute whose value came from somewhere else.
+/// `//` takes the right operand's values where they collide, so its projection
+/// selects the right origin for that name. Answering with the left's would
+/// report a position for an attribute whose value came from somewhere else.
 #[test]
 fn update_takes_the_right_operands_origin() {
     // Column 48 is the right `a`; the left one is at 34, so this fails
@@ -154,32 +249,92 @@ fn update_takes_the_right_operands_origin() {
     assert_eq!(pos_of("a", "{ a = 1; } // { a = 2; }"), col(48));
 }
 
-/// The other half of the same rule, and A KNOWN DIVERGENCE: an attribute the
-/// right operand does not have keeps the LEFT's value, and cppnix keeps the
-/// left's position with it (column 34). One origin per set cannot express
-/// that, so the answer is `null`. See `maintainers/ix/positions.md`.
+/// The other half of the same rule: an attribute the right operand does not
+/// have keeps the left's value and position (column 34).
 #[test]
-fn update_answers_null_for_an_attribute_only_the_left_had() {
-    assert_eq!(pos_of("a", "{ a = 1; } // { b = 2; }"), "null");
+fn update_keeps_the_left_only_attributes_position() {
+    assert_eq!(pos_of("a", "{ a = 1; } // { b = 2; }"), col(34));
+    assert_eq!(pos_of("b", "{ a = 1; } // { b = 2; }"), col(48));
+}
+
+/// A source-less right value still wins. Falling back to the positioned left
+/// operand here would return a real line for the wrong value; `null` is the
+/// only safe answer and matches cppnix.
+#[test]
+fn update_does_not_expose_a_shadowed_left_position() {
+    assert_eq!(
+        pos_of("a", r#"{ a = 1; } // builtins.fromJSON ''{"a":2}''"#),
+        "null"
+    );
 }
 
 /// `rec { __overrides = ...; }` is the same rule reached by a different road,
 /// and it is worth pinning separately because nothing in the source says
 /// `//`: the compiler closes the statics into one set and appends the
 /// override set with an `Update` (`compile::emit_rec_set_build`), so the
-/// result takes the OVERRIDE set's origin.
+/// result projects positions from both sets.
 ///
-/// An overridden attribute therefore answers cppnix's column exactly -- 54,
-/// inside `{ a = 20; }`, which is where cppnix reads it from too -- and a
-/// static the override does not name answers `null` where cppnix says 72.
-/// Both columns measured against `nix-instantiate --eval --strict` on the
-/// wrapped fixture, 2026-08-06; the divergence is the `//`-left one in
-/// `maintainers/ix/positions.md`, not a new one.
+/// An overridden attribute therefore answers column 54 inside `{ a = 20; }`,
+/// which is where cppnix reads it from too. A static the override does not
+/// name keeps the rec literal's column 72. Both columns were measured against
+/// `nix-instantiate --eval --strict` on the wrapped fixture, 2026-08-06.
 #[test]
-fn a_rec_override_answers_the_override_sites_position() {
+fn a_rec_override_keeps_both_arms_positions() {
     let src = "rec { __overrides = { a = 20; }; a = 1; b = 2; }";
     assert_eq!(pos_of("a", src), col(54));
-    assert_eq!(pos_of("b", src), "null");
+    assert_eq!(pos_of("b", src), col(72));
+}
+
+/// Each mixed `//` result carries one flat projection. An older accumulator's
+/// position therefore survives more than one fold step instead of depending
+/// on a chain through every intermediate result.
+#[test]
+fn an_update_fold_keeps_every_surviving_position() {
+    let src = r#"let
+  merged = builtins.foldl' (acc: next: acc // next) {} [
+    { first = 1; }
+    { middle = 2; }
+    { last = 3; }
+  ];
+in [
+  (builtins.unsafeGetAttrPos "first" merged)
+  (builtins.unsafeGetAttrPos "middle" merged)
+  (builtins.unsafeGetAttrPos "last" merged)
+]"#;
+    let position = |name: &str| {
+        let offset = src.find(&format!("{name} =")).expect("the fixture moved");
+        let prefix = &src[..offset];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = offset - prefix.rfind('\n').map_or(0, |newline| newline + 1) + 1;
+        format!(r#"{{ column = {column}; file = "{F}"; line = {line}; }}"#)
+    };
+    assert_eq!(
+        at_file(src, F),
+        format!(
+            "[ {} {} {} ]",
+            position("first"),
+            position("middle"),
+            position("last")
+        )
+    );
+}
+
+/// Dynamic bindings are applied after `__overrides` by `MkAttrsOnto`. The
+/// dynamic binding keeps its own position, and names it did not add fall back
+/// to the post-`Update` projection. That fallback must preserve the override
+/// position for `a` and the rec literal's position for `b`.
+#[test]
+fn a_rec_override_and_runtime_name_keep_all_positions() {
+    let src = r#"let key = "dyn"; set = rec { __overrides = { a = 20; }; a = 1; b = 3; ${key} = 2; }; in [ (builtins.unsafeGetAttrPos "a" set) (builtins.unsafeGetAttrPos "b" set) (builtins.unsafeGetAttrPos "dyn" set) ]"#;
+    let override_column = src.find("a = 20").expect("the fixture moved") + 1;
+    let static_column = src.find("b = 3").expect("the fixture moved") + 1;
+    let dynamic_column = src.find("${key}").expect("the fixture moved") + 1;
+    assert_eq!(
+        at_file(src, F),
+        format!(
+            r#"[ {{ column = {override_column}; file = "{F}"; line = 1; }} {{ column = {static_column}; file = "{F}"; line = 1; }} {{ column = {dynamic_column}; file = "{F}"; line = 1; }} ]"#
+        )
+    );
 }
 
 /// `removeAttrs` keeps the values it did not remove, so it keeps its own
@@ -241,6 +396,208 @@ fn an_inherited_attribute_answers_its_name_in_the_inherit_list() {
 #[test]
 fn a_rec_set_answers_like_a_plain_one() {
     assert_eq!(pos_of("a", "rec { a = 1; }"), col(38));
+}
+
+/// A projected `//` entry keeps the module that supplied each winning name.
+/// The foreign offsets are small enough to look plausible in the root file,
+/// so the exact file assertions are what catch interpreting them in the slab
+/// owner's module.
+#[test]
+fn update_positions_can_cross_an_import_boundary() {
+    let root = fixture("update-root.nix");
+    let foreign = fixture("update-foreign.nix");
+    let root = root.to_str().expect("fixture path is UTF-8");
+    let foreign = foreign.to_str().expect("fixture path is UTF-8");
+    assert_eq!(
+        eval_fixture("update-root.nix"),
+        format!(
+            "[ {} {} {} ]",
+            position(root, 4, 5),
+            position(foreign, 2, 3),
+            position(foreign, 3, 3)
+        )
+    );
+}
+
+/// `listToAttrs` delegates each result name to its winning pair's `value`
+/// attribute, including when the pair belongs to an imported module.
+#[test]
+fn list_to_attrs_positions_can_cross_an_import_boundary() {
+    let root = fixture("list-root.nix");
+    let foreign = fixture("list-foreign.nix");
+    let root = root.to_str().expect("fixture path is UTF-8");
+    let foreign = foreign.to_str().expect("fixture path is UTF-8");
+    assert_eq!(
+        eval_fixture("list-root.nix"),
+        format!("[ {} {} ]", position(root, 4, 23), position(foreign, 3, 3))
+    );
+}
+
+/// `inherit (e)` records the inherited name in the inherit list. It does not
+/// reuse the position of `e.a`.
+#[test]
+fn inherit_from_an_expression_uses_the_inherited_names_position() {
+    let source = r#"let e = { a = 1; };
+in builtins.unsafeGetAttrPos "a" {
+  inherit (e) a;
+}"#;
+    assert_eq!(at_file(source, F), position(F, 3, 15));
+}
+
+/// These builtins construct new attrsets without source `Attr`s. cppnix gives
+/// their result names `noPos`, even when an input set had a source position.
+#[test]
+fn synthesized_builtin_sets_have_null_positions() {
+    let source = r#"let
+  mapped = builtins.mapAttrs (name: value: value) { a = 1; };
+  zipped = builtins.zipAttrsWith (name: values: builtins.head values) [ { a = 1; } ];
+  json = builtins.fromJSON ''{"a":1}'';
+  toml = builtins.fromTOML ''a = 1'';
+in [
+  (builtins.unsafeGetAttrPos "a" mapped)
+  (builtins.unsafeGetAttrPos "a" zipped)
+  (builtins.unsafeGetAttrPos "a" json)
+  (builtins.unsafeGetAttrPos "a" toml)
+]"#;
+    assert_eq!(at_file(source, F), "[ null null null null ]");
+}
+
+/// `catAttrs` copies the selected value slots. If those values are sets, their
+/// own per-attribute origins survive the list construction.
+#[test]
+fn cat_attrs_preserves_origins_of_selected_set_values() {
+    let source = r#"let
+  values = builtins.catAttrs "payload" [
+    { payload = { first = 1; }; }
+    { payload = { second = 2; }; }
+  ];
+in [
+  (builtins.unsafeGetAttrPos "first" (builtins.elemAt values 0))
+  (builtins.unsafeGetAttrPos "second" (builtins.elemAt values 1))
+]"#;
+    assert_eq!(
+        at_file(source, F),
+        format!("[ {} {} ]", position(F, 3, 19), position(F, 4, 19))
+    );
+}
+
+/// `getAttr` forces and returns the stored slot; it does not rebuild a set and
+/// discard the selected value's origin.
+#[test]
+fn get_attr_preserves_the_selected_set_values_origin() {
+    let source = r#"let
+  source = {
+    payload = {
+      kept = 1;
+    };
+  };
+in builtins.unsafeGetAttrPos "kept" (builtins.getAttr "payload" source)"#;
+    assert_eq!(at_file(source, F), position(F, 4, 7));
+}
+
+/// `attrValues` orders by attribute text, not interner id or source order, and
+/// each copied value retains its own nested-set origin.
+#[test]
+fn attr_values_sorts_by_name_and_preserves_selected_origins() {
+    let source = r#"let
+  values = builtins.attrValues {
+    z = { fromZ = 1; };
+    a = { fromA = 2; };
+  };
+in [
+  (builtins.unsafeGetAttrPos "fromA" (builtins.elemAt values 0))
+  (builtins.unsafeGetAttrPos "fromZ" (builtins.elemAt values 1))
+]"#;
+    assert_eq!(
+        at_file(source, F),
+        format!("[ {} {} ]", position(F, 4, 11), position(F, 3, 11))
+    );
+}
+
+/// `head` is the generic slot-copying case: returning a set through a list
+/// selector must not strip the set's own origin.
+#[test]
+fn a_slot_copying_builtin_preserves_a_set_origin() {
+    let source = r#"builtins.unsafeGetAttrPos "copied" (builtins.head [
+  { copied = 1; }
+])"#;
+    assert_eq!(at_file(source, F), position(F, 2, 5));
+}
+
+/// `filterAttrs` is a Nix-level composition, not an evaluator primitive. Pin
+/// the `removeAttrs` composition so surviving names keep the input set's
+/// positions and removed names remain absent.
+#[test]
+fn filter_attrs_composition_keeps_only_surviving_positions() {
+    let source = r#"let
+  filterAttrs = pred: set:
+    builtins.removeAttrs set
+      (builtins.filter (name: ! pred name (builtins.getAttr name set))
+        (builtins.attrNames set));
+  source = {
+    keep = 1;
+    drop = 2;
+  };
+  filtered = filterAttrs (name: value: name == "keep") source;
+in [
+  (builtins.unsafeGetAttrPos "keep" filtered)
+  (builtins.unsafeGetAttrPos "drop" filtered)
+]"#;
+    assert_eq!(
+        at_file(source, F),
+        format!("[ {} null ]", position(F, 7, 5))
+    );
+}
+
+/// The `derivation` wrapper copies the caller's input attributes through `//`
+/// and builds its bookkeeping in cppnix's `/derivation-internal.nix` source.
+/// The result is therefore a deliberate mix of caller and wrapper positions;
+/// only an attribute absent from the result answers `null`.
+#[test]
+fn the_derivation_wrapper_distinguishes_copied_and_synthesized_fields() {
+    let source = r#"let
+  drv = derivation {
+    name = "position-oracle";
+    system = "x86_64-linux";
+    builder = "/bin/sh";
+  };
+in [
+  (builtins.unsafeGetAttrPos "name" drv)
+  (builtins.unsafeGetAttrPos "system" drv)
+  (builtins.unsafeGetAttrPos "builder" drv)
+  (builtins.unsafeGetAttrPos "out" drv)
+  (builtins.unsafeGetAttrPos "all" drv)
+  (builtins.unsafeGetAttrPos "drvAttrs" drv)
+  (builtins.unsafeGetAttrPos "outPath" drv)
+  (builtins.unsafeGetAttrPos "drvPath" drv)
+  (builtins.unsafeGetAttrPos "type" drv)
+  (builtins.unsafeGetAttrPos "outputName" drv)
+  (builtins.unsafeGetAttrPos "outputs" drv)
+]"#;
+    let settings = Settings {
+        store_dir: Some("/nix/store".to_owned()),
+        ..Settings::default()
+    };
+    let answer = match eval_str_with(source, "/private/tmp", Origin::File(F), &settings) {
+        Ok(text) => text,
+        Err(error) => format!("{error:?}"),
+    };
+    assert_eq!(
+        answer,
+        format!(
+            "[ {} {} {} {} {} {} {} {} {} {} null ]",
+            position(F, 3, 5),
+            position(F, 4, 5),
+            position(F, 5, 5),
+            position("/derivation-internal.nix", 48, 5),
+            position("/derivation-internal.nix", 42, 7),
+            position("/derivation-internal.nix", 43, 15),
+            position("/derivation-internal.nix", 49, 7),
+            position("/derivation-internal.nix", 50, 7),
+            position("/derivation-internal.nix", 51, 7),
+            position("/derivation-internal.nix", 52, 15)
+        )
+    );
 }
 
 // -- positions on errors -----------------------------------------------------

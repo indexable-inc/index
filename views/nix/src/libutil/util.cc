@@ -12,21 +12,8 @@
 #include <boost/lexical_cast.hpp>
 #include <stdint.h>
 
-/* This guards the translation units linked into libutil, not the whole
-   codebase: src/libexpr/meson.build deliberately builds the generated
-   parser library (nixexpr-parser) with assertions disabled for measured
-   performance reasons, and that library is a separate set of translation
-   units this guard cannot see. See the override_options comment there
-   for why, and for confirmation that nothing in that library depends on
-   assertions for input validation (every parse error there is a thrown
-   exception, never an assert). That library actually strips assertions two
-   separate ways: the build option above, and parser.y's own prologue, which
-   unconditionally (i.e. regardless of build type) undefines
-   _GLIBCXX_ASSERTIONS to drop libstdc++'s hardened container checks for the
-   same performance reason. Neither governs parse validation. */
 #ifdef NDEBUG
-#  error \
-      "libutil may not be built with assertions disabled (i.e. with -DNDEBUG); see the comment above this guard for the one library that is exempt, and why."
+#  error "libutil requires assertions enabled"
 #endif
 
 namespace nix {

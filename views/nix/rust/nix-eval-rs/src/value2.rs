@@ -7,10 +7,229 @@ use crate::ir::Module;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::ops::Deref;
 use std::rc::Rc;
 
 /// Interned symbol id within one VM instance.
 pub type Sym = u32;
+
+/// The accessor a path value belongs to.
+///
+/// cppnix keeps this as the `SourceAccessor` inside `SourcePath`. A pointer
+/// cannot cross this evaluator's ABI, so a mounted input is named by the
+/// exact logical store path it was mounted at. The empty wire spelling is
+/// reserved for the ambient filesystem.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Root {
+    #[default]
+    Ambient,
+    Mounted(Rc<str>),
+}
+
+impl Root {
+    #[must_use]
+    pub fn mounted(mount_point: impl Into<Rc<str>>) -> Self {
+        Root::Mounted(mount_point.into())
+    }
+
+    /// The ABI/witness spelling. Empty is ambient; a non-empty value is the
+    /// exact key in cppnix's `storeFS` mount table.
+    #[must_use]
+    pub fn wire_name(&self) -> &str {
+        match self {
+            Root::Ambient => "",
+            Root::Mounted(mount_point) => mount_point,
+        }
+    }
+
+    pub fn from_wire_name(name: &str) -> Result<Root, String> {
+        if name.is_empty() {
+            return Ok(Root::Ambient);
+        }
+        require_canonical_absolute("mounted root", name)?;
+        Ok(Root::mounted(name))
+    }
+}
+
+/// `path` relative to `mount_point` when it is that root or lies below it:
+/// the one test [`PathValue::try_new`], [`PathValue::normalized`] and
+/// [`PathValue::accessor_path`] share.
+fn below<'a>(mount_point: &str, path: &'a str) -> Option<&'a str> {
+    if path == mount_point {
+        return Some("/");
+    }
+    path.strip_prefix(mount_point)
+        .filter(|rest| rest.starts_with('/'))
+}
+
+/// A Nix path's printed spelling and the accessor root that owns it.
+///
+/// `path` stays absolute because that is what Nix programs see. At the host
+/// boundary a mounted path is encoded relative to `root`, matching the path
+/// accepted by the mounted accessor and the identity cppnix fingerprints.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PathValue {
+    pub root: Root,
+    pub path: Rc<str>,
+}
+
+impl PathValue {
+    #[must_use]
+    pub fn ambient(path: impl Into<Rc<str>>) -> PathValue {
+        PathValue {
+            root: Root::Ambient,
+            path: path.into(),
+        }
+    }
+
+    #[must_use]
+    #[expect(
+        clippy::panic,
+        reason = "the constructor for paths the evaluator derived itself (a parent, a join, a \
+                  normalisation under a root it already holds): a mounted path outside its root \
+                  here is a bug in the deriving code, not an input. `try_new` is the constructor \
+                  for inputs (cached constants, witnesses, the wire)"
+    )]
+    pub fn new(root: Root, path: impl Into<Rc<str>>) -> PathValue {
+        PathValue::try_new(root, path).unwrap_or_else(|why| panic!("{why}"))
+    }
+
+    /// [`PathValue::new`] for a pair that arrived from outside the evaluator
+    /// -- a cached module's constant, a witness -- where a mounted path
+    /// outside its root is a corrupt input to report, not an invariant to
+    /// assert.
+    pub fn try_new(root: Root, path: impl Into<Rc<str>>) -> Result<PathValue, String> {
+        let path = path.into();
+        if let Root::Mounted(mount_point) = &root
+            && below(mount_point, &path).is_none()
+        {
+            return Err(format!(
+                "mounted path '{path}' is outside its root '{mount_point}'"
+            ));
+        }
+        Ok(PathValue { root, path })
+    }
+
+    #[must_use]
+    pub fn with_path(&self, path: impl Into<Rc<str>>) -> PathValue {
+        PathValue::new(self.root.clone(), path)
+    }
+
+    /// Lexically normalize `path` within `root`. A mounted accessor's `/` is
+    /// a hard boundary: `..` cannot escape it into the ambient filesystem.
+    #[must_use]
+    pub fn normalized(root: Root, path: &str) -> PathValue {
+        match &root {
+            Root::Ambient => PathValue::new(root.clone(), normalize_path(path)),
+            Root::Mounted(mount_point) => {
+                let Some(relative) = below(mount_point, path) else {
+                    // Outside its root: `new` reports that as the bug it is.
+                    return PathValue::new(root.clone(), path);
+                };
+                let relative = normalize_path(relative);
+                let absolute = if relative == "/" {
+                    mount_point.to_string()
+                } else {
+                    format!("{mount_point}{relative}")
+                };
+                PathValue::new(root.clone(), absolute)
+            }
+        }
+    }
+
+    /// The path's parent within its accessor. The mounted root is its own
+    /// parent, exactly as `/` is for the ambient accessor.
+    #[must_use]
+    pub fn parent(&self) -> PathValue {
+        if let Root::Mounted(mount_point) = &self.root
+            && self.path.as_ref() == mount_point.as_ref()
+        {
+            return self.clone();
+        }
+        let parent = match self.path.rfind('/') {
+            Some(0) | None => "/",
+            Some(i) => self.path.get(..i).unwrap_or("/"),
+        };
+        if let Root::Mounted(mount_point) = &self.root
+            && parent.len() < mount_point.len()
+        {
+            return PathValue::new(self.root.clone(), Rc::clone(mount_point));
+        }
+        PathValue::new(self.root.clone(), parent)
+    }
+
+    /// The path understood by the accessor selected by [`PathValue::root`].
+    #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "both constructors refuse a mounted path outside its root, and the fields, public \
+                  so callers can read them, are written by nothing else: no struct literal and \
+                  no field assignment exists outside this impl (`rg 'PathValue \\{'`, `rg \
+                  '\\.(root|path) = '`), so the value below is there by construction until a \
+                  writer is added, which is the change that must revisit this"
+    )]
+    pub fn accessor_path(&self) -> &str {
+        match &self.root {
+            Root::Ambient => &self.path,
+            Root::Mounted(mount_point) => {
+                below(mount_point, &self.path).expect("a mounted PathValue lies below its root")
+            }
+        }
+    }
+
+    /// Rebuild a VM path from the two fields carried over the ABI or in a
+    /// witness. Reject malformed mounted pairs instead of treating them as
+    /// ambient paths.
+    pub fn from_wire(root: &str, accessor_path: &str) -> Result<PathValue, String> {
+        if root.is_empty() {
+            require_canonical_absolute("ambient path", accessor_path)?;
+            return Ok(PathValue::ambient(accessor_path));
+        }
+        require_canonical_absolute("mounted root", root)?;
+        require_canonical_absolute("accessor path", accessor_path)?;
+        let absolute = if accessor_path == "/" {
+            root.to_owned()
+        } else {
+            format!("{root}{accessor_path}")
+        };
+        Ok(PathValue::new(Root::mounted(root), absolute))
+    }
+}
+
+fn require_canonical_absolute(kind: &str, path: &str) -> Result<(), String> {
+    if !path.starts_with('/') {
+        return Err(format!("{kind} is not absolute"));
+    }
+    if normalize_path(path) != path {
+        return Err(format!("{kind} is not canonical"));
+    }
+    Ok(())
+}
+
+#[must_use]
+pub fn ambient_path(path: impl Into<Rc<str>>) -> Rc<PathValue> {
+    Rc::new(PathValue::ambient(path))
+}
+
+impl Deref for PathValue {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<str> for PathValue {
+    fn as_ref(&self) -> &str {
+        &self.path
+    }
+}
+
+impl fmt::Display for PathValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.path)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -20,7 +239,7 @@ pub enum Value {
     Null,
     /// String with its (rarely present) context.
     Str(NixStr),
-    Path(Rc<str>),
+    Path(Rc<PathValue>),
     List(Rc<Vec<Slot>>),
     /// Sorted by symbol id at construction; iteration order for printing is
     /// name-alphabetical, resolved through the interner at print time.
@@ -28,6 +247,18 @@ pub enum Value {
     Closure(Rc<ClosureData>),
     /// A builtin, possibly partially applied (arity > args.len()).
     Builtin(Rc<BuiltinData>),
+}
+
+impl Value {
+    /// A list of these elements: the one place a list's backing `Vec` is
+    /// put behind an `Rc`, so the allocation census counts every list and
+    /// every element. Sharing an existing `Rc<Vec<Slot>>` (a list value
+    /// passed through unchanged) is `Value::List(rc)` and is not a build.
+    #[must_use]
+    pub fn list(items: Vec<Slot>) -> Value {
+        crate::perf::note_list(items.len());
+        Value::List(Rc::new(items))
+    }
 }
 
 /// An attribute set: the bindings, and where they were written.
@@ -40,53 +271,493 @@ pub enum Value {
 ///
 /// `Deref` to the map, so the hundred-odd places that only want to look
 /// something up read exactly as they did.
-#[derive(Debug, Clone, Default)]
+///
+/// The origin is deliberately not mutable outside this crate. Replacing it
+/// would make the set's values and source provenance disagree; the constructors
+/// below keep those two parts together.
+///
+/// ```compile_fail
+/// use nix_eval_rs::value2::Attrs;
+///
+/// fn detach_origin(attrs: &mut Attrs) {
+///     attrs.origin = None;
+/// }
+/// ```
+#[derive(Debug)]
 pub struct Attrs {
-    map: BTreeMap<Sym, Slot>,
+    map: AttrMap,
     /// Which `MkAttrs` built this set, or `None` when nothing in the source
     /// did.
     ///
-    /// `None` is the honest answer for a set no source expression wrote --
-    /// `builtins.listToAttrs`, `//`, a set built by the bridge -- and
-    /// `unsafeGetAttrPos` answers `null` for those, which is what cppnix
-    /// answers for an attribute with no recorded position. See
-    /// [`AttrOrigin`] for why `//` is in that list.
-    pub origin: Option<AttrOrigin>,
+    /// `None` is the honest answer for a set no source expression wrote, such
+    /// as a set built by the bridge. `builtins.listToAttrs` carries each
+    /// winning input pair's origin in the dynamic-origin slab. `//` carries a
+    /// flat projection of the positions selected from both operands. When no
+    /// origin exists, `unsafeGetAttrPos` answers `null`.
+    pub(crate) origin: Option<AttrOrigin>,
 }
 
 /// Which instruction of which unit built an attribute set.
 ///
-/// Three words and no work: the names and their offsets are already in the
-/// module's `attr_sites`, so construction copies a refcount and two integers
-/// and the search only happens if someone calls `unsafeGetAttrPos`.
+/// 16 bytes. Static sets copy a module refcount and two integers; their names
+/// and offsets stay in the module's `attr_sites`. A set with a dynamic name
+/// uses the integers as a tagged index into that module's reclaiming
+/// dynamic-origin slab. `listToAttrs` retains the winning input pair's origin
+/// for each result name. `Update` stores resolved per-name positions in a
+/// third entry shape in the same slab. `Update` resolves byte offsets while it
+/// builds that projection; line and column resolution remains confined to
+/// `unsafeGetAttrPos`.
 ///
-/// # What this cannot express, and why that is `null` rather than a guess
+/// # Composite sets
 ///
-/// One set, one origin. cppnix stores a position per *attribute*, inside the
-/// `Bindings`, so `a // b` keeps a's positions for a's attributes and b's for
-/// b's, and `listToAttrs` gives each attribute the position of the element it
-/// came from. A single origin cannot say that.
+/// `listToAttrs` already walks each pair and chooses one value for each
+/// runtime name, so its slab entry records those winning pair origins.
+/// `Update` projects every surviving name directly to the position from the
+/// operand that supplied its value. Equality consults only the right origin;
+/// a missing right position cannot expose a shadowed left position. The
+/// projection is flat, so folding `//` replaces one result projection with
+/// another and retains no origin chain.
 ///
-/// The rule that makes one origin safe anyway: **a derived set takes the
-/// origin of the operand whose values it takes.** `//` takes the right's,
-/// `removeAttrs` keeps its own, `intersectAttrs` takes the second's. Because
-/// [`AttrOrigin::offset_of`] answers only for names that origin's `MkAttrs`
-/// actually built, an attribute that came from somewhere else falls out as
-/// `None` rather than as the wrong line. So the answer is cppnix's wherever
-/// there is one, and `null` where there is not -- never a real line of a real
-/// file belonging to a different attribute, which a reader could not tell
-/// apart from a right answer.
+/// The coordinates are read-only outside this crate. Mutating a cloned
+/// coordinate would make its retained slab slot differ from the slot released
+/// by `Drop`.
 ///
-/// What that costs, both pinned by tests in `tests/positions.rs`: an
-/// attribute only the LEFT operand of `//` had answers `null` where cppnix
-/// gives the left's position, and every attribute of a `listToAttrs` set
-/// answers `null`. `maintainers/ix/positions.md` is the full statement.
-#[derive(Debug, Clone)]
+/// ```compile_fail
+/// use nix_eval_rs::value2::AttrOrigin;
+///
+/// fn redirect_release(origin: &mut AttrOrigin) {
+///     origin.ip = 0;
+/// }
+/// ```
+#[derive(Debug)]
 pub struct AttrOrigin {
+    pub(crate) module: Rc<Module>,
+    pub(crate) unit: u32,
+    /// Index of the `MkAttrs` in the unit's ops, [`AttrOrigin::FORMALS`], or a
+    /// slab index when `unit` is [`AttrOrigin::DYNAMIC_UNIT`],
+    /// [`AttrOrigin::LIST_TO_ATTRS_UNIT`], or
+    /// [`AttrOrigin::PROJECTED_UNIT`].
+    pub(crate) ip: u32,
+}
+
+/// A module's symbols as one VM's global symbols: the link step.
+///
+/// `Module::symbols` is module-local, and every op that names an attribute
+/// (`Select`, `HasAttr`, the formals of a call) used to re-intern its name on
+/// each execution: a `String` clone of the module's spelling, then a hash
+/// probe of the interner. On the darwin toplevel that was an allocation and
+/// a probe per attribute access. This table is built once per module per
+/// VM, on the first name the VM needs, and a lookup is an indexed load.
+///
+/// Runtime-only, like [`DynamicAttrOriginSlab`]: module encoding omits it
+/// and a cloned module starts empty. It carries the id of the VM that built
+/// it, and answers only that VM: two VMs number their interners
+/// independently, and a module handed from one to the other (tests do this)
+/// would otherwise resolve `a` to whatever symbol the first VM gave that
+/// index -- a wrong attribute name, not a slow one. The table is never
+/// invalidated within a VM because the interner only grows (`Vm::reset`
+/// leaves it alone), so an index assigned once stays that name for the VM's
+/// life.
+#[derive(Debug, Default)]
+pub(crate) struct LinkedSymbols(RefCell<Option<(u64, Box<[Sym]>)>>);
+
+impl Clone for LinkedSymbols {
+    fn clone(&self) -> LinkedSymbols {
+        LinkedSymbols::default()
+    }
+}
+
+impl LinkedSymbols {
+    /// The global symbol for module-local `sym` as linked by VM `vm`, or
+    /// `None` when this VM has not linked the module (or the index is out of
+    /// range).
+    pub(crate) fn get(&self, vm: u64, sym: u32) -> Option<Sym> {
+        let linked = self.0.borrow();
+        let (owner, table) = linked.as_ref()?;
+        if *owner != vm {
+            return None;
+        }
+        table.get(usize::try_from(sym).ok()?).copied()
+    }
+
+    /// Record VM `vm`'s numbering of every symbol, replacing any other VM's.
+    pub(crate) fn set(&self, vm: u64, table: Box<[Sym]>) {
+        *self.0.borrow_mut() = Some((vm, table));
+    }
+}
+
+/// Reclaiming storage for dynamic, `listToAttrs`, and projected origins.
+///
+/// Entries are reused after their last `AttrOrigin` drops, so retained memory
+/// is proportional to the high-water mark of simultaneously live slab
+/// origins, not the number of requests a session has served. `None` until the
+/// module's first origin: most modules never have one.
+#[derive(Debug, Default)]
+pub(crate) struct DynamicAttrOriginSlab(RefCell<Option<Box<DynamicAttrOrigins>>>);
+
+#[derive(Debug, Default)]
+struct DynamicAttrOrigins {
+    dynamic: Slab<DynamicAttrOrigin>,
+    list_to_attrs: Slab<ListToAttrsOrigin>,
+    projected: Slab<ProjectedAttrOrigin>,
+}
+
+/// Reference-counted storage indexed by `u32`, the shape the three origin
+/// kinds share: one holder at insertion, one more per [`Slab::retain`], the
+/// value handed back by the [`Slab::release`] that drops the last.
+///
+/// A `retain` or `release` of an index that names no live entry, a free index
+/// that names a live one, a count that overflows: each is a bug in the
+/// holder's counting, and the holder is a `Clone` or `Drop` impl with no
+/// error channel, so `slab_bug` stops the process in every build, as the
+/// three slabs this one replaced did. A slab that kept going would hand a
+/// position to two holders or free one still held, and a position is an
+/// answer (`unsafeGetAttrPos`), so continuing is a wrong answer, not a leak.
+#[derive(Debug)]
+struct Slab<T> {
+    entries: Vec<Option<Counted<T>>>,
+    free: Vec<u32>,
+}
+
+#[derive(Debug)]
+struct Counted<T> {
+    refs: usize,
+    value: T,
+}
+
+impl<T> Default for Slab<T> {
+    fn default() -> Slab<T> {
+        Slab {
+            entries: Vec::new(),
+            free: Vec::new(),
+        }
+    }
+}
+
+/// A [`Slab`] invariant did not hold (see the type's doc for why this is not
+/// an error the caller could handle).
+#[expect(
+    clippy::panic,
+    reason = "the holder is a `Clone` or `Drop` impl with no error channel, and a slab that \
+              continued would hand one position to two holders; the panic is the only stop"
+)]
+fn slab_bug(what: &str, ip: u32) -> ! {
+    panic!("slab: {what} (index {ip})")
+}
+
+impl<T> Slab<T> {
+    /// The index of the new entry, or `None` when the slab is full.
+    fn insert(&mut self, value: T) -> Option<u32> {
+        let entry = Counted { refs: 1, value };
+        if let Some(ip) = self.free.pop() {
+            let Some(slot) = self.slot_mut(ip) else {
+                slab_bug("a free index is outside the slab", ip)
+            };
+            if slot.is_some() {
+                slab_bug("a free index names a live entry", ip)
+            }
+            *slot = Some(entry);
+            return Some(ip);
+        }
+        let ip = u32::try_from(self.entries.len()).ok()?;
+        self.entries.push(Some(entry));
+        Some(ip)
+    }
+
+    fn slot_mut(&mut self, ip: u32) -> Option<&mut Option<Counted<T>>> {
+        self.entries.get_mut(usize::try_from(ip).ok()?)
+    }
+
+    /// The live value at `ip`, if any.
+    fn get(&self, ip: u32) -> Option<&T> {
+        let entry = self.entries.get(usize::try_from(ip).ok()?)?.as_ref()?;
+        Some(&entry.value)
+    }
+
+    /// One more holder of the entry at `ip`.
+    fn retain(&mut self, ip: u32) {
+        let Some(entry) = self.slot_mut(ip).and_then(Option::as_mut) else {
+            slab_bug("retain of an entry that is not live", ip)
+        };
+        entry.refs = entry
+            .refs
+            .checked_add(1)
+            .unwrap_or_else(|| slab_bug("too many holders of one entry", ip));
+    }
+
+    /// One fewer holder of the entry at `ip`; the value when that was the last.
+    fn release(&mut self, ip: u32) -> Option<T> {
+        let Some(slot) = self.slot_mut(ip) else {
+            slab_bug("release of an index outside the slab", ip)
+        };
+        let Some(entry) = slot.as_mut() else {
+            slab_bug("release of an entry that is not live", ip)
+        };
+        entry.refs = entry
+            .refs
+            .checked_sub(1)
+            .unwrap_or_else(|| slab_bug("release of an entry with no holders", ip));
+        if entry.refs != 0 {
+            return None;
+        }
+        let Some(taken) = slot.take() else {
+            slab_bug("a live entry vanished under its release", ip)
+        };
+        self.free.push(ip);
+        Some(taken.value)
+    }
+
+    #[cfg(test)]
+    fn live_len(&self) -> usize {
+        self.entries.iter().flatten().count()
+    }
+
+    #[cfg(test)]
+    fn slot_len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[derive(Debug)]
+struct DynamicAttrOrigin {
+    names: Box<[(Sym, u32)]>,
+    fallback: Option<AttrOrigin>,
+}
+
+/// Origins retained only for attributes that won a `listToAttrs` insertion.
+///
+/// Keeping the input pair's origin defers the potentially recursive source
+/// lookup until `unsafeGetAttrPos` while avoiding a reference cycle through
+/// the input list and arbitrary unused attributes on its pairs.
+#[derive(Debug)]
+struct ListToAttrsOrigin {
+    pairs: Box<[(Sym, AttrOrigin)]>,
+    value_sym: Sym,
+}
+
+/// Resolved per-name positions for a set assembled from more than one origin.
+///
+/// `Update` pays this only for its result. Ordinary sets and their `Slot`s
+/// remain unchanged. Storing resolved positions instead of child origins is
+/// what makes a repeated `//` fold flat rather than a retained origin chain.
+#[derive(Debug)]
+struct ProjectedAttrOrigin {
+    positions: Box<[ProjectedAttrPosition]>,
+}
+
+/// A resolved attribute position includes its source module. `listToAttrs`
+/// may combine pairs imported from different files, so an offset alone could
+/// name a real line in the wrong file.
+#[derive(Debug, Clone)]
+pub(crate) struct AttrPosition {
     pub module: Rc<Module>,
-    pub unit: u32,
-    /// Index of the `MkAttrs` in the unit's ops, or [`AttrOrigin::FORMALS`].
-    pub ip: u32,
+    pub offset: u32,
+}
+
+/// One flat `Update` projection entry. Field order keeps this at 16 bytes on
+/// 64-bit targets: one module pointer and the two `u32`s `AttrOrigin` would
+/// otherwise carry.
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectedAttrPosition {
+    module: Rc<Module>,
+    sym: Sym,
+    offset: u32,
+}
+
+impl ProjectedAttrPosition {
+    #[must_use]
+    pub(crate) fn new(sym: Sym, position: AttrPosition) -> ProjectedAttrPosition {
+        ProjectedAttrPosition {
+            module: position.module,
+            sym,
+            offset: position.offset,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn sym(&self) -> Sym {
+        self.sym
+    }
+}
+
+impl Clone for DynamicAttrOriginSlab {
+    fn clone(&self) -> DynamicAttrOriginSlab {
+        DynamicAttrOriginSlab::default()
+    }
+}
+
+impl DynamicAttrOriginSlab {
+    /// Run `f` on the origins, which exist from the first insertion on. A
+    /// `retain` or `release` before that is the holder's counting bug and is
+    /// treated as [`Slab`] treats one.
+    fn with_live<R>(&self, f: impl FnOnce(&mut DynamicAttrOrigins) -> R) -> Option<R> {
+        let mut slab = self.0.borrow_mut();
+        let origins = slab.as_deref_mut();
+        debug_assert!(
+            origins.is_some(),
+            "a slab origin outlives its module's slab"
+        );
+        origins.map(f)
+    }
+
+    fn insert(&self, names: Box<[(Sym, u32)]>, fallback: Option<AttrOrigin>) -> Option<u32> {
+        self.0
+            .borrow_mut()
+            .get_or_insert_with(Box::default)
+            .dynamic
+            .insert(DynamicAttrOrigin { names, fallback })
+    }
+
+    fn retain(&self, ip: u32) {
+        self.with_live(|origins| origins.dynamic.retain(ip));
+    }
+
+    fn release(&self, ip: u32) -> Option<DynamicAttrOrigin> {
+        self.with_live(|origins| origins.dynamic.release(ip))?
+    }
+
+    fn position_of(
+        &self,
+        module: &Rc<Module>,
+        ip: u32,
+        name: &str,
+        sym: Sym,
+    ) -> Option<AttrPosition> {
+        let slab = self.0.borrow();
+        let origin = slab.as_deref()?.dynamic.get(ip)?;
+        origin
+            .names
+            .binary_search_by_key(&sym, |(candidate, _)| *candidate)
+            .ok()
+            .and_then(|position| origin.names.get(position))
+            .map(|(_, offset)| *offset)
+            .filter(|p| *p != crate::ir::NO_POS)
+            .map(|offset| AttrPosition {
+                module: Rc::clone(module),
+                offset,
+            })
+            .or_else(|| origin.fallback.as_ref()?.position_of(name, sym))
+    }
+
+    fn insert_list_to_attrs(&self, pairs: Box<[(Sym, AttrOrigin)]>, value_sym: Sym) -> Option<u32> {
+        self.0
+            .borrow_mut()
+            .get_or_insert_with(Box::default)
+            .list_to_attrs
+            .insert(ListToAttrsOrigin { pairs, value_sym })
+    }
+
+    fn retain_list_to_attrs(&self, ip: u32) {
+        self.with_live(|origins| origins.list_to_attrs.retain(ip));
+    }
+
+    fn release_list_to_attrs(&self, ip: u32) -> Option<ListToAttrsOrigin> {
+        self.with_live(|origins| origins.list_to_attrs.release(ip))?
+    }
+
+    fn list_to_attrs_position_of(&self, ip: u32, sym: Sym) -> Option<AttrPosition> {
+        let slab = self.0.borrow();
+        let origin = slab.as_deref()?.list_to_attrs.get(ip)?;
+        let pair_index = origin
+            .pairs
+            .binary_search_by_key(&sym, |(candidate, _)| *candidate)
+            .ok()?;
+        let (_, pair_origin) = origin.pairs.get(pair_index)?;
+        pair_origin.position_of("value", origin.value_sym)
+    }
+
+    fn insert_projected(&self, positions: Box<[ProjectedAttrPosition]>) -> Option<u32> {
+        self.0
+            .borrow_mut()
+            .get_or_insert_with(Box::default)
+            .projected
+            .insert(ProjectedAttrOrigin { positions })
+    }
+
+    fn retain_projected(&self, ip: u32) {
+        self.with_live(|origins| origins.projected.retain(ip));
+    }
+
+    fn release_projected(&self, ip: u32) -> Option<ProjectedAttrOrigin> {
+        self.with_live(|origins| origins.projected.release(ip))?
+    }
+
+    /// Every position this projected origin holds for the sorted `syms`,
+    /// appended to `out` in `syms` order, in one walk under one borrow.
+    ///
+    /// `false` when `ip` names no live projected entry, in which case
+    /// nothing was appended and the caller resolves name by name (which
+    /// answers `None` for each, as [`Self::projected_position_of`] would).
+    fn projected_positions_of(
+        &self,
+        ip: u32,
+        syms: &[Sym],
+        out: &mut Vec<ProjectedAttrPosition>,
+    ) -> bool {
+        let slab = self.0.borrow();
+        let Some(origin) = slab
+            .as_deref()
+            .and_then(|origins| origins.projected.get(ip))
+        else {
+            return false;
+        };
+        let mut held = origin.positions.iter().peekable();
+        for &sym in syms {
+            while held.peek().is_some_and(|position| position.sym < sym) {
+                held.next();
+            }
+            if let Some(position) = held.peek()
+                && position.sym == sym
+            {
+                out.push((*position).clone());
+            }
+        }
+        true
+    }
+
+    fn projected_position_of(&self, ip: u32, sym: Sym) -> Option<AttrPosition> {
+        let slab = self.0.borrow();
+        let origin = slab.as_deref()?.projected.get(ip)?;
+        let position_index = origin
+            .positions
+            .binary_search_by_key(&sym, |position| position.sym)
+            .ok()?;
+        origin
+            .positions
+            .get(position_index)
+            .map(|position| AttrPosition {
+                module: Rc::clone(&position.module),
+                offset: position.offset,
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_len(&self) -> usize {
+        self.0
+            .borrow()
+            .as_deref()
+            .map_or(0, DynamicAttrOrigins::live_len)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn slot_len(&self) -> usize {
+        self.0
+            .borrow()
+            .as_deref()
+            .map_or(0, DynamicAttrOrigins::slot_len)
+    }
+}
+
+impl DynamicAttrOrigins {
+    #[cfg(test)]
+    fn live_len(&self) -> usize {
+        self.dynamic.live_len() + self.list_to_attrs.live_len() + self.projected.live_len()
+    }
+
+    #[cfg(test)]
+    fn slot_len(&self) -> usize {
+        self.dynamic.slot_len() + self.list_to_attrs.slot_len() + self.projected.slot_len()
+    }
 }
 
 impl AttrOrigin {
@@ -94,102 +765,455 @@ impl AttrOrigin {
     /// formal parameters, whose positions are on the `Param` and not on any
     /// instruction.
     pub const FORMALS: u32 = u32::MAX;
+    /// `unit` tag saying `ip` indexes the module's dynamic-origin slab.
+    pub const DYNAMIC_UNIT: u32 = u32::MAX;
+    /// `unit` tag saying `ip` indexes the slab's `listToAttrs` origins.
+    pub const LIST_TO_ATTRS_UNIT: u32 = u32::MAX - 1;
+    /// `unit` tag saying `ip` indexes the slab's flat projected origins.
+    pub const PROJECTED_UNIT: u32 = u32::MAX - 2;
+
+    pub(crate) fn dynamic(
+        module: Rc<Module>,
+        mut names: Box<[(Sym, u32)]>,
+        fallback: Option<AttrOrigin>,
+    ) -> Option<AttrOrigin> {
+        names.sort_unstable_by_key(|(sym, _)| *sym);
+        debug_assert!(
+            names.is_sorted_by(|a, b| a.0 < b.0),
+            "dynamic origin names are unique"
+        );
+        let ip = module.dynamic_attr_origins.insert(names, fallback)?;
+        Some(AttrOrigin {
+            module,
+            unit: AttrOrigin::DYNAMIC_UNIT,
+            ip,
+        })
+    }
+
+    pub(crate) fn list_to_attrs(
+        mut pairs: Box<[(Sym, AttrOrigin)]>,
+        value_sym: Sym,
+    ) -> Option<AttrOrigin> {
+        // Keep the first retained pair's module as the slab owner. Sorting is
+        // a lookup detail and must not change ownership for cross-file input.
+        let module = Rc::clone(&pairs.first()?.1.module);
+        pairs.sort_unstable_by_key(|(sym, _)| *sym);
+        debug_assert!(
+            pairs.is_sorted_by(|a, b| a.0 < b.0),
+            "listToAttrs origin names are unique"
+        );
+        let ip = module
+            .dynamic_attr_origins
+            .insert_list_to_attrs(pairs, value_sym)?;
+        Some(AttrOrigin {
+            module,
+            unit: AttrOrigin::LIST_TO_ATTRS_UNIT,
+            ip,
+        })
+    }
+
+    pub(crate) fn projected(
+        module: Rc<Module>,
+        positions: Box<[ProjectedAttrPosition]>,
+    ) -> Option<AttrOrigin> {
+        debug_assert!(!positions.is_empty(), "a projected origin has a position");
+        debug_assert!(
+            positions.is_sorted_by(|a, b| a.sym < b.sym),
+            "projected positions are sorted by symbol"
+        );
+        let ip = module.dynamic_attr_origins.insert_projected(positions)?;
+        Some(AttrOrigin {
+            module,
+            unit: AttrOrigin::PROJECTED_UNIT,
+            ip,
+        })
+    }
+
+    /// [`Self::position_of`] for a sorted run of names, appended to `out` in
+    /// that order, skipping the names this origin does not hold.
+    ///
+    /// A projected origin (the accumulator of a `//` fold) answers all of
+    /// them in one linear walk of its flat positions beside `syms`, under
+    /// one slab borrow. Before this the fold resolved every accumulated name
+    /// with its own borrow and binary search at every step, and that was
+    /// 5-8% of the darwin toplevel's main thread (round 8 profile,
+    /// goals/rust-eval.md). Any other origin resolves name by name.
+    pub(crate) fn positions_of<'a>(
+        &self,
+        syms: &[Sym],
+        name_of: impl Fn(Sym) -> &'a str,
+        out: &mut Vec<ProjectedAttrPosition>,
+    ) {
+        if self.unit == AttrOrigin::PROJECTED_UNIT
+            && self
+                .module
+                .dynamic_attr_origins
+                .projected_positions_of(self.ip, syms, out)
+        {
+            return;
+        }
+        for &sym in syms {
+            if let Some(position) = self.position_of(name_of(sym), sym) {
+                out.push(ProjectedAttrPosition::new(sym, position));
+            }
+        }
+    }
 
     /// Where the attribute named `name` was written, or `None` when this
-    /// origin does not name it -- a dynamic attribute, or a name that came
-    /// from somewhere else.
+    /// origin does not name it because it came from somewhere else.
     #[must_use]
-    pub fn offset_of(&self, name: &str) -> Option<u32> {
+    pub(crate) fn position_of(&self, name: &str, sym: Sym) -> Option<AttrPosition> {
+        if self.unit == AttrOrigin::DYNAMIC_UNIT {
+            return self
+                .module
+                .dynamic_attr_origins
+                .position_of(&self.module, self.ip, name, sym);
+        }
+        if self.unit == AttrOrigin::LIST_TO_ATTRS_UNIT {
+            return self
+                .module
+                .dynamic_attr_origins
+                .list_to_attrs_position_of(self.ip, sym);
+        }
+        if self.unit == AttrOrigin::PROJECTED_UNIT {
+            return self
+                .module
+                .dynamic_attr_origins
+                .projected_position_of(self.ip, sym);
+        }
         let unit = self.module.units.get(self.unit as usize)?;
-        if self.ip == AttrOrigin::FORMALS {
+        // A lookup arrives with the name's text. Formals are scanned (nothing
+        // bounds them, but a lambda's are a handful in practice). An attr
+        // site's static half is in emission
+        // order, the VM zips it with the values it pops, so the lookup goes
+        // through the site's text-sorted index instead: `//` folds and
+        // position tracking resolve names by the million, and a linear scan
+        // here was 6.4% of the hil-compute-1 toplevel (2026-09-04 profile,
+        // goals/rust-eval.md).
+        let offset = if self.ip == AttrOrigin::FORMALS {
             let Some(crate::ir::Param::Formals { fields, .. }) = &unit.param else {
                 return None;
             };
-            return fields
+            fields
                 .iter()
-                .find(|f| {
-                    self.module
-                        .symbols
-                        .get(f.sym as usize)
-                        .is_some_and(|s| s == name)
-                })
+                .find(|f| self.module.symbol_is(f.sym, name))
                 .map(|f| f.pos)
-                .filter(|p| *p != crate::ir::NO_POS);
+                .filter(|p| *p != crate::ir::NO_POS)?
+        } else {
+            let site = unit
+                .attr_sites
+                .binary_search_by_key(&self.ip, |s| s.ip)
+                .ok()
+                .and_then(|i| unit.attr_sites.get(i))?;
+            site.static_offset(name, &self.module.symbols)
+                .filter(|p| *p != crate::ir::NO_POS)?
+        };
+        Some(AttrPosition {
+            module: Rc::clone(&self.module),
+            offset,
+        })
+    }
+}
+
+impl Clone for AttrOrigin {
+    fn clone(&self) -> AttrOrigin {
+        if self.unit == AttrOrigin::DYNAMIC_UNIT {
+            self.module.dynamic_attr_origins.retain(self.ip);
+        } else if self.unit == AttrOrigin::LIST_TO_ATTRS_UNIT {
+            self.module
+                .dynamic_attr_origins
+                .retain_list_to_attrs(self.ip);
+        } else if self.unit == AttrOrigin::PROJECTED_UNIT {
+            self.module.dynamic_attr_origins.retain_projected(self.ip);
         }
-        let site = unit
-            .attr_sites
-            .binary_search_by_key(&self.ip, |s| s.ip)
-            .ok()
-            .and_then(|i| unit.attr_sites.get(i))?;
-        // `names` is sorted by the symbol's TEXT, which is what a lookup
-        // arrives with; the symbol index is assignment order and no use here.
-        site.names
-            .binary_search_by(|(sym, _)| {
-                self.module
-                    .symbols
-                    .get(*sym as usize)
-                    .map_or("", String::as_str)
-                    .cmp(name)
-            })
-            .ok()
-            .and_then(|i| site.names.get(i))
-            .map(|(_, offset)| *offset)
-            .filter(|p| *p != crate::ir::NO_POS)
+        AttrOrigin {
+            module: Rc::clone(&self.module),
+            unit: self.unit,
+            ip: self.ip,
+        }
+    }
+}
+
+impl Drop for AttrOrigin {
+    fn drop(&mut self) {
+        if self.unit == AttrOrigin::DYNAMIC_UNIT {
+            let released = self.module.dynamic_attr_origins.release(self.ip);
+            // A fallback can belong to this module's slab too. Drop it after
+            // the mutable borrow ends so its own `Drop` can enter the slab.
+            drop(released);
+            return;
+        }
+        if self.unit == AttrOrigin::LIST_TO_ATTRS_UNIT {
+            let released = self
+                .module
+                .dynamic_attr_origins
+                .release_list_to_attrs(self.ip);
+            // A retained pair origin may use this slab. Release it after the
+            // list slab's mutable borrow ends.
+            drop(released);
+            return;
+        }
+        if self.unit == AttrOrigin::PROJECTED_UNIT {
+            let released = self.module.dynamic_attr_origins.release_projected(self.ip);
+            // Positions can retain this slot's owner module. Drop them after
+            // the mutable borrow ends.
+            drop(released);
+        }
+    }
+}
+
+/// The bindings of an attribute set: `(Sym, Slot)` pairs in strictly
+/// ascending `Sym` order, in one allocation.
+///
+/// cppnix's `Bindings` (a sorted array of 16-byte `Attr`s), chosen over a
+/// `BTreeMap` for the reasons cppnix chose it: a set is read far more often
+/// than it is built, most sets are small, and the two operations Nix code
+/// performs on sets in bulk, lookup and `//`, are a binary search and a
+/// merge over contiguous memory. Measured on the hil-compute-1 toplevel
+/// (goals/rust-eval.md, footprint ledger): B-tree node clones and inserts
+/// were 19% of every page the evaluation touched, because a leaf node holds
+/// up to eleven entries in 160 bytes whether the set has one attribute or
+/// eleven, and cloning a set for `//` rebuilt every node.
+///
+/// Iteration is in `Sym` order, the order the `BTreeMap` gave, and what the
+/// merges rely on. Inserting into the middle moves the tail; the evaluator
+/// builds sets from a stream it sorts once (`FromIterator`) or already has
+/// sorted (`from_sorted`), or by merging (`update`), and reaches for `insert`
+/// only for dynamic names, which are few.
+#[derive(Debug, Clone, Default)]
+pub struct AttrMap {
+    entries: Vec<(Sym, Slot)>,
+}
+
+/// Borrowing iteration over an [`AttrMap`], `(&Sym, &Slot)` in `Sym` order.
+#[derive(Debug, Clone)]
+pub struct AttrIter<'a>(std::slice::Iter<'a, (Sym, Slot)>);
+
+impl<'a> Iterator for AttrIter<'a> {
+    type Item = (&'a Sym, &'a Slot);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(k, v)| (k, v))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for AttrIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.next_back().map(|(k, v)| (k, v))
+    }
+}
+
+impl ExactSizeIterator for AttrIter<'_> {}
+
+impl AttrMap {
+    #[must_use]
+    pub fn new() -> AttrMap {
+        AttrMap {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Pairs already in strictly ascending `Sym` order: what a merge over
+    /// sorted inputs, or iteration over another map, produces. Sortedness is
+    /// the caller's contract, checked in debug builds, which is why this is
+    /// crate-private: every caller is in view.
+    #[must_use]
+    pub(crate) fn from_sorted(entries: Vec<(Sym, Slot)>) -> AttrMap {
+        debug_assert!(
+            entries
+                .windows(2)
+                .all(|w| matches!(w, [(a, _), (b, _)] if a < b)),
+            "AttrMap::from_sorted: keys not in strictly ascending order"
+        );
+        AttrMap { entries }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn position(&self, key: Sym) -> std::result::Result<usize, usize> {
+        self.entries.binary_search_by_key(&key, |(k, _)| *k)
+    }
+
+    #[must_use]
+    pub fn get(&self, key: &Sym) -> Option<&Slot> {
+        let i = self.position(*key).ok()?;
+        self.entries.get(i).map(|(_, v)| v)
+    }
+
+    pub fn get_mut(&mut self, key: &Sym) -> Option<&mut Slot> {
+        let i = self.position(*key).ok()?;
+        self.entries.get_mut(i).map(|(_, v)| v)
+    }
+
+    #[must_use]
+    pub fn contains_key(&self, key: &Sym) -> bool {
+        self.position(*key).is_ok()
+    }
+
+    /// Bind `key`, returning the slot it replaced. Moves the tail when the
+    /// name is new, so bulk construction goes through `FromIterator` or
+    /// `from_sorted`.
+    pub fn insert(&mut self, key: Sym, slot: Slot) -> Option<Slot> {
+        match self.position(key) {
+            Ok(i) => self
+                .entries
+                .get_mut(i)
+                .map(|entry| std::mem::replace(&mut entry.1, slot)),
+            Err(i) => {
+                self.entries.insert(i, (key, slot));
+                None
+            }
+        }
+    }
+
+    pub fn remove(&mut self, key: &Sym) -> Option<Slot> {
+        let i = self.position(*key).ok()?;
+        Some(self.entries.remove(i).1)
+    }
+
+    /// Keep the bindings `keep` accepts, in order.
+    pub fn retain(&mut self, mut keep: impl FnMut(&Sym, &mut Slot) -> bool) {
+        self.entries.retain_mut(|(k, v)| keep(k, v));
+    }
+
+    pub fn iter(&self) -> AttrIter<'_> {
+        AttrIter(self.entries.iter())
+    }
+
+    pub fn keys(&self) -> impl DoubleEndedIterator<Item = &Sym> + ExactSizeIterator + Clone {
+        self.entries.iter().map(|(k, _)| k)
+    }
+
+    pub fn values(&self) -> impl DoubleEndedIterator<Item = &Slot> + ExactSizeIterator + Clone {
+        self.entries.iter().map(|(_, v)| v)
+    }
+
+    /// `self // right`: every binding of `right`, plus the bindings of `self`
+    /// whose names `right` lacks. One pass over each side; the result is born
+    /// sorted.
+    #[must_use]
+    pub fn update(&self, right: &AttrMap) -> AttrMap {
+        let mut out = Vec::with_capacity(self.len() + right.len());
+        let mut lefts = self.entries.iter().peekable();
+        let mut rights = right.entries.iter().peekable();
+        while let (Some((lk, _)), Some((rk, _))) = (lefts.peek(), rights.peek()) {
+            match lk.cmp(rk) {
+                std::cmp::Ordering::Less => out.extend(lefts.next().cloned()),
+                std::cmp::Ordering::Greater => out.extend(rights.next().cloned()),
+                std::cmp::Ordering::Equal => {
+                    lefts.next();
+                    out.extend(rights.next().cloned());
+                }
+            }
+        }
+        out.extend(lefts.cloned());
+        out.extend(rights.cloned());
+        AttrMap { entries: out }
+    }
+}
+
+/// Later pairs win, as `BTreeMap::from_iter` had it.
+impl FromIterator<(Sym, Slot)> for AttrMap {
+    fn from_iter<I: IntoIterator<Item = (Sym, Slot)>>(iter: I) -> AttrMap {
+        let mut entries: Vec<(Sym, Slot)> = iter.into_iter().collect();
+        // Stable, so equal keys keep their arrival order and the last one
+        // of each run is the one that arrived last.
+        entries.sort_by_key(|(k, _)| *k);
+        let mut out: Vec<(Sym, Slot)> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match out.last_mut() {
+                Some(last) if last.0 == entry.0 => *last = entry,
+                _ => out.push(entry),
+            }
+        }
+        AttrMap { entries: out }
+    }
+}
+
+impl From<BTreeMap<Sym, Slot>> for AttrMap {
+    /// A `BTreeMap` iterates sorted and unique, so this is the sorted-stream
+    /// constructor with no check to fail.
+    fn from(map: BTreeMap<Sym, Slot>) -> AttrMap {
+        AttrMap {
+            entries: map.into_iter().collect(),
+        }
+    }
+}
+
+impl IntoIterator for AttrMap {
+    type Item = (Sym, Slot);
+    type IntoIter = std::vec::IntoIter<(Sym, Slot)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a AttrMap {
+    type Item = (&'a Sym, &'a Slot);
+    type IntoIter = AttrIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
 impl Attrs {
+    /// The one place an `Attrs` comes into existence, so the allocation
+    /// census (`perf::note_attrs`) sees every set: the public constructors,
+    /// `Default`, and `Clone` all come through here.
+    fn built(map: AttrMap, origin: Option<AttrOrigin>) -> Attrs {
+        crate::perf::note_attrs(map.len());
+        Attrs { map, origin }
+    }
+
     /// A set with no source behind it.
     #[must_use]
-    pub fn new(map: BTreeMap<Sym, Slot>) -> Attrs {
-        Attrs { map, origin: None }
+    pub fn new(map: impl Into<AttrMap>) -> Attrs {
+        Attrs::built(map.into(), None)
     }
 
     /// A set with no source behind it, built from pairs already in strictly
-    /// ascending `Sym` order.
-    ///
-    /// Exists so that a caller which produced its pairs in order -- a merge
-    /// over two sets that are themselves sorted, like `intersectAttrs` --
-    /// does not pay for a per-call `BTreeMap` rebuild through the tree's
-    /// comparison path, and so that the order guarantee is stated at the
-    /// construction site rather than rediscovered. It is also the
-    /// constructor a future persistent (structurally shared) representation
-    /// needs, where "build from a sorted stream" is the cheap bulk operation
-    /// (ENG-13148, ENG-13152).
-    ///
-    /// Sortedness is the caller's contract, checked in debug builds.
+    /// ascending `Sym` order: what a merge over two sorted sets produces, like
+    /// `intersectAttrs`. States the order guarantee at the construction site;
+    /// `AttrMap::from_sorted` checks it in debug builds.
     #[must_use]
-    pub fn from_sorted_iter(iter: impl IntoIterator<Item = (Sym, Slot)>) -> Attrs {
-        let mut prev: Option<Sym> = None;
-        let map: BTreeMap<Sym, Slot> = iter
-            .into_iter()
-            .inspect(|(k, _)| {
-                debug_assert!(
-                    prev.is_none_or(|p| p < *k),
-                    "from_sorted_iter: keys not in strictly ascending order"
-                );
-                prev = Some(*k);
-            })
-            .collect();
-        Attrs { map, origin: None }
+    pub(crate) fn from_sorted_iter(iter: impl IntoIterator<Item = (Sym, Slot)>) -> Attrs {
+        Attrs::built(AttrMap::from_sorted(iter.into_iter().collect()), None)
     }
 
     /// A set the given instruction built.
     #[must_use]
-    pub fn at(map: BTreeMap<Sym, Slot>, origin: AttrOrigin) -> Attrs {
-        Attrs {
-            map,
-            origin: Some(origin),
-        }
-    }
-
-    /// The bindings, for the few callers that take the map apart.
-    #[must_use]
-    pub fn into_map(self) -> BTreeMap<Sym, Slot> {
-        self.map
+    pub fn at(map: impl Into<AttrMap>, origin: AttrOrigin) -> Attrs {
+        Attrs::built(map.into(), Some(origin))
     }
 }
 
+impl Default for Attrs {
+    fn default() -> Attrs {
+        Attrs::built(AttrMap::new(), None)
+    }
+}
+
+/// A clone is a second set on the heap, so it is counted as one, at the
+/// width it has when cloned.
+impl Clone for Attrs {
+    fn clone(&self) -> Attrs {
+        Attrs::built(self.map.clone(), self.origin.clone())
+    }
+}
 impl From<BTreeMap<Sym, Slot>> for Attrs {
     fn from(map: BTreeMap<Sym, Slot>) -> Attrs {
         Attrs::new(map)
@@ -197,20 +1221,20 @@ impl From<BTreeMap<Sym, Slot>> for Attrs {
 }
 
 impl std::ops::Deref for Attrs {
-    type Target = BTreeMap<Sym, Slot>;
+    type Target = AttrMap;
 
-    fn deref(&self) -> &BTreeMap<Sym, Slot> {
+    fn deref(&self) -> &AttrMap {
         &self.map
     }
 }
 
 impl std::ops::DerefMut for Attrs {
     /// Mutating the bindings does NOT clear the origin, and the callers that
-    /// rely on that are the derived sets: `//` and `removeAttrs` mutate a
-    /// clone whose origin is deliberately the one whose values survive. See
+    /// rely on that are the derived sets: `//` and `removeAttrs` derive from
+    /// a set whose origin is deliberately the one whose values survive. See
     /// [`AttrOrigin`] for why that is safe, and `Attrs::new` for a set with
     /// no origin at all.
-    fn deref_mut(&mut self) -> &mut BTreeMap<Sym, Slot> {
+    fn deref_mut(&mut self) -> &mut AttrMap {
         &mut self.map
     }
 }
@@ -600,10 +1624,12 @@ pub enum SlotState {
 
 impl Slot {
     pub fn value(v: Value) -> Self {
+        crate::perf::note_slot_value();
         Slot(Rc::new(RefCell::new(SlotState::Value(v))))
     }
 
     pub fn thunk(module: Rc<Module>, unit: u32, env: Env) -> Self {
+        crate::perf::note_slot_thunk();
         Slot(Rc::new(RefCell::new(SlotState::Thunk {
             module,
             unit,
@@ -612,10 +1638,12 @@ impl Slot {
     }
 
     pub fn pending(f: Slot, args: Vec<Slot>) -> Self {
+        crate::perf::note_slot_pending();
         Slot(Rc::new(RefCell::new(SlotState::PendingApply { f, args })))
     }
 
     pub fn unimplemented(what: &str) -> Self {
+        crate::perf::note_slot_refusal();
         Slot(Rc::new(RefCell::new(SlotState::Unimplemented(Rc::new(
             crate::refusal::Refusal::new(crate::refusal::RefusalToken::UnimplementedBuiltin, what),
         )))))
@@ -767,6 +1795,38 @@ pub enum EnvNode {
     },
 }
 
+impl EnvNode {
+    /// A frame over `up` holding `slots`: the one place a frame is
+    /// allocated, so the allocation census counts every frame and slot.
+    #[must_use]
+    pub fn frame(up: Env, slots: Vec<Slot>) -> Env {
+        crate::perf::note_frame(slots.len());
+        Rc::new(EnvNode::Frame {
+            up,
+            slots: RefCell::new(slots),
+        })
+    }
+
+    /// Give a frame built empty its slots. A `let`, a `rec`, or a call with
+    /// defaulted formals builds the frame first because its thunks capture
+    /// it, then fills it once they exist; this is that second step, and the
+    /// census counts the slots here rather than at the empty build.
+    ///
+    /// Only a frame has slots; a `with` scope or the root here is an
+    /// interpreter bug, reported as one rather than dropped (the `if let`
+    /// this replaces did nothing on that path).
+    pub(crate) fn fill(frame: &Env, slots: Vec<Slot>) -> Result<(), crate::vm::VmError> {
+        let EnvNode::Frame { slots: cell, .. } = &**frame else {
+            return Err(crate::vm::VmError::eval(
+                "internal: filling slots into an env node that is not a frame",
+            ));
+        };
+        crate::perf::note_frame_filled(slots.len());
+        *cell.borrow_mut() = slots;
+        Ok(())
+    }
+}
+
 pub fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Int(_) => "an integer",
@@ -851,6 +1911,41 @@ pub fn format_f6(x: f64) -> String {
     format!("{x:.6}")
 }
 
+#[cfg(test)]
+mod rooted_path_tests {
+    use super::{PathValue, Root};
+
+    #[test]
+    fn accessor_path_borrows_each_wire_spelling() {
+        let mount = "/nix/store/00000000000000000000000000000000-source";
+        let ambient = PathValue::ambient("/tmp/a");
+        let mounted_root = PathValue::new(Root::mounted(mount), mount);
+        let mounted_child = PathValue::new(Root::mounted(mount), format!("{mount}/dir/a"));
+
+        assert_eq!(ambient.accessor_path(), "/tmp/a");
+        assert_eq!(mounted_root.accessor_path(), "/");
+        assert_eq!(mounted_child.accessor_path(), "/dir/a");
+    }
+
+    #[test]
+    fn wire_paths_reject_aliasing_spellings() {
+        let mount = "/nix/store/00000000000000000000000000000000-source";
+        for (root, path) in [
+            (String::new(), "/a/../b"),
+            (String::new(), "/a//b"),
+            (String::new(), "/a/"),
+            (format!("{mount}/"), "/a"),
+            (format!("{mount}/../other"), "/a"),
+            (mount.to_owned(), "/a/./b"),
+        ] {
+            assert!(
+                PathValue::from_wire(&root, path).is_err(),
+                "accepted root={root:?}, path={path:?}"
+            );
+        }
+    }
+}
+
 impl fmt::Display for Value {
     /// Debug-ish display for errors; the real corpus printer lives in
     /// `print` (it needs the interner for attr names and forces lazily).
@@ -868,5 +1963,340 @@ impl fmt::Display for Value {
             Value::Attrs(_) => write!(f, "{{ ... }}"),
             Value::Closure(_) | Value::Builtin(_) => write!(f, "<LAMBDA>"),
         }
+    }
+}
+
+#[cfg(test)]
+mod attr_origin_tests {
+    use super::AttrOrigin;
+    use crate::ir::Module;
+    use std::rc::Rc;
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn attr_origin_remains_16_bytes() {
+        assert_eq!(std::mem::size_of::<AttrOrigin>(), 16);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn dynamic_origin_slab_layout_matches_the_documented_cost() {
+        assert_eq!(std::mem::size_of::<super::DynamicAttrOriginSlab>(), 16);
+        assert_eq!(std::mem::size_of::<super::Slab<()>>(), 48);
+        assert_eq!(std::mem::size_of::<super::DynamicAttrOrigins>(), 144);
+        assert_eq!(std::mem::size_of::<super::DynamicAttrOrigin>(), 32);
+        assert_eq!(
+            std::mem::size_of::<super::Counted<super::DynamicAttrOrigin>>(),
+            40
+        );
+        assert_eq!(
+            std::mem::size_of::<Option<super::Counted<super::DynamicAttrOrigin>>>(),
+            40
+        );
+        assert_eq!(std::mem::size_of::<super::ListToAttrsOrigin>(), 24);
+        assert_eq!(std::mem::size_of::<(super::Sym, AttrOrigin)>(), 24);
+        assert_eq!(
+            std::mem::size_of::<Option<super::Counted<super::ListToAttrsOrigin>>>(),
+            32
+        );
+        assert_eq!(std::mem::size_of::<super::AttrPosition>(), 16);
+        assert_eq!(std::mem::size_of::<super::ProjectedAttrPosition>(), 16);
+        assert_eq!(std::mem::size_of::<super::ProjectedAttrOrigin>(), 16);
+        assert_eq!(
+            std::mem::size_of::<Option<super::Counted<super::ProjectedAttrOrigin>>>(),
+            24
+        );
+    }
+
+    #[test]
+    fn the_last_origin_clone_reclaims_dynamic_position_storage() {
+        let module = Rc::new(Module::default());
+        let fallback = AttrOrigin {
+            module: Rc::clone(&module),
+            unit: 0,
+            ip: 0,
+        };
+        let origin = AttrOrigin::dynamic(
+            Rc::clone(&module),
+            vec![(1, 2)].into_boxed_slice(),
+            Some(fallback),
+        )
+        .expect("the slab has room");
+        let first_ip = origin.ip;
+        let clone = origin.clone();
+
+        drop(origin);
+        assert_eq!(module.dynamic_attr_origins.live_len(), 1);
+        drop(clone);
+        assert_eq!(module.dynamic_attr_origins.live_len(), 0);
+
+        let reused = AttrOrigin::dynamic(Rc::clone(&module), vec![(3, 4)].into_boxed_slice(), None)
+            .expect("the freed slot is reusable");
+        assert_eq!(reused.ip, first_ip);
+    }
+
+    /// `//` resolves each winning position. These two origin kinds must make
+    /// that lookup logarithmic, so their constructor boundary owns the sorted
+    /// storage invariant even when evaluation encountered names out of order.
+    #[test]
+    fn lookup_origins_store_names_in_symbol_order() {
+        let module = Rc::new(Module::default());
+        let dynamic = AttrOrigin::dynamic(
+            Rc::clone(&module),
+            vec![(9, 90), (2, 20), (5, 50)].into_boxed_slice(),
+            None,
+        )
+        .expect("the dynamic slab has room");
+        {
+            let slab = module.dynamic_attr_origins.0.borrow();
+            let origins = slab.as_deref().expect("the slab was allocated");
+            let stored = origins
+                .dynamic
+                .get(dynamic.ip)
+                .expect("the dynamic origin is live");
+            assert_eq!(
+                stored.names.iter().map(|(sym, _)| *sym).collect::<Vec<_>>(),
+                [2, 5, 9]
+            );
+        }
+
+        let pairs = [8, 1, 4]
+            .into_iter()
+            .map(|sym| {
+                (
+                    sym,
+                    AttrOrigin {
+                        module: Rc::clone(&module),
+                        unit: 0,
+                        ip: 0,
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let list = AttrOrigin::list_to_attrs(pairs, 0).expect("the list slab has room");
+        let slab = module.dynamic_attr_origins.0.borrow();
+        let origins = slab.as_deref().expect("the slab was allocated");
+        let stored = origins
+            .list_to_attrs
+            .get(list.ip)
+            .expect("the list origin is live");
+        assert_eq!(
+            stored.pairs.iter().map(|(sym, _)| *sym).collect::<Vec<_>>(),
+            [1, 4, 8]
+        );
+    }
+
+    #[test]
+    fn the_last_list_to_attrs_origin_clone_reclaims_pair_origins() {
+        let module = Rc::new(Module::default());
+        let pair_origin = AttrOrigin {
+            module: Rc::clone(&module),
+            unit: 0,
+            ip: 0,
+        };
+        let origin = AttrOrigin::list_to_attrs(vec![(1, pair_origin)].into_boxed_slice(), 2)
+            .expect("the slab has room");
+        let clone = origin.clone();
+
+        drop(origin);
+        assert_eq!(module.dynamic_attr_origins.live_len(), 1);
+        drop(clone);
+        assert_eq!(module.dynamic_attr_origins.live_len(), 0);
+    }
+
+    #[test]
+    fn the_last_projected_origin_clone_reclaims_flat_positions() {
+        let module = Rc::new(Module::default());
+        let position = super::AttrPosition {
+            module: Rc::clone(&module),
+            offset: 7,
+        };
+        let origin = AttrOrigin::projected(
+            Rc::clone(&module),
+            vec![super::ProjectedAttrPosition::new(1, position)].into_boxed_slice(),
+        )
+        .expect("the slab has room");
+        let first_ip = origin.ip;
+        let clone = origin.clone();
+        assert_eq!(
+            origin.position_of("a", 1).map(|position| position.offset),
+            Some(7)
+        );
+
+        drop(origin);
+        assert_eq!(module.dynamic_attr_origins.live_len(), 1);
+        drop(clone);
+        assert_eq!(module.dynamic_attr_origins.live_len(), 0);
+
+        let reused = AttrOrigin::projected(
+            Rc::clone(&module),
+            vec![super::ProjectedAttrPosition::new(
+                2,
+                super::AttrPosition {
+                    module: Rc::clone(&module),
+                    offset: 9,
+                },
+            )]
+            .into_boxed_slice(),
+        )
+        .expect("the freed slot is reusable");
+        assert_eq!(reused.ip, first_ip);
+    }
+
+    /// The counting stops the process instead of continuing: a `release` of
+    /// an entry with no holders left is the slab's own bug, and the control
+    /// for the three tests above (a slab that answered `None` here would pass
+    /// every `live_len` assertion they make).
+    #[test]
+    #[should_panic(expected = "release of an entry that is not live (index 0)")]
+    fn slab_release_of_a_freed_entry_stops() {
+        let mut slab = super::Slab::default();
+        let ip = slab.insert(7_u8).expect("the slab has room");
+        assert_eq!(slab.release(ip), Some(7));
+        slab.release(ip);
+    }
+
+    #[test]
+    #[should_panic(expected = "retain of an entry that is not live (index 3)")]
+    fn slab_retain_outside_the_slab_stops() {
+        let mut slab: super::Slab<u8> = super::Slab::default();
+        slab.retain(3);
+    }
+}
+
+#[cfg(test)]
+mod attr_map_tests {
+    use super::{AttrMap, Attrs, Slot, Sym, Value};
+    use std::collections::BTreeMap;
+
+    fn slot(n: i64) -> Slot {
+        Slot::value(Value::Int(n))
+    }
+
+    fn int_of(slot: &Slot) -> i64 {
+        match &*slot.0.borrow() {
+            super::SlotState::Value(Value::Int(n)) => *n,
+            other => unreachable!("expected an int slot, found {other:?}"),
+        }
+    }
+
+    fn pairs(map: &AttrMap) -> Vec<(Sym, i64)> {
+        map.iter().map(|(k, v)| (*k, int_of(v))).collect()
+    }
+
+    /// The reference is the map this type replaced: whatever a `BTreeMap`
+    /// built from the same pairs would hold, in the same order.
+    fn reference(items: &[(Sym, i64)]) -> Vec<(Sym, i64)> {
+        items
+            .iter()
+            .copied()
+            .collect::<BTreeMap<Sym, i64>>()
+            .into_iter()
+            .collect()
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn one_binding_is_sixteen_bytes_and_the_map_is_one_vec() {
+        assert_eq!(std::mem::size_of::<(Sym, Slot)>(), 16);
+        assert_eq!(std::mem::size_of::<AttrMap>(), 24);
+        assert_eq!(std::mem::size_of::<Attrs>(), 40);
+    }
+
+    #[test]
+    fn from_iter_sorts_and_the_last_duplicate_wins() {
+        let items = [(7, 1), (3, 2), (7, 3), (1, 4), (3, 5)];
+        let map: AttrMap = items.iter().map(|(k, v)| (*k, slot(*v))).collect();
+        assert_eq!(pairs(&map), reference(&items));
+        assert_eq!(pairs(&map), vec![(1, 4), (3, 5), (7, 3)]);
+    }
+
+    #[test]
+    fn insert_remove_and_lookup_match_the_reference() {
+        let mut map = AttrMap::new();
+        let mut model = BTreeMap::new();
+        for (k, v) in [(5, 1), (2, 2), (9, 3), (5, 4), (1, 5)] {
+            let replaced = map.insert(k, slot(v)).map(|s| int_of(&s));
+            assert_eq!(replaced, model.insert(k, v));
+        }
+        assert_eq!(
+            pairs(&map),
+            model.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>()
+        );
+        assert_eq!(map.get(&5).map(int_of), Some(4));
+        assert_eq!(map.get(&4).map(int_of), None);
+        assert!(map.contains_key(&9));
+        assert!(!map.contains_key(&0));
+        assert_eq!(map.remove(&2).map(|s| int_of(&s)), Some(2));
+        assert_eq!(map.remove(&2).map(|s| int_of(&s)), None);
+        model.remove(&2);
+        assert_eq!(
+            pairs(&map),
+            model.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>()
+        );
+        assert_eq!(map.len(), 3);
+        assert!(!map.is_empty());
+        assert_eq!(map.keys().copied().collect::<Vec<_>>(), vec![1, 5, 9]);
+        assert_eq!(map.values().map(int_of).collect::<Vec<_>>(), vec![5, 4, 3]);
+    }
+
+    #[test]
+    fn update_is_right_biased_and_sorted() {
+        let left: AttrMap = [(1, 10), (3, 30), (5, 50), (8, 80)]
+            .into_iter()
+            .map(|(k, v)| (k, slot(v)))
+            .collect();
+        let right: AttrMap = [(0, 0), (3, 33), (6, 66), (8, 88), (9, 99)]
+            .into_iter()
+            .map(|(k, v)| (k, slot(v)))
+            .collect();
+        let merged = left.update(&right);
+        assert_eq!(
+            pairs(&merged),
+            vec![(0, 0), (1, 10), (3, 33), (5, 50), (6, 66), (8, 88), (9, 99)]
+        );
+        // Either side empty is the other side.
+        assert_eq!(pairs(&left.update(&AttrMap::new())), pairs(&left));
+        assert_eq!(pairs(&AttrMap::new().update(&right)), pairs(&right));
+        // Neither input moved.
+        assert_eq!(left.len(), 4);
+        assert_eq!(right.len(), 5);
+    }
+
+    #[test]
+    fn retain_keeps_order_and_reports_each_key_once() {
+        let mut map: AttrMap = (0..10).map(|k| (k, slot(i64::from(k)))).collect();
+        let mut seen = Vec::new();
+        map.retain(|k, _| {
+            seen.push(*k);
+            k % 3 == 0
+        });
+        assert_eq!(seen, (0..10).collect::<Vec<_>>());
+        assert_eq!(pairs(&map), vec![(0, 0), (3, 3), (6, 6), (9, 9)]);
+    }
+
+    #[test]
+    fn a_btreemap_converts_without_reordering() {
+        let model: BTreeMap<Sym, Slot> = [(4, slot(4)), (2, slot(2)), (8, slot(8))]
+            .into_iter()
+            .collect();
+        let keys: Vec<Sym> = model.keys().copied().collect();
+        let map = AttrMap::from(model);
+        assert_eq!(map.keys().copied().collect::<Vec<_>>(), keys);
+        let attrs = Attrs::new(map);
+        assert_eq!(attrs.len(), 3);
+        assert_eq!(attrs.get(&8).map(int_of), Some(8));
+        assert!(attrs.origin.is_none());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "AttrMap::from_sorted: keys not in strictly ascending order")]
+    fn from_sorted_refuses_an_unsorted_stream_in_debug_builds() {
+        assert_eq!(
+            AttrMap::from_sorted(vec![(2, slot(2)), (2, slot(3))]).len(),
+            2
+        );
     }
 }

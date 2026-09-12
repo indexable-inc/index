@@ -2,6 +2,7 @@
 #include <nlohmann/json.hpp>
 
 #include "nix/store/build/worker.hh"
+#include "nix/store/build/substitution-goal.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/dummy-store-impl.hh"
 #include "nix/store/globals.hh"
@@ -99,6 +100,142 @@ TEST_F(WorkerSubstitutionTest, singleStoreObject)
 
     // Verify the goal succeeded
     ASSERT_EQ(upcast_goal(goal)->exitCode, Goal::ecSuccess);
+}
+
+TEST_F(WorkerSubstitutionTest, missingOutputDoesNotCancelIndependentRoot)
+{
+    auto source = make_ref<MemorySourceAccessor>();
+    source->root = MemorySourceAccessor::File{MemorySourceAccessor::File::Regular{
+        .executable = false,
+        .contents = "already built",
+    }};
+    auto output = dummyStore->addToStore(
+        "independent-output", SourcePath{source}, ContentAddressMethod::Raw::NixArchive, HashAlgorithm::SHA256);
+    Derivation drv;
+    drv.name = "independent-root";
+    drv.outputs.emplace("out", DerivationOutput{DerivationOutput::InputAddressed{.path = output}});
+    auto drvPath = dummyStore->writeDerivation(drv);
+    DerivedPath bad = DerivedPath::Built{
+        .drvPath = makeConstantStorePathRef(drvPath),
+        .outputs = OutputsSpec::Names{"missing"},
+    };
+    DerivedPath good = DerivedPath::Built{
+        .drvPath = makeConstantStorePathRef(drvPath),
+        .outputs = OutputsSpec::Names{"out"},
+    };
+    auto configuredKeepGoing = settings.getWorkerSettings().keepGoing.get();
+
+    // Default callers retain their throwing behavior. The independent mode
+    // must attribute the same exception to only the bad requested output.
+    EXPECT_THROW(dummyStore->buildPathsWithResults({bad, good}), Error);
+    auto results = dummyStore->buildPathsWithResults({bad, good}, bmNormal, nullptr, BuildFailureMode::KeepGoing);
+    ASSERT_EQ(results.size(), 2);
+    EXPECT_EQ(results[0].path.raw(), bad.raw());
+    auto failure = results[0].tryGetFailure();
+    ASSERT_NE(failure, nullptr);
+    EXPECT_NE(failure->message().find("missing"), std::string::npos);
+    EXPECT_EQ(results[1].path.raw(), good.raw());
+    ASSERT_NE(results[1].tryGetSuccess(), nullptr);
+    EXPECT_TRUE(dummyStore->isValidPath(output));
+    EXPECT_EQ(settings.getWorkerSettings().keepGoing.get(), configuredKeepGoing);
+}
+
+namespace {
+
+class NestedErrorGoal : public PathSubstitutionGoal
+{
+    GoalPtr dependency;
+    bool fail;
+    bool & continued;
+
+    Co nested()
+    {
+        if (dependency)
+            co_await await(Goals{dependency});
+        if (fail)
+            throw Error("nested request failure");
+        co_return Return{};
+    }
+
+    Co run()
+    {
+        co_await nested();
+        continued = true;
+        co_return doneSuccess(BuildResult::Success{.status = BuildResult::Success::AlreadyValid});
+    }
+
+public:
+    NestedErrorGoal(
+        Worker & worker, const StorePath & path, std::string name, GoalPtr dependency, bool fail, bool & continued)
+        : PathSubstitutionGoal(path, worker)
+        , dependency(std::move(dependency))
+        , fail(fail)
+        , continued(continued)
+    {
+        this->name = std::move(name);
+        // Worker removal deliberately recognizes concrete goal types. Keep
+        // its substitution lifecycle, replacing only the test's coroutine.
+        top_co.emplace(run());
+        top_co->handle.promise().goal = this;
+    }
+
+    std::string key() override
+    {
+        return name;
+    }
+
+    JobCategory jobCategory() const override
+    {
+        return JobCategory::Administration;
+    }
+};
+
+StorePath nestedGoalPath(DummyStore & store)
+{
+    auto source = make_ref<MemorySourceAccessor>();
+    source->root = MemorySourceAccessor::File{MemorySourceAccessor::File::Regular{
+        .executable = false,
+        .contents = "already valid",
+    }};
+    return store.addToStore(
+        "nested-goal", SourcePath{source}, ContentAddressMethod::Raw::NixArchive, HashAlgorithm::SHA256);
+}
+
+}
+
+TEST_F(WorkerSubstitutionTest, nestedErrorStopsContinuationAndPreservesSharedDependencyPeer)
+{
+    Worker worker{*dummyStore, *dummyStore, BuildFailureMode::KeepGoing};
+    auto path = nestedGoalPath(*dummyStore);
+    bool dependencyContinued = false, badContinued = false, goodContinued = false;
+    auto dependency = std::make_shared<NestedErrorGoal>(worker, path, "2-dependency", nullptr, false, dependencyContinued);
+    auto bad = std::make_shared<NestedErrorGoal>(worker, path, "0-bad", dependency, true, badContinued);
+    auto good = std::make_shared<NestedErrorGoal>(worker, path, "1-good", dependency, false, goodContinued);
+    worker.wakeUp(bad);
+    worker.wakeUp(good);
+    worker.wakeUp(dependency);
+    worker.run(Goals{bad, good});
+
+    EXPECT_EQ(bad->exitCode, Goal::ecFailed);
+    ASSERT_NE(bad->buildResult.tryGetFailure(), nullptr);
+    EXPECT_NE(bad->buildResult.tryGetFailure()->message().find("nested request failure"), std::string::npos);
+    EXPECT_FALSE(badContinued);
+    EXPECT_EQ(good->exitCode, Goal::ecSuccess);
+    EXPECT_TRUE(goodContinued);
+    EXPECT_EQ(dependency->exitCode, Goal::ecSuccess);
+    EXPECT_TRUE(dependencyContinued);
+    EXPECT_TRUE(dependency->waiters.empty());
+}
+
+TEST_F(WorkerSubstitutionTest, nestedErrorStillThrowsForConfiguredWorker)
+{
+    Worker worker{*dummyStore, *dummyStore};
+    auto path = nestedGoalPath(*dummyStore);
+    bool continued = false;
+    auto bad = std::make_shared<NestedErrorGoal>(worker, path, "bad", nullptr, true, continued);
+    worker.wakeUp(bad);
+    EXPECT_THROW(worker.run(Goals{bad}), Error);
+    EXPECT_FALSE(continued);
 }
 
 TEST_F(WorkerSubstitutionTest, singleRootStoreObjectWithSingleDepStoreObject)
@@ -448,3 +585,84 @@ TEST_F(WorkerSubstitutionTest, floatingDerivationOutputWithDepDrv)
 }
 
 } // namespace nix
+
+#ifndef _WIN32
+namespace nix {
+namespace {
+
+struct ReadyBatchObservation
+{
+    unsigned int childEvents = 0;
+    unsigned int selfWakeResumptions = 0;
+};
+
+enum class ReadyBatchRole { First, Child, SelfWake };
+
+class ReadyBatchGoal : public PathSubstitutionGoal
+{
+    ReadyBatchRole role;
+    ReadyBatchObservation & observation;
+
+    Co run()
+    {
+        if (role == ReadyBatchRole::Child) {
+            auto event = co_await WaitForChildEvent{};
+            EXPECT_TRUE(std::holds_alternative<ChildOutput>(event));
+            ++observation.childEvents;
+            worker.childTerminated(this);
+        } else if (role == ReadyBatchRole::SelfWake) {
+            worker.wakeUp(shared_from_this());
+            co_await Suspend{};
+            ++observation.selfWakeResumptions;
+        }
+        co_return doneSuccess(BuildResult::Success{.status = BuildResult::Success::AlreadyValid});
+    }
+
+public:
+    ReadyBatchGoal(Worker & worker, const StorePath & path, ReadyBatchRole role, ReadyBatchObservation & observation)
+        : PathSubstitutionGoal(path, worker), role(role), observation(observation)
+    {
+        top_co.emplace(run());
+        top_co->handle.promise().goal = this;
+    }
+
+    std::string key() override
+    {
+        switch (role) {
+        case ReadyBatchRole::First: return "a-first";
+        case ReadyBatchRole::Child: return "b-child";
+        case ReadyBatchRole::SelfWake: return "c-self-wake";
+        }
+        unreachable();
+    }
+
+    JobCategory jobCategory() const override { return JobCategory::Administration; }
+};
+
+}
+
+TEST_F(WorkerSubstitutionTest, childEventCoalescesWithReadyBatchButPreservesSelfWake)
+{
+    Worker worker{*dummyStore, *dummyStore, BuildFailureMode::KeepGoing};
+    auto path = nestedGoalPath(*dummyStore);
+    ReadyBatchObservation observation;
+    auto first = std::make_shared<ReadyBatchGoal>(worker, path, ReadyBatchRole::First, observation);
+    auto child = std::make_shared<ReadyBatchGoal>(worker, path, ReadyBatchRole::Child, observation);
+    auto selfWake = std::make_shared<ReadyBatchGoal>(worker, path, ReadyBatchRole::SelfWake, observation);
+    Pipe output;
+    output.create();
+    writeFull(output.writeSide.get(), "ready");
+    worker.childStarted(child, {output.readSide.get()}, false, false);
+    worker.wakeUp(first);
+    worker.wakeUp(child);
+    worker.wakeUp(selfWake);
+    // First completes, then the real child poll requeues Child before its
+    // existing batch turn. Retain every goal so a stale wake cannot expire.
+    worker.run(Goals{first, child, selfWake});
+    EXPECT_EQ(observation.childEvents, 1U);
+    EXPECT_EQ(observation.selfWakeResumptions, 1U);
+    EXPECT_EQ(child->exitCode, Goal::ecSuccess);
+    EXPECT_EQ(selfWake->exitCode, Goal::ecSuccess);
+}
+}
+#endif

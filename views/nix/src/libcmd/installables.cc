@@ -1,8 +1,8 @@
 #include "nix/store/globals.hh"
 #include "nix/cmd/installables.hh"
 #include "nix/cmd/installable-derived-path.hh"
-#include "nix/cmd/installable-attr-path.hh"
 #include "nix/cmd/installable-flake.hh"
+#include "nix/cmd/rust-eval-session.hh"
 #include "nix/store/outputs-spec.hh"
 #include "nix/util/users.hh"
 #include "nix/util/util.hh"
@@ -99,7 +99,15 @@ MixFlakeOptions::MixFlakeOptions()
 
     addFlag({
         .longName = "commit-lock-file",
-        .description = "Commit changes to the flake's lock file.",
+        .description = R"(
+    Commit changes to the flake's lock file.
+
+    Required when the flake's own source is identified by a commit, as a Git
+    working tree is: writing the lock file into such a source would leave it
+    with uncommitted changes and so with no revision to lock to, and the write
+    is refused without this flag. A flake in a jj workspace needs no flag,
+    because the snapshot taken at the next fetch is the commit.
+        )",
         .category = category,
         .handler = {&lockFlags.commitLockFile, true},
     });
@@ -184,9 +192,9 @@ MixFlakeOptions::MixFlakeOptions()
                 *evalState,
                 parseFlakeRef(fetchSettings, flakeRef, absPath(getCommandBaseDir()).string()),
                 {.writeLockFile = false});
-            for (auto & [inputName, input] : flake.lockFile.root->inputs) {
+            for (auto & [inputName, input] : flake.lockFile.inputs(flake.lockFile.root)) {
                 auto input2 = flake.lockFile.findInput({inputName}); // resolve 'follows' nodes
-                if (auto input3 = std::dynamic_pointer_cast<const flake::LockedNode>(input2)) {
+                if (auto input3 = input2 ? flake.lockFile.node(*input2) : nullptr) {
                     fetchers::Attrs extraAttrs;
 
                     if (!input3->lockedRef.subdir.empty()) {
@@ -266,143 +274,20 @@ Args::CompleterClosure SourceExprCommand::getCompleteInstallable()
 
 void SourceExprCommand::completeInstallable(AddCompletions & completions, std::string_view prefix)
 {
-    try {
-        if (file) {
-            completions.setType(AddCompletions::Type::Attrs);
-
-            evalSettings.pureEval = false;
-            auto state = getEvalState();
-            auto e = state->parseExprFromFile(resolveExprPath(lookupFileArg(*state, file->string())));
-
-            Value root;
-            state->eval(e, root);
-
-            auto autoArgs = getAutoArgs(*state);
-
-            std::string prefix_ = std::string(prefix);
-            auto sep = prefix_.rfind('.');
-            std::string searchWord;
-            if (sep != std::string::npos) {
-                searchWord = prefix_.substr(sep + 1, std::string::npos);
-                prefix_ = prefix_.substr(0, sep);
-            } else {
-                searchWord = prefix_;
-                prefix_ = "";
-            }
-
-            auto [v, pos] = findAlongAttrPath(*state, prefix_, *autoArgs, root);
-            Value & v1(*v);
-            state->forceValue(v1, pos);
-            Value v2;
-            state->autoCallFunction(*autoArgs, v1, v2);
-
-            if (v2.type() == nAttrs) {
-                for (auto & i : *v2.attrs()) {
-                    std::string_view name = state->symbols[i.name];
-                    if (name.find(searchWord) == 0) {
-                        if (prefix_ == "")
-                            completions.add(std::string(name));
-                        else
-                            completions.add(prefix_ + "." + name);
-                    }
-                }
-            }
-        } else {
-            completeFlakeRefWithFragment(
-                completions,
-                getEvalState(),
-                lockFlags,
-                getDefaultFlakeAttrPathPrefixes(),
-                getDefaultFlakeAttrPaths(),
-                prefix);
-        }
-    } catch (EvalError &) {
-        // Don't want eval errors to mess-up with the completion engine, so let's just swallow them
-    }
+    if (!file && prefix.find('#') == std::string_view::npos)
+        completeFlakeRef(completions, getStore(), prefix);
 }
 
 void completeFlakeRefWithFragment(
     AddCompletions & completions,
     ref<EvalState> evalState,
-    flake::LockFlags lockFlags,
-    Strings attrPathPrefixes,
-    const Strings & defaultFlakeAttrPaths,
+    flake::LockFlags,
+    Strings,
+    const Strings &,
     std::string_view prefix)
 {
-    /* Look for flake output attributes that match the
-       prefix. */
-    try {
-        auto hash = prefix.find('#');
-        if (hash == std::string::npos) {
-            completeFlakeRef(completions, evalState->store, prefix);
-        } else {
-            completions.setType(AddCompletions::Type::Attrs);
-
-            auto fragment = prefix.substr(hash + 1);
-            std::string prefixRoot = "";
-            if (fragment.starts_with(".")) {
-                fragment = fragment.substr(1);
-                prefixRoot = ".";
-            }
-            auto flakeRefS = std::string(prefix.substr(0, hash));
-
-            // TODO: ideally this would use the command base directory instead of assuming ".".
-            auto flakeRef =
-                parseFlakeRef(fetchSettings, expandTilde(flakeRefS), std::filesystem::current_path().string());
-
-            auto evalCache = openEvalCache(
-                *evalState, make_ref<flake::LockedFlake>(lockFlake(flakeSettings, *evalState, flakeRef, lockFlags)));
-
-            auto root = evalCache->getRoot();
-
-            if (prefixRoot == ".") {
-                attrPathPrefixes.clear();
-            }
-            /* Complete 'fragment' relative to all the
-               attrpath prefixes as well as the root of the
-               flake. */
-            attrPathPrefixes.push_back("");
-
-            for (auto & attrPathPrefixS : attrPathPrefixes) {
-                auto attrPathPrefix = AttrPath::parse(*evalState, attrPathPrefixS);
-                auto attrPathS = attrPathPrefixS + std::string(fragment);
-                auto attrPath = AttrPath::parse(*evalState, attrPathS);
-
-                std::string lastAttr;
-                if (!attrPath.empty() && !hasSuffix(attrPathS, ".")) {
-                    lastAttr = evalState->symbols[attrPath.back()];
-                    attrPath.pop_back();
-                }
-
-                auto attr = root->findAlongAttrPath(attrPath);
-                if (!attr)
-                    continue;
-
-                for (auto & attr2 : (*attr)->getAttrs()) {
-                    if (hasPrefix(evalState->symbols[attr2], lastAttr)) {
-                        auto attrPath2 = (*attr)->getAttrPath(attr2);
-                        /* Strip the attrpath prefix. */
-                        attrPath2.erase(attrPath2.begin(), attrPath2.begin() + attrPathPrefix.size());
-                        // FIXME: handle names with dots
-                        completions.add(flakeRefS + "#" + prefixRoot + attrPath2.to_string(*evalState));
-                    }
-                }
-            }
-
-            /* And add an empty completion for the default
-               attrpaths. */
-            if (fragment.empty()) {
-                for (auto & attrPath : defaultFlakeAttrPaths) {
-                    auto attr = root->findAlongAttrPath(AttrPath::parse(*evalState, attrPath));
-                    if (!attr)
-                        continue;
-                    completions.add(flakeRefS + "#" + prefixRoot);
-                }
-            }
-        }
-    } catch (Error & e) {
-        logWarning(e.info());
-    }
+    if (prefix.find('#') == std::string_view::npos)
+        completeFlakeRef(completions, evalState->store, prefix);
 }
 
 void completeFlakeRef(AddCompletions & completions, ref<Store> store, std::string_view prefix)
@@ -417,7 +302,7 @@ void completeFlakeRef(AddCompletions & completions, ref<Store> store, std::strin
 
     /* Look for registry entries that match the prefix. */
     for (auto & registry : fetchers::getRegistries(fetchSettings, *store)) {
-        for (auto & entry : registry->entries) {
+        for (auto & entry : registry->entries()) {
             auto from = entry.from.to_string();
             if (!hasPrefix(prefix, "flake:") && hasPrefix(from, "flake:")) {
                 std::string from2(from, 6);
@@ -451,87 +336,7 @@ static StorePath getDeriver(ref<Store> store, const Installable & i, const Store
 
 Installables SourceExprCommand::parseInstallables(ref<Store> store, std::vector<std::string> ss)
 {
-    Installables result;
-
-    if (file || expr) {
-        if (file && expr)
-            throw UsageError("'--file' and '--expr' are exclusive");
-
-        // FIXME: backward compatibility hack
-        if (file) {
-            if (evalSettings.pureEval && evalSettings.pureEval.overridden)
-                throw UsageError("'--file' is not compatible with '--pure-eval'");
-            evalSettings.pureEval = false;
-        }
-
-        auto state = getEvalState();
-        auto vFile = state->allocValue();
-
-        if (file == "-") {
-            auto e = state->parseStdin();
-            state->eval(e, *vFile);
-        } else if (file) {
-            auto dir = absPath(getCommandBaseDir());
-            state->evalFile(lookupFileArg(*state, file->string(), &dir), *vFile);
-        } else {
-            auto dir = absPath(getCommandBaseDir());
-            auto e = state->parseExprFromString(*expr, state->rootPath(dir.string()));
-            state->eval(e, *vFile);
-        }
-
-        for (auto & s : ss) {
-            auto [prefix, extendedOutputsSpec] = ExtendedOutputsSpec::parse(s);
-            result.push_back(
-                make_ref<InstallableAttrPath>(InstallableAttrPath::parse(
-                    state, *this, vFile, std::move(prefix), std::move(extendedOutputsSpec))));
-        }
-
-    } else {
-
-        for (auto & s : ss) {
-            std::exception_ptr ex;
-
-            auto [prefix_, extendedOutputsSpec_] = ExtendedOutputsSpec::parse(s);
-            // To avoid clang's pedantry
-            auto prefix = std::move(prefix_);
-            auto extendedOutputsSpec = std::move(extendedOutputsSpec_);
-
-            if (prefix.find('/') != std::string::npos) {
-                try {
-                    result.push_back(
-                        make_ref<InstallableDerivedPath>(
-                            InstallableDerivedPath::parse(store, prefix, extendedOutputsSpec.raw)));
-                    continue;
-                } catch (BadStorePath &) {
-                } catch (...) {
-                    if (!ex)
-                        ex = std::current_exception();
-                }
-            }
-
-            try {
-                auto [flakeRef, fragment] =
-                    parseFlakeRefWithFragment(fetchSettings, std::string{prefix}, absPath(getCommandBaseDir()));
-                result.push_back(
-                    make_ref<InstallableFlake>(
-                        this,
-                        getEvalState(),
-                        std::move(flakeRef),
-                        fragment,
-                        std::move(extendedOutputsSpec),
-                        getDefaultFlakeAttrPaths(),
-                        getDefaultFlakeAttrPathPrefixes(),
-                        lockFlags));
-                continue;
-            } catch (...) {
-                ex = std::current_exception();
-            }
-
-            std::rethrow_exception(ex);
-        }
-    }
-
-    return result;
+    return rustParseInstallables(*this, store, std::move(ss));
 }
 
 ref<Installable> SourceExprCommand::parseInstallable(ref<Store> store, const std::string & installable)
@@ -837,7 +642,7 @@ void RawInstallablesCommand::run(ref<Store> store)
     run(store, std::move(rawInstallables));
 }
 
-std::vector<FlakeRef> InstallableCommand::getFlakeRefsForCompletion()
+std::vector<FlakeRef> RawInstallableCommand::getFlakeRefsForCompletion()
 {
     return {parseFlakeRefWithFragment(fetchSettings, expandTilde(_installable), absPath(getCommandBaseDir()).string())
                 .first};
@@ -849,7 +654,7 @@ void InstallablesCommand::run(ref<Store> store, std::vector<std::string> && rawI
     run(store, std::move(installables));
 }
 
-InstallableCommand::InstallableCommand()
+RawInstallableCommand::RawInstallableCommand()
     : SourceExprCommand()
 {
     expectArgs({
@@ -862,7 +667,7 @@ InstallableCommand::InstallableCommand()
 
 void InstallableCommand::run(ref<Store> store)
 {
-    auto installable = parseInstallable(store, _installable);
+    auto installable = parseInstallable(store, rawInstallable());
     run(store, std::move(installable));
 }
 

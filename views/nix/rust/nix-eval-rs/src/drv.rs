@@ -49,6 +49,21 @@ pub struct InputDrv {
     pub outputs: Vec<String>,
 }
 
+impl Derivation {
+    /// `writeDerivation`'s reference set (`derivations.cc:172`): the input
+    /// sources plus every input derivation, as a set. What an embedder
+    /// derives from the parsed ATerm when it writes one; the evaluator never
+    /// sends a second copy across the boundary.
+    #[must_use]
+    pub fn references(&self) -> Vec<String> {
+        let mut references = self.input_srcs.clone();
+        references.extend(self.input_drvs.iter().map(|d| d.drv_path.clone()));
+        references.sort();
+        references.dedup();
+        references
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvVar {
     pub name: String,
@@ -368,26 +383,32 @@ pub fn parse(input: &str) -> Result<Derivation> {
 
 /// cppnix's `printString`: the only four escapes it applies.
 ///
-/// cppnix's loop is byte-wise and this one is char-wise, and they emit the
-/// same bytes anyway: every escape trigger is ASCII, so the chars of a valid
-/// UTF-8 string re-serialize to exactly its bytes. A `&str` can hold nothing
-/// else, and everything that reaches a [`Derivation`] was text-validated at
-/// intake (ENG-13147: a non-UTF-8 byte string refuses at the store boundary
-/// by name, so it can never diverge silently here).
+/// Byte-wise like cppnix's loop, copying each escape-free run in one
+/// `push_str`: every escape trigger is ASCII, so a trigger's byte offset is a
+/// char boundary and the runs between triggers are the string's own bytes.
+/// A `&str` can hold nothing but UTF-8, and everything that reaches a
+/// [`Derivation`] was text-validated at intake (ENG-13147: a non-UTF-8 byte
+/// string refuses at the store boundary by name, so it can never diverge
+/// silently here). A char-at-a-time `push` here was 2.1% of a NixOS
+/// toplevel's samples (prof4, 2026-09-04): derivation text is mostly long
+/// escape-free runs.
 fn quoted(out: &mut String, s: &str) {
     out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' | '\\' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            other => out.push(other),
-        }
+    let mut run = 0;
+    for (i, b) in s.bytes().enumerate() {
+        let escape = match b {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            _ => continue,
+        };
+        out.push_str(&s[run..i]);
+        out.push_str(escape);
+        run = i + 1;
     }
+    out.push_str(&s[run..]);
     out.push('"');
 }
 
@@ -493,8 +514,53 @@ pub fn unparse(drv: &Derivation, mask_outputs: bool) -> String {
 mod tests {
     use super::{
         Derivation, DrvError, EnvVar, InputDrv, Output, OutputKind, canonicalise, is_canonical,
-        parse, unparse,
+        parse, quoted, unparse,
     };
+
+    /// `quoted` copies escape-free runs and escapes the five bytes cppnix's
+    /// `printString` escapes (four rules; `"` and `\\` share one), at every
+    /// position a run boundary can fall:
+    /// start, end, adjacent, around multibyte text, and the empty string.
+    #[test]
+    fn quoted_matches_the_char_at_a_time_rendering() {
+        fn reference(s: &str) -> String {
+            let mut out = String::from('"');
+            for ch in s.chars() {
+                match ch {
+                    '"' | '\\' => {
+                        out.push('\\');
+                        out.push(ch);
+                    }
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    other => out.push(other),
+                }
+            }
+            out.push('"');
+            out
+        }
+        for s in [
+            "",
+            "plain",
+            "\"",
+            "\\",
+            "\"\\\n\r\t",
+            "a\"b",
+            "\"at start",
+            "at end\"",
+            "tab\tand\nnewline\r",
+            "héllo \"wörld\" \u{1F600}\n\u{1F600}",
+            "\u{1F600}",
+        ] {
+            let mut out = String::new();
+            quoted(&mut out, s);
+            assert_eq!(out, reference(s), "input {s:?}");
+        }
+        let mut out = String::new();
+        quoted(&mut out, "x\"y");
+        assert_eq!(out, "\"x\\\"y\"");
+    }
 
     /// Every `DrvError` says what went wrong and where.
     ///

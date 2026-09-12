@@ -1,17 +1,15 @@
 use std::collections::HashMap;
-use std::collections::HashSet;
 
 use codex_install_context::InstallContext;
-use codex_protocol::ThreadId;
 use codex_rollout::RolloutConfig;
-use codex_rollout::find_thread_names_by_ids;
 use codex_rollout::first_rollout_content_match_snippet;
 use codex_rollout::parse_cursor;
 use codex_rollout::search_rollout_matches;
 
 use super::LocalThreadStore;
-use super::helpers::distinct_thread_metadata_title;
-use super::helpers::set_thread_name_from_title;
+use super::helpers::resolve_thread_names;
+use super::helpers::resolve_thread_section_metadata;
+use super::helpers::set_thread_name;
 use super::helpers::stored_thread_from_rollout_item;
 use super::list_threads::list_rollout_threads;
 use crate::ListThreadsParams;
@@ -55,6 +53,11 @@ pub(super) async fn search_threads(
         ThreadSortKey::CreatedAt => codex_rollout::ThreadSortKey::CreatedAt,
         ThreadSortKey::UpdatedAt => codex_rollout::ThreadSortKey::UpdatedAt,
         ThreadSortKey::RecencyAt => codex_rollout::ThreadSortKey::RecencyAt,
+        ThreadSortKey::SectionPosition => {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "section-position sorting requires a section filter".to_owned(),
+            });
+        }
     };
     let sort_direction = match params.sort_direction {
         SortDirection::Asc => codex_rollout::SortDirection::Asc,
@@ -63,7 +66,7 @@ pub(super) async fn search_threads(
     let state_db = store.state_db().await;
     let rollout_config = RolloutConfig {
         codex_home: store.config.codex_home.clone(),
-        sqlite_home: store.config.sqlite_home.clone(),
+        sqlite: store.config.sqlite.clone(),
         cwd: store.config.codex_home.clone(),
         model_provider_id: store.config.default_model_provider_id.clone(),
         generate_memories: false,
@@ -96,6 +99,8 @@ pub(super) async fn search_threads(
         allowed_sources: params.allowed_sources.clone(),
         model_providers: None,
         cwd_filters: None,
+        section: None,
+        project_id: None,
         archived: params.archived,
         search_term: None,
         relation_filter: None,
@@ -168,6 +173,23 @@ pub(super) async fn search_threads(
             })
         })
         .collect::<Vec<_>>();
+    if let Some(state_db) = state_db {
+        let sectioned_thread_ids = items
+            .iter()
+            .filter(|item| item.thread.section.is_some())
+            .map(|item| item.thread.thread_id)
+            .collect::<Vec<_>>();
+        let mut section_metadata =
+            resolve_thread_section_metadata(state_db.as_ref(), &sectioned_thread_ids).await;
+        for item in &mut items {
+            if let Some((section_position, section_entered_at)) =
+                section_metadata.remove(&item.thread.thread_id)
+            {
+                item.thread.section_position = section_position;
+                item.thread.section_entered_at = section_entered_at;
+            }
+        }
+    }
     set_thread_search_result_names(store, &mut items).await;
 
     Ok(ThreadSearchPage { items, next_cursor })
@@ -190,10 +212,12 @@ fn cursor_from_thread_search_item(
             .as_deref()
             .or(item.item.updated_at.as_deref())
             .or(item.item.created_at.as_deref())?,
+        ThreadSortKey::SectionPosition => return None,
     };
     match sort_key {
         ThreadSortKey::RecencyAt => parse_cursor(&format!("{timestamp}|{}", item.item.thread_id?)),
         ThreadSortKey::CreatedAt | ThreadSortKey::UpdatedAt => parse_cursor(timestamp),
+        ThreadSortKey::SectionPosition => None,
     }
 }
 
@@ -201,32 +225,14 @@ async fn set_thread_search_result_names(
     store: &LocalThreadStore,
     items: &mut [StoredThreadSearchResult],
 ) {
-    let thread_ids = items
+    let thread_history_modes = items
         .iter()
-        .map(|item| item.thread.thread_id)
-        .collect::<HashSet<_>>();
-    let mut names = HashMap::<ThreadId, String>::with_capacity(thread_ids.len());
-    if let Some(state_db_ctx) = store.state_db().await {
-        for &thread_id in &thread_ids {
-            let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await else {
-                continue;
-            };
-            if let Some(title) = distinct_thread_metadata_title(&metadata) {
-                names.insert(thread_id, title);
-            }
-        }
-    }
-    if names.len() < thread_ids.len()
-        && let Ok(legacy_names) =
-            find_thread_names_by_ids(store.config.codex_home.as_path(), &thread_ids).await
-    {
-        for (thread_id, title) in legacy_names {
-            names.entry(thread_id).or_insert(title);
-        }
-    }
+        .map(|item| (item.thread.thread_id, item.thread.history_mode))
+        .collect::<HashMap<_, _>>();
+    let names = resolve_thread_names(store, &thread_history_modes).await;
     for item in items {
-        if let Some(title) = names.get(&item.thread.thread_id).cloned() {
-            set_thread_name_from_title(&mut item.thread, title);
+        if let Some(name) = names.get(&item.thread.thread_id).cloned() {
+            set_thread_name(&mut item.thread, name);
         }
     }
 }

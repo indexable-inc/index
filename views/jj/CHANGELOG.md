@@ -8,6 +8,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+* The `jj views` command group and the `jj-views` crate (git-based derived
+  subtrees with anchors, forks and a survey cache) are gone. The ix client
+  binary carries `jj view` instead, which tracks a subtree by blake3 tree
+  identity over a native ix store or a git remote; see docs/jj-view.md in the
+  ix repository.
+
 ### Release highlights
 
 * `jj views push` now refuses a commit that changes paths outside the view it is

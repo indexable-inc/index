@@ -29,12 +29,15 @@ FileIngestionMethod parseFileIngestionMethod(std::string_view input)
 {
     if (input == "git") {
         return FileIngestionMethod::Git;
+    } else if (input == "jj-tree") {
+        return FileIngestionMethod::JjTree;
     } else {
         auto ret = parseFileSerialisationMethodOpt(input);
         if (ret)
             return static_cast<FileIngestionMethod>(*ret);
         else
-            throw UsageError("Unknown file ingestion method '%s', expect `flat`, `nar`, or `git`", input);
+            throw UsageError(
+                "Unknown file ingestion method '%s', expect `flat`, `nar`, `git`, or `jj-tree`", input);
     }
 }
 
@@ -58,6 +61,8 @@ std::string_view renderFileIngestionMethod(FileIngestionMethod method)
         return renderFileSerialisationMethod(static_cast<FileSerialisationMethod>(method));
     case FileIngestionMethod::Git:
         return "git";
+    case FileIngestionMethod::JjTree:
+        return "jj-tree";
     default:
         unreachable();
     }
@@ -105,6 +110,11 @@ hashPath(const SourcePath & path, FileIngestionMethod method, HashAlgorithm ht, 
     }
     case FileIngestionMethod::Git:
         return {git::dumpHash(ht, path, filter).hash, std::nullopt};
+    case FileIngestionMethod::JjTree:
+        throw TreeIdNotComputable(
+            "cannot compute a Jujutsu tree id for '%s': Nix does not serialize trees the way jj does, "
+            "the id is read from the jj object store that minted it",
+            path);
     }
     assert(false);
 }

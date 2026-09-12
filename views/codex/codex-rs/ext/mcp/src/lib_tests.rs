@@ -27,10 +27,11 @@ async fn hosted_plugin_runtime_forwards_thread_originator() -> Result<(), Box<dy
             &thread_init,
             &thread_store,
             "codex_work_desktop",
-            /*available_environment_ids*/ &[],
+            /*ready_selected_capability_roots*/ &[],
+            /*executor_capability_discovery*/ None,
         ))
         .await;
-    let [McpServerContribution::Set { config: server, .. }] = contributions.as_slice() else {
+    let [McpServerContribution::HostedApps { config: server }] = contributions.as_slice() else {
         panic!("hosted plugin runtime should contribute one server");
     };
     let McpServerTransportConfig::StreamableHttp { http_headers, .. } = &server.transport else {

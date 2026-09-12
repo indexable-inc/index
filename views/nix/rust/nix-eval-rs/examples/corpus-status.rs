@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
         .ok_or("usage: corpus-status <file.nix>")?;
 
     let real = RealFs;
-    let resolved = match real.resolve_import(&path) {
+    let resolved = match real.resolve_import(&nix_eval_rs::value2::ambient_path(path.as_str())) {
         Ok(resolved) => resolved,
         Err(error) => {
             println!("{path}\tunreadable\t-\t{}", one_line(&error));
@@ -43,12 +43,13 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
             return Ok(());
         }
     };
-    let base = match resolved.rsplit_once('/') {
+    let resolved_text = resolved.to_string();
+    let base = match resolved_text.rsplit_once('/') {
         Some((dir, _)) if !dir.is_empty() => dir.to_owned(),
         _ => ".".to_owned(),
     };
 
-    let origin = nix_eval_rs::compile::Origin::File(&resolved);
+    let origin = nix_eval_rs::compile::Origin::File(&resolved_text);
     let module = match nix_eval_rs::compile::compile_source(
         &source,
         &base,

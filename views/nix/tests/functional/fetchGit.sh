@@ -27,15 +27,18 @@ echo world > "$repo"/hello
 git -C "$repo" commit -m 'Bla2' -a
 git -C "$repo" worktree add "$TEST_ROOT"/worktree
 echo hello >> "$TEST_ROOT"/worktree/hello
+git -C "$TEST_ROOT"/worktree commit -m 'Bla2-worktree' -a
 rev2=$(git -C "$repo" rev-parse HEAD)
 git -C "$repo" tag -a tag2 -m tag2
 
 # Check whether fetching in read-only mode works.
 nix-instantiate --eval -E "builtins.readFile ((builtins.fetchGit \"file://$TEST_ROOT/worktree\") + \"/hello\") == \"utrecht\\n\""
 
-# Fetch a worktree.
+# Fetch a worktree. A worktree is a checkout like any other: the fetch is of
+# the commit it has checked out, on its own branch.
 unset _NIX_FORCE_HTTP
-expectStderr 0 nix eval -vvvv --impure --raw --expr "(builtins.fetchGit \"file://$TEST_ROOT/worktree\").outPath" | grepQuiet "copying '$TEST_ROOT/worktree/' to the store"
+worktreeRev=$(git -C "$TEST_ROOT"/worktree rev-parse HEAD)
+[[ $(nix eval --impure --raw --expr "(builtins.fetchGit \"file://$TEST_ROOT/worktree\").rev") = "$worktreeRev" ]]
 path0=$(nix eval --impure --raw --expr "(builtins.fetchGit \"file://$TEST_ROOT/worktree\").outPath")
 path0_=$(nix eval --impure --raw --expr "(builtins.fetchTree { type = \"git\"; url = \"file://$TEST_ROOT/worktree\"; }).outPath")
 [[ $path0 = "$path0_" ]]
@@ -106,7 +109,9 @@ expectStderr 1 nix eval --expr 'builtins.fetchGit "file:///foo"' | grepQuiet "'f
 path2=$(nix eval --impure --raw --expr "(builtins.fetchGit $repo).outPath")
 [[ $path = "$path2" ]]
 
-# Using an unclean tree should yield the tracked but uncommitted changes.
+# An unclean tree has no commit to lock to, so it is refused, and the error
+# names the files that differ. Untracked files are not changes: `bar` and
+# `dir2/bar` below never appear in it.
 mkdir "$repo"/dir1 "$repo"/dir2
 echo foo > "$repo"/dir1/foo
 echo bar > "$repo"/bar
@@ -115,33 +120,38 @@ git -C "$repo" add dir1/foo
 git -C "$repo" rm hello
 
 unset _NIX_FORCE_HTTP
-path2=$(nix eval --impure --raw --expr "(builtins.fetchGit $repo).outPath")
-[ ! -e "$path2"/hello ]
-[ ! -e "$path2"/bar ]
-[ ! -e "$path2"/dir2/bar ]
-[ ! -e "$path2"/.git ]
-[[ $(cat "$path2"/dir1/foo) = foo ]]
+expectStderr 1 nix eval --impure --raw --expr "(builtins.fetchGit $repo).outPath" \
+    | grepQuiet "has uncommitted changes to 2 tracked file(s)"
+expectStderr 1 nix eval --impure --raw --expr "(builtins.fetchGit $repo).outPath" | grepQuiet "dir1/foo"
+expectStderr 1 nix eval --impure --raw --expr "(builtins.fetchGit $repo).outPath" | grepQuiet "hello (deleted)"
+expectStderr 1 nix eval --impure --raw --expr "(builtins.fetchGit $repo).outPath" | grepQuietInverse "dir2/bar"
 
-[[ $(nix eval --impure --raw --expr "(builtins.fetchGit $repo).rev") = 0000000000000000000000000000000000000000 ]]
-[[ $(nix eval --impure --raw --expr "(builtins.fetchGit $repo).dirtyRev") = "${rev2}-dirty" ]]
-[[ $(nix eval --impure --raw --expr "(builtins.fetchGit $repo).dirtyShortRev") = "${rev2:0:7}-dirty" ]]
-
-# ... unless we're using an explicit ref or rev.
+# ... unless we're using an explicit ref or rev: those name a commit, and the
+# working tree is not consulted at all.
 path3=$(nix eval --impure --raw --expr "(builtins.fetchGit { url = $repo; ref = \"master\"; }).outPath")
 [[ $path = "$path3" ]]
 
 path3=$(nix eval --raw --expr "(builtins.fetchGit { url = $repo; rev = \"$rev2\"; }).outPath")
 [[ $path = "$path3" ]]
 
-# Committing should not affect the store path.
+# Committing makes it fetchable again, at the new commit.
 git -C "$repo" commit -m 'Bla3' -a
+rev3=$(git -C "$repo" rev-parse HEAD)
 
-path4=$(nix eval --impure --refresh --raw --expr "(builtins.fetchGit \"file://$repo\").outPath")
+path2=$(nix eval --impure --refresh --raw --expr "(builtins.fetchGit \"file://$repo\").outPath")
+[ ! -e "$path2"/hello ]
+[ ! -e "$path2"/bar ]
+[ ! -e "$path2"/dir2/bar ]
+[ ! -e "$path2"/.git ]
+[[ $(cat "$path2"/dir1/foo) = foo ]]
+
+# A bare checkout and an explicit `?rev=<HEAD>` are the same fetch, so they
+# must land on one store path.
+path4=$(nix eval --impure --refresh --raw --expr "(builtins.fetchGit { url = \"file://$repo\"; rev = \"$rev3\"; }).outPath")
 [[ $path2 = "$path4" ]]
 
 [[ $(nix eval --impure --expr "builtins.hasAttr \"rev\" (builtins.fetchGit $repo)") == "true" ]]
-[[ $(nix eval --impure --expr "builtins.hasAttr \"dirtyRev\" (builtins.fetchGit $repo)") == "false" ]]
-[[ $(nix eval --impure --expr "builtins.hasAttr \"dirtyShortRev\" (builtins.fetchGit $repo)") == "false" ]]
+[[ $(nix eval --impure --raw --expr "(builtins.fetchGit $repo).rev") = "$rev3" ]]
 
 expect 102 nix eval --raw --expr "(builtins.fetchGit { url = $repo; rev = \"$rev2\"; narHash = \"sha256-B5yIPHhEm0eysJKEsO7nqxprh9vcblFxpJG11gXJus1=\"; }).outPath"
 
@@ -168,26 +178,26 @@ path=$(nix eval --impure --raw --expr "(builtins.fetchGit \"file://$repo\").outP
 git -C "$repo" checkout "$rev2" -b dev
 echo dev > "$repo"/hello
 
-# File URI uses dirty tree unless specified otherwise
-path2=$(nix eval --impure --raw --expr "(builtins.fetchGit \"file://$repo\").outPath")
-[ "$(cat "$path2"/hello)" = dev ]
+# A dirty tree is refused however the repository is spelled.
+expectStderr 1 nix eval --impure --raw --expr "(builtins.fetchGit \"file://$repo\").outPath" \
+    | grepQuiet "has uncommitted changes"
+expectStderr 1 nix eval --impure --raw --expr "(builtins.fetchGit $repo).outPath" \
+    | grepQuiet "has uncommitted changes"
 
-# Using local path with branch other than 'master' should work when clean or dirty
-path3=$(nix eval --impure --raw --expr "(builtins.fetchGit $repo).outPath")
-# (check dirty-tree handling was used)
-[[ $(nix eval --impure --raw --expr "(builtins.fetchGit $repo).rev") = 0000000000000000000000000000000000000000 ]]
-[[ $(nix eval --impure --raw --expr "(builtins.fetchGit $repo).shortRev") = 0000000 ]]
 # Making a dirty tree clean again and fetching it should
 # record correct revision information. See: #4140
 echo world > "$repo"/hello
 [[ $(nix eval --impure --raw --expr "(builtins.fetchGit $repo).rev") = "$rev2" ]]
 
-# Committing shouldn't change store path, or switch to using 'master'
+# Committing shouldn't switch to using 'master'
 echo dev > "$repo"/hello
 git -C "$repo" commit -m 'Bla5' -a
-path4=$(nix eval --impure --raw --expr "(builtins.fetchGit $repo).outPath")
+devRev=$(git -C "$repo" rev-parse HEAD)
+path3=$(nix eval --impure --raw --expr "(builtins.fetchGit $repo).outPath")
+path4=$(nix eval --impure --raw --expr "(builtins.fetchGit \"file://$repo\").outPath")
 [[ $(cat "$path4"/hello) = dev ]]
 [[ $path3 = "$path4" ]]
+[[ $(nix eval --impure --raw --expr "(builtins.fetchGit $repo).rev") = "$devRev" ]]
 
 # Using remote path with branch other than 'master' should fetch the HEAD revision.
 # (--tarball-ttl 0 to prevent using the cached repo above)
@@ -263,11 +273,12 @@ rm -rf "$repo"/.git
 rm -rf "$TEST_HOME"/.cache/nix
 (! nix eval --impure --raw --expr "(builtins.fetchGit \"file://$repo\").outPath")
 
-# should succeed for a repo without commits
+# A repo without commits has nothing to fetch: a staged file is an
+# uncommitted change like any other.
 initGitRepo "$repo"
-git -C "$repo" add hello # need to add at least one file to cause the root of the repo to be visible
-# shellcheck disable=SC2034
-path10=$(nix eval --impure --raw --expr "(builtins.fetchGit \"file://$repo\").outPath")
+git -C "$repo" add hello
+expectStderr 1 nix eval --impure --raw --expr "(builtins.fetchGit \"file://$repo\").outPath" \
+    | grepQuiet "has uncommitted changes"
 
 # should succeed for a path with a space
 # regression test for #7707
@@ -282,24 +293,21 @@ cd "$repo"
 # shellcheck disable=SC2034
 path11=$(nix eval --impure --raw --expr "(builtins.fetchGit ./.).outPath")
 
-# Test a workdir with no commits.
+# Test a workdir with no commits: there is no revision to lock to, so the
+# fetch is refused rather than answered with the null revision.
 empty="$TEST_ROOT/empty"
 createGitRepo "$empty"
 
-emptyAttrs="{ lastModified = 0; lastModifiedDate = \"19700101000000\"; narHash = \"sha256-pQpattmS9VmO3ZIQUFn66az8GSmB4IvYhTTCFn6SUmo=\"; rev = \"0000000000000000000000000000000000000000\"; revCount = 0; shortRev = \"0000000\"; submodules = false; }"
-result=$(nix eval --impure --expr "builtins.removeAttrs (builtins.fetchGit $empty) [\"outPath\"]")
-[[ "$result" = "$emptyAttrs" ]]
+expectStderr 1 nix eval --impure --expr "(builtins.fetchGit $empty).outPath" | grepQuiet "has no commits"
 
+# An untracked file is not a change, so the repository is still commitless.
 echo foo > "$empty/x"
+expectStderr 1 nix eval --impure --expr "(builtins.fetchGit $empty).outPath" | grepQuiet "has no commits"
 
-result=$(nix eval --impure --expr "builtins.removeAttrs (builtins.fetchGit $empty) [\"outPath\"]")
-[[ "$result" = "$emptyAttrs" ]]
-
+# Staging it is a change, and there is still no commit behind it.
 git -C "$empty" add x
-
-expected_attrs="{ lastModified = 0; lastModifiedDate = \"19700101000000\"; narHash = \"sha256-wzlAGjxKxpaWdqVhlq55q5Gxo4Bf860+kLeEa/v02As=\"; rev = \"0000000000000000000000000000000000000000\"; revCount = 0; shortRev = \"0000000\"; submodules = false; }"
-result=$(nix eval --impure --expr "builtins.removeAttrs (builtins.fetchGit $empty) [\"outPath\"]")
-[[ "$result" = "$expected_attrs" ]]
+expectStderr 1 nix eval --impure --expr "(builtins.fetchGit $empty).outPath" \
+    | grepQuiet "has uncommitted changes"
 
 # Test a repo with an empty commit.
 git -C "$empty" rm -f x

@@ -12,9 +12,10 @@
  * a.b.c` must not force a's siblings, and a call whose only output is
  * rendered text has already forced everything by the time it returns.
  *
- * The string API is not deprecated by the handle API: nix-instantiate's
- * whole-expression path has no selection to do, and one call is cheaper than
- * five.
+ * The string API stays beside the handle API for an embedder with one
+ * expression and no selection, arguments or applications to name: the
+ * crate's own tests and harnesses. Every nix command goes through the
+ * session API, whose question is what the memo keys on.
  */
 
 #include <stddef.h>
@@ -33,6 +34,16 @@ extern "C" {
  * `-Dnix:rust-eval=enabled` while the default configuration stayed green. A
  * type every section may want belongs before all of them. */
 typedef struct IxeSession IxeSession;
+typedef struct IxeEvalCache IxeEvalCache;
+
+typedef struct
+{
+    uint64_t memory_hits;
+    uint64_t disk_loads;
+    uint64_t retained_bytes;
+    uint64_t entries;
+    uint64_t evictions;
+} IxeEvalCacheStats;
 
 /* Where a failure happened.
  *
@@ -69,9 +80,9 @@ typedef struct
 typedef struct IxeHostVtable IxeHostVtable;
 
 /* 0 ok; 1 eval error; 2 unimplemented construct; 3 parse error; 4 bad call;
- * 5 builtins.throw (ThrownError); 6 failed assert (AssertionError). The last
- * two are separate because the exception class cannot be read back out of
- * the message, and cppnix reports each under its own trace note. */
+ * 5 builtins.throw (ThrownError); 6 failed assert (AssertionError); 8 import
+ * from derivation disabled (IFDError). The exception classes are separate
+ * because they cannot be read back out of the message. */
 int ixe_eval_expr(
     /* who answers this evaluation's questions about the outside world, or
      * NULL for a host that answers none of them. Per call rather than
@@ -151,18 +162,45 @@ void ixe_set_eval_cache_dir(const unsigned char * path, size_t path_len);
  * ixe_set_eval_cache_dir, since with no cache there is nothing to check. */
 void ixe_set_cache_verify_rate(unsigned int rate);
 
+/* Byte cap on that cache. After each result is published the store is swept,
+ * least recently used entries first, until it fits; 0 (the default) never
+ * sweeps and the cache grows without bound. The sweep reads directory
+ * metadata and the small `.refs` sidecar beside each witness, never a witness
+ * body, so it costs entries and not bytes. Eviction can only cause a later
+ * miss, never a different answer. Meaningless without ixe_set_eval_cache_dir. */
+void ixe_set_eval_cache_max_bytes(uint64_t bytes);
+
 /* How the evaluator turns a path interpolated into a string into a store
  * path. cppnix coerces such a path with copyToStore set (eval.cc:2582), so
  * `"${./f}"` is the store path and not the source path, and only the
  * embedder owns a store to answer with. Without a hook the coercion reports
  * itself unimplemented rather than inventing a path (ENG-12447).
  *
+ * `root` is empty for the ambient rootPath accessor. Otherwise it is the
+ * exact storeFS mount point and `path` is relative to that mounted accessor.
+ * The pair is parse-time provenance; the host must not resolve a spelling to
+ * some other accessor.
+ *
  * Return 0 and point *out at the store path, or non-zero and point it at the
  * error text. The callee keeps ownership and the buffer need only outlive the
  * call: the evaluator copies it before returning, so neither side frees
  * across the boundary and the two allocators never meet. */
 typedef int (*ixe_copy_to_store_fn)(
-    void * ctx, const unsigned char * path, size_t path_len, const unsigned char ** out, size_t * out_len);
+    void * ctx,
+    const unsigned char * root,
+    size_t root_len,
+    const unsigned char * path,
+    size_t path_len,
+    const unsigned char ** out,
+    size_t * out_len);
+
+/* builtins.storePath. The rooted input has the same provenance contract as
+ * ixe_copy_to_store_fn. Apply cppnix's storePath rules, including its
+ * symlink resolution, in-store check, lazy mounted-store exemption and
+ * ensurePath call. On success write `store-object NUL visible-path` to *out;
+ * the evaluator uses the first field as string context and returns the
+ * second. Errors use the same status and buffer contract. */
+typedef ixe_copy_to_store_fn ixe_store_path_fn;
 
 /* How the embedder stores a text blob, for builtins.toFile. Same buffer
  * discipline as ixe_copy_to_store_fn. `references` is NUL-terminated fields: each
@@ -190,14 +228,15 @@ typedef int (*ixe_store_text_fn)(
  * applies it; what arrives here is the finished decision. `request` is
  * NUL-terminated fields:
  *
- *   1. the root path (NOT symlink-resolved; resolve it as addPath does);
- *   2. the store object's name;
- *   3. "nar" or "flat";
- *   4. the expected SHA-256 as SRI, or empty for "no sha256 attribute";
- *   5. "inherit-references" or "own-references";
- *   6. "unfiltered" (copy everything, cppnix's defaultPathFilter) or
+ *   1. the accessor root (empty for rootPath, otherwise the exact mount point);
+ *   2. the path relative to that accessor;
+ *   3. the store object's name;
+ *   4. "nar" or "flat";
+ *   5. the expected SHA-256 as SRI, or empty for "no sha256 attribute";
+ *   6. "inherit-references" or "own-references";
+ *   7. "unfiltered" (copy everything, cppnix's defaultPathFilter) or
  *      "filtered";
- *   7. when filtered, a path and a type ("regular", "directory", "symlink",
+ *   8. when filtered, an accessor-relative path and a type ("regular", "directory", "symlink",
  *      "unknown") per accepted entry.
  *
  * "inherit-references" is addPath's store-path branch (primops.cc:2947): the
@@ -223,11 +262,21 @@ typedef int (*ixe_store_text_fn)(
 typedef int (*ixe_store_filtered_fn)(
     void * ctx, const unsigned char * request, size_t request_len, const unsigned char ** out, size_t * out_len);
 
-/* How the embedder writes a `.drv`, for builtins.derivationStrict. Same three
- * arguments and same encoding as ixe_store_text_fn, because cppnix's
- * writeDerivation is addTextToStore of the ATerm: an embedder should answer
- * both with the same call. `name` arrives WITHOUT the `.drv` suffix, exactly
- * as writeDerivation takes it, and the callee appends it.
+/* How the embedder registers derivations prepared by Rust.
+ * The packet begins with a little-endian u64 derivation count, a u64 lazy
+ * source count, and that many length-prefixed, eight-byte-padded source
+ * paths. The remainder is the AddMultipleToStore stream: a count followed
+ * by WorkerProto 1.16 ValidPathInfo records and NAR bytes.
+ *
+ * Rust owns canonical derivation parsing, references, paths, NAR framing,
+ * hashes and metadata. The host materializes the listed lazy sources and
+ * transports the prepared stream; it does not reinterpret derivations.
+ *
+ * A batch because the evaluator answers derivationStrict itself, from the
+ * bytes, and tells the store later: at the first build, validity check,
+ * read or toFile reference that names one of them, and at every return to
+ * the embedder. cppnix pays one store round trip per derivationStrict (23k
+ * of them for one NixOS closure); this pays one per batch.
  *
  * Leaving this NULL is not an error, and is not the same as leaving
  * store_text NULL. A derivation still evaluates and still reports the
@@ -235,20 +284,13 @@ typedef int (*ixe_store_filtered_fn)(
  * is precisely cppnix under readOnlyMode. `nix build` needs the hook;
  * `nix eval` does not.
  *
- * Return 0 with *out pointing at the store path the write landed on. The
- * evaluator compares it with the path it computed from the same bytes and
- * fails loudly if they differ, so an embedder must return what its store
- * actually used rather than recomputing it some other way. */
-typedef int (*ixe_write_drv_fn)(
-    void * ctx,
-    const unsigned char * name,
-    size_t name_len,
-    const unsigned char * aterm,
-    size_t aterm_len,
-    const unsigned char * references,
-    size_t references_len,
-    const unsigned char ** out,
-    size_t * out_len);
+ * Return 0 when every derivation in the batch is a store object with the
+ * temporary root cppnix's writeDerivation gives one; *out may be empty.
+ * Return non-zero with *out the failure text, under the same buffer
+ * discipline as ixe_store_text_fn: the evaluation that wrote these
+ * derivations fails, and the evaluator will not memoise it. */
+typedef int (*ixe_write_drvs_fn)(
+    void * ctx, const unsigned char * batch, size_t batch_len, const unsigned char ** out, size_t * out_len);
 
 /* How the embedder fetches a URL into the store, for builtins.fetchurl and
  * builtins.fetchTarball. Same buffer discipline as ixe_copy_to_store_fn.
@@ -389,29 +431,67 @@ typedef int (*ixe_flake_ref_to_string_fn)(
 typedef int (*ixe_ensure_path_fn)(
     void * ctx, const unsigned char * path, size_t path_len, const unsigned char ** out, size_t * out_len);
 
+/* Which of a list of store paths the store holds now: Store::queryValidPaths,
+ * one round trip for the whole list. `paths` is newline-separated printed
+ * store paths; on 0, *out is the newline-separated subset that is valid
+ * (possibly empty). Asked by the evaluation-cache verifier for the objects a
+ * witness relies on -- the derivations it wrote, the outputs it realised,
+ * the copies and fetches it made -- so that a hit checks each is still there
+ * instead of writing, building or copying it again. Which objects a row
+ * relies on is the verifier's business; this says only what the store holds.
+ * On non-zero, *out is the error text under the same buffer contract as
+ * ixe_copy_to_store_fn. */
+typedef int (*ixe_valid_paths_fn)(
+    void * ctx, const unsigned char * paths, size_t paths_len, const unsigned char ** out, size_t * out_len);
+
+/* Which of a list of store objects are sealed -- held by the store and
+ * content-addressed (the path is the one its content address derives), so
+ * the name pins every byte, symlink text included -- and, for each, every
+ * symlink under it. `paths` is newline-separated "<hash>-<name>" lines; on
+ * 0, *out has one line per sealed object: the name verbatim, then for each
+ * symlink its object-relative path and its target, all tab-separated (an
+ * even number of fields after the name; possibly no lines; an object the
+ * store does not hold is simply absent). A path or target that a line
+ * cannot carry (a control character) leaves its object out of the answer.
+ * Which links leave the object -- and so which reads under it must ask
+ * rather than replay -- the evaluator decides (readset::leaving_links).
+ * Asked by the evaluation-cache verifier once per object it has not yet
+ * recorded, which it then never asks again: content addressing and the link
+ * graph are permanent facts about immutable bytes; presence is checked
+ * every time through ixe_valid_paths_fn. On non-zero, *out is the error text
+ * under the same buffer contract as ixe_copy_to_store_fn. */
+typedef int (*ixe_sealed_paths_fn)(
+    void * ctx, const unsigned char * paths, size_t paths_len, const unsigned char ** out, size_t * out_len);
+
+/* `allowPath` for each NUL-terminated store path in `paths`: what the copy,
+ * fetch and tree hooks end with, for an effect the evaluation-cache verifier
+ * served by validity instead of re-running. Not the closure form: a copy
+ * allows its own path and nothing it references; realised outputs go
+ * through ixe_realise_allow_fn. On non-zero, *out is the error text under
+ * the same buffer contract as ixe_copy_to_store_fn. */
+typedef int (*ixe_allow_paths_fn)(
+    void * ctx, const unsigned char * paths, size_t paths_len, const unsigned char ** out, size_t * out_len);
+
 /* How the embedder realises a string context: import from derivation.
  *
- * This is EvalState::realiseContext (primops.cc:72) behind one call. Whenever
- * a read-shaped builtin -- import, readFile, readDir, pathExists, findFile,
- * builtins.path, filterSource -- coerces a path whose string context is not
- * empty, the evaluator asks this FIRST and only then asks its read question,
- * which is the order realisePath (primops.cc:167) uses.
+ * This is EvalState::realiseContext (primops.cc:72) split into three hooks,
+ * so the evaluator can run the build off its own thread and keep evaluating
+ * (ENG-13150). Whenever a read-shaped builtin -- import, readFile, readDir,
+ * pathExists, findFile, builtins.path, filterSource -- coerces a path whose
+ * string context is not empty, the evaluator asks this FIRST and only then
+ * asks its read question, which is the order realisePath (primops.cc:167)
+ * uses. Supply all three or none; a partial set is refused at session
+ * creation, because the phases only mean anything as a protocol. Without
+ * them, a read through a derivation output refuses by name --
+ * StoreUnavailable -- rather than reading a path nothing built.
  *
- * `request` is the context: NUL-terminated fields, one per element, each
- * rendered as NixStringContextElem::to_string renders it --
- * "!<output>!<drvpath>" for a single output, "=<drvpath>" for a deep
+ * `request`, for phases 1 and 2, is the context: NUL-terminated fields, one
+ * per element, each rendered as NixStringContextElem::to_string renders it
+ * -- "!<output>!<drvpath>" for a single output, "=<drvpath>" for a deep
  * dependency, or a bare store path for an opaque one. Parse them back with
  * NixStringContextElem::parse; do not invent a second spelling. A NUL cannot
  * occur in a store path, so the framing is unambiguous, and an empty request
  * is never sent.
- *
- * Return 0 and point *out at the rewrite map realiseContext returns:
- * NUL-terminated fields, an even number, alternating from and to. Write
- * nothing for the empty map, which is the answer for every input-addressed
- * derivation. Under ca-derivations it is the DownstreamPlaceholder ->
- * real-output-path map, and the evaluator rewrites the path it is about to
- * read with it, so returning an empty map there means reading a path that
- * never exists.
  *
  * Everything policy-shaped is the embedder's, because none of it is visible
  * from inside the evaluator: the isValidPath check on each element (an
@@ -419,65 +499,61 @@ typedef int (*ixe_ensure_path_fn)(
  * IFDError, trace-import-from-derivation, buildPaths, and copyClosure plus
  * allowClosure when the build store is not the evaluation store.
  *
- * Non-zero is a failure with a message under the same buffer contract as
- * ixe_copy_to_store_fn. It becomes an uncatchable evaluation error, which is
- * cppnix's behaviour and not a shortcut: prim_tryEval catches AssertionError
- * alone (primops.cc:1219), and an invalid path, a disabled-IFD refusal and a
- * failed build are none of them that.
- *
- * Without a hook, a read through a derivation output refuses by name --
- * StoreUnavailable -- rather than reading a path nothing built. */
-typedef int (*ixe_realise_fn)(
-    void * ctx, const unsigned char * request, size_t request_len, const unsigned char ** out, size_t * out_len);
-
-/* The non-blocking form of ixe_realise_fn: three hooks that split one
- * realise into phases so the evaluator can run the build off its own
- * thread and keep evaluating (ENG-13150). Supply all three -- and
- * ixe_realise_fn above, which stays the fallback -- or none; a partial set
- * is refused at session creation, because the phases only mean anything as
- * a protocol.
- *
- * The protocol, for one realise question:
+ * The protocol, for one realise question. The evaluator's blocking route
+ * runs phase 1 on the calling thread, queues phase 2 on the session's build
+ * dispatcher, then runs phase 3 when the answer is delivered. The blocking
+ * route waits for the same dispatcher. Each phase runs at most once per
+ * question. Session destruction joins the dispatcher before returning.
  *
  *   1. realise_check(request)   evaluation thread. Everything realiseContext
  *                               does before building that touches the
  *                               embedder's evaluation-side state: validity
  *                               checks (and their read-set recording), the
  *                               allow-import-from-derivation refusal, the
- *                               trace warning. Non-zero declines: the
- *                               evaluator falls back to ixe_realise_fn,
- *                               which re-runs the same checks and reports
- *                               the failure exactly as the blocking flow
- *                               always did, so nothing here is
- *                               program-visible. Return non-zero too when
- *                               the context has nothing to build.
+ *                               trace warning. The status is an
+ *                               IxeRealiseCheck: BUILD when something needs
+ *                               building, NOTHING when every element is
+ *                               already valid (the answer is then the empty
+ *                               rewrite map and no other phase runs), or
+ *                               FAILED with the message under the same
+ *                               buffer contract as ixe_copy_to_store_fn and
+ *                               `error_class` set. The class preserves
+ *                               disabled IFD as its own exception class;
+ *                               other failures become an uncatchable
+ *                               evaluation error. Both match cppnix's
+ *                               behaviour: prim_tryEval catches
+ *                               AssertionError alone (primops.cc:1219).
  *
- *   2. realise_build(request)   A WORKER THREAD THE EVALUATOR OWNS -- the
- *                               one hook in this vtable with that contract,
- *                               and supplying it is the embedder's written
- *                               consent. It may run concurrently with every
- *                               other hook (called on the evaluation
- *                               thread) and with other realise_build calls
- *                               (several builds in flight). It must
- *                               therefore touch only state that serves
- *                               concurrent callers -- for the nix embedder
- *                               that is the stores -- and its answer buffer
- *                               must not be shared with any other hook or
- *                               call: thread-local is the natural shape.
- *                               `request` is the same bytes check saw;
- *                               the buffer stays live until this call
- *                               returns, as everywhere else in this ABI.
+ *   2. realise_build(requests)  A WORKER THREAD THE EVALUATOR OWNS, the one hook in this
+ *                               vtable with that contract, and supplying it
+ *                               is the embedder's written consent. It may
+ *                               run concurrently with every other hook
+ *                               (called on the evaluation thread). Build
+ *                               calls within one session never overlap.
+ *                               It must therefore touch only
+ *                               state that serves concurrent callers -- for
+ *                               the nix embedder that is the stores -- and
+ *                               its answer buffer must not be shared with
+ *                               any other hook or call: thread-local is the
+ *                               natural shape. Each request has the bytes
+ *                               check saw; the buffers stay live until this
+ *                               call returns, as everywhere else in this
+ *                               ABI.
  *
- *                               Success writes the rewrite map as from/to
- *                               fields exactly as ixe_realise_fn does, then
- *                               ONE EMPTY FIELD as a separator, then the
- *                               built output store paths, one per field,
- *                               all NUL-terminated. Neither a placeholder
- *                               nor a store path can be empty, so the
- *                               separator is unambiguous. Failure is
- *                               non-zero with the message; it reaches the
- *                               program with the same text the blocking
- *                               flow would have reported.
+ *                               Success (0) writes the rewrite map
+ *                               realiseContext returns -- NUL-terminated
+ *                               fields, an even number, alternating from
+ *                               and to; under ca-derivations the
+ *                               DownstreamPlaceholder -> real-output-path
+ *                               map the evaluator rewrites the path it is
+ *                               about to read with -- then ONE EMPTY FIELD
+ *                               as a separator, then the built output store
+ *                               paths, one per field, all NUL-terminated.
+ *                               Neither a placeholder nor a store path can
+ *                               be empty, so the separator is unambiguous.
+ *                               Failure is non-zero with the message; it
+ *                               reaches the program as an uncatchable
+ *                               evaluation error.
  *
  *   3. realise_allow(outputs)   evaluation thread, at the moment the answer
  *                               is delivered -- which the scheduler orders
@@ -492,10 +568,47 @@ typedef int (*ixe_realise_fn)(
  *                               Runs before the program can see the
  *                               answer, so no read through a built output
  *                               can precede its registration. */
+typedef enum IxeRealiseErrorClass {
+    IXE_REALISE_ERROR_OTHER = 0,
+    IXE_REALISE_ERROR_IMPORT_FROM_DERIVATION = 1,
+} IxeRealiseErrorClass;
+
+typedef enum IxeRealiseCheck {
+    IXE_REALISE_CHECK_BUILD = 0,
+    IXE_REALISE_CHECK_FAILED = 1,
+    IXE_REALISE_CHECK_NOTHING = 2,
+} IxeRealiseCheck;
+
 typedef int (*ixe_realise_check_fn)(
-    void * ctx, const unsigned char * request, size_t request_len, const unsigned char ** out, size_t * out_len);
+    void * ctx,
+    const unsigned char * request,
+    size_t request_len,
+    /* One of the IxeRealiseErrorClass values, written as a plain int on
+       IXE_REALISE_CHECK_FAILED: the evaluator decodes it and refuses any
+       value the enum does not name, rather than holding an enum cell C may
+       have filled with anything. */
+    int * error_class,
+    const unsigned char ** out,
+    size_t * out_len);
+typedef struct {
+    const unsigned char * data;
+    size_t len;
+} IxeRealiseRequest;
+
+typedef struct {
+    int status;
+    const unsigned char * data;
+    size_t len;
+} IxeRealiseResult;
+
+/* The dispatcher calls one batch at a time. Requests and result slots have
+ * count elements. Fill every result slot, preserving request order. A result
+ * has status 0 and the existing build-answer encoding, or a nonzero status
+ * and its error message. Result bytes remain valid until the next build call.
+ * Return nonzero only when the entire callback failed to produce results.
+ * The host must keep independent requests alive when one build fails. */
 typedef int (*ixe_realise_build_fn)(
-    void * ctx, const unsigned char * request, size_t request_len, const unsigned char ** out, size_t * out_len);
+    void * ctx, const IxeRealiseRequest * requests, size_t count, IxeRealiseResult * results);
 typedef int (*ixe_realise_allow_fn)(
     void * ctx, const unsigned char * outputs, size_t outputs_len, const unsigned char ** out, size_t * out_len);
 
@@ -521,10 +634,28 @@ typedef void (*ixe_warn_fn)(void * ctx, const unsigned char * message, size_t me
  * including those NULs. The list travels with the question because it is an
  * ordinary Nix value the program can rebind, not a process setting.
  *
- * Return 0 and point *out at the resolved path; 5 and point it at the error
- * text for "not found", which cppnix raises as a ThrownError and which
- * builtins.tryEval therefore catches; 1 and the error text for anything else.
- * Same buffer contract as ixe_copy_to_store_fn. */
+ * On success, write `root NUL accessor-relative-path` to *out. An empty root
+ * selects the ambient rootFS accessor. A non-empty root is the exact complete
+ * store path used as a key in cppnix's storeFS mount table; the second field
+ * starts with `/` and is relative to that mounted accessor. Both fields must
+ * be canonical. Return 5 with error text for "not found", which cppnix raises
+ * as a ThrownError and builtins.tryEval therefore catches; return 2 with
+ * error text when the name resolved to something this embedding cannot hand
+ * the evaluator at all (cppnix's in-memory corepkgs beyond fetchurl.nix),
+ * which the evaluator reports as its own unimplemented construct rather than
+ * as a mismatch; return 1 with error text for anything else. A status 0 whose
+ * payload does not decode is a protocol fault and is reported as a failure,
+ * never as a refusal. Same buffer contract as ixe_copy_to_store_fn.
+ *
+ * A name that resolves into an accessor the evaluator cannot read -- cppnix's
+ * in-memory corepkgs, a downloaded search-path entry behind its fetcher --
+ * is answered with a THIRD field: `NUL accessor-relative-path NUL contents`,
+ * the empty root selecting the ambient accessor. The evaluator holds those
+ * bytes for the session and serves every later question about the path from
+ * them (existence, kind, contents, import), which is how
+ * `builtins.toString <nix/fetchurl.nix>` stays `/fetchurl.nix` on both arms.
+ * Contents beside a non-empty root are a protocol fault: a mounted root is a
+ * real accessor. */
 typedef int (*ixe_find_file_fn)(
     void * ctx,
     const unsigned char * entries,
@@ -543,15 +674,16 @@ typedef int (*ixe_find_file_fn)(
  * -I changes. Return 0 on success, non-zero with error text in *out. */
 typedef int (*ixe_nix_path_fn)(void * ctx, const unsigned char ** out, size_t * out_len);
 
-/* The plain filesystem reads: builtins.readFile, pathExists, readDir and
- * readFileType, plus the resolving kind query an `import` is half made of.
+/* The plain filesystem reads: builtins.readFile, both pathExists shapes,
+ * readDir and readFileType, plus the resolving kind query an `import` is half
+ * made of.
  *
  * Carried as a set by IxeHostVtable below, and read through the embedder for
  * one reason: pure-eval and restrict-eval are enforced in cppnix
  * by wrapping EvalState::rootFS in an AllowListSourceAccessor (eval.cc:306),
  * so a read that does not go through that accessor cannot honour either
  * setting. Without these hooks the evaluator reads with std::fs, and
- * rust/nix-eval-rs/src/purity.rs refuses all five questions under either
+ * rust/nix-eval-rs/src/purity.rs refuses all seven questions under either
  * setting rather than answering them outside the allow list. Supplying them
  * is what makes a flake evaluable, because flake entry means importing files
  * out of a fetched store path under pure eval. ENG-12792.
@@ -563,12 +695,11 @@ typedef int (*ixe_nix_path_fn)(void * ctx, const unsigned char ** out, size_t * 
  *   prim_readFile      primops.cc:2203  realisePath(pos, *args[0])
  *                                       -> SymlinkResolution::Full (the
  *                                          default argument, eval.hh:1133)
- *   prim_pathExists    primops.cc:2092  realisePath(pos, arg, Ancestors),
- *                                       and Full only when the ARGUMENT was a
- *                                       string ending "/" or "/." -- a value
- *                                       test (primops.cc:2088) that cannot be
- *                                       reached from here, because a CanonPath
- *                                       has no trailing slash left to inspect
+ *   prim_pathExists    primops.cc:2092  Ancestors for the plain callback;
+ *                                       a string ending "/" or "/." selects
+ *                                       the separate directory-existence
+ *                                       callback before coercion, and that
+ *                                       callback resolves Full
  *   prim_readDir       primops.cc:2510  realisePath(pos, *args[0]) -> Full
  *   prim_readFileType  primops.cc:2492  realisePath(pos, *args[0], nullopt)
  *                                       -> resolves NOTHING, so a symlinked
@@ -588,22 +719,41 @@ typedef int (*ixe_nix_path_fn)(void * ctx, const unsigned char ** out, size_t * 
  * refuses rather than follows (posix-source-accessor.cc:198) -- cppnix puts
  * the resolution in EvalState::realisePath and not in the accessor.
  *
- * Keep prim_pathExists's catch: a forbidden path is `false` there and must be
- * `false` here, not a failure.
+ * Keep prim_pathExists's narrow catch: a forbidden path is `false` there and
+ * must be `false` here. Missing is also false. Other failures propagate.
  *
  * Same buffer discipline as ixe_copy_to_store_fn: return 0 and point *out at
  * the answer, or non-zero and point it at the error text, which the evaluator
- * reports as an ordinary evaluation error. A RestrictedPathError is one of
- * those on both arms -- cppnix's builtins.tryEval catches AssertionError only
- * (primops.cc:1219) -- so its own wording is what a refused read says. */
+ * reports as an ordinary evaluation error. The two existence hooks'
+ * exception contract is documented separately below. */
 typedef int (*ixe_read_file_fn)(
-    void * ctx, const unsigned char * path, size_t path_len, const unsigned char ** out, size_t * out_len);
+    void * ctx,
+    const unsigned char * root,
+    size_t root_len,
+    const unsigned char * path,
+    size_t path_len,
+    const unsigned char ** out,
+    size_t * out_len);
 
-/* Whether a path exists. 1 for yes, anything else for no.
- *
- * No out buffer and no error channel, because prim_pathExists has neither:
- * it turns a RestrictedPathError into false and a missing path into false. */
-typedef int (*ixe_path_exists_fn)(void * ctx, const unsigned char * path, size_t path_len);
+/* Resolve and read an import in one accessor-stable operation. On success
+ * the answer is root NUL accessor-relative-path NUL source-bytes. The source
+ * occupies the remainder of the buffer and may itself contain NUL bytes. */
+typedef ixe_read_file_fn ixe_import_fn;
+
+/* Whether a path exists. On success return 0 and write `1` or `0` to *out.
+ * A missing path and RestrictedPathError answer `0`. Every other failure,
+ * including a vanished mounted root or an I/O error, returns non-zero with
+ * error text. This distinction is part of replay correctness: an error must
+ * not digest as the same observation as a missing file. */
+typedef ixe_read_file_fn ixe_path_exists_fn;
+
+/* The value-level trailing-slash branch of builtins.pathExists. On success,
+ * write `1` only when full symlink resolution ends at a directory, otherwise
+ * `0`. Its three outcomes have the same contract as ixe_path_exists_fn:
+ * missing and RestrictedPathError are false; every other failure is an
+ * error. Kept separate because a canonical path no longer carries the
+ * trailing slash that selected this operation. It uses the
+ * ixe_path_exists_fn signature in the vtable. */
 
 /* A directory listing, written to *out as NUL-terminated fields in pairs:
  * name, type, name, type, ... with a trailing NUL after each field, so every
@@ -620,7 +770,13 @@ typedef int (*ixe_path_exists_fn)(void * ctx, const unsigned char * path, size_t
  * not give, which prim_readDir turns into a lazy builtins.readFileType call.
  * There is no lazy field here, so resolve it before answering. */
 typedef int (*ixe_read_dir_fn)(
-    void * ctx, const unsigned char * path, size_t path_len, const unsigned char ** out, size_t * out_len);
+    void * ctx,
+    const unsigned char * root,
+    size_t root_len,
+    const unsigned char * path,
+    size_t path_len,
+    const unsigned char ** out,
+    size_t * out_len);
 
 /* What a path is, written to *out as one of the four spellings above.
  *
@@ -656,15 +812,21 @@ typedef int (*ixe_read_dir_fn)(
  * ixe_read_dir_fn has none either -- an entry a directory listed and the
  * accessor cannot see is a broken hook, not a file with no type. */
 typedef int (*ixe_file_type_fn)(
-    void * ctx, const unsigned char * path, size_t path_len, const unsigned char ** out, size_t * out_len);
+    void * ctx,
+    const unsigned char * root,
+    size_t root_len,
+    const unsigned char * path,
+    size_t path_len,
+    const unsigned char ** out,
+    size_t * out_len);
 
-/* The five are all present or all absent, and a vtable with some of them is
+/* The seven are all present or all absent, and a vtable with some of them is
  * REFUSED rather than partly honoured. purity.rs decides those questions as a
  * group: the settings can be honoured exactly when every one of the reads
- * goes through an accessor that applies the allow list, so "four of five" is
- * a state the evaluator would have to call both honoured and not. All five
+ * goes through an accessor that applies the allow list, so "six of seven" is
+ * a state the evaluator would have to call both honoured and not. All seven
  * NULL is the standalone embedding -- the evaluator reads with std::fs and
- * refuses all five questions under either purity setting. */
+ * refuses all seven questions under either purity setting. */
 
 /* Where a builtins.trace line goes. Separate from ixe_warn_fn because cppnix
  * sends the two to different places: warn builds an ErrorInfo at lvlWarn,
@@ -697,9 +859,9 @@ typedef int (*ixe_interrupted_fn)(void * ctx);
  * Every field may be NULL, and NULL means the evaluator answers for itself:
  * an operation with no hook reports itself unimplemented (a store or fetch
  * question), resolves nothing (find_file, nix_path), does nothing (warn,
- * trace, interrupted), or reads with std::fs (the five path reads). The one
+ * trace, interrupted), or reads with std::fs (the seven path reads). The one
  * combination that is refused rather than defaulted is a PARTIAL set of the
- * five reads; see above.
+ * seven reads; see above.
  *
  * `ctx` is handed back to every function unchanged and is the embedder's
  * place for per-session state -- an EvalState, a store handle, the buffers
@@ -710,8 +872,9 @@ struct IxeHostVtable
 {
     void * ctx;
     ixe_copy_to_store_fn copy_to_store;
+    ixe_store_path_fn store_path;
     ixe_store_text_fn store_text;
-    ixe_write_drv_fn write_derivation;
+    ixe_write_drvs_fn write_derivations;
     ixe_store_filtered_fn store_filtered;
     ixe_fetch_fn fetch;
     ixe_fetch_tree_fn fetch_tree;
@@ -719,9 +882,10 @@ struct IxeHostVtable
     ixe_parse_flake_ref_fn parse_flake_ref;
     ixe_flake_ref_to_string_fn flake_ref_to_string;
     ixe_ensure_path_fn ensure_path;
-    ixe_realise_fn realise;
-    /* All three or none, and only beside a non-NULL realise; see the
-     * protocol above ixe_realise_check_fn. */
+    ixe_valid_paths_fn valid_paths;
+    ixe_sealed_paths_fn sealed_paths;
+    ixe_allow_paths_fn allow_paths;
+    /* All three or none; see the protocol above ixe_realise_check_fn. */
     ixe_realise_check_fn realise_check;
     ixe_realise_build_fn realise_build;
     ixe_realise_allow_fn realise_allow;
@@ -730,9 +894,11 @@ struct IxeHostVtable
     ixe_warn_fn warn;
     ixe_trace_fn trace;
     ixe_interrupted_fn interrupted;
-    /* All five or none; see the note above ixe_read_file_fn. */
+    /* All seven or none; see the note above ixe_read_file_fn. */
+    ixe_import_fn import_source;
     ixe_read_file_fn read_file;
     ixe_path_exists_fn path_exists;
+    ixe_path_exists_fn dir_exists;
     ixe_read_dir_fn read_dir;
     ixe_file_type_fn file_type;
     ixe_file_type_fn file_type_resolved;
@@ -751,14 +917,15 @@ struct IxeHostVtable
  * table draws: a question the embedder answers through cppnix's own rootFS or
  * checkURI is served under both settings, because cppnix's access control
  * already applies and its own error text comes back. A question this crate's
- * own Host answers with a direct std::fs read -- import, readFile, pathExists,
- * readDir, and the path-kind query -- is refused, because that Host consults
- * no allow list and cannot tell an allowed path from a forbidden one.
+ * own Host answers with a direct std::fs read -- import, readFile, both
+ * pathExists shapes, readDir, and the two path-kind queries -- is refused,
+ * because that Host consults no allow list and cannot tell an allowed path
+ * from a forbidden one.
  *
  * That claim about the Rust side's Host is held by section 8b of
  * maintainers/ix/rust-nix-eval-gate.sh, which reads a file under each setting
  * and requires a named refusal, rather than by this comment. When ENG-12480
- * routes those five questions through the accessor too, that section is what
+ * routes those seven questions through the accessor too, that section is what
  * should fail and the last Refuse row in purity.rs goes away with it. */
 void ixe_set_pure_eval(int on);
 void ixe_set_restrict_eval(int on);
@@ -786,6 +953,28 @@ void ixe_set_abort_on_warn(int on);
  * is the feature-is-disabled error (primops.cc:1632), and with it on the
  * same derivation is a floating-CA `.drv`. Also in the memo key. */
 void ixe_set_ca_derivations(int on);
+
+/* Whether cppnix's `blake3-hashes` experimental feature is enabled.
+
+ * Value-deciding wherever a hash algorithm is parsed: with it off Blake3 is
+ * the feature-is-disabled error, and with it on the same expression computes
+ * a 32-byte digest (libutil/hash.cc:25-29,468-473). Also in the memo key. */
+void ixe_set_blake3_hashes(int on);
+
+/* Whether `allow-import-from-derivation` is on. In the memo key: a witness
+ * recorded with it on holds realisations the verifier serves by validity
+ * without reaching `realiseContextCheck`, which refuses them with it off. */
+void ixe_set_allow_import_from_derivation(int on);
+
+/* `allowed-uris`, one entry per newline-terminated line. In the memo key: a
+ * fetch served by validity never reaches `checkURI`, so a witness recorded
+ * under a wider list must not hit under a narrower one. */
+void ixe_set_allowed_uris(const unsigned char * uris, size_t uris_len);
+
+/* Whether the evaluation runs under `--repair`. Nothing is served from the
+ * memo under repair: repair means redo, and a served answer would skip the
+ * rewrites `writeDerivation(repair)` performs on valid derivations. */
+void ixe_set_repair(int on);
 
 /* cppnix's three parser lints, as levels: 0 ignore, 1 warn, 2 fatal.
  *
@@ -815,26 +1004,17 @@ void ixe_set_pipe_operators(int on);
  * prim_fromTOML). Also in the memo key. */
 void ixe_set_parse_toml_timestamps(int on);
 
-/* The names cppnix's own `builtins` attrset has, space separated, taken from
- * EvalState::getBuiltins().
- *
- * The answer rather than the inputs. cppnix decides which primops to register
- * from an experimental feature (primops.cc:5606), a plain setting
- * (primops.cc:5537), an .internal flag (eval.cc:608) and a meson option that
- * decides whether the source file is compiled at all
- * (src/libexpr/primops/meson.build:14), and a table on the Rust side that
- * re-derived those rules would be a mirror that cannot see the last one.
- *
- * Without this the Rust backend advertised eight names cppnix hides and then
- * refused on force, so `builtins ? fetchClosure` -- the standard capability
- * test -- answered true and steered the evaluation into the one branch that
- * cannot work. ENG-12717.
- *
- * Only the names cppnix gates are read from this list, so a short list cannot
- * delete an ordinary builtin. Set-once per process: returns IXE_ERR_BADCALL
- * and fills ixe_take_setting_conflict when given a different set. Order and
- * repeats do not make a different set. */
-int ixe_set_cpp_builtin_names(const unsigned char * v, size_t v_len);
+/* Explicit language capabilities. Flakes also enables fetchTree. Unknown bits
+ * return IXE_ERR_BADCALL without changing settings. Captured in every memo key. */
+#define IXE_BUILTIN_FLAKES 1u
+#define IXE_BUILTIN_FETCH_TREE 2u
+#define IXE_BUILTIN_WASM 4u
+int ixe_set_builtin_features(unsigned int flags);
+
+/* Owned language documentation JSON, independent of any store/session. Both
+ * output slots must be distinct and non-null; free non-null strings with
+ * ixe_string_free. On success *error is null. */
+int ixe_language_docs(char ** out, char ** error);
 
 /* The stable name for why the last call refused, or NULL when the last
  * failure was not a refusal (IXE_ERR_UNIMPLEMENTED).
@@ -864,14 +1044,6 @@ const char * ixe_session_refusal_token(IxeSession * session);
  * that claimed otherwise (ENG-12541). */
 char * ixe_take_setting_conflict(void);
 
-/* Register a file by content, for a path the evaluator cannot read off the
- * filesystem. cppnix resolves <nix/fetchurl.nix> into an in-memory accessor;
- * this evaluator reads real paths, so the embedder hands over the bytes and
- * answers the lookup with the path cppnix itself reports, which keeps
- * `builtins.toString <nix/fetchurl.nix>` identical on both arms. ENG-12607. */
-int ixe_add_virtual_file(
-    const unsigned char * path, size_t path_len, const unsigned char * contents, size_t contents_len);
-
 /* The refusal-token vocabulary, so a caller can build a histogram with a
  * denominator instead of one that only has rows for what it happened to see.
  * A kind with no row reads as "never happened" rather than as "not counted",
@@ -899,6 +1071,12 @@ int ixe_refusal_token_raised_by(size_t index);
 /* What builtins.nixVersion reports. Passed in rather than compiled into the
  * Rust crate so there is only one copy of the version number. */
 int ixe_set_nix_version(const unsigned char * v, size_t v_len);
+
+/* Immutable host artifact identity, including the host implementation and its
+ * dependencies. Required for persistent caching with external host callbacks.
+ * Must be nonempty UTF-8. Identical repeats are accepted; a conflicting value
+ * fails and reports its diagnostic through ixe_take_setting_conflict. */
+int ixe_set_host_build_identity(const unsigned char * identity, size_t identity_len);
 
 /* What builtins.currentSystem reports, from settings.thisSystem. Passed in
  * because --system and nix.conf both move it, so a value derived from this
@@ -945,6 +1123,13 @@ typedef uint64_t IxeHandle;
 
 /* Statuses beyond the six above: */
 #define IXE_ERR_MISSING 7 /* no such attribute, or index past the end */
+#define IXE_ERR_IFD 8     /* import from derivation disabled (IFDError) */
+/* a top-level auto-call met a formal with neither a default nor an
+ * argument (MissingArgumentError) */
+#define IXE_ERR_MISSING_ARGUMENT 9
+/* all selection candidates are missing (AttrPathNotFound); unlike the
+ * optional field/index sentinel, carries a complete diagnostic */
+#define IXE_ERR_ATTR_PATH_NOT_FOUND 10
 
 /* ixe_value_type results. Negative values are not Nix types; they say the
  * question could not be answered. */
@@ -980,6 +1165,13 @@ typedef uint64_t IxeHandle;
  * --no-location turns the source positions off. The document already ends
  * in a newline; print it without appending one. */
 #define IXE_RENDER_XML 4
+/* nix-instantiate --eval without --strict: the value in weak head normal
+ * form, served only when it has no children (a string, a number, a Boolean,
+ * null, a path), for which lazy and strict printing are one answer; a value
+ * with children is refused with the `lazy-print` token, because which
+ * children cppnix prints as <CODE> is evaluator-internal. Its own mode so
+ * that a row rendered strictly is never served to a lazy request. */
+#define IXE_RENDER_PLAIN_LAZY 5
 
 /* Create a session that answers through `host`.
  *
@@ -988,11 +1180,26 @@ typedef uint64_t IxeHandle;
  * included, must outlive the session.
  *
  * Returns NULL when `host` is NULL, and when it is malformed, which today
- * means a partial set of the five path reads; ixe_take_setting_conflict then
+ * means a partial set of the seven path reads; ixe_take_setting_conflict then
  * carries the reason. A session with no host is not a useful object, and
  * accepting one would put the "which embedder answers this" question back
  * where it was. */
 IxeSession * ixe_session_new(const IxeHostVtable * host);
+
+/* Explicit bounded decoded-witness owner. Budgets are accounted payload bytes
+ * and entries; zero disables retention. Cache and sessions stay on one thread.
+ * No VM values or host contexts are retained. */
+IxeEvalCache * ixe_eval_cache_new(uint64_t max_bytes, size_t max_entries);
+/* Attached sessions hold their own reference; NULL is accepted. */
+void ixe_eval_cache_free(IxeEvalCache * cache);
+/* Non-null pointers must be valid; NULL cache or output returns BADCALL. */
+int ixe_eval_cache_stats(const IxeEvalCache * cache, IxeEvalCacheStats * output);
+/* Attach to an idle session, or detach with NULL. Retains shared ownership. */
+int ixe_session_set_eval_cache(IxeSession * session, const IxeEvalCache * cache);
+
+/* Root for file-backed questions: empty for ambient, otherwise a canonical
+ * mounted store path. Refused while a question is in flight. */
+int ixe_session_set_source_root(IxeSession * session, const unsigned char * root, size_t root_len);
 void ixe_session_free(IxeSession * session);
 
 /* The message belonging to this session's most recent non-zero status, or
@@ -1070,8 +1277,25 @@ int ixe_session_eval(
  * Only successful answers are memoised; see ixe_session_question_answer.
  *
  * *out_answer is owned by the caller and freed with ixe_string_free. */
-#define IXE_QUESTION_SELECT 0     /* walk attr_paths, then render */
-#define IXE_QUESTION_DERIVATION 1 /* walk attr_paths, then read a derivation */
+#define IXE_QUESTION_SELECT 0          /* walk attr_paths, then render */
+#define IXE_QUESTION_DERIVATION 1      /* walk attr_paths, then read a derivation */
+#define IXE_QUESTION_APP 2             /* walk attr_paths, then read an application */
+#define IXE_QUESTION_FLAKE_SHOW 3      /* lazily describe a flake output tree */
+#define IXE_QUESTION_DERIVATION_PATH 4 /* read only a derivation path */
+/* walk EVERY attr path (a list to visit, not a ladder) and report every
+ * derivation cppnix's getDerivations reaches from each: nix-build */
+#define IXE_QUESTION_DERIVATION_SET 5
+/* read the source as a flake.nix: the root must be a set literal (the
+ * question fails before evaluating otherwise, as evalFile(mustBeTrivial)
+ * does), and the answer is ixe_flake_document's JSON. Pass one empty attr
+ * path; there is nothing to select. */
+#define IXE_QUESTION_FLAKE_DOCUMENT 6
+/* select a package, then strictly read its meta.position */
+#define IXE_QUESTION_SOURCE_POSITION 7
+/* unfiltered package metadata; render=0 selects a candidate, render=1 unions existing roots */
+#define IXE_QUESTION_SEARCH_PACKAGES 8
+/* strict flake output validation; render carries the checked scope options */
+#define IXE_QUESTION_FLAKE_CHECK 9
 
 #define IXE_SERVE_EVALUATE 0
 #define IXE_SERVE_ANSWER 1
@@ -1108,6 +1332,20 @@ typedef struct
     IxeBytes text;
 } IxeArgument;
 
+#define IXE_AUTO_ARG_EXPR 0   /* --arg: an expression, parsed under the working directory */
+#define IXE_AUTO_ARG_STRING 1 /* --argstr: the bytes, as a string without context */
+
+/* One --arg/--argstr: cppnix's autoArgs entry. What a function met on the
+ * walk is applied to (findAlongAttrPath auto-calls before every component,
+ * getDerivations at every level, nix-instantiate --eval once more at the
+ * end), so the list is in the memo key whole. */
+typedef struct
+{
+    IxeBytes name;
+    int kind; /* IXE_AUTO_ARG_* */
+    IxeBytes text;
+} IxeAutoArg;
+
 int ixe_session_eval_question(
     IxeSession * session,
     const unsigned char * src,
@@ -1139,7 +1377,25 @@ int ixe_session_eval_question(
      * findAlongAttrPath) rather than naming an attribute (a flake's
      * AttrCursor::findAlongAttrPath). Also in the key. */
     int index_lists,
-    int render, /* IXE_RENDER_*; ignored for IXE_QUESTION_DERIVATION */
+    /* `nix eval --apply`: an expression applied to the selected value before
+     * the answer, or NULL/0 for none. In the key, together with the working
+     * directory it is parsed under (cppnix's rootPath(".")). The embedder
+     * applies it with ixe_question_apply below, which is the one application
+     * allowed while the question is in flight, because it is the one the key
+     * names. */
+    const unsigned char * apply,
+    size_t apply_len,
+    /* --arg/--argstr, or NULL/0 for none. In the key. A --arg is parsed now
+     * (a parse failure fails the call before anything can be served) and
+     * evaluated when a formal first reads it. The embedder applies them
+     * with ixe_auto_call below, wherever cppnix auto-calls. */
+    const IxeAutoArg * auto_args,
+    size_t auto_args_len,
+    /* whether the selected value is auto-called once more at the end, as
+     * nix-instantiate --eval does when it has arguments and nix eval never
+     * does. In the key. The embedder makes the call; this only names it. */
+    int auto_call,
+    int render, /* IXE_RENDER_*, or IXE_QUESTION_FLAKE_SHOW option bits */
     int * out_mode,
     IxeHandle * out_root,
     char ** out_answer);
@@ -1159,6 +1415,14 @@ int ixe_session_eval_question(
  * so a caller that was served and one that was not can call it on the same
  * line, and neither branch can forget it. */
 int ixe_session_question_answer(IxeSession * session, int status, const unsigned char * answer, size_t answer_len);
+
+/* The embedder could not use the answer the last ixe_session_eval_question
+ * served (it did not decode as the shape the question promised). Forgets that
+ * memo row and its witness, on disk too, so asking the question again
+ * evaluates and no later process is served it either. `why` is reported
+ * through the session's warnings. Fails when nothing was served or the store
+ * refused the removal. */
+int ixe_session_question_reject(IxeSession * session, const unsigned char * why, size_t why_len);
 
 /* Force a handle to weak head normal form. Idempotent: the cell memoises, so
  * a repeat is free and a failed force raises the same error rather than
@@ -1215,6 +1479,10 @@ int ixe_get_bool(IxeSession * session, IxeHandle handle, int * out);
  * looks complete and has lost the dependency. Letting context cross is
  * ENG-12492. */
 int ixe_get_string(IxeSession * session, IxeHandle handle, char ** out);
+/* Return a string's context as NUL-terminated NixStringContextElem spellings.
+ * An empty context yields NULL/0. The buffer is owned by the caller and is
+ * released with ixe_names_free. */
+int ixe_get_string_context(IxeSession * session, IxeHandle handle, char ** out, size_t * out_len);
 
 /* Render a value to the bytes a command prints. Forces deeply, which is what
  * each of these output modes does in cppnix too, so a throw in the selected
@@ -1255,6 +1523,47 @@ int ixe_alloc_json(IxeSession * session, const unsigned char * json, size_t json
  * builtins.<name>, and a second spelling here would differ in whether the
  * gate applies. */
 int ixe_internal_primop(IxeSession * session, const unsigned char * name, size_t name_len, IxeHandle * out);
+
+/* Apply the question's `apply` expression (see ixe_session_eval_question) to
+ * a value, lazily, the way ixe_apply does. Allowed while the question is in
+ * flight -- the expression and its directory are in the question's key, so
+ * the row filed for the question is filed for this application too -- and a
+ * bad call with no such expression in flight. */
+int ixe_question_apply(IxeSession * session, IxeHandle arg, IxeHandle * out);
+
+/* cppnix's autoCallFunction on `value`, under the --arg/--argstr of the
+ * question in flight: a set with __functor is applied to itself and the
+ * result treated the same way; a lambda with formals is applied to the set
+ * its formals select from the arguments (everything under an ellipsis,
+ * otherwise each formal's own or its default; neither is
+ * IXE_ERR_MISSING_ARGUMENT); anything else comes back as it was. Lazy like
+ * ixe_apply: force the result where cppnix forces. Refused outside a
+ * question (IXE_ERR_BADCALL): the arguments are in that question's key. */
+int ixe_auto_call(IxeSession * session, IxeHandle value, IxeHandle * out);
+
+/* cppnix's getDerivations from `root` (get-drvs.cc: auto-called at every
+ * level, attributes in name order and only path components, a set entered
+ * under recurseForDerivations = true or a parent's _combineChannels, every
+ * list element, each derivation once by identity, name forced), under the
+ * question in flight. *out is the records found, two netstrings per record
+ * -- `<len>:<drvPath>,<len>:<outputName>,` -- so no byte in a name can
+ * spell a record boundary; records concatenate across calls. Free with
+ * ixe_string_free. */
+int ixe_derivation_set(IxeSession * session, IxeHandle root, char ** out);
+
+/* Evaluate and normalize a FlakeDocument question. The JSON has
+ * description (null or string), inputs, self_attrs, and config. Each input
+ * has reference (null or tagged url/attrs/implicit), is_flake, follows
+ * (null or parsed path components), and overrides. Fetch/configuration
+ * leaves are tagged values; path values retain their mounted root.
+ *
+ * Rust owns validation, reference conflicts, follows syntax, self rules,
+ * configuration types and implicit inputs from output formals. Computed
+ * metadata is forced through the same read-tracked memo as evaluation;
+ * the outputs function is validated but never invoked. The host only
+ * translates normalized declarations into fetch/store operations.
+ * Free the returned bytes with ixe_string_free. */
+int ixe_flake_document(IxeSession * session, IxeHandle root, char ** out);
 
 /* Apply a function to one argument. cppnix's callFunction, minus the forcing:
  * the function is forced (cppnix answers "is this a function" at the call),

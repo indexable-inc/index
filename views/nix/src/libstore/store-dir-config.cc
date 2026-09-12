@@ -109,6 +109,13 @@ StorePath StoreDirConfig::makeFixedOutputPath(std::string_view name, const Fixed
             "Git file ingestion must use SHA-1 or SHA-256 hash, but instead using: %s", printHashAlgo(info.hash.algo));
     }
 
+    /* A jj tree id is BLAKE3; any other algorithm is not such an id, and a
+       path made from it would name an object no jj store can serve. */
+    if (info.method == FileIngestionMethod::JjTree && info.hash.algo != HashAlgorithm::BLAKE3) {
+        throw Error(
+            "Jujutsu tree ingestion must use a BLAKE3 tree id, but instead using: %s", printHashAlgo(info.hash.algo));
+    }
+
     /* The `source` scheme is the only one that can name references (including
        a self-reference), because `makeType` folds them into the digest input.
        It is available to any hash algorithm whose NAR digest is unambiguous in

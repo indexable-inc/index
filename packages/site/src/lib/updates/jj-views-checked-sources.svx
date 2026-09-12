@@ -3,15 +3,15 @@ id: jj-views-checked-sources
 postedAt: 2026-08-04T11:05:44Z
 title: "ix now stores patched sources as jj views"
 links:
-  - label: View manifest
-    href: https://github.com/indexable-inc/ix/blob/main/.jj-views.toml
-  - label: jj view commands
-    href: https://github.com/indexable-inc/jj/commits/main/
+  - label: Current mechanism (jj view, views.toml)
+    href: https://github.com/indexable-inc/ix/blob/main/docs/jj-view.md
 tags:
   - infrastructure
   - nix
   - jj
 ---
+
+_Historical (2026-08-04): the `.jj-views.toml` manifest and the `jj views` command group described below were replaced on 2026-08-30 by `jj view` and the root `views.toml`, which track each subtree by blake3 tree identity (docs/jj-view.md)._
 
 ix now keeps 39 patched and vendored source trees as checked jj views. Nix reads each tree from its repository path, so evaluation needs no source flake URL or patch application step.
 

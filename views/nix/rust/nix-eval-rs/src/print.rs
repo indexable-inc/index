@@ -26,21 +26,45 @@ enum Item {
     Lit(Vec<u8>),
 }
 
-/// The next values the printer will force, skipping the queued literals: the
-/// top of the worklist stack is the next thing emitted, so the `Slot`s read
-/// from the top downward are the pending values in print order. What the
-/// walk publishes as its fan-out offer before each force; capped at
-/// [`crate::vm::FANOUT_WIDTH`] so republishing at every force stays O(1)
-/// over a large worklist. Mirrors `deepwalk::pending_children`.
-fn pending_values(work: &[Item]) -> Vec<Slot> {
-    work.iter()
-        .rev()
-        .filter_map(|item| match item {
-            Item::Slot(slot) => Some(slot.clone()),
-            Item::Lit(_) => None,
-        })
-        .take(crate::vm::FANOUT_WIDTH)
-        .collect()
+/// A token stack and its pending values in the same push/pop order.
+///
+/// Literals can greatly outnumber values: a deeply nested singleton list leaves
+/// one closing literal per level. Searching that token stack for the next few
+/// values at every force makes printing quadratic in nesting depth. Keeping the
+/// value stack alongside it bounds each fan-out offer by `FANOUT_WIDTH`, even
+/// when no values remain behind a long run of literals.
+#[derive(Default)]
+struct Worklist {
+    items: Vec<Item>,
+    values: Vec<Slot>,
+}
+
+impl Worklist {
+    fn push(&mut self, item: Item) {
+        if let Item::Slot(slot) = &item {
+            self.values.push(slot.clone());
+        }
+        self.items.push(item);
+    }
+
+    fn pop(&mut self) -> Option<Item> {
+        let item = self.items.pop()?;
+        if let Item::Slot(slot) = &item {
+            let pending = self.values.pop();
+            debug_assert_eq!(pending.as_ref().map(Slot::id), Some(slot.id()));
+        }
+        Some(item)
+    }
+
+    /// The next values in print order, without inspecting queued literals.
+    fn pending_values(&self) -> Vec<Slot> {
+        self.values
+            .iter()
+            .rev()
+            .take(crate::vm::FANOUT_WIDTH)
+            .cloned()
+            .collect()
+    }
 }
 
 /// The same, for the coercion, plus whether this position owes a separator
@@ -147,7 +171,7 @@ enum Await {
 }
 
 pub struct Print {
-    work: Vec<Item>,
+    work: Worklist,
     /// Bytes, because a printed Nix string is written verbatim: cppnix's
     /// `printLiteralString` copies every byte it does not escape, UTF-8 or
     /// not, and `nix-instantiate --eval` output owes the corpus those bytes.
@@ -186,12 +210,14 @@ impl Print {
     }
 
     fn with_dialect(v: Value, value_printer: bool) -> Self {
+        let mut work = Worklist::default();
+        work.push(Item::Slot(Slot::value(v)));
         Print {
             // A fresh cell, which is what cppnix prints from too: it hands the
             // printer a stack `Value` copied off the binding, so a list
             // reached again through the binding's own cell is a second
             // sighting rather than the first.
-            work: vec![Item::Slot(Slot::value(v))],
+            work,
             out: Vec::new(),
             awaiting: Await::Idle,
             seen: Seen::new(),
@@ -249,7 +275,7 @@ impl Print {
                     if self.saved_offer.is_none() {
                         self.saved_offer = Some(vm.save_fanout_offer());
                     }
-                    vm.set_fanout_offer(pending_values(&self.work));
+                    vm.set_fanout_offer(self.work.pending_values());
                     return Ok(Yield::Force(s));
                 }
             }
@@ -717,7 +743,7 @@ impl Coerce {
             // ordinary incoming value and needs no state of its own.
             Value::Path(p) if self.copy_to_store => {
                 return Ok(Some(Yield::Need(crate::task::NeedPath::StorePath(
-                    p.to_string(),
+                    Rc::clone(p),
                 ))));
             }
             other => {
@@ -801,7 +827,7 @@ fn print_string(s: &[u8], out: &mut Vec<u8>) {
 }
 
 /// Attr names print bare when they are valid identifiers, quoted otherwise.
-fn print_attr_name(name: &str, out: &mut Vec<u8>) {
+pub(crate) fn print_attr_name(name: &str, out: &mut Vec<u8>) {
     let ident = !name.is_empty()
         && name
             .chars()
@@ -830,6 +856,65 @@ mod tests {
     use crate::value2::Value;
     use crate::vm::Vm;
 
+    #[test]
+    fn fanout_offer_preserves_order_across_literals_and_nested_pushes() {
+        use super::{Item, Worklist};
+        use crate::value2::Slot;
+
+        let mut work = Worklist::default();
+        for _ in 0..(crate::vm::FANOUT_WIDTH + 3) {
+            work.push(Item::Slot(Slot::value(Value::Null)));
+            work.push(Item::Lit(b" ]".to_vec()));
+        }
+        // A nested container queues its children above the existing siblings.
+        work.push(Item::Slot(Slot::value(Value::Int(100))));
+        work.push(Item::Lit(b" ".to_vec()));
+        while !work.items.is_empty() {
+            let original = work
+                .items
+                .iter()
+                .rev()
+                .filter_map(|item| match item {
+                    Item::Slot(slot) => Some(slot.id()),
+                    Item::Lit(_) => None,
+                })
+                .take(crate::vm::FANOUT_WIDTH)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                work.pending_values()
+                    .iter()
+                    .map(Slot::id)
+                    .collect::<Vec<_>>(),
+                original
+            );
+            let _ = work.pop();
+        }
+        assert!(work.pending_values().is_empty());
+    }
+
+    #[test]
+    fn literal_depth_does_not_hide_pending_siblings() {
+        use super::{Item, Worklist};
+        use crate::value2::Slot;
+
+        let sibling = Slot::value(Value::Int(7));
+        let mut work = Worklist::default();
+        work.push(Item::Slot(sibling.clone()));
+        for _ in 0..100_000 {
+            work.push(Item::Lit(b" ]".to_vec()));
+        }
+        assert_eq!(
+            work.pending_values()
+                .iter()
+                .map(Slot::id)
+                .collect::<Vec<_>>(),
+            vec![sibling.id()]
+        );
+        assert_eq!(work.values.len(), 1);
+        while work.pop().is_some() {}
+        assert!(work.pending_values().is_empty());
+    }
+
     /// One expression through both plain printers: the dialect
     /// `nix-instantiate --eval --strict` uses and the one `nix eval` uses.
     /// Both are pinned because both hung on a self-referential value -- the
@@ -844,6 +929,28 @@ mod tests {
             print_with(src, RenderMode::Plain),
             print_with(src, RenderMode::ValuePrinter),
         )
+    }
+
+    /// `nix-instantiate --eval` without `--strict`: a value with no children
+    /// prints as it does strictly, a value with children is refused by name
+    /// rather than printed with `<CODE>` markers this side cannot place
+    /// where cppnix does.
+    #[test]
+    fn lazy_plain_printing_serves_scalars_and_refuses_the_rest() {
+        assert_eq!(print_with("1 + 1", RenderMode::PlainLazy), "2");
+        assert_eq!(print_with(r#""s""#, RenderMode::PlainLazy), r#""s""#);
+        assert_eq!(print_with("true", RenderMode::PlainLazy), "true");
+        assert_eq!(print_with("null", RenderMode::PlainLazy), "null");
+        let list = print_with("[ (1 + 1) ]", RenderMode::PlainLazy);
+        assert!(
+            list.contains("lazy top-level printing of a list"),
+            "a list is refused by name, not printed: {list}"
+        );
+        let set = print_with("{ a = 1; }", RenderMode::PlainLazy);
+        assert!(
+            set.contains("lazy top-level printing of a set"),
+            "a set is refused by name, not printed: {set}"
+        );
     }
 
     fn print_with(src: &str, mode: RenderMode) -> String {

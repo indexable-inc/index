@@ -258,6 +258,12 @@ public:
      * Implementations of abstract store API methods.
      */
 
+    // Availability is live owner state, independent of cached registration metadata.
+    bool isValidPath(const StorePath & path) override
+    {
+        return isValidPathUncached(path);
+    }
+
     bool isValidPathUncached(const StorePath & path) override;
 
     StorePathSet queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute = NoSubstitute) override;

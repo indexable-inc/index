@@ -288,10 +288,10 @@ This operator is [strict](@docroot@/language/evaluation.md#strictness) in *bool1
 > **Example**
 >
 > ```
-> nix-repl> 1 |> builtins.add 2 |> builtins.mul 3
+> $ nix eval --extra-experimental-features pipe-operators --expr '1 |> builtins.add 2 |> builtins.mul 3'
 > 9
 >
-> nix-repl> builtins.add 1 <| builtins.mul 2 <| 3
+> $ nix eval --extra-experimental-features pipe-operators --expr 'builtins.add 1 <| builtins.mul 2 <| 3'
 > 7
 > ```
 

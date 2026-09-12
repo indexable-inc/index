@@ -13,15 +13,22 @@
   # the daemon version.
   id = "nix-ix";
   packageSet = true;
-  flake = true;
+  # Not a flake output, not a tested package, not a cross entry: index can
+  # no longer BUILD nix-ix. The fork's libfetchers links `libjj_tree.a`
+  # (crate `jj-tree-abi`), which lives in the ix repository outside this
+  # flake's source root, so default.nix takes it as an argument that throws
+  # when forced. Every one of the three flags below forces it: a flake
+  # output is evaluated by `nix flake check` and the flake-schema gate, a
+  # passthru test set is collected into `checks`, and a cross entry is a
+  # second flake output. Leaving any of them on turns index's own CI red
+  # for a package index cannot complete. The recipe stays in the registry
+  # package set (`packageSetFor`), which is how ix reaches it:
+  # `(indexLib.packageSetFor pkgs).nix-ix.override { jjTree = ...; }`
+  # (ix: nix/flake/outputs/workspace.nix). Tests and the Darwin cross build
+  # (RFC 0009, #3585) go with the override, so they are ix's to expose.
+  flake = false;
   overlay = false;
-  passthruTests = true;
+  passthruTests = false;
   updateScript = true;
-  # RFC 0009 cross lane (#3585): on a Linux build host, also expose nix-ix
-  # cross-compiled to Darwin (default target aarch64-apple-darwin) so the
-  # darwin cache lane substitutes the fork daemon instead of cold-building
-  # the modular C++ closure on a Mac. default.nix reads the `ix.cross`
-  # signal and swaps the component scope to the nixpkgs Linux -> Darwin
-  # cross scope (lib/darwin/nixpkgs-cross.nix).
-  cross = true;
+  cross = false;
 }

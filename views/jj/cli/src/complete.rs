@@ -307,25 +307,6 @@ pub fn aliases() -> Vec<CompletionCandidate> {
     })
 }
 
-/// The keys of the `views` config table, described by the prefix each
-/// publishes.
-pub fn views() -> Vec<CompletionCandidate> {
-    with_jj(|_, settings| {
-        Ok(settings
-            .table_keys("views")
-            .sorted()
-            .map(|name| {
-                CompletionCandidate::new(name).help(
-                    settings
-                        .get_string(["views", name, "path"])
-                        .ok()
-                        .map(|path| path.into()),
-                )
-            })
-            .collect())
-    })
-}
-
 fn revisions(match_prefix: &str, revset_filter: Option<&str>) -> Vec<CompletionCandidate> {
     with_jj(|jj, settings| {
         // display order

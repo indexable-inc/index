@@ -1,3 +1,4 @@
+use codex_core::TurnInputRequest;
 use core_test_support::test_codex::local_selections;
 use std::path::Path;
 use std::sync::Arc;
@@ -9,10 +10,14 @@ use chrono::Utc;
 use codex_login::CodexAuth;
 use codex_models_manager::client_version_to_whole;
 use codex_models_manager::manager::RefreshStrategy;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelMessages;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -20,7 +25,7 @@ use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::openai_models::TruncationPolicyConfig;
 use codex_protocol::openai_models::default_input_modalities;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
@@ -34,6 +39,7 @@ use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::json;
 use wiremock::MockServer;
 
 const ETAG: &str = "\"models-etag-ttl\"";
@@ -96,30 +102,27 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
         turn_permission_fields(PermissionProfile::Disabled, test.cwd_path());
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "hi".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
                 environments: Some(local_selections(test.config.cwd.clone())),
                 approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                    mode: codex_protocol::config_types::ModeKind::Default,
-                    settings: codex_protocol::config_types::Settings {
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
                         model: test.session_configured.model.clone(),
                         reasoning_effort: None,
                         developer_instructions: None,
                     },
                 }),
                 ..Default::default()
-            },
-        })
+            }),
+        )
         .await?;
 
     let _ = wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
@@ -154,9 +157,129 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn matching_models_etag_does_not_rewrite_recent_cache() -> Result<()> {
+    let server = MockServer::start().await;
+    let models_mock = responses::mount_models_once_with_etag(
+        &server,
+        ModelsResponse {
+            models: vec![test_remote_model(REMOTE_MODEL, /*priority*/ 1)],
+        },
+        ETAG,
+    )
+    .await;
+
+    let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    builder = builder.with_config(|config| {
+        config.model = Some("gpt-5.2".to_string());
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(1);
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let models_manager = test.thread_manager.get_models_manager();
+    let _ = models_manager
+        .list_models(
+            RefreshStrategy::OnlineIfUncached,
+            codex_core::test_support::default_http_client_factory(),
+        )
+        .await;
+
+    let cache_path = test.config.codex_home.join(CACHE_FILE);
+    rewrite_cache_timestamp(&cache_path, Utc::now() - chrono::Duration::seconds(60)).await?;
+    let original_contents = tokio::fs::read(&cache_path).await?;
+    let original_modified = tokio::fs::metadata(&cache_path).await?.modified()?;
+
+    let response_body = sse(vec![
+        ev_response_created("resp-1"),
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-1"),
+    ]);
+    let _responses_mock = responses::mount_response_once(
+        &server,
+        sse_response(response_body).insert_header("X-Models-Etag", ETAG),
+    )
+    .await;
+
+    test.submit_turn("hi").await?;
+
+    assert_eq!(tokio::fs::read(&cache_path).await?, original_contents);
+    assert_eq!(
+        tokio::fs::metadata(&cache_path).await?.modified()?,
+        original_modified
+    );
+    assert_eq!(
+        models_mock.requests().len(),
+        1,
+        "/models should not refetch on matching etag"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn matching_models_etag_renews_cache_after_half_its_lifetime() -> Result<()> {
+    let server = MockServer::start().await;
+    let models_mock = responses::mount_models_once_with_etag(
+        &server,
+        ModelsResponse {
+            models: vec![test_remote_model(REMOTE_MODEL, /*priority*/ 1)],
+        },
+        ETAG,
+    )
+    .await;
+
+    let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    builder = builder.with_config(|config| {
+        config.model = Some("gpt-5.2".to_string());
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(1);
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let models_manager = test.thread_manager.get_models_manager();
+    let _ = models_manager
+        .list_models(
+            RefreshStrategy::OnlineIfUncached,
+            codex_core::test_support::default_http_client_factory(),
+        )
+        .await;
+
+    let cache_path = test.config.codex_home.join(CACHE_FILE);
+    let fetched_at = Utc::now() - chrono::Duration::seconds(180);
+    rewrite_cache_timestamp(&cache_path, fetched_at).await?;
+
+    let response_body = sse(vec![
+        ev_response_created("resp-1"),
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-1"),
+    ]);
+    let _responses_mock = responses::mount_response_once(
+        &server,
+        sse_response(response_body).insert_header("X-Models-Etag", ETAG),
+    )
+    .await;
+
+    test.submit_turn("hi").await?;
+
+    assert!(read_cache(&cache_path).await?.fetched_at > fetched_at);
+    assert_eq!(
+        models_mock.requests().len(),
+        1,
+        "/models should not refetch on matching etag"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uses_cache_when_version_matches() -> Result<()> {
     let server = MockServer::start().await;
     let cached_model = test_remote_model(VERSIONED_MODEL, /*priority*/ 1);
+    let response = responses::mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
     let models_mock = responses::mount_models_once(
         &server,
         ModelsResponse {
@@ -168,20 +291,30 @@ async fn uses_cache_when_version_matches() -> Result<()> {
     let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     builder = builder
         .with_pre_build_hook(move |home| {
-            let cache = ModelsCache {
+            let mut cache = serde_json::to_value(ModelsCache {
                 fetched_at: Utc::now(),
                 etag: None,
                 client_version: Some(client_version_to_whole()),
                 models: vec![cached_model],
-            };
-            let cache_path = home.join(CACHE_FILE);
-            write_cache_sync(&cache_path, &cache).expect("write cache");
+            })
+            .expect("serialize cache");
+            let cached_model = cache["models"][0]
+                .as_object_mut()
+                .expect("cached model should serialize as an object");
+            cached_model.remove("model_messages");
+            cached_model.insert("base_instructions".to_string(), json!("base instructions"));
+            std::fs::write(
+                home.join(CACHE_FILE),
+                serde_json::to_vec_pretty(&cache).expect("serialize legacy cache"),
+            )
+            .expect("write legacy cache");
         })
         .with_config(|config| {
+            config.model = Some(VERSIONED_MODEL.to_string());
             config.model_provider.request_max_retries = Some(0);
         });
 
-    let test = builder.build(&server).await?;
+    let test = builder.build_with_auto_env(&server).await?;
     let models_manager = test.thread_manager.get_models_manager();
     let models = models_manager
         .list_models(
@@ -198,6 +331,11 @@ async fn uses_cache_when_version_matches() -> Result<()> {
         models_mock.requests().len(),
         0,
         "/models should not be called when cache version matches"
+    );
+    test.submit_turn("use cached model").await?;
+    assert_eq!(
+        response.single_request().instructions_text(),
+        "base instructions"
     );
 
     Ok(())
@@ -357,7 +495,7 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
                 description: "medium".to_string(),
             },
         ],
-        shell_type: ConfigShellToolType::ShellCommand,
+        shell_type: ConfigShellToolType::UnifiedExec,
         visibility: ModelVisibility::List,
         supported_in_api: true,
         priority,
@@ -365,10 +503,24 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
         service_tiers: Vec::new(),
         default_service_tier: None,
         upgrade: None,
-        base_instructions: "base instructions".to_string(),
-        model_messages: None,
+        model_messages: Some(ModelMessages {
+            persistent_instructions: None,
+            tools: None,
+            instructions_template: Some("base instructions".to_string()),
+            instructions_variables: None,
+            approvals: None,
+            collaboration_modes: None,
+            auto_review: None,
+            permissions: None,
+            multi_agent: None,
+            token_budget: None,
+            confirmation_policies: None,
+            guardian_v2: None,
+        }),
         include_skills_usage_instructions: false,
-        supports_reasoning_summaries: false,
+        include_plugin_usage_instructions: false,
+        include_apps_usage_instructions: false,
+        supports_reasoning_summary_parameter: true,
         default_reasoning_summary: ReasoningSummary::Auto,
         support_verbosity: false,
         default_verbosity: None,
@@ -376,7 +528,6 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
-        supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
         max_context_window: None,
@@ -388,8 +539,12 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         use_responses_lite: false,
+        node_repl_auto_review_required: false,
+        node_repl_disabled: false,
         auto_review_model_override: None,
+        model_specialty: None,
         tool_mode: None,
         multi_agent_version: None,
+        multi_agent_reasoning_effort: None,
     }
 }

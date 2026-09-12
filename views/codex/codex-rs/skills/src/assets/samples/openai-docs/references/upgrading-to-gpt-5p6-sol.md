@@ -4,7 +4,7 @@ Use this guide when the user asks to migrate an existing OpenAI API integration,
 
 The default explicit target is `gpt-5.6-sol`. The alias `gpt-5.6` routes to Sol; use it only when the repository intentionally prefers family aliases. Do not treat every old model usage as a Sol candidate: GPT-5.6 is a family with different cost, latency, context, and quality roles.
 
-Before changing code, use the OpenAI Docs MCP to fetch the current live GPT-5.6 model guidance:
+Before changing code, retrieve the current live GPT-5.6 model guidance using already-callable official documentation search and fetch, or immediately use official-domain web search and fetch:
 
 https://developers.openai.com/api/docs/guides/model-guidance?model=gpt-5.6
 

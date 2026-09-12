@@ -20,7 +20,7 @@ shape: take the nixpkgs `btop` derivation and override only its source.
 - Flake output: `nix run .#btop` / `nix build .#btop`. `package.nix` sets
   `packageSet = true` and `flake = true` (`packages/btop/package.nix:1-5`); no
   overlay, so `pkgs.btop` stays the plain nixpkgs monitor.
-- Update: use `jj views anchor btop` from a jj workspace.
+- Update: `jj view refresh btop` from a jj workspace (docs/jj-view.md in ix).
 - Platforms: inherited from nixpkgs `btop` (unix); no extra `systems` gate.
 - Darwin consumers substitute a Linux cross build: `package.nix` sets
   `cross = true` (#3584), so the RFC 0009 lane compiles a Mach-O arm64 btop

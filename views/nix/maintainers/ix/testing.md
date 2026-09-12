@@ -12,7 +12,7 @@ removed in that commit were `.github/workflows/ci.yml`, `labels.yml` and
 On any dev node (`dc1` through `dc6`), in a checkout of the revision under test:
 
 ```console
-$ nix develop --command bash -c 'meson setup build --prefix="$out" --buildtype=debugoptimized && ninja -C build && meson test -C build --print-errorlogs'
+$ nix develop --command nix shell nixpkgs#cargo nixpkgs#rustc --command bash -c 'meson setup build --prefix="$out" --buildtype=debugoptimized && ninja -C build && meson test -C build --print-errorlogs'
 ```
 
 `configurePhase` and `buildPhase` from [HACKING.md](../../HACKING.md) are shell
@@ -22,26 +22,20 @@ and ninja directly, as above. Note `--prefix="$out"`, not `"$prefix"`: the dev
 shell exports `out` but not `prefix`, and an empty prefix silently puts the
 system `nix` on `$PATH` instead of the one you just built.
 
-**Run both build configurations.** The command above is the default one,
-`rust-eval` disabled; the Rust evaluator is a separate configuration and the
-two diverge at every `#if`:
+**The Rust evaluator always links in.** There is one build configuration:
+`src/libcmd/meson.build` builds `libnix_eval_rs.a` with cargo unless
+`-Dnix-cmd:rust-eval-prefix` hands in a prebuilt archive (which is what
+`index/packages/nix/default.nix` does, since the sandbox has no cargo). The
+dev shell has no cargo either (ENG-12458, ENG-12464), which is why the
+command above wraps meson in `nix shell nixpkgs#cargo nixpkgs#rustc`: without
+that layer `meson setup` fails on `find_program('cargo')`.
 
-```console
-$ nix develop --command nix shell nixpkgs#cargo nixpkgs#rustc --command bash -c 'meson setup build-rust --prefix="$out" --buildtype=debugoptimized -Dnix:rust-eval=enabled && ninja -C build-rust && meson test -C build-rust --print-errorlogs'
-```
-
-Note `-Dnix:rust-eval=enabled` and not `-Drust-eval=enabled`: `src/nix` is a
-meson subproject, so its options are namespaced and the unqualified spelling
-is rejected as an unknown option. The dev shell has no cargo (ENG-12458,
-ENG-12464), hence the `nix shell` layer.
-
-Both, every time, because a change that builds under one can fail to link
-under the other and neither configuration is built anywhere else. That is not
-hypothetical: `rust-eval` defaults to `disabled`, and the default build of
-`ix-patched` did not link for the whole of rung H, because the `#else` stub
-for `rustEvalSelect` took five parameters where its declaration takes six
-(ENG-12495). Every agent working on the Rust backend built with it enabled, so
-nobody ran the command at the top of this section.
+Note the `nix:` prefix on any `src/nix` option: it is a meson subproject, so
+its options are namespaced and the unqualified spelling is rejected as
+unknown. There used to be a second, no-rust-eval configuration whose `#else`
+stubs had to match every declaration by arity; it failed to link twice
+(ENG-12495; the 2026-09-04 memo lane) because nobody built it locally, and it
+was deleted rather than fenced.
 
 When the change touches the Rust evaluator's caches or any `ixe_set_*`
 setting, also run the cache-semantics gate. It differs along the setting

@@ -101,7 +101,7 @@ struct CmdCopySigs : StorePathsCommand
 
 static auto rCmdCopySigs = registerCommand2<CmdCopySigs>({"store", "copy-sigs"});
 
-struct CmdSign : StorePathsCommand
+struct CmdSign : BuiltPathsCommand
 {
     std::filesystem::path secretKeyFile;
 
@@ -120,11 +120,24 @@ struct CmdSign : StorePathsCommand
 
     std::string description() override
     {
-        return "sign store paths with a local key";
+        return "sign store paths and explicit derivation-output realisations with a local key";
     }
 
-    void run(ref<Store> store, StorePaths && storePaths) override
+    void run(ref<Store> store, BuiltPaths && paths, BuiltPaths && rootPaths) override
     {
+        StorePathSet storePaths;
+        RealisedPath::Set realisations;
+        for (auto & path : paths) {
+            auto outputs = path.outPaths();
+            storePaths.insert(outputs.begin(), outputs.end());
+        }
+        // Only explicit derivation-output arguments authorize signing mappings.
+        // Opaque paths (including recursively selected references) do not identify
+        // which build produced them.
+        for (auto & path : rootPaths) {
+            auto selected = path.toRealisedPaths(*store);
+            realisations.insert(selected.begin(), selected.end());
+        }
         SecretKey secretKey(readFile(secretKeyFile));
         LocalSigner signer(std::move(secretKey));
 
@@ -144,7 +157,18 @@ struct CmdSign : StorePathsCommand
             }
         }
 
-        printInfo("added %d signatures", added);
+        size_t realisationsAdded{0};
+        for (auto & path : realisations) {
+            if (auto original = std::get_if<Realisation>(&path.raw)) {
+                auto signedRealisation = *original;
+                signedRealisation.sign(signedRealisation.id, signer);
+                if (signedRealisation.signatures != original->signatures) {
+                    store->registerDrvOutput(signedRealisation, CheckSigs);
+                    realisationsAdded++;
+                }
+            }
+        }
+        printInfo("added %d path signatures and %d realisation signatures", added, realisationsAdded);
     }
 };
 

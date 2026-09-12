@@ -5,10 +5,7 @@
 //! display. It is the final rendering stage used by higher-level helpers in
 //! `markdown.rs`.
 //!
-//! This renderer intentionally treats local file links differently from normal web links. For
-//! local paths, the displayed text comes from the destination, not the markdown label, so
-//! transcripts show the real file target (including normalized location suffixes) and can shorten
-//! absolute paths relative to a known working directory.
+//! Local file-link parsing and display policy live in [`local_links`].
 //!
 //! ## Table rendering pipeline
 //!
@@ -49,11 +46,11 @@ use crate::terminal_hyperlinks::annotate_web_urls_in_line;
 use crate::terminal_hyperlinks::remap_wrapped_line;
 use crate::terminal_hyperlinks::visible_lines;
 use crate::terminal_hyperlinks::web_destination;
+use crate::width::char_width;
+use crate::width::display_width;
 use crate::wrapping::RtOptions;
 use crate::wrapping::adaptive_wrap_line;
 use crate::wrapping::word_wrap_line;
-use codex_utils_string::normalize_markdown_hash_location_suffix;
-use dirs::home_dir;
 use pulldown_cmark::Alignment;
 use pulldown_cmark::CodeBlockKind;
 use pulldown_cmark::CowStr;
@@ -64,20 +61,24 @@ use pulldown_cmark::Parser;
 use pulldown_cmark::Tag;
 use pulldown_cmark::TagEnd;
 use ratatui::style::Style;
-use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::text::Text;
-use regex_lite::Regex;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::LazyLock;
-use unicode_width::UnicodeWidthChar;
-use unicode_width::UnicodeWidthStr;
-use url::Url;
 
+mod local_links;
+mod streaming;
 mod table_key_value;
+mod web_links;
+
+use local_links::is_local_path_like_link;
+use local_links::render_local_link_target;
+use local_links::should_render_local_link_label;
+pub(crate) use streaming::StreamingMarkdownRender;
+pub(crate) use streaming::render_streaming_markdown_lines_with_width_and_cwd;
+pub(crate) use web_links::hide_web_link_destination;
 
 const TABLE_COLUMN_GAP: usize = 2;
 const TABLE_CELL_PADDING: usize = 1;
@@ -155,14 +156,6 @@ impl TableCell {
     fn ensure_line(&mut self) {
         if self.lines.is_empty() {
             self.lines.push(HyperlinkLine::new(Line::default()));
-        }
-    }
-
-    #[inline]
-    fn push_span(&mut self, span: Span<'static>) {
-        self.ensure_line();
-        if let Some(line) = self.lines.last_mut() {
-            line.line.push_span(span);
         }
     }
 
@@ -315,16 +308,36 @@ pub(crate) fn render_markdown_text_with_width_and_cwd(
     )))
 }
 
+/// Keep destinations visible by default, including for callers that discard hyperlink metadata.
+/// Semantic output paths supply their hidden-destination policy explicitly.
 pub(crate) fn render_markdown_lines_with_width_and_cwd(
     input: &str,
     width: Option<usize>,
     cwd: Option<&Path>,
 ) -> Vec<HyperlinkLine> {
+    render_markdown_lines_with_width_cwd_and_hidden_link_destinations(
+        input,
+        width,
+        cwd,
+        &never_hide_link_destination,
+    )
+}
+
+fn never_hide_link_destination(_: &str) -> bool {
+    false
+}
+
+pub(crate) fn render_markdown_lines_with_width_cwd_and_hidden_link_destinations(
+    input: &str,
+    width: Option<usize>,
+    cwd: Option<&Path>,
+    is_hidden_link_destination: &dyn Fn(&str) -> bool,
+) -> Vec<HyperlinkLine> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
     let parser = DecodedTextMerge::new(Parser::new_ext(input, options).into_offset_iter());
-    let mut w = Writer::new(input, parser, width, cwd);
+    let mut w = Writer::new(input, parser, width, cwd, is_hidden_link_destination);
     w.run();
     w.text
 }
@@ -333,31 +346,19 @@ pub(crate) fn render_markdown_lines_with_width_and_cwd(
 struct LinkState {
     destination: String,
     show_destination: bool,
+    style_label: bool,
+    has_visible_label: bool,
     /// Pre-rendered display text for local file links.
     ///
-    /// When this is present, the markdown label is intentionally suppressed so the rendered
-    /// transcript always reflects the real target path.
+    /// When this is present, label spans are buffered until the link closes so path-like labels
+    /// can collapse to this canonical target without losing descriptive labels.
     local_target_display: Option<String>,
+    local_label_spans: Vec<Span<'static>>,
 }
 
 fn should_render_link_destination(dest_url: &str) -> bool {
     !is_local_path_like_link(dest_url)
 }
-
-static COLON_LOCATION_SUFFIX_RE: LazyLock<Regex> =
-    LazyLock::new(
-        || match Regex::new(r":\d+(?::\d+)?(?:[-–]\d+(?::\d+)?)?$") {
-            Ok(regex) => regex,
-            Err(error) => panic!("invalid location suffix regex: {error}"),
-        },
-    );
-
-// Covered by load_location_suffix_regexes.
-static HASH_LOCATION_SUFFIX_RE: LazyLock<Regex> =
-    LazyLock::new(|| match Regex::new(r"^L\d+(?:C\d+)?(?:-L\d+(?:C\d+)?)?$") {
-        Ok(regex) => regex,
-        Err(error) => panic!("invalid hash location regex: {error}"),
-    });
 
 /// Stateful pulldown-cmark event consumer that builds styled `ratatui` output.
 ///
@@ -365,7 +366,7 @@ static HASH_LOCATION_SUFFIX_RE: LazyLock<Regex> =
 /// and an optional `TableState` for accumulating table events.  The
 /// `wrap_width` field enables width-aware line wrapping and table column
 /// allocation; when `None`, lines keep their intrinsic width.
-struct Writer<'a, I>
+struct Writer<'a, 'policy, I>
 where
     I: Iterator<Item = (Event<'a>, Range<usize>)>,
 {
@@ -387,6 +388,7 @@ where
     code_block_buffer: String,
     wrap_width: Option<usize>,
     cwd: Option<PathBuf>,
+    is_hidden_link_destination: &'policy dyn Fn(&str) -> bool,
     line_ends_with_local_link_target: bool,
     pending_local_link_soft_break: bool,
     current_line_content: Option<HyperlinkLine>,
@@ -397,11 +399,17 @@ where
     table_state: Option<TableState>,
 }
 
-impl<'a, I> Writer<'a, I>
+impl<'a, 'policy, I> Writer<'a, 'policy, I>
 where
     I: Iterator<Item = (Event<'a>, Range<usize>)>,
 {
-    fn new(input: &'a str, iter: I, wrap_width: Option<usize>, cwd: Option<&Path>) -> Self {
+    fn new(
+        input: &'a str,
+        iter: I,
+        wrap_width: Option<usize>,
+        cwd: Option<&Path>,
+        is_hidden_link_destination: &'policy dyn Fn(&str) -> bool,
+    ) -> Self {
         Self {
             input,
             iter,
@@ -421,6 +429,7 @@ where
             code_block_buffer: String::new(),
             wrap_width,
             cwd: cwd.map(Path::to_path_buf),
+            is_hidden_link_destination,
             line_ends_with_local_link_target: false,
             pending_local_link_soft_break: false,
             current_line_content: None,
@@ -619,7 +628,14 @@ where
     }
 
     fn text(&mut self, text: CowStr<'a>) {
-        if self.suppressing_local_link_label() {
+        if self.collecting_local_link_label() {
+            let style = self.inline_styles.last().copied().unwrap_or_default();
+            for (index, line) in text.lines().enumerate() {
+                if index > 0 {
+                    self.push_local_link_label_break();
+                }
+                self.push_local_link_label_span(Span::styled(line.to_string(), style));
+            }
             return;
         }
         self.line_ends_with_local_link_target = false;
@@ -673,7 +689,8 @@ where
     }
 
     fn code(&mut self, code: CowStr<'a>) {
-        if self.suppressing_local_link_label() {
+        if self.collecting_local_link_label() {
+            self.push_local_link_label_span(Span::from(code.into_string()).style(self.styles.code));
             return;
         }
         self.line_ends_with_local_link_target = false;
@@ -691,7 +708,17 @@ where
     }
 
     fn html(&mut self, html: CowStr<'a>, inline: bool) {
-        if self.suppressing_local_link_label() {
+        if self.collecting_local_link_label() {
+            let style = self.inline_styles.last().copied().unwrap_or_default();
+            for (index, line) in html.lines().enumerate() {
+                if index > 0 {
+                    self.push_local_link_label_break();
+                }
+                self.push_local_link_label_span(Span::styled(line.to_string(), style));
+            }
+            if !inline {
+                self.push_local_link_label_break();
+            }
             return;
         }
         self.line_ends_with_local_link_target = false;
@@ -724,7 +751,8 @@ where
     }
 
     fn hard_break(&mut self) {
-        if self.suppressing_local_link_label() {
+        if self.collecting_local_link_label() {
+            self.push_local_link_label_break();
             return;
         }
         self.line_ends_with_local_link_target = false;
@@ -736,7 +764,8 @@ where
     }
 
     fn soft_break(&mut self) {
-        if self.suppressing_local_link_label() {
+        if self.collecting_local_link_label() {
+            self.push_local_link_label_break();
             return;
         }
         if self.in_table_cell() {
@@ -994,10 +1023,16 @@ where
     }
 
     fn push_span_to_table_cell(&mut self, span: Span<'static>) {
+        let span = self.style_link_label(span);
+        let mut annotated = HyperlinkLine::new(Line::default());
+        annotated.push_span(
+            span,
+            self.link.as_ref().map(|link| link.destination.as_str()),
+        );
         if let Some(table_state) = self.table_state.as_mut()
             && let Some(cell) = table_state.current_cell.as_mut()
         {
-            cell.push_span(span);
+            cell.push_annotated(annotated);
         }
     }
 
@@ -1020,7 +1055,7 @@ where
     }
 
     fn push_text_spans_to_table_cell(&mut self, text: &str, style: Style) {
-        let span = Span::styled(text.to_string(), style);
+        let span = self.style_link_label(Span::styled(text.to_string(), style));
         let destination = self
             .link
             .as_ref()
@@ -1089,8 +1124,7 @@ where
 
         let metrics = Self::collect_table_column_metrics(&header, &rows, column_count);
         let available_width = self.available_table_width(column_count);
-        let widths =
-            self.compute_column_widths(&header, &rows, &table_state.alignments, available_width);
+        let widths = Self::compute_column_widths(&metrics, available_width);
         let spillover_lines: Vec<HyperlinkLine> = spillover_rows
             .into_iter()
             .flat_map(|spillover| spillover.lines)
@@ -1205,19 +1239,15 @@ where
     /// Allocate column widths for aligned, row-separated table rendering.
     ///
     /// Each column starts at its natural (max cell content) width, then columns
-    /// are iteratively shrunk one character at a time until the total fits within
-    /// `available_width`. Token-heavy columns surrender excess width before
-    /// narrative prose; compact columns are preserved last. Returns `None` when
-    /// even the minimum width (3 chars per column) cannot fit.
+    /// are shrunk by priority until the total fits within `available_width`.
+    /// Token-heavy columns surrender excess width before narrative prose; compact
+    /// columns are preserved last. Returns `None` when even the minimum width
+    /// (3 chars per column) cannot fit.
     fn compute_column_widths(
-        &self,
-        header: &[TableCell],
-        rows: &[Vec<TableCell>],
-        alignments: &[Alignment],
+        metrics: &[TableColumnMetrics],
         available_width: Option<usize>,
     ) -> Option<Vec<usize>> {
         let min_column_width = 3usize;
-        let metrics = Self::collect_table_column_metrics(header, rows, alignments.len());
         let mut widths: Vec<usize> = metrics
             .iter()
             .map(|col| col.max_width.max(min_column_width))
@@ -1226,7 +1256,7 @@ where
         let Some(max_width) = available_width else {
             return Some(widths);
         };
-        let minimum_total = alignments.len() * min_column_width;
+        let minimum_total = metrics.len() * min_column_width;
         if max_width < minimum_total {
             return None;
         }
@@ -1235,41 +1265,19 @@ where
             .iter()
             .map(|col| Self::preferred_column_floor(col, min_column_width))
             .collect();
-        let mut floor_total: usize = floors.iter().sum();
+        let floor_total: usize = floors.iter().sum();
         if floor_total > max_width {
-            // Relax preferred floors in wrapping priority order until the hard width budget fits.
-            while floor_total > max_width {
-                let Some((idx, _)) = floors
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, floor)| **floor > min_column_width)
-                    .min_by_key(|(idx, floor)| {
-                        (
-                            Self::column_shrink_priority(metrics[*idx].kind),
-                            usize::MAX.saturating_sub(**floor),
-                        )
-                    })
-                else {
-                    break;
-                };
-
-                floors[idx] -= 1;
-                floor_total -= 1;
-            }
+            let minimums = vec![min_column_width; floors.len()];
+            Self::shrink_columns(&mut floors, &minimums, metrics, floor_total - max_width);
         }
 
-        let mut total_width: usize = widths.iter().sum();
-
-        while total_width > max_width {
-            let Some(idx) = Self::next_column_to_shrink(&widths, &floors, &metrics) else {
-                break;
-            };
-            widths[idx] -= 1;
-            total_width -= 1;
-        }
-
+        let total_width: usize = widths.iter().sum();
         if total_width > max_width {
-            return None;
+            let remaining =
+                Self::shrink_columns(&mut widths, &floors, metrics, total_width - max_width);
+            if remaining > 0 {
+                return None;
+            }
         }
 
         Some(widths)
@@ -1297,17 +1305,18 @@ where
                 let cell = &row[column];
                 max_width = max_width.max(Self::cell_display_width(cell));
                 let plain = cell.plain_text();
-                body_token_width = body_token_width.max(Self::longest_token_width(&plain));
-                let word_count = plain.split_whitespace().count();
+                let mut word_count = 0usize;
+                for token in plain.split_whitespace() {
+                    let token_width = display_width(token);
+                    body_token_width = body_token_width.max(token_width);
+                    long_body_token_count += usize::from(token_width >= 20);
+                    word_count += 1;
+                }
                 if word_count > 0 {
                     body_token_count += word_count;
-                    long_body_token_count += plain
-                        .split_whitespace()
-                        .filter(|token| token.width() >= 20)
-                        .count();
                     total_words += word_count;
                     total_cells += 1;
-                    total_cell_width += plain.width();
+                    total_cell_width += display_width(&plain);
                 }
             }
 
@@ -1317,7 +1326,7 @@ where
                 total_words as f64 / total_cells as f64
             };
             let avg_cell_width = if total_cells == 0 {
-                header_plain.width() as f64
+                display_width(&header_plain) as f64
             } else {
                 total_cell_width as f64 / total_cells as f64
             };
@@ -1358,36 +1367,87 @@ where
         token_target.max(min_column_width).min(metrics.max_width)
     }
 
-    /// Pick the next column to shrink by one character during width allocation.
+    /// Shrink columns in priority order, balancing slack within each priority.
     ///
     /// Priority: TokenHeavy columns are shrunk before Narrative, then Compact.
-    /// Within the same kind, the column with the most slack above its floor is
-    /// chosen so similarly-shaped columns stay balanced.
-    fn next_column_to_shrink(
-        widths: &[usize],
+    /// Within the same kind, columns with the most slack above their floor are
+    /// shrunk first so similarly-shaped columns stay balanced. This produces the
+    /// same result as repeatedly shrinking one display cell, without repeatedly
+    /// scanning every column for long tokens.
+    fn shrink_columns(
+        widths: &mut [usize],
         floors: &[usize],
         metrics: &[TableColumnMetrics],
-    ) -> Option<usize> {
-        widths
-            .iter()
-            .enumerate()
-            .filter(|(idx, width)| **width > floors[*idx])
-            .min_by_key(|(idx, width)| {
-                let slack = width.saturating_sub(floors[*idx]);
-                (
-                    Self::column_shrink_priority(metrics[*idx].kind),
-                    usize::MAX.saturating_sub(slack),
-                )
-            })
-            .map(|(idx, _)| idx)
-    }
+        mut amount: usize,
+    ) -> usize {
+        for kind in [
+            TableColumnKind::TokenHeavy,
+            TableColumnKind::Narrative,
+            TableColumnKind::Compact,
+        ] {
+            let slack_total = widths
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| metrics[*idx].kind == kind)
+                .map(|(idx, width)| width.saturating_sub(floors[idx]))
+                .sum::<usize>();
+            let to_remove = amount.min(slack_total);
+            if to_remove == 0 {
+                continue;
+            }
 
-    fn column_shrink_priority(kind: TableColumnKind) -> usize {
-        match kind {
-            TableColumnKind::TokenHeavy => 0,
-            TableColumnKind::Narrative => 1,
-            TableColumnKind::Compact => 2,
+            let mut low = 0usize;
+            let mut high = widths
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| metrics[*idx].kind == kind)
+                .map(|(idx, width)| width.saturating_sub(floors[idx]))
+                .max()
+                .unwrap_or(/*default*/ 0);
+            while low < high {
+                let cap = low + (high - low) / 2;
+                let removed = widths
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| metrics[*idx].kind == kind)
+                    .map(|(idx, width)| width.saturating_sub(floors[idx]).saturating_sub(cap))
+                    .sum::<usize>();
+                if removed > to_remove {
+                    low = cap + 1;
+                } else {
+                    high = cap;
+                }
+            }
+
+            let cap = low;
+            let mut removed = 0usize;
+            for (idx, width) in widths.iter_mut().enumerate() {
+                if metrics[idx].kind != kind {
+                    continue;
+                }
+                let reduction = width.saturating_sub(floors[idx]).saturating_sub(cap);
+                *width -= reduction;
+                removed += reduction;
+            }
+
+            let mut remainder = to_remove - removed;
+            for (idx, width) in widths.iter_mut().enumerate() {
+                if remainder == 0 {
+                    break;
+                }
+                if metrics[idx].kind == kind && width.saturating_sub(floors[idx]) == cap {
+                    *width -= 1;
+                    remainder -= 1;
+                }
+            }
+
+            amount -= to_remove;
+            if amount == 0 {
+                break;
+            }
         }
+
+        amount
     }
 
     fn render_table_separator(
@@ -1552,7 +1612,7 @@ where
                     } else {
                         current_text.push(ch);
                     }
-                    column += UnicodeWidthChar::width(ch).unwrap_or(/*default*/ 0);
+                    column += char_width(ch);
                 }
                 flush(&mut out, &mut current_text, current_destination);
             }
@@ -1701,7 +1761,10 @@ where
 
     #[inline]
     fn spans_display_width(spans: &[Span<'_>]) -> usize {
-        spans.iter().map(|span| span.content.width()).sum()
+        spans
+            .iter()
+            .map(|span| display_width(span.content.as_ref()))
+            .sum()
     }
 
     #[inline]
@@ -1720,7 +1783,10 @@ where
 
     #[inline]
     fn longest_token_width(text: &str) -> usize {
-        text.split_whitespace().map(str::width).max().unwrap_or(0)
+        text.split_whitespace()
+            .map(display_width)
+            .max()
+            .unwrap_or(0)
     }
 
     fn push_inline_style(&mut self, style: Style) {
@@ -1733,22 +1799,45 @@ where
         self.inline_styles.pop();
     }
 
+    fn style_link_label(&mut self, mut span: Span<'static>) -> Span<'static> {
+        if let Some(link) = self.link.as_mut()
+            && web_destination(&link.destination).is_some()
+        {
+            link.has_visible_label |=
+                !span.content.trim().is_empty() && display_width(&span.content) > 0;
+            span.style = span.style.patch(self.styles.link);
+        }
+        span
+    }
+
     fn push_link(&mut self, dest_url: String) {
-        let show_destination = should_render_link_destination(&dest_url);
+        let style_label = (self.is_hidden_link_destination)(&dest_url);
+        if style_label {
+            self.push_inline_style(self.styles.link);
+        }
+        let show_destination = !style_label && should_render_link_destination(&dest_url);
         self.link = Some(LinkState {
             show_destination,
+            style_label,
+            has_visible_label: false,
             local_target_display: if is_local_path_like_link(&dest_url) {
                 render_local_link_target(&dest_url, self.cwd.as_deref())
             } else {
                 None
             },
+            local_label_spans: Vec::new(),
             destination: dest_url,
         });
     }
 
     fn pop_link(&mut self) {
         if let Some(link) = self.link.take() {
-            if link.show_destination {
+            if link.style_label {
+                self.pop_inline_style();
+            }
+            if link.show_destination
+                || (!link.has_visible_label && web_destination(&link.destination).is_some())
+            {
                 // Link destinations are rendered as " (url)" suffixes. When parsing table cells,
                 // append the suffix into the active cell buffer rather than the outer paragraph
                 // line to avoid detached url lines.
@@ -1776,8 +1865,13 @@ where
                     self.push_span(")".into());
                 }
             } else if let Some(local_target_display) = link.local_target_display {
-                // Local file links are rendered as code-like path text so the transcript shows the
-                // resolved target instead of arbitrary caller-provided label text.
+                let local_label_text = link
+                    .local_label_spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                let show_label =
+                    should_render_local_link_label(&local_label_text, &link.destination);
                 let style = self
                     .inline_styles
                     .last()
@@ -1786,23 +1880,59 @@ where
                     .patch(self.styles.code);
                 let span = Span::styled(local_target_display, style);
                 if self.in_table_cell() {
+                    if show_label {
+                        for label_span in link.local_label_spans {
+                            self.push_span_to_table_cell(label_span);
+                        }
+                        self.push_span_to_table_cell(" (".into());
+                    }
                     self.push_span_to_table_cell(span);
+                    if show_label {
+                        self.push_span_to_table_cell(")".into());
+                    }
                 } else {
                     if self.pending_marker_line {
                         self.push_line(Line::default());
                     }
+                    if show_label {
+                        for label_span in link.local_label_spans {
+                            self.push_span(label_span);
+                        }
+                        self.push_span(" (".into());
+                    }
                     self.push_span(span);
+                    if show_label {
+                        self.push_span(")".into());
+                    }
                     self.line_ends_with_local_link_target = true;
                 }
             }
         }
     }
 
-    fn suppressing_local_link_label(&self) -> bool {
+    fn collecting_local_link_label(&self) -> bool {
         self.link
             .as_ref()
             .and_then(|link| link.local_target_display.as_ref())
             .is_some()
+    }
+
+    fn push_local_link_label_span(&mut self, span: Span<'static>) {
+        if let Some(link) = self.link.as_mut() {
+            link.local_label_spans.push(span);
+        }
+    }
+
+    fn push_local_link_label_break(&mut self) {
+        let needs_space = self
+            .link
+            .as_ref()
+            .and_then(|link| link.local_label_spans.last())
+            .and_then(|span| span.content.chars().last())
+            .is_some_and(|character| !character.is_whitespace());
+        if needs_space {
+            self.push_local_link_label_span(" ".into());
+        }
     }
 
     fn flush_current_line(&mut self) {
@@ -1824,7 +1954,7 @@ where
                 }
             } else {
                 let mut spans = self.current_initial_indent.clone();
-                let shift = spans.iter().map(|span| span.content.width()).sum::<usize>();
+                let shift = Self::spans_display_width(&spans);
                 spans.append(&mut line.line.spans);
                 for hyperlink in &mut line.hyperlinks {
                     hyperlink.columns =
@@ -1863,7 +1993,7 @@ where
         };
 
         let mut spans = self.prefix_spans(pending_marker_line);
-        let shift = spans.iter().map(|span| span.content.width()).sum::<usize>();
+        let shift = Self::spans_display_width(&spans);
         spans.append(&mut line.line.spans);
         for hyperlink in &mut line.hyperlinks {
             hyperlink.columns = hyperlink.columns.start + shift..hyperlink.columns.end + shift;
@@ -1901,10 +2031,15 @@ where
     }
 
     fn push_span(&mut self, span: Span<'static>) {
+        let span = self.style_link_label(span);
+        if self.current_line_content.is_none() {
+            self.push_line(Line::default());
+        }
         if let Some(line) = self.current_line_content.as_mut() {
-            line.line.push_span(span);
-        } else {
-            self.push_line(Line::from(vec![span]));
+            line.push_span(
+                span,
+                self.link.as_ref().map(|link| link.destination.as_str()),
+            );
         }
     }
 
@@ -1924,7 +2059,7 @@ where
     }
 
     fn push_text_spans(&mut self, text: &str, style: Style) {
-        let span = Span::styled(text.to_string(), style);
+        let span = self.style_link_label(Span::styled(text.to_string(), style));
         let destination = self
             .link
             .as_ref()
@@ -1987,225 +2122,6 @@ where
 
         prefix
     }
-}
-
-fn is_local_path_like_link(dest_url: &str) -> bool {
-    dest_url.starts_with("file://")
-        || dest_url.starts_with('/')
-        || dest_url.starts_with("~/")
-        || dest_url.starts_with("./")
-        || dest_url.starts_with("../")
-        || dest_url.starts_with("\\\\")
-        || matches!(
-            dest_url.as_bytes(),
-            [drive, b':', separator, ..]
-                if drive.is_ascii_alphabetic() && matches!(separator, b'/' | b'\\')
-        )
-}
-
-/// Parse a local link target into normalized path text plus an optional location suffix.
-///
-/// This accepts the path shapes Codex emits today: `file://` URLs, absolute and relative paths,
-/// `~/...`, Windows paths, and `#L..C..` or `:line:col` suffixes.
-fn render_local_link_target(dest_url: &str, cwd: Option<&Path>) -> Option<String> {
-    let (path_text, location_suffix) = parse_local_link_target(dest_url)?;
-    let mut rendered = display_local_link_path(&path_text, cwd);
-    if let Some(location_suffix) = location_suffix {
-        rendered.push_str(&location_suffix);
-    }
-    Some(rendered)
-}
-
-/// Split a local-link destination into `(normalized_path_text, location_suffix)`.
-///
-/// The returned path text never includes a trailing `#L..` or `:line[:col]` suffix. Path
-/// normalization expands `~/...` when possible and rewrites path separators into display-stable
-/// forward slashes. The suffix, when present, is returned separately in normalized markdown form.
-///
-/// Returns `None` only when the destination looks like a `file://` URL but cannot be parsed into a
-/// local path. Plain path-like inputs always return `Some(...)` even if they are relative.
-fn parse_local_link_target(dest_url: &str) -> Option<(String, Option<String>)> {
-    if dest_url.starts_with("file://") {
-        let url = Url::parse(dest_url).ok()?;
-        let path_text = file_url_to_local_path_text(&url)?;
-        let location_suffix = url
-            .fragment()
-            .and_then(normalize_hash_location_suffix_fragment);
-        return Some((path_text, location_suffix));
-    }
-
-    let mut path_text = dest_url;
-    let mut location_suffix = None;
-    // Prefer `#L..` style fragments when both forms are present so URLs like `path#L10` do not
-    // get misparsed as a plain path ending in `:10`.
-    if let Some((candidate_path, fragment)) = dest_url.rsplit_once('#')
-        && let Some(normalized) = normalize_hash_location_suffix_fragment(fragment)
-    {
-        path_text = candidate_path;
-        location_suffix = Some(normalized);
-    }
-    if location_suffix.is_none()
-        && let Some(suffix) = extract_colon_location_suffix(path_text)
-    {
-        let path_len = path_text.len().saturating_sub(suffix.len());
-        path_text = &path_text[..path_len];
-        location_suffix = Some(suffix);
-    }
-
-    let decoded_path_text =
-        urlencoding::decode(path_text).unwrap_or(std::borrow::Cow::Borrowed(path_text));
-    Some((expand_local_link_path(&decoded_path_text), location_suffix))
-}
-
-/// Normalize a hash fragment like `L12` or `L12C3-L14C9` into the display suffix we render.
-///
-/// Returns `None` for fragments that are not location references. This deliberately ignores other
-/// `#...` fragments so non-location hashes stay part of the path text.
-fn normalize_hash_location_suffix_fragment(fragment: &str) -> Option<String> {
-    HASH_LOCATION_SUFFIX_RE
-        .is_match(fragment)
-        .then(|| format!("#{fragment}"))
-        .and_then(|suffix| normalize_markdown_hash_location_suffix(&suffix))
-}
-
-/// Extract a trailing `:line`, `:line:col`, or range suffix from a plain path-like string.
-///
-/// The suffix must occur at the end of the input; embedded colons elsewhere in the path are left
-/// alone. This is what keeps Windows drive letters like `C:/...` from being misread as locations.
-fn extract_colon_location_suffix(path_text: &str) -> Option<String> {
-    COLON_LOCATION_SUFFIX_RE
-        .find(path_text)
-        .filter(|matched| matched.end() == path_text.len())
-        .map(|matched| matched.as_str().to_string())
-}
-
-/// Expand home-relative paths and normalize separators for display.
-///
-/// If `~/...` cannot be expanded because the home directory is unavailable, the original text still
-/// goes through separator normalization and is returned as-is otherwise.
-fn expand_local_link_path(path_text: &str) -> String {
-    // Expand `~/...` eagerly so home-relative links can participate in the same normalization and
-    // cwd-relative shortening path as absolute links.
-    if let Some(rest) = path_text.strip_prefix("~/")
-        && let Some(home) = home_dir()
-    {
-        return normalize_local_link_path_text(&home.join(rest).to_string_lossy());
-    }
-
-    normalize_local_link_path_text(path_text)
-}
-
-/// Convert a `file://` URL into the normalized local-path text used for transcript rendering.
-///
-/// This prefers `Url::to_file_path()` for standard file URLs. When that rejects Windows-oriented
-/// encodings, we reconstruct a display path from the host/path parts so UNC paths and drive-letter
-/// URLs still render sensibly.
-fn file_url_to_local_path_text(url: &Url) -> Option<String> {
-    if let Ok(path) = url.to_file_path() {
-        return Some(normalize_local_link_path_text(&path.to_string_lossy()));
-    }
-
-    // Fall back to string reconstruction for cases `to_file_path()` rejects, especially UNC-style
-    // hosts and Windows drive paths encoded in URL form.
-    let mut path_text = url.path().to_string();
-    if let Some(host) = url.host_str()
-        && !host.is_empty()
-        && host != "localhost"
-    {
-        path_text = format!("//{host}{path_text}");
-    } else if matches!(
-        path_text.as_bytes(),
-        [b'/', drive, b':', b'/', ..] if drive.is_ascii_alphabetic()
-    ) {
-        path_text.remove(0);
-    }
-
-    Some(normalize_local_link_path_text(&path_text))
-}
-
-/// Normalize local-path text into the transcript display form.
-///
-/// Display normalization is intentionally lexical: it does not touch the filesystem, resolve
-/// symlinks, or collapse `.` / `..`. It only converts separators to forward slashes and rewrites
-/// UNC-style `\\\\server\\share` inputs into `//server/share` so later prefix checks operate on a
-/// stable representation.
-fn normalize_local_link_path_text(path_text: &str) -> String {
-    // Render all local link paths with forward slashes so display and prefix stripping are stable
-    // across mixed Windows and Unix-style inputs.
-    if let Some(rest) = path_text.strip_prefix("\\\\") {
-        format!("//{}", rest.replace('\\', "/").trim_start_matches('/'))
-    } else {
-        path_text.replace('\\', "/")
-    }
-}
-
-fn is_absolute_local_link_path(path_text: &str) -> bool {
-    path_text.starts_with('/')
-        || path_text.starts_with("//")
-        || matches!(
-            path_text.as_bytes(),
-            [drive, b':', b'/', ..] if drive.is_ascii_alphabetic()
-        )
-}
-
-/// Remove trailing separators from a local path without destroying root semantics.
-///
-/// Roots like `/`, `//`, and `C:/` stay intact so callers can still distinguish "the root itself"
-/// from "a path under the root".
-fn trim_trailing_local_path_separator(path_text: &str) -> &str {
-    if path_text == "/" || path_text == "//" {
-        return path_text;
-    }
-    if matches!(path_text.as_bytes(), [drive, b':', b'/'] if drive.is_ascii_alphabetic()) {
-        return path_text;
-    }
-    path_text.trim_end_matches('/')
-}
-
-/// Strip `cwd_text` from the start of `path_text` when `path_text` is strictly underneath it.
-///
-/// Returns the relative remainder without a leading slash. If the path equals the cwd exactly, this
-/// returns `None` so callers can keep rendering the full path instead of collapsing it to an empty
-/// string.
-fn strip_local_path_prefix<'a>(path_text: &'a str, cwd_text: &str) -> Option<&'a str> {
-    let path_text = trim_trailing_local_path_separator(path_text);
-    let cwd_text = trim_trailing_local_path_separator(cwd_text);
-    if path_text == cwd_text {
-        return None;
-    }
-
-    // Treat filesystem roots specially so `/tmp/x` under `/` becomes `tmp/x` instead of being
-    // left unchanged by the generic prefix-stripping branch.
-    if cwd_text == "/" || cwd_text == "//" {
-        return path_text.strip_prefix('/');
-    }
-
-    path_text
-        .strip_prefix(cwd_text)
-        .and_then(|rest| rest.strip_prefix('/'))
-}
-
-/// Choose the visible path text for a local link after normalization.
-///
-/// Relative paths stay relative. Absolute paths are shortened against `cwd` only when they are
-/// lexically underneath it; otherwise the absolute path is preserved. This is display logic only,
-/// not filesystem canonicalization.
-fn display_local_link_path(path_text: &str, cwd: Option<&Path>) -> String {
-    let path_text = normalize_local_link_path_text(path_text);
-    if !is_absolute_local_link_path(&path_text) {
-        return path_text;
-    }
-
-    if let Some(cwd) = cwd {
-        // Only shorten absolute paths that are under the provided session cwd; otherwise preserve
-        // the original absolute target for clarity.
-        let cwd_text = normalize_local_link_path_text(&cwd.to_string_lossy());
-        if let Some(stripped) = strip_local_path_prefix(&path_text, &cwd_text) {
-            return stripped.to_string();
-        }
-    }
-
-    path_text
 }
 
 #[cfg(test)]
@@ -2400,11 +2316,17 @@ mod tests {
     #[test]
     fn wrap_cell_preserves_hard_break_lines() {
         let mut cell = TableCell::default();
-        cell.push_span("first line".into());
+        cell.push_annotated(Line::from("first line").into());
         cell.hard_break();
-        cell.push_span("second line".into());
+        cell.push_annotated(Line::from("second line").into());
 
-        let writer = W::new("", std::iter::empty(), Some(80), /*cwd*/ None);
+        let writer = W::new(
+            "",
+            std::iter::empty(),
+            /*wrap_width*/ Some(80),
+            /*cwd*/ None,
+            &never_hide_link_destination,
+        );
         let wrapped = writer.wrap_cell(&cell, /*width*/ 40);
         let rendered = wrapped
             .iter()
@@ -2426,12 +2348,12 @@ mod tests {
     // ---------------------------------------------------------------
     // Type alias for calling private associated functions on Writer.
     // ---------------------------------------------------------------
-    type W<'a> = Writer<'a, std::iter::Empty<(Event<'a>, Range<usize>)>>;
+    type W<'a> = Writer<'a, 'a, std::iter::Empty<(Event<'a>, Range<usize>)>>;
 
     /// Build a single-line `TableCell` from plain text.
     fn make_cell(text: &str) -> TableCell {
         let mut cell = TableCell::default();
-        cell.push_span(Span::raw(text.to_string()));
+        cell.push_annotated(Line::from(text.to_string()).into());
         cell
     }
 
@@ -2551,38 +2473,100 @@ mod tests {
     }
 
     #[test]
-    fn next_column_to_shrink_prefers_token_heavy_then_narrative() {
-        let widths = [20usize, 20, 20];
-        let floors = [8usize, 8, 8];
+    fn bulk_column_shrink_matches_one_cell_at_a_time() {
+        fn priority(kind: TableColumnKind) -> usize {
+            match kind {
+                TableColumnKind::TokenHeavy => 0,
+                TableColumnKind::Narrative => 1,
+                TableColumnKind::Compact => 2,
+            }
+        }
+
+        fn shrink_one_at_a_time(
+            widths: &mut [usize],
+            floors: &[usize],
+            metrics: &[TableColumnMetrics],
+            mut amount: usize,
+        ) -> usize {
+            while amount > 0 {
+                let Some(idx) = widths
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, width)| **width > floors[*idx])
+                    .min_by_key(|(idx, width)| {
+                        (
+                            priority(metrics[*idx].kind),
+                            usize::MAX - width.saturating_sub(floors[*idx]),
+                        )
+                    })
+                    .map(|(idx, _)| idx)
+                else {
+                    break;
+                };
+                widths[idx] -= 1;
+                amount -= 1;
+            }
+            amount
+        }
+
+        for case in 0..64usize {
+            let metrics = (0..5)
+                .map(|idx| TableColumnMetrics {
+                    max_width: 100,
+                    header_token_width: 8,
+                    body_token_width: 8,
+                    kind: match (case + idx) % 3 {
+                        0 => TableColumnKind::TokenHeavy,
+                        1 => TableColumnKind::Narrative,
+                        _ => TableColumnKind::Compact,
+                    },
+                })
+                .collect::<Vec<_>>();
+            let floors = (0..5)
+                .map(|idx| 3 + (case * (idx + 1) + idx) % 14)
+                .collect::<Vec<_>>();
+            let initial = floors
+                .iter()
+                .enumerate()
+                .map(|(idx, floor)| floor + (case * (idx + 3) + idx * 7) % 41)
+                .collect::<Vec<_>>();
+            let slack = initial
+                .iter()
+                .zip(&floors)
+                .map(|(width, floor)| width - floor)
+                .sum::<usize>();
+
+            for amount in 0..=slack + 1 {
+                let mut expected = initial.clone();
+                let expected_remaining =
+                    shrink_one_at_a_time(&mut expected, &floors, &metrics, amount);
+                let mut actual = initial.clone();
+                let actual_remaining = W::shrink_columns(&mut actual, &floors, &metrics, amount);
+                assert_eq!((actual, actual_remaining), (expected, expected_remaining));
+            }
+        }
+    }
+
+    #[test]
+    fn column_widths_bulk_shrink_large_token_heavy_column() {
         let metrics = [
             TableColumnMetrics {
-                max_width: 30,
-                header_token_width: 8,
-                body_token_width: 6,
-                kind: TableColumnKind::Narrative,
-            },
-            TableColumnMetrics {
-                max_width: 30,
-                header_token_width: 8,
-                body_token_width: 28,
+                max_width: 1_000_000,
+                header_token_width: 4,
+                body_token_width: 1_000_000,
                 kind: TableColumnKind::TokenHeavy,
             },
             TableColumnMetrics {
-                max_width: 30,
-                header_token_width: 8,
-                body_token_width: 6,
+                max_width: 8,
+                header_token_width: 5,
+                body_token_width: 8,
                 kind: TableColumnKind::Compact,
             },
         ];
-        let idx = W::next_column_to_shrink(&widths, &floors, &metrics);
-        assert_eq!(idx, Some(1), "token-heavy column should shrink first");
 
-        let widths = [20usize, 8, 20];
-        let idx = W::next_column_to_shrink(&widths, &floors, &metrics);
         assert_eq!(
-            idx,
-            Some(0),
-            "narrative column should shrink before compact"
+            W::compute_column_widths(&metrics, /*available_width*/ Some(24)),
+            Some(vec![16, 8])
         );
     }
 
@@ -2711,6 +2695,13 @@ mod tests {
                 .iter()
                 .all(|link| link.destination == destination)
         }));
+    }
+
+    #[test]
+    fn table_widths_count_halfwidth_sound_marks() {
+        let cell = make_cell("ｶﾞﾊﾟ");
+        assert_eq!(W::cell_display_width(&cell), 4);
+        assert_eq!(W::longest_token_width("ｶﾞﾊﾟtail"), 8);
     }
 
     #[test]

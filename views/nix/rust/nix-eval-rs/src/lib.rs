@@ -14,17 +14,28 @@
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod abi_check;
+pub mod builtin_catalogue;
 pub mod builtins;
-pub mod builtins_gen;
 pub mod capi;
+mod closure_diff;
 pub mod compile;
 pub mod deepwalk;
 pub mod drv;
+mod drv_name;
 pub mod drvpath;
 pub mod drvstrict;
 pub mod eval;
+pub mod flake_doc;
+mod flake_show;
+mod search;
+mod terminal;
+mod suggestions;
+pub mod flake_check;
 pub mod host;
+mod imported_drv;
+pub(crate) mod import_cache;
 pub mod ir;
+pub mod lock_graph;
 pub mod modcache;
 pub mod nixhash;
 pub mod perf;
@@ -36,7 +47,11 @@ pub mod readset;
 pub mod refusal;
 pub mod session;
 pub mod store;
+mod store_batch;
 pub mod storepath;
 pub mod task;
 pub mod value2;
 pub mod vm;
+/// `builtins.wasm`: WebAssembly guests over the `env` host interface.
+pub mod wasm;
+

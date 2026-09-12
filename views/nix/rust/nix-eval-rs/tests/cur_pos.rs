@@ -40,6 +40,21 @@ fn a_token_at_the_start_of_a_file() {
     );
 }
 
+/// The set `__curPos` builds takes its names from an attr site like every
+/// other literal (`emit_cur_pos`), with NO position of their own, so
+/// `unsafeGetAttrPos` answers `null` for them. The ordinary attribute is the
+/// control: the same call answers a record for a name that was written.
+#[test]
+fn the_synthesised_attributes_have_no_position_of_their_own() {
+    let src = "let p = __curPos; s = { a = 1; }; in [ (builtins.unsafeGetAttrPos \"file\" p) \
+               (builtins.unsafeGetAttrPos \"line\" p) (builtins.unsafeGetAttrPos \"column\" p) \
+               (builtins.unsafeGetAttrPos \"a\" s).line ]";
+    assert_eq!(
+        at_file(src, "/tmp/curpos-oracle/g.nix"),
+        "[ null null null 1 ]"
+    );
+}
+
 /// The corpus case, `tests/functional/lang/eval-okay-curpos.nix`, whose `.exp`
 /// is `[ 3 7 4 9 ]`: line and column are 1-based and point at the first
 /// character of the token.

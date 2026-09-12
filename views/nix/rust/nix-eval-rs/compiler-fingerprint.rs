@@ -117,8 +117,9 @@ fn compiler_fingerprint_inputs(
     let manifest = crate_root.join("Cargo.toml");
     inputs.push(FingerprintInput {
         name: "Cargo.toml".to_owned(),
-        bytes: std::fs::read(&manifest)
-            .map_err(|error| format!("cannot read {} to fingerprint: {error}", manifest.display()))?,
+        bytes: std::fs::read(&manifest).map_err(|error| {
+            format!("cannot read {} to fingerprint: {error}", manifest.display())
+        })?,
         path: Some(manifest),
     });
 
@@ -181,9 +182,13 @@ fn collect_rust_sources(
         if kind.is_dir() {
             collect_rust_sources(root, &path, into)?;
         } else if path.extension().is_some_and(|ext| ext == "rs") {
-            let relative = path
-                .strip_prefix(root)
-                .map_err(|error| format!("{} is not under {}: {error}", path.display(), root.display()))?;
+            let relative = path.strip_prefix(root).map_err(|error| {
+                format!(
+                    "{} is not under {}: {error}",
+                    path.display(),
+                    root.display()
+                )
+            })?;
             let mut name = String::new();
             for part in relative.components() {
                 if !name.is_empty() {

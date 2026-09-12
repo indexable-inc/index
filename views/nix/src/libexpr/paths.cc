@@ -1,54 +1,12 @@
 #include "nix/store/store-api.hh"
+#include "nix/store/local-fs-store.hh"
 #include "nix/expr/eval.hh"
+#include "nix/util/file-system.hh"
 #include "nix/util/mounted-source-accessor.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/fetchers/fetchers.hh"
-#include "nix/util/file-system.hh"
-#include "nix/util/sync.hh"
-#include "nix/util/configuration.hh"
-
-#ifdef __APPLE__
-#  include <sys/clonefile.h>
-#endif
 
 namespace nix {
-
-/* Snapshot a mutable source tree with an in-kernel APFS directory clone.
-
-   A lazily mounted input is read from the live filesystem for the whole
-   evaluation, so a `path:` input or a dirty git worktree that another
-   process writes to mid-eval makes the on-demand copy hash differently
-   from the mount-time dry-run hash and the evaluation dies in
-   ensureLazyPathCopied (indexable-inc/index#3749). Cloning the tree at
-   mount time (clonefile(2): one blocking syscall, ~70 ms for a
-   4k-file/59 MB worktree, content verified identical) and evaluating
-   from the clone makes hash and content agree by construction.
-
-   Returns std::nullopt when cloning is unavailable (non-Darwin,
-   cross-volume EXDEV, non-APFS); the caller then falls back to copying
-   the tree to the store eagerly, which is the pre-lazy-trees base
-   behavior. Snapshots are deduplicated per source path and live until
-   process exit. */
-static std::optional<std::filesystem::path> cloneTreeSnapshot(const std::filesystem::path & src)
-{
-#ifdef __APPLE__
-    static std::filesystem::path snapRoot = createTempDir("", "nix-eval-snapshot");
-    static AutoDelete snapRootDelete(snapRoot, true);
-    static Sync<std::map<std::filesystem::path, std::filesystem::path>> snapshots_;
-
-    auto snapshots(snapshots_.lock());
-    if (auto it = snapshots->find(src); it != snapshots->end())
-        return it->second;
-    auto dst = snapRoot / fmt("snapshot-%d", snapshots->size());
-    if (clonefile(src.c_str(), dst.c_str(), 0) != 0)
-        return std::nullopt;
-    snapshots->emplace(src, dst);
-    return dst;
-#else
-    (void) src;
-    return std::nullopt;
-#endif
-}
 
 SourcePath EvalState::rootPath(CanonPath path)
 {
@@ -65,15 +23,33 @@ SourcePath EvalState::storePath(const StorePath & path)
     return {rootFS, CanonPath{store->printStorePath(path)}};
 }
 
+/* The content-addressing method a mounted input is ingested with, decided
+   from the accessor alone so that the mount (`mountInput`) and the forced
+   copy (`ensureLazyPathCopied`) cannot disagree: the two must land on one
+   store path, and the accessor is the only state both sites share.
+
+   An accessor that reads straight out of jj's content-addressed object
+   store knows its root's tree id a priori (jj maintained it while
+   snapshotting), and `Raw::JjTree` addresses store objects by exactly that
+   id: the store path with zero file reads. Everything else is NAR-hashed on
+   the walk.
+
+   That includes git, deliberately. A git input is locked by `narHash`
+   (`Input::fetchToStore`, the road `nix flake prefetch` and `nix flake
+   archive` take, and every lock file in existence), so a mount that
+   addressed the same input by its git tree id would give one input two
+   store paths depending on the road, and would have to refuse every lock
+   it was handed for carrying a hash it cannot check -- a refusal `nix flake
+   update` could never clear, since the update writes `narHash` again. One
+   identity per input: git's is the NAR hash. Git is the boundary bridge;
+   tree-id addressing is jj's. */
+static ContentAddressMethod ingestionMethodFor(const SourceAccessor & accessor)
+{
+    return accessor.knownTreeRoot ? ContentAddressMethod::Raw::JjTree : ContentAddressMethod::Raw::NixArchive;
+}
+
 void EvalState::ensureLazyPathCopied(const StorePath & path)
 {
-    /* With lazy-trees disabled every input was copied to the store when
-       it was mounted, so there is nothing left to materialize. Returning
-       early keeps the disabled mode byte-for-byte identical to the
-       behavior before this patch series. */
-    if (!settings.lazyTrees)
-        return;
-
     if (settings.readOnlyMode)
         return;
 
@@ -86,17 +62,12 @@ void EvalState::ensureLazyPathCopied(const StorePath & path)
         fetchSettings,
         *store,
         SourcePath{ref(mount)},
-        /* Force a copy. mountInput does a dryRun to just calculate the storePath and narHash. */
+        /* Force a copy: mountInput only computed the store path. */
         FetchMode::Copy,
         path.name(),
-        /* Ingest with the same method mountInput used, or this re-fetch
-           lands on a different store path and the mismatch check below
-           misfires. `knownTreeRoot` survives on the accessor exactly when
-           the mount was git-CA: mountInput clears it both when the feature
-           or a narHash promise rules git-CA out AND when the id's family is
-           one nix cannot ingest, so the predicate here stays a presence
-           test and the two sites cannot drift apart. */
-        mount->knownTreeRoot ? ContentAddressMethod::Raw::Git : ContentAddressMethod::Raw::NixArchive);
+        ingestionMethodFor(*mount),
+        nullptr,
+        repair);
 
     /* This can happen if the source gets modified by another process while we are evaluaing
        from it. Alternatively, the caching might be unsound and fetcher cache is poisoned somehow.
@@ -121,88 +92,75 @@ void EvalState::ensureLazyPathsCopied(const NixStringContext & context)
 StorePath
 EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalInput, ref<SourceAccessor> accessor)
 {
-    /* With lazy-trees enabled, dryRun is sufficient to mount the input.
-       We still compute the narHash (to check for mismatches) and the store
-       path to figure out where to mount it, so paths, hashes and lock files
-       do not depend on the setting. TODO: This could be relaxed in the future by making outPath and narHash
-       lazier. Good code that doesn't do `toString ./.` or otherwise inspects the outPath string and only uses it for
-       doing relative imports does not even require computing the store path. That is a big invasive change though and
-       would require having a special "LazyStorePathString" thunk. narHash also doesn't need to be computed eagerly in
-       case it's not actually specified (like during local development with a dirty tree) - in that case narHash could
-       also become a lazy app/thunk that shares the state with the storePath delayed computation. */
-    auto mode = settings.lazyTrees ? FetchMode::DryRun : FetchMode::Copy;
+    /* Lazy is the only mode: the input's tree is mounted at its store path
+       inside the evaluator and materialised only when something forces it
+       (`ensureLazyPathCopied`). That is sound only when the tree cannot
+       change under the evaluation. An accessor reading a content-addressed
+       object cannot change; a live directory on the filesystem can, and a
+       writer landing mid-evaluation would put two states into one
+       evaluation and then fail the forced copy with a store path mismatch.
 
-    /* Only `path` and `git` (workdir) inputs are backed by trees that
-       other processes can mutate; anything else with a physical path
-       (say, an archive extracted into the fetcher cache) is owned by
-       Nix and stays lazily mounted as-is. The tree root comes from the
-       input attrs, not the accessor's physical path: for a git workdir
-       the accessor root omits .git, which the re-fetch of the snapshot
-       needs. */
-    if (mode == FetchMode::DryRun && (input.getType() == "path" || input.getType() == "git")
-        && accessor->getPhysicalPath(CanonPath::root)) {
-        std::optional<std::filesystem::path> treeRoot;
-        if (input.getType() == "path") {
-            if (auto phys = accessor->getPhysicalPath(CanonPath::root); phys && phys->is_absolute())
-                treeRoot = *phys;
-        } else if (auto url = fetchers::maybeGetStrAttr(input.attrs, "url");
-                   url && hasPrefix(*url, "file://") && url->size() > 7 && (*url)[7] == '/')
-            treeRoot = url->substr(7);
-        if (treeRoot && !store->isInStore(treeRoot->string())) {
-            bool snapshotted = false;
-            if (auto snapshot = cloneTreeSnapshot(*treeRoot)) {
-                try {
-                    auto attrs = input.attrs;
-                    /* Identity and lock attrs describe the original
-                       location; mountInput below re-checks the snapshot
-                       against the original lock via its narHash. */
-                    for (auto & attr :
-                         {"narHash", "lastModified", "rev", "revCount", "dirtyRev", "dirtyShortRev", "__final"})
-                        attrs.erase(attr);
-                    if (input.getType() == "path")
-                        attrs.insert_or_assign("path", snapshot->string());
-                    else
-                        attrs.insert_or_assign("url", "file://" + snapshot->string());
-                    accessor = fetchers::Input::fromAttrs(fetchSettings, std::move(attrs))
-                                   .getAccessor(fetchSettings, *store)
-                                   .first;
-                    snapshotted = true;
-                } catch (Error & e) {
-                    /* e.g. a worktree whose .git file points outside the
-                       cloned tree; fall through to the eager copy. */
-                    debug("cannot re-fetch snapshot of '%s': %s", treeRoot->string(), e.what());
-                }
-            }
-            if (!snapshotted)
-                mode = FetchMode::Copy;
-        }
-    }
+       A materialised store object is the one filesystem-backed exception,
+       because the store keeps it immutable. Ask the store for its REAL
+       directory rather than using `isInStore`, which compares against the
+       logical `storeDir`: under a chroot store (`nix --store /x`) the two
+       differ, and comparing against the logical one would refuse every
+       store object such a store serves.
 
-    /* Content-address the mount by the tree id the accessor already knows
-       (the jj workdir fetcher announces it): the store path then costs zero
-       file reads, where the NAR method re-reads all of a 14k+-file tree on
-       every source edit. Only for ids whose family nix ingests, and only
-       for inputs that made no narHash promise -- a locked input's narHash
-       can only be checked by NAR-ingesting the tree. */
-    auto method = ContentAddressMethod::Raw::NixArchive;
-    if (accessor->knownTreeRoot) {
-        if (accessor->knownTreeRoot->family == KnownTreeRoot::Family::Git
-            && experimentalFeatureSettings.isEnabled(Xp::GitHashing) && !originalInput.getNarHash())
-            method = ContentAddressMethod::Raw::Git;
-        else
-            /* Drop the hint so ensureLazyPathCopied re-fetches this mount
-               with the same (NAR) method it is being created with. This is
-               also the path a family nix cannot ingest takes: the id stays
-               true, but it is not a store path address, so it must not
-               reach a consumer that would treat it as one. */
-            accessor->knownTreeRoot.reset();
-    }
+       Announcing a tree id does not exempt an accessor here. An accessor
+       that both hands out a live filesystem path and claims a fixed id is
+       the unsound combination, not a safe one: the id would go on
+       addressing bytes that can still change.
 
-    auto [storePath, hash] = fetchToStore2(fetchSettings, *store, accessor, mode, input.getName(), method);
+       This is an INVARIANT, not the user-facing refusal. By the time an
+       input reaches this line its fetcher has already had its chance to
+       refuse in terms of the input the user actually wrote; reaching here
+       means a fetcher served a mutable directory outside the store, which
+       is a defect in that fetcher. The remedy is named anyway, because it
+       is the same one either way. */
+    auto isImmutableStoreObject = [&](const std::filesystem::path & physical) {
+        if (auto * fsStore = dynamic_cast<LocalFSStore *>(&*store))
+            return isDirOrInDir(physical, fsStore->getRealStoreDir());
+        return store->isInStore(physical.string());
+    };
 
-    allowPath(storePath); // FIXME: should just whitelist the entire virtual store
+    if (auto physical = accessor->getPhysicalPath(CanonPath::root); physical && !isImmutableStoreObject(*physical))
+        throw Error(
+            "input '%s' was served as a mutable directory (%s) outside the store, which cannot be mounted as a "
+            "flake source because its contents could change during the evaluation. "
+            "Put it in a Jujutsu repository ('jj init' in that directory) and reference it as 'jj+file://%s'.",
+            originalInput.to_string(),
+            physical->string(),
+            physical->string());
 
-    storeFS->mount(CanonPath(store->printStorePath(storePath)), accessor);
+    auto method = ingestionMethodFor(*accessor);
+
+    /* A NAR hash can only be checked by NAR-ingesting the tree, which a
+       tree-addressed mount never does; verifying nothing and going on would
+       be the silent kind of wrong, so the promise is refused with the fix
+       named.
+
+       Only a hand-written promise can get here. The jj scheme rejects the
+       `narHash` attribute at parse time, so no `jj` input, locked or not,
+       carries one; a git input is NAR-addressed and takes the branch below.
+       What remains is a relative input written with a NAR promise inside a
+       jj-backed flake (`inputs.sub.url = "path:./sub?narHash=..."`): the
+       `path` scheme accepts the attribute, and the subtree it resolves to is
+       addressed by its tree id. No lock update can remove that promise,
+       because it lives in flake.nix; the message says so. */
+    if (method != ContentAddressMethod::Raw::NixArchive && originalInput.getNarHash())
+        throw Error(
+            "input '%s' promises a NAR hash ('narHash' in its flake.nix attributes), but it is addressed by its "
+            "Jujutsu tree id (%s), which a NAR hash cannot be checked against: a tree-addressed mount never "
+            "NAR-ingests the tree. Remove 'narHash' from the input in flake.nix; a jj tree is locked by "
+            "'treeHash', which the fetcher writes.",
+            originalInput.to_string(),
+            std::string(method.render()));
+
+    auto [storePath, hash] =
+        fetchToStore2(fetchSettings, *store, accessor, FetchMode::DryRun, input.getName(), method);
+
+    mountLazily(storePath, accessor);
 
     if (method == ContentAddressMethod::Raw::NixArchive) {
         input.attrs.insert_or_assign("narHash", hash.to_string(HashFormat::SRI, true));
@@ -217,6 +175,97 @@ EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalI
     }
 
     return storePath;
+}
+
+void EvalState::mountLazily(const StorePath & storePath, ref<SourceAccessor> accessor)
+{
+    allowPath(storePath); // FIXME: should just whitelist the entire virtual store
+    auto mountPoint = CanonPath(store->printStorePath(storePath));
+    if (!storeFS->getMount(mountPoint))
+        storeFS->mount(std::move(mountPoint), std::move(accessor));
+}
+
+StorePath EvalState::addPathToStore(
+    const SourcePath & path,
+    std::string_view name,
+    ContentAddressMethod method,
+    PathFilter * filter,
+    const std::optional<Hash> & expectedHash,
+    const StorePathSet & refs)
+{
+    /* A NAR copy re-reads every byte of a tree to find a hash the tree may
+       already have. When the directory is, or filters to, a jj tree object,
+       its id IS the address: mount the object where the copy would land and
+       materialize it only when forced, `mountInput`'s road, taken here for
+       every path value under a jj-backed input. A pinned hash names a NAR
+       hash, which only the NAR road can check, and references have no
+       tree-id form, so both keep it. `--repair` stays on this road (the
+       store path must not depend on the flag) but cannot stay lazy: a
+       repair means "compare the bytes in the store with the source and
+       rewrite them", so the object is materialised here, under `repair`,
+       instead of at the first force. */
+    if (method == ContentAddressMethod::Raw::NixArchive && !expectedHash && refs.empty()) {
+        /* A path under a lazily mounted input names bytes the mount serves:
+           ask the mount, not the root filesystem it is composed into. The
+           impure root filesystem is a union of the real filesystem over the
+           store mounts, and once a mount has been materialized both layers
+           have the path, so the union cannot say which tree is meant
+           (`UnionSourceAccessor::getSubtree`); the mount can. Access control
+           is not skipped by this: every mounted path was allowed when it was
+           mounted (`mountLazily`). The filter keeps seeing the coordinates
+           it was written for. */
+        SourcePath source = path;
+        std::optional<PathFilter> rerooted;
+        if (store->isInStore(path.path.abs())) {
+            auto [storePath, subPath] = store->toStorePath(path.path.abs());
+            auto mountPoint = CanonPath(store->printStorePath(storePath));
+            if (auto mount = storeFS->getMount(mountPoint)) {
+                source = SourcePath{ref(mount), subPath};
+                if (filter)
+                    rerooted = [&, mountPoint](const std::string & p) { return (*filter)((mountPoint / CanonPath(p)).abs()); };
+            }
+        }
+        if (auto tree = treeObjectAt(source, rerooted ? &*rerooted : filter)) {
+            auto [storePath, hash] = fetchToStore2(
+                fetchSettings,
+                *store,
+                SourcePath{ref(tree)},
+                repair == Repair ? FetchMode::Copy : FetchMode::DryRun,
+                name,
+                ContentAddressMethod::Raw::JjTree,
+                nullptr,
+                repair);
+            mountLazily(storePath, ref(tree));
+            return storePath;
+        }
+    }
+
+    std::optional<StorePath> expectedStorePath;
+    if (expectedHash)
+        expectedStorePath =
+            store->makeFixedOutputPathFromCA(name, ContentAddressWithReferences::fromParts(method, *expectedHash, {refs}));
+
+    if (expectedStorePath && store->isValidPath(*expectedStorePath)) {
+        allowPath(*expectedStorePath);
+        return *expectedStorePath;
+    }
+
+    // FIXME: support refs in fetchToStore()?
+    auto dstPath = refs.empty() ? fetchToStore(
+                                      fetchSettings,
+                                      *store,
+                                      path,
+                                      settings.readOnlyMode ? FetchMode::DryRun : FetchMode::Copy,
+                                      name,
+                                      method,
+                                      filter,
+                                      repair)
+                                : store->addToStore(
+                                      name, path, method, HashAlgorithm::SHA256, refs, filter ? *filter : defaultPathFilter, repair);
+    if (expectedStorePath && *expectedStorePath != dstPath)
+        throw Error("store path mismatch in (possibly filtered) path added from '%s'", path);
+    allowPath(dstPath);
+    return dstPath;
 }
 
 } // namespace nix

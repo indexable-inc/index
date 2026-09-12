@@ -136,16 +136,6 @@ struct MercurialInputScheme : InputScheme
         return url;
     }
 
-    Input applyOverrides(const Input & input, std::optional<std::string> ref, std::optional<Hash> rev) const override
-    {
-        auto res(input);
-        if (rev)
-            res.attrs.insert_or_assign("rev", rev->gitRev());
-        if (ref)
-            res.attrs.insert_or_assign("ref", *ref);
-        return res;
-    }
-
     std::optional<std::filesystem::path> getSourcePath(const Input & input) const override
     {
         auto url = parseURL(getStrAttr(input.attrs, "url"));

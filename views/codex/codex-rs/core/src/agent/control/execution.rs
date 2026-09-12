@@ -1,9 +1,9 @@
 use super::AgentControl;
-use codex_protocol::ThreadId;
+use crate::codex_thread::CodexThread;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -27,29 +27,14 @@ impl Drop for AgentExecutionGuard {
 }
 
 impl AgentControl {
-    pub(crate) async fn ensure_execution_capacity_for_op(
+    pub(crate) async fn ensure_execution_capacity_for_turn_start(
         &self,
-        thread_id: ThreadId,
-        op: &Op,
+        thread: &CodexThread,
     ) -> CodexResult<()> {
-        self.ensure_execution_capacity_for_turn_start(thread_id, op_starts_turn(op))
-            .await
-    }
-
-    pub(super) async fn ensure_execution_capacity_for_turn_start(
-        &self,
-        thread_id: ThreadId,
-        starts_turn: bool,
-    ) -> CodexResult<()> {
-        if !starts_turn {
+        if thread.session.active_turn.lock().await.is_some() {
             return Ok(());
         }
-        let state = self.upgrade()?;
-        let thread = state.get_thread(thread_id).await?;
-        if thread.codex.session.active_turn.lock().await.is_some() {
-            return Ok(());
-        }
-        let config = thread.codex.session.get_config().await;
+        let config = thread.session.get_config().await;
         let multi_agent_version = thread
             .multi_agent_version()
             .unwrap_or_else(|| config.multi_agent_version_from_features());
@@ -68,7 +53,9 @@ impl AgentControl {
         if self.agent_execution_limiter.has_capacity() {
             Ok(())
         } else {
-            Err(CodexErr::AgentLimitReached { max_threads })
+            Err(CodexErr::new(CodexErrorDetails::AgentLimitReached {
+                max_threads,
+            }))
         }
     }
 
@@ -99,11 +86,6 @@ impl AgentExecutionLimiter {
         self.active.fetch_add(1, Ordering::AcqRel);
         AgentExecutionGuard { limiter: self }
     }
-}
-
-fn op_starts_turn(op: &Op) -> bool {
-    matches!(op, Op::UserInput { .. })
-        || matches!(op, Op::InterAgentCommunication { communication } if communication.trigger_turn)
 }
 
 fn is_execution_limited(

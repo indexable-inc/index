@@ -44,7 +44,7 @@ This release has a number performance improvements, in particular:
   Unlike the existing [`--trace-function-calls`], this profiler includes the name of the function
   being called when it's available.
 
-- [`nix repl`] prints which variables were loaded [#11406](https://github.com/NixOS/nix/pull/11406)
+- `nix repl` prints which variables were loaded [#11406](https://github.com/NixOS/nix/pull/11406)
 
   Instead of `Added <n> variables` it now prints the first 10 variables that were added to the global scope.
 
@@ -142,7 +142,6 @@ This release was made possible by the following 32 contributors:
 [`--eval-profiler-frequency`]: @docroot@/command-ref/conf-file.md#conf-eval-profiler-frequency
 [`build-dir`]: @docroot@/command-ref/conf-file.md#conf-build-dir
 [`nix profile add`]: @docroot@/command-ref/new-cli/nix3-profile-add.md
-[`nix repl`]: @docroot@/command-ref/new-cli/nix3-repl.md
 [`nix flake archive`]: @docroot@/command-ref/new-cli/nix3-flake-archive.md
 [`json-log-path`]: @docroot@/command-ref/conf-file.md#conf-json-log-path
 [`trace-import-from-derivation`]: @docroot@/command-ref/conf-file.md#conf-trace-import-from-derivation

@@ -6,10 +6,6 @@
   # Writer for `passthru.updateScript`, bound only on the flake-package path
   # (lib/packages.nix); the overlay path leaves it null so `pkgs.*` carries no
   # updater. Same nullable-writer pattern as vector-bin / claude-code.
-  # The fork client rather than stock `pkgs.nix`; see packages/yc/default.nix
-  # for why an updater must not pull nixpkgs' nix into its closure. Empty on
-  # the overlay path, which omits the updateScript anyway.
-  repoPackages ? {},
   updateScriptWriter ? null,
 }: let
   # Prebuilt upstream release binary, aarch64-darwin only: the motivating
@@ -20,7 +16,7 @@
   pin = ix.pins.loadPin ./pins.json "bbctl";
   updateScript = ix.pins.mkOptionalUpdater {
     writeNushellApplication = updateScriptWriter;
-    nix = repoPackages.nix-ix;
+    nix = ix.nixPackageFor "packages/bbctl: updateScript";
     pname = "bbctl";
     relPath = "packages/bbctl/pins.json";
   };

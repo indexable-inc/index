@@ -25,15 +25,15 @@
 use crate::host::FileType;
 use crate::primops_pure::{
     Begin, Coerced, Cont, ImportStage, PathPhase as ReadPhase, PathReady, PathStage,
-    apply_rewrites, argv, ask, coerce_for_read, coerce_to_path, want_attrs, want_bool, want_list,
-    want_text, want_text_no_ctx,
+    apply_rewrites, argv, ask, coerce_for_read, coerce_path_with_context, coerce_to_path,
+    want_attrs, want_bool, want_list, want_text, want_text_no_ctx,
 };
 use crate::refusal::{Refusal, RefusalToken};
 use crate::task::{
     AcceptedPath, FetchKind, FetchRequest, FetchTreeRequest, FilteredCopy, NeedPath, PathMethod,
     TreeAttr, TreeFetcher, Yield,
 };
-use crate::value2::{ContextElem, Slot, Sym, Value, type_name};
+use crate::value2::{ContextElem, PathValue, Root, Slot, Sym, Value, type_name};
 use crate::vm::{Result, Vm, VmError};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
@@ -55,6 +55,9 @@ pub enum Ext {
     DrvStrict(Box<crate::drvstrict::DrvStrict>),
     /// `builtins.appendContext`.
     AppendContext(Box<AppendContext>),
+    /// `builtins.storePath`: path coercion without `realisePath`, followed by
+    /// preservation of the input string context.
+    StorePath(StorePath),
     /// `builtins.findFile`, and so every `<x>` in the language.
     FindFile(Box<FindFile>),
     /// `builtins.convertHash`, whose attribute walk forces `hash`,
@@ -85,6 +88,10 @@ pub enum Ext {
     /// `builtins.getFlake`, which is cppnix's `lockFlake` in the embedder
     /// followed by `callFlake` here.
     GetFlake(GetFlake),
+    /// `builtins.wasm`: a WebAssembly guest suspended in a host call, and
+    /// the handle table it sees Nix values through. Boxed for the reason
+    /// `DrvStrict` is. See [`crate::wasm`].
+    Wasm(Box<crate::wasm::WasmCall>),
 }
 
 pub fn step(vm: &mut Vm, args: &[Slot], ext: &mut Ext, incoming: Option<Value>) -> Result<Yield> {
@@ -92,6 +99,7 @@ pub fn step(vm: &mut Vm, args: &[Slot], ext: &mut Ext, incoming: Option<Value>) 
         Ext::DeepWalk(w) => w.step(vm, incoming),
         Ext::DrvStrict(d) => d.step(vm, incoming),
         Ext::AppendContext(a) => a.step(vm, incoming),
+        Ext::StorePath(s) => s.step(args, incoming),
         Ext::FindFile(f) => f.step(incoming),
         Ext::ConvertHash(c) => c.step(vm, incoming),
         Ext::HashFile(h) => h.step(args, incoming),
@@ -101,6 +109,7 @@ pub fn step(vm: &mut Vm, args: &[Slot], ext: &mut Ext, incoming: Option<Value>) 
         Ext::GetFlake(g) => g.step(vm, incoming),
         Ext::FetchTree(f) => f.step(vm, incoming),
         Ext::FlakeRefToString(f) => f.step(vm, incoming),
+        Ext::Wasm(w) => w.step(vm, incoming),
     }
 }
 
@@ -157,6 +166,58 @@ pub fn bi_path_exists(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
         }
     }
     ask(NeedPath::Exists)
+}
+
+pub fn bi_store_path(_vm: &mut Vm, _args: &[Slot]) -> Result<Begin> {
+    Ok(Begin::Cont(Cont::Ext(Ext::StorePath(StorePath {
+        stage: PathStage::Value,
+        context: BTreeSet::new(),
+        asked: false,
+    }))))
+}
+
+/// The one path consumer that does not use cppnix's `realisePath`.
+///
+/// `prim_storePath` calls `coerceToPath`, checks that the result belongs to
+/// the store, and copies the coercion context onto the validated result. It
+/// never calls `realiseContext`; doing so can build a derivation merely to
+/// validate a spelling and also replaces the dependency set with the single
+/// returned store object.
+pub struct StorePath {
+    stage: PathStage,
+    context: BTreeSet<ContextElem>,
+    asked: bool,
+}
+
+impl StorePath {
+    fn step(&mut self, args: &[Slot], incoming: Option<Value>) -> Result<Yield> {
+        if !self.asked {
+            let (coerced, context) = coerce_path_with_context(args, 0, &mut self.stage, incoming)?;
+            return match coerced {
+                Coerced::Run(y) => Ok(y),
+                Coerced::Done(path) => {
+                    self.context = context;
+                    self.asked = true;
+                    Ok(Yield::Need(NeedPath::UseStorePath(path)))
+                }
+            };
+        }
+
+        let answer =
+            incoming.ok_or_else(|| VmError::eval("internal: builtins.storePath answer lost"))?;
+        let Value::Str(answer) = answer else {
+            return Err(VmError::eval(
+                "internal: builtins.storePath answer is not a string",
+            ));
+        };
+        self.context.extend(answer.context_set());
+        Ok(Yield::Done(Value::Str(
+            crate::value2::NixStr::with_context(
+                answer.bytes_rc(),
+                core::mem::take(&mut self.context),
+            ),
+        )))
+    }
 }
 
 pub fn bi_read_dir(_vm: &mut Vm, _args: &[Slot]) -> Result<Begin> {
@@ -806,7 +867,7 @@ impl Emit {
             // `prim_trace` hands the value to, not nix-instantiate's.
             (_, Sink::Trace) => {
                 self.stage = EmitStage::Printed;
-                Ok(Yield::Sub(crate::task::Task::Print(
+                Ok(Yield::sub(crate::task::Task::Print(
                     crate::print::Print::value_printer(message.clone()),
                 )))
             }
@@ -854,9 +915,10 @@ pub struct ConvertHash {
     hash: String,
     algo: Option<crate::nixhash::HashAlgo>,
     format: Option<crate::nixhash::HashFormat>,
+    blake3_hashes: bool,
 }
 
-pub fn bi_convert_hash(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
+pub fn bi_convert_hash(vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
     let entry = want_attrs(&argv(args, 0)?)?;
     Ok(Begin::Cont(Cont::Ext(Ext::ConvertHash(Box::new(
         ConvertHash {
@@ -865,6 +927,7 @@ pub fn bi_convert_hash(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
             hash: String::new(),
             algo: None,
             format: None,
+            blake3_hashes: vm.settings().blake3_hashes,
         },
     )))))
 }
@@ -897,7 +960,9 @@ impl ConvertHash {
             ConvertStage::Algo => {
                 let name = want_text_no_ctx(&value)?;
                 self.algo = Some(
-                    crate::nixhash::parse_algo(&name).map_err(|e| VmError::eval(e.to_string()))?,
+                    crate::nixhash::parse_algo(&name)
+                        .and_then(|algo| algo.require_enabled(self.blake3_hashes))
+                        .map_err(|e| VmError::eval(e.to_string()))?,
                 );
                 self.ask_format(vm)
             }
@@ -929,7 +994,7 @@ impl ConvertHash {
         let format = self
             .format
             .ok_or_else(|| VmError::eval("internal: convertHash finished without a format"))?;
-        let hash = crate::nixhash::parse_any(&self.hash, self.algo)
+        let hash = crate::nixhash::parse_any(&self.hash, self.algo, self.blake3_hashes)
             .map_err(|e| VmError::eval(e.to_string()))?;
         // `to_string(hf, hf == HashFormat::SRI)`: only SRI carries the
         // algorithm, and it always does.
@@ -947,19 +1012,33 @@ impl ConvertHash {
 pub struct HashFile {
     algo: crate::nixhash::HashAlgo,
     phase: ReadPhase,
+    /// Whether the path argument has been forced yet. It is not in the
+    /// builtin's strict list, because cppnix validates the algorithm before
+    /// it touches the path (`prim_hashFile`), so a refused algorithm must
+    /// never force the path; this body forces it itself, after that.
+    path_forced: bool,
 }
 
-pub fn bi_hash_file(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
+pub fn bi_hash_file(vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
     let algo = want_text_no_ctx(&argv(args, 0)?)?;
-    let algo = crate::primops_pure::parse_algo_name(&algo)?;
+    let algo = crate::primops_pure::parse_algo_name(&algo, vm.settings().blake3_hashes)?;
     Ok(Begin::Cont(Cont::Ext(Ext::HashFile(Box::new(HashFile {
         algo,
         phase: ReadPhase::Coerce(PathStage::Value),
+        path_forced: false,
     })))))
 }
 
 impl HashFile {
     fn step(&mut self, args: &[Slot], incoming: Option<Value>) -> Result<Yield> {
+        if !self.path_forced {
+            self.path_forced = true;
+            let slot = args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| VmError::eval("builtins.hashFile: missing path argument"))?;
+            return Ok(Yield::Force(slot));
+        }
         match &mut self.phase {
             ReadPhase::Coerce(stage) => match coerce_for_read(args, 1, stage, incoming)? {
                 PathReady::Run(y) => Ok(y),
@@ -976,7 +1055,7 @@ impl HashFile {
                 }
             },
             ReadPhase::Realising(path) => {
-                let p = apply_rewrites(core::mem::take(path), incoming)?;
+                let p = apply_rewrites(Rc::clone(path), incoming)?;
                 self.phase = ReadPhase::Asked;
                 Ok(Yield::Need(NeedPath::HashFile {
                     path: p,
@@ -1123,7 +1202,7 @@ impl FindFile {
                 // (ENG-12854).
                 Value::Attrs(_) => {
                     self.stage = FindStage::PathCoerced;
-                    Ok(Yield::Sub(crate::task::Task::coerce_as_primop(
+                    Ok(Yield::sub(crate::task::Task::coerce_as_primop(
                         Slot::value(value),
                         crate::print::CoerceFlags::NEITHER,
                     )))
@@ -1144,7 +1223,7 @@ impl FindFile {
                 self.settle_path(text, context)
             }
             FindStage::PathRealising => {
-                let path = crate::primops_pure::apply_rewrites(
+                let path = crate::primops_pure::rewrite_spelling(
                     core::mem::take(&mut self.pending),
                     Some(value),
                 )?;
@@ -1385,6 +1464,101 @@ mod tests {
         );
     }
 
+    /// Every builtin surface that accepts Blake3 must reject it when the
+    /// experimental feature is disabled. These are separate rows so removing
+    /// any one surface's gate makes that row fail even while the others still
+    /// reject it. `hashString` and `hashFile` preserve their named-refusal
+    /// contract; `convertHash` preserves its evaluation-error contract. Its
+    /// final row is the in-band `blake3:<hex>` parser route rather than the
+    /// `hashAlgo` attribute route immediately above it.
+    #[test]
+    fn blake3_hash_builtins_require_the_feature_when_disabled() {
+        for (label, expr) in [
+            ("hashString", r#"builtins.hashString "blake3" "abc""#),
+            (
+                "hashFile",
+                r#"builtins.hashFile "blake3" (throw "the path must stay unforced")"#,
+            ),
+        ] {
+            let got = render(expr);
+            assert!(
+                got.contains("Unimplemented")
+                    && got.contains("UnimplementedBuiltin")
+                    && got.contains("blake3 hashes"),
+                "{label} should refuse disabled Blake3 by name, got {got}"
+            );
+        }
+
+        for (label, expr) in [
+            (
+                "convertHash hashAlgo",
+                r#"builtins.convertHash {
+                    hash = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85";
+                    hashAlgo = "blake3";
+                    toHashFormat = "sri";
+                }"#,
+            ),
+            (
+                "convertHash in-band prefix",
+                r#"builtins.convertHash {
+                    hash = "blake3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85";
+                    toHashFormat = "sri";
+                }"#,
+            ),
+            // The two above would still refuse with the early gate in
+            // `ConvertStage::Algo` deleted, because `nixhash` rejects the
+            // algorithm again further in. What only the early gate protects is
+            // the ORDER: cppnix refuses the algorithm before it forces
+            // `toHashFormat`, so a caller whose format argument throws sees the
+            // Blake3 refusal and not its own throw. The case below pins that,
+            // and it goes red if the early gate is removed -- which is the
+            // property the pair above lacks. Same shape as the `hashFile` case just
+            // above, which keeps its path unforced for the same reason.
+            //
+            // Only the `hashAlgo` spelling can be pinned this way. With no
+            // `hashAlgo` attribute, `ConvertStage::Hash` goes straight to
+            // `ask_format`, so the in-band `blake3:` prefix is not read until
+            // after the format has been forced -- there is no ordering there to
+            // protect. Whether cppnix forces in the same order on that route is
+            // not established here.
+            (
+                "convertHash hashAlgo, format must stay unforced",
+                r#"builtins.convertHash {
+                    hash = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85";
+                    hashAlgo = "blake3";
+                    toHashFormat = throw "the format must stay unforced";
+                }"#,
+            ),
+        ] {
+            assert_eq!(
+                render(expr),
+                "Eval(Eval, \"blake3 hashes (cppnix gates these behind the blake3-hashes experimental feature)\")",
+                "{label} should reject disabled Blake3 by name"
+            );
+        }
+    }
+
+    /// The enabled half of `convertHash` reaches decoding and literal SRI
+    /// rendering, rather than merely accepting the algorithm name.
+    #[test]
+    fn blake3_convert_hash_matches_cppnixs_known_answer() {
+        let settings = crate::eval::Settings {
+            blake3_hashes: true,
+            ..crate::eval::Settings::default()
+        };
+        assert_eq!(
+            crate::eval::render_str_with(
+                &settings,
+                r#"builtins.convertHash {
+                    hash = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85";
+                    hashAlgo = "blake3";
+                    toHashFormat = "sri";
+                }"#,
+            ),
+            "\"blake3-ZDezrDhGUTP/tjt1JzqNtUjFWEZdedsD/TWcbNW9nYU=\""
+        );
+    }
+
     /// The failures, each one cppnix's wording: which attribute is located
     /// first decides which missing attribute an incomplete call reports.
     #[test]
@@ -1437,6 +1611,21 @@ mod tests {
         assert_eq!(
             render("builtins.hashString \"sha3\" \"\""),
             "Eval(Eval, \"unknown hash algorithm 'sha3', expect 'blake3', 'md5', 'sha1', 'sha256', or 'sha512'\")"
+        );
+    }
+
+    /// The first Blake3 vector in cppnix's `libutil-tests/hash.cc:40-49`:
+    /// digesting `abc` through the evaluator must produce the same 32 bytes
+    /// as cppnix, rather than merely accepting the algorithm name.
+    #[test]
+    fn blake3_hash_string_matches_cppnixs_known_answer() {
+        let settings = crate::eval::Settings {
+            blake3_hashes: true,
+            ..crate::eval::Settings::default()
+        };
+        assert_eq!(
+            crate::eval::render_str_with(&settings, "builtins.hashString \"blake3\" \"abc\""),
+            "\"6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85\""
         );
     }
 
@@ -1646,8 +1835,9 @@ mod context_tests {
     }
 
     impl Host for Store {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -1668,23 +1858,36 @@ mod context_tests {
             nix_path,
             trace
         );
-        fn read_file(&self, _p: &str) -> Result<String, String> {
+        fn read_file(&self, _p: &crate::value2::PathValue) -> Result<String, String> {
             Ok(String::new())
         }
-        fn read_dir(&self, _p: &str) -> Result<Vec<(String, FileType)>, String> {
+        fn read_dir(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> Result<Vec<(String, FileType)>, String> {
             Ok(Vec::new())
         }
-        fn path_exists(&self, _p: &str) -> bool {
-            true
+        fn path_exists_checked(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(true)
         }
-        fn file_type(&self, _p: &str) -> Result<Option<FileType>, String> {
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
+        }
+        fn file_type(&self, _p: &crate::value2::PathValue) -> Result<Option<FileType>, String> {
             Ok(Some(FileType::Regular))
         }
         /// Store-path-shaped, unlike the shorter fakes elsewhere in this
         /// crate's tests: `appendContext` validates its keys, so a fake that
         /// is not a valid store path makes the round-trip test fail on the
         /// fixture rather than on the code.
-        fn copy_to_store(&self, path: &str) -> Result<String, StoreError> {
+        fn copy_to_store(&self, path: &crate::value2::PathValue) -> Result<String, StoreError> {
             Ok(format!("/nix/store/{}-f", fake_hash(path)))
         }
         fn ensure_path(&self, path: &str) -> Result<(), StoreError> {
@@ -1902,8 +2105,9 @@ mod context_tests {
     fn without_a_store_append_context_refuses_by_name() {
         struct NoStore;
         impl Host for NoStore {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -1926,16 +2130,29 @@ mod context_tests {
                 nix_path,
                 trace
             );
-            fn read_file(&self, _p: &str) -> Result<String, String> {
+            fn read_file(&self, _p: &crate::value2::PathValue) -> Result<String, String> {
                 Ok(String::new())
             }
-            fn read_dir(&self, _p: &str) -> Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                true
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(true)
             }
-            fn file_type(&self, _p: &str) -> Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(&self, _p: &crate::value2::PathValue) -> Result<Option<FileType>, String> {
                 Ok(Some(FileType::Regular))
             }
         }
@@ -2029,8 +2246,9 @@ mod to_file_tests {
     struct TextStore(RefCell<Vec<(String, String, Vec<String>)>>);
 
     impl Host for TextStore {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -2052,16 +2270,32 @@ mod to_file_tests {
             nix_path,
             trace
         );
-        fn read_file(&self, _p: &str) -> std::result::Result<String, String> {
+        fn read_file(&self, _p: &crate::value2::PathValue) -> std::result::Result<String, String> {
             Ok(String::new())
         }
-        fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+        fn read_dir(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<Vec<(String, FileType)>, String> {
             Ok(Vec::new())
         }
-        fn path_exists(&self, _p: &str) -> bool {
-            true
+        fn path_exists_checked(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(true)
         }
-        fn file_type(&self, _p: &str) -> std::result::Result<Option<FileType>, String> {
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
+        }
+        fn file_type(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<Option<FileType>, String> {
             Ok(Some(FileType::Regular))
         }
         fn store_text(
@@ -2242,8 +2476,9 @@ mod to_file_tests {
     fn to_file_without_a_store_refuses_rather_than_computing() {
         struct NoStore;
         impl Host for NoStore {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -2266,16 +2501,35 @@ mod to_file_tests {
                 nix_path,
                 trace
             );
-            fn read_file(&self, _p: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 Ok(String::new())
             }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                true
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(true)
             }
-            fn file_type(&self, _p: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 Ok(Some(FileType::Regular))
             }
         }
@@ -2306,8 +2560,9 @@ mod to_json_path_tests {
     struct Copies;
 
     impl Host for Copies {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -2329,19 +2584,38 @@ mod to_json_path_tests {
             nix_path,
             trace
         );
-        fn read_file(&self, _p: &str) -> std::result::Result<String, String> {
+        fn read_file(&self, _p: &crate::value2::PathValue) -> std::result::Result<String, String> {
             Ok(String::new())
         }
-        fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+        fn read_dir(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<Vec<(String, FileType)>, String> {
             Ok(Vec::new())
         }
-        fn path_exists(&self, _p: &str) -> bool {
-            true
+        fn path_exists_checked(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(true)
         }
-        fn file_type(&self, _p: &str) -> std::result::Result<Option<FileType>, String> {
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
+        }
+        fn file_type(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<Option<FileType>, String> {
             Ok(Some(FileType::Regular))
         }
-        fn copy_to_store(&self, path: &str) -> std::result::Result<String, StoreError> {
+        fn copy_to_store(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<String, StoreError> {
             Ok(format!(
                 "/nix/store/0000000000000000000000000000000a-{}",
                 path.rsplit('/').next().unwrap_or("x")
@@ -2554,7 +2828,7 @@ pub struct PathBuiltin {
     /// coercion arrives back here a second time.
     path_stage: PathStage,
 
-    root: Option<String>,
+    root: Option<Rc<PathValue>>,
     name: Option<String>,
     filter: Option<Value>,
     method: PathMethod,
@@ -2563,7 +2837,7 @@ pub struct PathBuiltin {
     /// The prefixes of the root path, shortest first, each of which is
     /// lstat'ed to catch a symlink cppnix would have resolved. The last is the
     /// root itself, so its answer also decides whether there is a tree to walk.
-    ancestors: Vec<String>,
+    ancestors: Vec<Rc<PathValue>>,
     ancestor: usize,
 
     stack: Vec<DirFrame>,
@@ -2574,7 +2848,7 @@ pub struct PathBuiltin {
     /// context and is in the store. See [`FilteredCopy::inherit_references`].
     inherit_references: bool,
     /// The root as coerced, held while its context is out being realised.
-    pending_root: String,
+    pending_root: Option<Rc<PathValue>>,
 }
 
 pub fn bi_path(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
@@ -2597,7 +2871,7 @@ pub fn bi_path(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
         accepted: Vec::new(),
         pending: None,
         inherit_references: false,
-        pending_root: String::new(),
+        pending_root: None,
     })))))
 }
 
@@ -2648,7 +2922,7 @@ pub fn bi_filter_source(vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
         accepted: Vec::new(),
         pending: None,
         inherit_references: false,
-        pending_root: String::new(),
+        pending_root: None,
     })))))
 }
 
@@ -2670,10 +2944,11 @@ impl PathBuiltin {
             (PathPhase::Attr, Some(v)) => self.take_attr(vm, v),
             (PathPhase::Warned, _) => self.next_attr(vm),
             (PathPhase::RootRealising, Some(v)) => {
-                self.root = Some(crate::primops_pure::apply_rewrites(
-                    core::mem::take(&mut self.pending_root),
-                    Some(v),
-                )?);
+                let pending = self
+                    .pending_root
+                    .take()
+                    .ok_or_else(|| VmError::eval("internal: builtins.path lost its root"))?;
+                self.root = Some(crate::primops_pure::apply_rewrites(pending, Some(v))?);
                 self.inherit_references = true;
                 self.next_attr(vm)
             }
@@ -2780,9 +3055,9 @@ impl PathBuiltin {
                         .settings()
                         .store_dir
                         .as_deref()
-                        .is_none_or(|dir| crate::storepath::is_store_path(dir, &path))
+                        .is_none_or(|dir| crate::storepath::is_store_path(dir, path.as_ref()))
                 {
-                    self.pending_root = path;
+                    self.pending_root = Some(path);
                     self.phase = PathPhase::RootRealising;
                     return Ok(Yield::Need(NeedPath::Realise(
                         elements.into_iter().collect(),
@@ -2818,6 +3093,7 @@ impl PathBuiltin {
                 let (hash, warning) = crate::nixhash::new_hash_allow_empty(
                     &text,
                     Some(crate::nixhash::HashAlgo::Sha256),
+                    false,
                 )
                 .map_err(|e| VmError::eval(e.to_string()))?;
                 self.expected_sha256 = Some(hash.to_sri());
@@ -2842,7 +3118,7 @@ impl PathBuiltin {
         // cppnix: `if (name.empty()) name = path->baseName();`, so an explicit
         // empty name also falls back rather than naming the store object "".
         if self.name.as_ref().is_none_or(String::is_empty) {
-            self.name = Some(base_name_of(&root));
+            self.name = Some(base_name_of(root.as_ref()));
         }
         // `Flat` ingests one file's bytes and never opens a directory, so
         // cppnix's copy never consults the filter even when one was given
@@ -2947,7 +3223,7 @@ impl PathBuiltin {
         self.open(path)
     }
 
-    fn open(&mut self, dir: String) -> Result<Yield> {
+    fn open(&mut self, dir: Rc<PathValue>) -> Result<Yield> {
         self.phase = PathPhase::Entries;
         Ok(Yield::Need(NeedPath::Entries(dir)))
     }
@@ -2960,7 +3236,8 @@ impl PathBuiltin {
             Some(entry) => entry.path.clone(),
             None => self
                 .root
-                .clone()
+                .as_ref()
+                .map(ToString::to_string)
                 .ok_or_else(|| VmError::eval("internal: builtins.path lost its root"))?,
         };
         self.pending = None;
@@ -3025,7 +3302,11 @@ impl PathBuiltin {
                 path: path.clone(),
                 file_type: FileType::Directory,
             });
-            return self.open(path);
+            let root = self
+                .root
+                .as_ref()
+                .ok_or_else(|| VmError::eval("internal: builtins.path lost its root"))?;
+            return self.open(Rc::new(root.with_path(path)));
         }
         self.walk()
     }
@@ -3077,13 +3358,25 @@ fn base_name_of(path: &str) -> String {
 /// Every prefix of an absolute path, shortest first, ending in the path
 /// itself. `/a/b` yields `/a` then `/a/b`; `/` yields nothing, which is right
 /// -- there is no component to be a symlink.
-fn ancestors_of(path: &str) -> Vec<String> {
+fn ancestors_of(path: &Rc<PathValue>) -> Vec<Rc<PathValue>> {
     let mut out = Vec::new();
-    let mut acc = String::new();
-    for component in path.split('/').filter(|c| !c.is_empty()) {
+    let (mut acc, suffix) = match &path.root {
+        Root::Ambient => (String::new(), path.as_ref().as_ref()),
+        Root::Mounted(mount) => (
+            mount.to_string(),
+            path.as_ref()
+                .as_ref()
+                .strip_prefix(mount.as_ref())
+                .unwrap_or(""),
+        ),
+    };
+    for component in suffix.split('/').filter(|c| !c.is_empty()) {
         acc.push('/');
         acc.push_str(component);
-        out.push(acc.clone());
+        out.push(Rc::new(path.with_path(acc.clone())));
+    }
+    if out.is_empty() {
+        out.push(Rc::clone(path));
     }
     out
 }
@@ -3156,8 +3449,9 @@ mod path_tests {
     ];
 
     impl Host for Tree {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -3178,11 +3472,14 @@ mod path_tests {
             nix_path,
             trace
         );
-        fn read_file(&self, _p: &str) -> std::result::Result<String, String> {
+        fn read_file(&self, _p: &crate::value2::PathValue) -> std::result::Result<String, String> {
             Ok(String::new())
         }
-        fn read_dir(&self, p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
-            match ENTRIES.iter().find(|(dir, _)| *dir == p) {
+        fn read_dir(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<Vec<(String, FileType)>, String> {
+            match ENTRIES.iter().find(|(dir, _)| *dir == p.path.as_ref()) {
                 Some((_, items)) => Ok(items
                     .iter()
                     .map(|(name, t)| ((*name).to_owned(), *t))
@@ -3190,11 +3487,24 @@ mod path_tests {
                 None => Err(format!("path '{p}' does not exist")),
             }
         }
-        fn path_exists(&self, p: &str) -> bool {
-            KINDS.iter().any(|(path, _)| *path == p)
+        fn path_exists_checked(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(KINDS.iter().any(|(path, _)| *path == p.path.as_ref()))
         }
-        fn file_type(&self, p: &str) -> std::result::Result<Option<FileType>, String> {
-            match KINDS.iter().find(|(path, _)| *path == p) {
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
+        }
+        fn file_type(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<Option<FileType>, String> {
+            match KINDS.iter().find(|(path, _)| *path == p.path.as_ref()) {
                 Some((_, t)) => Ok(Some(*t)),
                 None => Err(format!("path '{p}' does not exist")),
             }
@@ -3246,7 +3556,7 @@ mod path_tests {
             "\"/nix/store/0000000000000000000000000000000a-t\""
         );
         let request = only(&asked);
-        assert_eq!(request.root, "/t");
+        assert_eq!(request.root.path.as_ref(), "/t");
         // cppnix defaults the name to the root's base name.
         assert_eq!(request.name, "t");
         assert_eq!(request.accepted, None);
@@ -3282,7 +3592,7 @@ mod path_tests {
             "builtins.path { path = { outPath = /t; }; filter = p: t: true; }",
         ] {
             let (_, asked) = run(src);
-            assert_eq!(only(&asked).root, "/t", "{src}");
+            assert_eq!(only(&asked).root.path.as_ref(), "/t", "{src}");
         }
         // The name still defaults to the coerced path's base name.
         let (_, asked) = run("builtins.path { path = { outPath = /t/sub; }; }");
@@ -3317,7 +3627,8 @@ mod path_tests {
             vec!["/t/a.txt", "/t/skip", "/t/skip/c", "/t/sub", "/t/sub/b"]
         );
         // The root itself is never offered to the filter, so rejecting
-        // everything still copies a directory -- an empty one.
+        // everything still names a directory: an empty one on the NAR road,
+        // jj's empty tree on the tree-id road.
         assert_eq!(
             accepted("builtins.path { path = /t; filter = p: t: false; }"),
             Vec::<String>::new()
@@ -3458,7 +3769,7 @@ mod path_tests {
         // Without a filter nothing observes the difference: the embedder
         // resolves the root exactly as cppnix does.
         let (_, asked) = run("builtins.path { path = /link-root; }");
-        assert_eq!(only(&asked).root, "/link-root");
+        assert_eq!(only(&asked).root.path.as_ref(), "/link-root");
     }
 
     /// Every directory the walk opened is an `Entries` question, so a
@@ -3483,7 +3794,7 @@ mod path_tests {
         let asked = format!("{:?}", host.take().questions());
         for dir in ["/t", "/t/skip", "/t/sub"] {
             assert!(
-                asked.contains(&format!("ReadDir({dir:?})")),
+                asked.contains(&format!("ReadDir({:?})", crate::value2::ambient_path(dir))),
                 "{dir} missing from {asked}"
             );
         }
@@ -3500,8 +3811,9 @@ mod path_tests {
     fn without_a_store_the_copy_refuses_by_name() {
         struct NoStore;
         impl Host for NoStore {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -3524,16 +3836,35 @@ mod path_tests {
                 nix_path,
                 trace
             );
-            fn read_file(&self, _p: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 Ok(String::new())
             }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                true
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(true)
             }
-            fn file_type(&self, _p: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 Ok(Some(FileType::Directory))
             }
         }
@@ -3628,7 +3959,7 @@ mod path_tests {
             r#"builtins.filterSource (p: t: true) { __toString = _: "/t"; }"#,
         ] {
             let (_, asked) = run(src);
-            assert_eq!(only(&asked).root, "/t", "{src}");
+            assert_eq!(only(&asked).root.path.as_ref(), "/t", "{src}");
         }
     }
 
@@ -3852,6 +4183,7 @@ impl FetchBuiltin {
                 let (hash, warning) = crate::nixhash::new_hash_allow_empty(
                     &text,
                     Some(crate::nixhash::HashAlgo::Sha256),
+                    false,
                 )
                 .map_err(|e| VmError::eval(e.to_string()))?;
                 self.expected_sha256 = Some(hash.to_sri());
@@ -3973,8 +4305,9 @@ mod fetch_tests {
     }
 
     impl Host for Downloads {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -3995,16 +4328,32 @@ mod fetch_tests {
             nix_path,
             trace
         );
-        fn read_file(&self, p: &str) -> std::result::Result<String, String> {
+        fn read_file(&self, p: &crate::value2::PathValue) -> std::result::Result<String, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn read_dir(&self, p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+        fn read_dir(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<Vec<(String, FileType)>, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn path_exists(&self, _p: &str) -> bool {
-            false
+        fn path_exists_checked(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(false)
         }
-        fn file_type(&self, p: &str) -> std::result::Result<Option<FileType>, String> {
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
+        }
+        fn file_type(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<Option<FileType>, String> {
             Err(format!("path '{p}' does not exist"))
         }
         fn warn(&self, message: &str) {
@@ -4253,8 +4602,9 @@ mod fetch_tests {
     fn no_fetcher_behind_the_host_is_a_named_refusal() {
         struct NoStoreHost;
         impl Host for NoStoreHost {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -4277,16 +4627,35 @@ mod fetch_tests {
                 trace,
                 warn
             );
-            fn read_file(&self, p: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                p: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 Err(format!("path '{p}' does not exist"))
             }
-            fn read_dir(&self, p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Err(format!("path '{p}' does not exist"))
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                false
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(false)
             }
-            fn file_type(&self, p: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                p: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 Err(format!("path '{p}' does not exist"))
             }
         }
@@ -4394,28 +4763,69 @@ pub fn bi_fetch_final_tree(vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
     begin_fetch_tree(vm, args, TreeFetcher::FinalTree)
 }
 
+/// cppnix's `fixGitURL`, for the bare-string spelling of `builtins.fetchGit`:
+/// an scp-style `user@host:path` becomes `ssh://host/path`, a `file:` URL and
+/// anything with a scheme pass through, and an absolute path becomes a
+/// `file://` URL. A relative path is the one case left to the embedder, so it
+/// is returned as `None` and the caller keeps the refusal.
+fn fix_git_url(url: &str) -> Option<String> {
+    if !url.starts_with('/')
+        && let Some((user_host, path)) = url.split_once(':')
+        && let Some((_, host)) = user_host.split_once('@')
+        && !user_host.contains('/')
+        && !path.starts_with('/')
+    {
+        return Some(format!("ssh://{host}/{path}"));
+    }
+    if url.starts_with("file:") || url.contains("://") {
+        return Some(url.to_owned());
+    }
+    if url.starts_with('/') {
+        return Some(format!("file://{url}"));
+    }
+    None
+}
+
 fn begin_fetch_tree(_vm: &mut Vm, args: &[Slot], fetcher: TreeFetcher) -> Result<Begin> {
     let arg = argv(args, 0)?;
-    let Value::Attrs(attrs) = &arg else {
-        return Err(VmError::Unimplemented(Refusal::new(
-            RefusalToken::UnimplementedBuiltin,
-            format!(
-                "builtins.{} with a {} argument rather than an attribute set: cppnix turns \
-                 it into an input with Input::fromURL or fixGitURL, which is URL parsing this \
-                 backend does not do",
-                fetcher.error_name(),
-                type_name(&arg)
-            ),
-        )));
+    // `fetchGit "file:///repo"` and `fetchGit ./repo`: cppnix runs the string
+    // through `fixGitURL` and reads it as `{ url = ...; }`. That much URL
+    // fixing is small enough to carry here; `fetchTree "github:..."` still goes
+    // through `Input::fromURL` and stays refused.
+    let bare_git_url = match (&arg, fetcher) {
+        (Value::Str(s), TreeFetcher::Git) => {
+            fix_git_url(crate::primops_pure::text_of(s)?)
+        }
+        (Value::Path(p), TreeFetcher::Git) => fix_git_url(&p.to_string()),
+        _ => None,
+    };
+    let (queue, seeded_url): (VecDeque<(Sym, Slot)>, Option<String>) = match (&arg, bare_git_url) {
+        (Value::Attrs(attrs), _) => (attrs.iter().map(|(k, v)| (*k, v.clone())).collect(), None),
+        (_, Some(url)) => (VecDeque::new(), Some(url)),
+        _ => {
+            return Err(VmError::Unimplemented(Refusal::new(
+                RefusalToken::UnimplementedBuiltin,
+                format!(
+                    "builtins.{} with a {} argument rather than an attribute set: cppnix turns \
+                     it into an input with Input::fromURL or fixGitURL, which is URL parsing this \
+                     backend does not do",
+                    fetcher.error_name(),
+                    type_name(&arg)
+                ),
+            )));
+        }
     };
     let mut machine = FetchTreeBuiltin {
         fetcher,
-        queue: attrs.iter().map(|(k, v)| (*k, v.clone())).collect(),
+        queue,
         current: None,
         asked: false,
         type_attr_seen: false,
         attrs: BTreeMap::new(),
     };
+    if let Some(url) = seeded_url {
+        machine.attrs.insert("url".to_owned(), TreeAttr::Str(url));
+    }
     // cppnix seeds `type = "git"` for fetchGit before it reads the set, which
     // is why an explicit `type` there is "unexpected argument" rather than a
     // duplicate.
@@ -4551,8 +4961,9 @@ mod fetch_tree_tests {
     struct Trees(RefCell<Vec<FetchTreeRequest>>);
 
     impl Host for Trees {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -4574,16 +4985,32 @@ mod fetch_tree_tests {
             trace,
             warn
         );
-        fn read_file(&self, p: &str) -> std::result::Result<String, String> {
+        fn read_file(&self, p: &crate::value2::PathValue) -> std::result::Result<String, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn read_dir(&self, p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+        fn read_dir(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<Vec<(String, FileType)>, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn path_exists(&self, _p: &str) -> bool {
-            false
+        fn path_exists_checked(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(false)
         }
-        fn file_type(&self, p: &str) -> std::result::Result<Option<FileType>, String> {
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
+        }
+        fn file_type(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<Option<FileType>, String> {
             Err(format!("path '{p}' does not exist"))
         }
         fn fetch_tree(
@@ -4791,15 +5218,15 @@ mod fetch_tree_tests {
         assert_eq!(kinds, "\"int,bool\"");
     }
 
-    /// A bare string or path argument, and `publicKeys`, are refused by name
-    /// rather than approximated -- both would need this crate to reimplement
-    /// something (URL parsing, a JSON writer) that decides a store path.
+    /// A bare `fetchTree` string, a relative `fetchGit` string, and
+    /// `publicKeys` are refused by name rather than approximated -- each would
+    /// need this crate to reimplement something (flake-ref parsing, a
+    /// relative-path anchor, a JSON writer) that decides a store path.
     #[test]
     fn the_two_shapes_this_backend_will_not_guess_are_refused_by_name() {
         for src in [
             r#"builtins.fetchTree "github:NixOS/nixpkgs""#,
-            r#"builtins.fetchGit "/repo""#,
-            r#"builtins.fetchGit ./repo"#,
+            r#"builtins.fetchGit "repo""#,
             r#"builtins.fetchTree { type = "git"; url = "/r"; publicKeys = [ { key = "k"; } ]; }"#,
         ] {
             let out = fails_with(src);
@@ -4810,14 +5237,55 @@ mod fetch_tree_tests {
         }
     }
 
+    /// The bare-string spelling of `fetchGit` goes through cppnix's
+    /// `fixGitURL` and arrives at the fetcher as `{ type = "git"; url = ...; }`:
+    /// an absolute path becomes a `file://` URL, an scp-style remote becomes
+    /// `ssh://`, and anything that already carries a scheme is kept.
+    #[test]
+    fn fetch_git_bare_strings_go_through_fix_git_url() {
+        for (src, url) in [
+            (r#"builtins.fetchGit "/repo""#, "file:///repo"),
+            (r#"builtins.fetchGit "file:///repo""#, "file:///repo"),
+            (r#"builtins.fetchGit "https://h/r.git""#, "https://h/r.git"),
+            (
+                r#"builtins.fetchGit "git@host:owner/repo.git""#,
+                "ssh://host/owner/repo.git",
+            ),
+        ] {
+            let request = only(src);
+            assert_eq!(request.fetcher, TreeFetcher::Git, "{src}");
+            assert_eq!(
+                request.attrs.get("type"),
+                Some(&TreeAttr::Str("git".to_owned())),
+                "{src}"
+            );
+            assert_eq!(
+                request.attrs.get("url"),
+                Some(&TreeAttr::Str(url.to_owned())),
+                "{src}"
+            );
+        }
+        // A path value is absolute by construction, so it takes the `file://`
+        // branch whatever directory the test runs in.
+        let request = only(r#"builtins.fetchGit ./repo"#);
+        match request.attrs.get("url") {
+            Some(TreeAttr::Str(url)) => {
+                assert!(url.starts_with("file:///"), "got {url}");
+                assert!(url.ends_with("/repo"), "got {url}");
+            }
+            other => panic!("path argument should seed a file:// url, got {other:?}"),
+        }
+    }
+
     /// No fetcher behind the host: a named refusal, as for the fixed-output
     /// pair, and never a guessed attribute set.
     #[test]
     fn no_fetcher_behind_the_host_is_a_named_refusal() {
         struct NoStoreHost;
         impl Host for NoStoreHost {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -4840,16 +5308,35 @@ mod fetch_tree_tests {
                 trace,
                 warn
             );
-            fn read_file(&self, p: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                p: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 Err(format!("path '{p}' does not exist"))
             }
-            fn read_dir(&self, p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Err(format!("path '{p}' does not exist"))
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                false
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(false)
             }
-            fn file_type(&self, p: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                p: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 Err(format!("path '{p}' does not exist"))
             }
         }
@@ -4887,8 +5374,9 @@ mod fetch_tree_tests {
     fn an_embedder_that_declines_is_unimplemented_not_an_error() {
         struct Declining;
         impl Host for Declining {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -4910,16 +5398,35 @@ mod fetch_tree_tests {
                 trace,
                 warn
             );
-            fn read_file(&self, p: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                p: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 Err(format!("path '{p}' does not exist"))
             }
-            fn read_dir(&self, p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Err(format!("path '{p}' does not exist"))
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                false
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(false)
             }
-            fn file_type(&self, p: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                p: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 Err(format!("path '{p}' does not exist"))
             }
             fn fetch_tree(
@@ -4976,8 +5483,9 @@ mod path_exists_tests {
     }
 
     impl Host for Fs {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -4999,21 +5507,45 @@ mod path_exists_tests {
             trace,
             warn
         );
-        fn read_file(&self, p: &str) -> std::result::Result<String, String> {
+        fn read_file(&self, p: &crate::value2::PathValue) -> std::result::Result<String, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn read_dir(&self, p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+        fn read_dir(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<Vec<(String, FileType)>, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn file_type(&self, p: &str) -> std::result::Result<Option<FileType>, String> {
+        fn file_type(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<Option<FileType>, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn path_exists(&self, p: &str) -> bool {
-            self.plain.borrow_mut().push(p.to_owned());
-            canon(p) == "/base/lib.nix" || canon(p) == "/base"
+        fn path_exists_checked(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.plain.borrow_mut().push(p.to_string());
+            Ok(canon(p) == "/base/lib.nix" || canon(p) == "/base")
         }
-        fn file_type_resolved(&self, p: &str) -> std::result::Result<FileType, String> {
-            self.resolved.borrow_mut().push(p.to_owned());
+        /// As the real hosts answer it: a path that is not there is `false`,
+        /// only a resolver failure is an error.
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            match self.file_type_resolved(path) {
+                Ok(kind) => Ok(kind == crate::host::FileType::Directory),
+                Err(error) if error.contains("No such file or directory") => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
+        fn file_type_resolved(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<FileType, String> {
+            self.resolved.borrow_mut().push(p.to_string());
             match canon(p).as_str() {
                 "/base/lib.nix" => Ok(FileType::Regular),
                 "/base" => Ok(FileType::Directory),
@@ -5052,7 +5584,8 @@ mod path_exists_tests {
     /// `/` or `/.` on a *file* is `false`, on a directory `true`, and a
     /// missing path stays `false` through the error branch. The question is
     /// asked on the canonicalized path -- the slash decides the predicate
-    /// and then leaves.
+    /// and then leaves, as it does in cppnix's `CanonPath`, and the embedder
+    /// refuses a non-canonical spelling rather than repairing one.
     #[test]
     fn a_trailing_slash_string_must_name_a_directory() {
         for (src, want) in [
@@ -5069,10 +5602,10 @@ mod path_exists_tests {
         let (_, host) = run(r#"builtins.pathExists "/base/lib.nix/""#);
         assert_eq!(
             host.resolved.borrow().as_slice(),
-            ["/base/lib.nix/".to_owned()],
+            ["/base/lib.nix".to_owned()],
             "the trailing-slash spelling resolves fully, and the question \
-             carries the program's own spelling -- canonicalization is the \
-             embedder's, as it is for every path question"
+             carries the canonical spelling: the slash decided the predicate \
+             and left, as in cppnix's CanonPath"
         );
         assert!(
             host.plain.borrow().is_empty(),
@@ -5105,7 +5638,8 @@ mod flake_ref_tests {
     }
 
     impl Host for Grammar {
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        crate::host::host_stubs!(settle);
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -5128,16 +5662,32 @@ mod flake_ref_tests {
             trace,
             warn
         );
-        fn read_file(&self, p: &str) -> std::result::Result<String, String> {
+        fn read_file(&self, p: &crate::value2::PathValue) -> std::result::Result<String, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn read_dir(&self, p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+        fn read_dir(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<Vec<(String, FileType)>, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn path_exists(&self, _p: &str) -> bool {
-            false
+        fn path_exists_checked(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(false)
         }
-        fn file_type(&self, p: &str) -> std::result::Result<Option<FileType>, String> {
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
+        }
+        fn file_type(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<Option<FileType>, String> {
             Err(format!("path '{p}' does not exist"))
         }
         fn parse_flake_ref(&self, flake_ref: &str) -> Result<String, StoreError> {
@@ -5224,8 +5774,9 @@ mod flake_ref_tests {
     fn no_grammar_behind_the_evaluator_is_unimplemented() {
         struct NoGrammar;
         impl Host for NoGrammar {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -5248,16 +5799,35 @@ mod flake_ref_tests {
                 trace,
                 warn
             );
-            fn read_file(&self, p: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                p: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 Err(format!("path '{p}' does not exist"))
             }
-            fn read_dir(&self, p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Err(format!("path '{p}' does not exist"))
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                false
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(false)
             }
-            fn file_type(&self, p: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                p: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 Err(format!("path '{p}' does not exist"))
             }
         }
@@ -5303,8 +5873,9 @@ mod emit_tests {
     }
 
     impl Host for Lines {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -5325,16 +5896,32 @@ mod emit_tests {
             find_file,
             nix_path
         );
-        fn read_file(&self, p: &str) -> std::result::Result<String, String> {
+        fn read_file(&self, p: &crate::value2::PathValue) -> std::result::Result<String, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn read_dir(&self, p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+        fn read_dir(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<Vec<(String, FileType)>, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn path_exists(&self, _p: &str) -> bool {
-            false
+        fn path_exists_checked(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(false)
         }
-        fn file_type(&self, p: &str) -> std::result::Result<Option<FileType>, String> {
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
+        }
+        fn file_type(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> std::result::Result<Option<FileType>, String> {
             Err(format!("path '{p}' does not exist"))
         }
         fn trace(&self, message: &str) {

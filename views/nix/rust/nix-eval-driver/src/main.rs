@@ -255,12 +255,8 @@ fn run(options: &Options) -> Result<i32, String> {
         // driver does not name are the crate's defaults on purpose, and
         // spelling it this way makes a new field a decision somebody sees
         // rather than one that silently keeps its default.
-        // Left at the crate default deliberately, and worth naming because
-        // it is the one setting where the driver and the bridge can differ
-        // without the parity gate noticing: it decides which gated builtin
-        // names exist, and no case in the corpus uses one. If a case ever
-        // does, this needs plumbing from a flag.
-        //   cpp_builtin_names: None
+        // Standalone drivers enable all implemented builtin features by
+        // default; production embedding supplies its explicit feature policy.
         ..Settings::default()
     };
 

@@ -1,8 +1,8 @@
 use crate::model::ThreadMetadata;
+use codex_history::RolloutItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::UserMessageEvent;
@@ -21,11 +21,14 @@ pub fn apply_rollout_item(
         RolloutItem::SessionMeta(meta_line) => apply_session_meta_from_item(metadata, meta_line),
         RolloutItem::TurnContext(turn_ctx) => apply_turn_context(metadata, turn_ctx),
         RolloutItem::EventMsg(event) => apply_event_msg(metadata, event),
-        RolloutItem::ResponseItem(item) => apply_response_item(metadata, item),
+        RolloutItem::ResponseItem(item) => apply_response_item(metadata, &item.item),
         RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
         RolloutItem::Compacted(_) => {}
         RolloutItem::WorldState(_) => {}
+        RolloutItem::RetainedContext(_) | RolloutItem::SecurityRiskScore(_) => {}
+        RolloutItem::RealtimeItem(_) => {}
+        RolloutItem::TokenUsageRecord(_) => {}
     }
     if metadata.model_provider.is_empty() {
         metadata.model_provider = default_provider.to_string();
@@ -37,7 +40,10 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
     match item {
         RolloutItem::SessionMeta(_) | RolloutItem::TurnContext(_) => true,
         RolloutItem::EventMsg(
-            EventMsg::TokenCount(_) | EventMsg::UserMessage(_) | EventMsg::ThreadGoalUpdated(_),
+            EventMsg::TokenCount(_)
+            | EventMsg::UserMessage(_)
+            | EventMsg::ThreadGoalUpdated(_)
+            | EventMsg::ThreadSettingsApplied(_),
         ) => true,
         RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
             if matches!(event.item, TurnItem::UserMessage(_)) =>
@@ -49,6 +55,10 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
+        | RolloutItem::RealtimeItem(_)
+        | RolloutItem::RetainedContext(_)
+        | RolloutItem::SecurityRiskScore(_)
+        | RolloutItem::TokenUsageRecord(_)
         | RolloutItem::WorldState(_) => false,
     }
 }
@@ -61,6 +71,9 @@ fn apply_session_meta_from_item(metadata: &mut ThreadMetadata, meta_line: &Sessi
     }
     metadata.id = meta_line.meta.id;
     metadata.source = enum_to_string(&meta_line.meta.source);
+    if metadata.originator.is_none() && !meta_line.meta.originator.is_empty() {
+        metadata.originator = Some(meta_line.meta.originator.clone());
+    }
     // Later SessionMeta lines do not redefine the canonical history_mode.
     metadata.thread_source = meta_line.meta.thread_source.clone();
     metadata.agent_nickname = meta_line.meta.agent_nickname.clone();
@@ -114,6 +127,16 @@ fn apply_event_msg(metadata: &mut ThreadMetadata, event: &EventMsg) {
                 set_preview_if_empty(metadata, Some(objective.to_string()));
             }
         }
+        EventMsg::ThreadSettingsApplied(event) => {
+            let settings = &event.thread_settings;
+            metadata.model = Some(settings.model.clone());
+            metadata.model_provider = settings.model_provider_id.clone();
+            metadata.reasoning_effort = settings.reasoning_effort.clone();
+            metadata.cwd = settings.cwd.clone().into_path_buf();
+            metadata.sandbox_policy =
+                serde_json::to_string(&settings.permission_profile).unwrap_or_default();
+            metadata.approval_mode = enum_to_string(&settings.approval_policy);
+        }
         _ => {}
     }
 }
@@ -151,10 +174,17 @@ pub(crate) fn enum_to_string<T: Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::apply_rollout_item;
+    use super::rollout_item_affects_thread_metadata;
     use crate::model::ThreadMetadata;
     use chrono::DateTime;
     use chrono::Utc;
+    use codex_history::RolloutItem;
     use codex_protocol::ThreadId;
+    use codex_protocol::config_types::ApprovalsReviewer;
+    use codex_protocol::config_types::CollaborationMode;
+    use codex_protocol::config_types::ModeKind;
+    use codex_protocol::config_types::ReasoningSummary;
+    use codex_protocol::config_types::Settings;
     use codex_protocol::items::TurnItem;
     use codex_protocol::items::UserMessageItem;
     use codex_protocol::models::ContentItem;
@@ -164,7 +194,6 @@ mod tests {
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::ItemCompletedEvent;
-    use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionMeta;
     use codex_protocol::protocol::SessionMetaLine;
@@ -173,6 +202,8 @@ mod tests {
     use codex_protocol::protocol::ThreadGoalStatus;
     use codex_protocol::protocol::ThreadGoalUpdatedEvent;
     use codex_protocol::protocol::ThreadHistoryMode;
+    use codex_protocol::protocol::ThreadSettingsAppliedEvent;
+    use codex_protocol::protocol::ThreadSettingsSnapshot;
     use codex_protocol::protocol::TurnContextItem;
     use codex_protocol::protocol::USER_MESSAGE_BEGIN;
     use codex_protocol::protocol::UserMessageEvent;
@@ -185,15 +216,18 @@ mod tests {
     #[test]
     fn response_item_user_messages_do_not_set_title_or_first_user_message() {
         let mut metadata = metadata_for_test();
-        let item = RolloutItem::ResponseItem(ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "hello from response item".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        });
+        let item = RolloutItem::ResponseItem(
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "hello from response item".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }
+            .into(),
+        );
 
         apply_rollout_item(&mut metadata, &item, "test-provider");
 
@@ -234,6 +268,7 @@ mod tests {
                 text: format!("{USER_MESSAGE_BEGIN} actual user request"),
                 text_elements: Vec::new(),
             }])),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
         }));
 
@@ -263,6 +298,27 @@ mod tests {
 
         assert_eq!(metadata.first_user_message.as_deref(), Some("[Image]"));
         assert_eq!(metadata.preview.as_deref(), Some("[Image]"));
+        assert_eq!(metadata.title, "");
+    }
+
+    #[test]
+    fn event_msg_audio_only_user_message_sets_audio_placeholder_preview() {
+        let mut metadata = metadata_for_test();
+        let item = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            client_id: None,
+            message: String::new(),
+            images: None,
+            local_images: vec![],
+            audio: Some(vec!["https://example.com/audio.mp3".to_string()]),
+            local_audio: vec![],
+            text_elements: vec![],
+            ..Default::default()
+        }));
+
+        apply_rollout_item(&mut metadata, &item, "test-provider");
+
+        assert_eq!(metadata.first_user_message.as_deref(), Some("[Audio]"));
+        assert_eq!(metadata.preview.as_deref(), Some("[Audio]"));
         assert_eq!(metadata.title, "");
     }
 
@@ -344,6 +400,7 @@ mod tests {
                     forked_from_id: Some(
                         ThreadId::from_string(&Uuid::now_v7().to_string()).expect("thread id"),
                     ),
+                    forked_from_ordinal_exclusive: None,
                     parent_thread_id: None,
                     timestamp: "2026-02-26T00:00:00.000Z".to_string(),
                     cwd: PathBuf::from("/child/worktree"),
@@ -360,6 +417,8 @@ mod tests {
                     selected_capability_roots: Vec::new(),
                     memory_mode: None,
                     history_mode: Default::default(),
+                    history_base: None,
+                    subagent_history_start_ordinal: None,
                     multi_agent_version: None,
                     context_window: None,
                 },
@@ -371,6 +430,7 @@ mod tests {
             &mut metadata,
             &RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("turn-1".to_string()),
+                root_turn_id: None,
                 cwd: serde_json::from_value(serde_json::json!(
                     std::env::current_dir()
                         .expect("current directory")
@@ -384,6 +444,7 @@ mod tests {
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
                 permission_profile: None,
+                active_permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
@@ -393,6 +454,7 @@ mod tests {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: None,
                 summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
@@ -417,6 +479,7 @@ mod tests {
             &mut metadata,
             &RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("turn-1".to_string()),
+                root_turn_id: None,
                 cwd: serde_json::from_value(serde_json::json!(
                     std::env::current_dir()
                         .expect("current directory")
@@ -430,6 +493,7 @@ mod tests {
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::DangerFullAccess,
                 permission_profile: Some(permission_profile.clone()),
+                active_permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
@@ -439,6 +503,7 @@ mod tests {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: None,
                 summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
@@ -463,6 +528,7 @@ mod tests {
             &mut metadata,
             &RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("turn-1".to_string()),
+                root_turn_id: None,
                 cwd: serde_json::from_value(serde_json::json!(&fallback_cwd))
                     .expect("absolute fallback cwd"),
                 workspace_roots: None,
@@ -472,6 +538,7 @@ mod tests {
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 permission_profile: None,
+                active_permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
@@ -481,6 +548,7 @@ mod tests {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: Some(ReasoningEffort::High),
                 summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
@@ -498,6 +566,7 @@ mod tests {
             &mut metadata,
             &RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("turn-1".to_string()),
+                root_turn_id: None,
                 cwd: serde_json::from_value(serde_json::json!(
                     std::env::current_dir()
                         .expect("current directory")
@@ -511,6 +580,7 @@ mod tests {
                 approvals_reviewer: None,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 permission_profile: None,
+                active_permission_profile: None,
                 network: None,
                 file_system_sandbox_policy: None,
                 model: "gpt-5".to_string(),
@@ -520,6 +590,7 @@ mod tests {
                 multi_agent_version: None,
                 multi_agent_mode: None,
                 realtime_active: None,
+                cyber_access_program: None,
                 effort: Some(ReasoningEffort::High),
                 summary: codex_protocol::config_types::ReasoningSummary::Auto,
             }),
@@ -528,6 +599,55 @@ mod tests {
 
         assert_eq!(metadata.model.as_deref(), Some("gpt-5"));
         assert_eq!(metadata.reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn thread_settings_applied_updates_resume_metadata() {
+        let mut metadata = metadata_for_test();
+        let permission_profile = PermissionProfile::workspace_write();
+        let cwd = std::env::current_dir()
+            .expect("current directory")
+            .join("updated/workspace");
+        let item = RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+            ThreadSettingsAppliedEvent {
+                thread_id: None,
+                thread_settings: ThreadSettingsSnapshot {
+                    model: "gpt-5.2-codex".to_string(),
+                    model_provider_id: "updated-provider".to_string(),
+                    service_tier: None,
+                    approval_policy: AskForApproval::Never,
+                    approvals_reviewer: ApprovalsReviewer::User,
+                    permission_profile: permission_profile.clone(),
+                    active_permission_profile: None,
+                    cwd: cwd.clone().try_into().expect("absolute settings cwd"),
+                    reasoning_effort: Some(ReasoningEffort::Ultra),
+                    reasoning_summary: Some(ReasoningSummary::Auto),
+                    personality: None,
+                    collaboration_mode: CollaborationMode {
+                        mode: ModeKind::Default,
+                        settings: Settings {
+                            model: "gpt-5.2-codex".to_string(),
+                            reasoning_effort: Some(ReasoningEffort::Ultra),
+                            developer_instructions: None,
+                        },
+                    },
+                },
+            },
+        ));
+
+        assert!(rollout_item_affects_thread_metadata(&item));
+        apply_rollout_item(&mut metadata, &item, "test-provider");
+
+        assert_eq!(metadata.model.as_deref(), Some("gpt-5.2-codex"));
+        assert_eq!(metadata.model_provider, "updated-provider");
+        assert_eq!(metadata.reasoning_effort, Some(ReasoningEffort::Ultra));
+        assert_eq!(metadata.cwd, cwd);
+        assert_eq!(metadata.approval_mode, "never");
+        assert_eq!(
+            metadata.sandbox_policy,
+            serde_json::to_string(&permission_profile)
+                .expect("permission profile should serialize")
+        );
     }
 
     #[test]
@@ -543,6 +663,7 @@ mod tests {
                     session_id: thread_id.into(),
                     id: thread_id,
                     forked_from_id: None,
+                    forked_from_ordinal_exclusive: None,
                     parent_thread_id: None,
                     timestamp: "2026-02-26T00:00:00.000Z".to_string(),
                     cwd: PathBuf::from("/workspace"),
@@ -559,6 +680,8 @@ mod tests {
                     selected_capability_roots: Vec::new(),
                     memory_mode: None,
                     history_mode: ThreadHistoryMode::Legacy,
+                    history_base: None,
+                    subagent_history_start_ordinal: None,
                     multi_agent_version: None,
                     context_window: None,
                 },
@@ -576,6 +699,7 @@ mod tests {
         let id = ThreadId::from_string(&Uuid::from_u128(42).to_string()).expect("thread id");
         let created_at = DateTime::<Utc>::from_timestamp(1_735_689_600, 0).expect("timestamp");
         ThreadMetadata {
+            originator: None,
             id,
             rollout_path: PathBuf::from("/tmp/a.jsonl"),
             created_at,
@@ -593,12 +717,17 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             cli_version: "0.0.0".to_string(),
             title: String::new(),
+            name: None,
             preview: None,
             sandbox_policy: "read-only".to_string(),
             approval_mode: "on-request".to_string(),
             tokens_used: 1,
             first_user_message: None,
             archived_at: None,
+            section: None,
+            section_position: None,
+            section_entered_at: None,
+            project_id: None,
             git_sha: None,
             git_branch: None,
             git_origin_url: None,

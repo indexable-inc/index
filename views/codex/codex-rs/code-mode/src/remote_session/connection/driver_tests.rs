@@ -7,20 +7,27 @@ use std::time::Duration;
 
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeNestedToolCall;
+use codex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::NotificationFuture;
 use codex_code_mode_protocol::ToolInvocationFuture;
 use codex_code_mode_protocol::WaitRequest;
+use codex_code_mode_protocol::host::CapabilitySet;
+use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::DelegateRequestId;
+use codex_code_mode_protocol::host::EncodedFrame;
+use codex_code_mode_protocol::host::HostRequest;
 use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
+use codex_code_mode_protocol::host::MAX_PENDING_DELEGATE_CALLS;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::WireNestedToolCall;
 use codex_code_mode_protocol::host::WireResult;
 use codex_code_mode_protocol::host::WireRuntimeResponse;
+use codex_code_mode_protocol::host::WireSessionCellExecutionLimits;
 use codex_code_mode_protocol::host::WireWaitOutcome;
 use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
@@ -28,6 +35,8 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use super::super::Connection;
+use super::super::DEFAULT_HOST_WAIT_TRANSPORT_TIMEOUT;
 use super::ConnectionDriver;
 use super::DriverCommand;
 use super::DriverEvent;
@@ -42,6 +51,7 @@ struct DriverHarness {
     outgoing_rx: mpsc::Receiver<codex_code_mode_protocol::host::EncodedFrame>,
     cancellation: CancellationToken,
     alive: Arc<AtomicBool>,
+    failure: Arc<StdMutex<Option<String>>>,
     driver_task: tokio::task::JoinHandle<()>,
 }
 
@@ -52,6 +62,7 @@ impl DriverHarness {
         let (outgoing_tx, outgoing_rx) = mpsc::channel(/*max_capacity*/ 16);
         let cancellation = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
+        let failure = Arc::new(StdMutex::new(None));
         let (driver, execute_claim_tx) = ConnectionDriver::new(
             command_rx,
             event_rx,
@@ -59,7 +70,7 @@ impl DriverHarness {
             outgoing_tx,
             DriverLifecycle {
                 alive: Arc::clone(&alive),
-                failure: Arc::new(StdMutex::new(None)),
+                failure: Arc::clone(&failure),
                 cancellation: cancellation.clone(),
             },
         );
@@ -71,6 +82,7 @@ impl DriverHarness {
             outgoing_rx,
             cancellation,
             alive,
+            failure,
             driver_task,
         }
     }
@@ -86,6 +98,7 @@ impl DriverHarness {
             .send(DriverCommand::OpenSession {
                 session: session.clone(),
                 delegate,
+                limits: Default::default(),
                 cleanup: cleanup.clone(),
                 caller_cancellation: CancellationToken::new(),
                 response_tx,
@@ -179,6 +192,50 @@ impl Drop for DriverHarness {
     fn drop(&mut self) {
         self.cancellation.cancel();
     }
+}
+
+#[tokio::test]
+async fn open_session_includes_nondefault_cell_execution_limits() {
+    let mut harness = DriverHarness::start();
+    let session = remote_session();
+    let limits = CodeModeSessionCellExecutionLimits {
+        max_yield_time_ms: Some(250),
+        max_heap_size_bytes: Some(16 * 1024 * 1024),
+    };
+    let (response_tx, _response_rx) = oneshot::channel();
+
+    harness
+        .command_tx
+        .send(DriverCommand::OpenSession {
+            session: session.clone(),
+            delegate: Arc::new(RecordingDelegate::default()),
+            limits,
+            cleanup: SessionCleanup::new(),
+            caller_cancellation: CancellationToken::new(),
+            response_tx,
+        })
+        .await
+        .expect("limited session open command");
+    let frame = harness
+        .outgoing_rx
+        .recv()
+        .await
+        .expect("limited session open frame");
+
+    assert_eq!(
+        EncodedFrame::decode_framed::<ClientToHost>(&frame.into_framed_bytes())
+            .expect("decode limited session open request"),
+        ClientToHost::Request {
+            id: RequestId::new(/*value*/ 1),
+            request: HostRequest::OpenSession {
+                session_id: session.id,
+                cell_execution_limits: Some(WireSessionCellExecutionLimits {
+                    max_yield_time_ms: Some(250),
+                    max_heap_size_bytes: Some(16 * 1024 * 1024),
+                }),
+            },
+        }
+    );
 }
 
 #[derive(Default)]
@@ -328,6 +385,143 @@ async fn next_held_delegate_event(
 }
 
 #[tokio::test]
+async fn deferred_delegates_follow_cell_readiness_and_cancellation() {
+    let mut harness = DriverHarness::start();
+    let session = remote_session();
+    let delegate = Arc::new(RecordingDelegate::default());
+    harness.open(session.clone(), delegate.clone()).await;
+
+    let (first_response_tx, first_response_rx) = oneshot::channel();
+    let (second_response_tx, second_response_rx) = oneshot::channel();
+    for (tool_call_id, response_tx) in [
+        ("first-cell", first_response_tx),
+        ("second-cell", second_response_tx),
+    ] {
+        harness
+            .command_tx
+            .send(DriverCommand::Execute {
+                session: session.clone(),
+                request: ExecuteRequest {
+                    tool_call_id: tool_call_id.to_string(),
+                    enabled_tools: Vec::new(),
+                    source: "text('done')".to_string(),
+                    yield_time_ms: Some(/*yield_time_ms*/ 1),
+                    max_output_tokens: None,
+                },
+                caller_cancellation: CancellationToken::new(),
+                response_tx,
+            })
+            .await
+            .expect("execute command");
+        harness.outgoing_rx.recv().await.expect("execute frame");
+    }
+
+    let first_cell_id = CellId::new("first-cell".to_string());
+    let second_cell_id = CellId::new("second-cell".to_string());
+    let first_delegate_id = DelegateRequestId::new(/*value*/ 7);
+    let second_delegate_id = DelegateRequestId::new(/*value*/ 8);
+    let cancelled_delegate_id = DelegateRequestId::new(/*value*/ 9);
+    for (delegate_id, cell_id) in [
+        (first_delegate_id, first_cell_id.clone()),
+        (second_delegate_id, second_cell_id.clone()),
+        (cancelled_delegate_id, first_cell_id.clone()),
+    ] {
+        harness
+            .event_tx
+            .send(DriverEvent::HostMessage(HostToClient::DelegateRequest {
+                id: delegate_id,
+                session_id: session.id.clone(),
+                request: DelegateRequest::Notify {
+                    call_id: format!("notify-{}", cell_id.as_str()),
+                    cell_id: (&cell_id).into(),
+                    text: "hello".to_string(),
+                },
+            }))
+            .await
+            .expect("early delegate request");
+    }
+
+    harness
+        .event_tx
+        .send(DriverEvent::HostMessage(
+            HostToClient::CancelDelegateRequest {
+                id: cancelled_delegate_id,
+            },
+        ))
+        .await
+        .expect("deferred delegate cancellation");
+
+    harness
+        .event_tx
+        .send(DriverEvent::HostMessage(HostToClient::Response {
+            id: RequestId::new(/*value*/ 3),
+            result: WireResult::Ok {
+                value: HostResponse::ExecutionStarted {
+                    cell_id: (&second_cell_id).into(),
+                },
+            },
+        }))
+        .await
+        .expect("second execution-started response");
+    let _second_started = second_response_rx
+        .await
+        .expect("second execute response")
+        .expect("second started cell");
+    let second_response = tokio::time::timeout(Duration::from_secs(1), harness.outgoing_rx.recv())
+        .await
+        .expect("second delegate response timeout")
+        .expect("second delegate response frame");
+    assert_eq!(
+        EncodedFrame::decode_framed::<ClientToHost>(&second_response.into_framed_bytes())
+            .expect("decode second delegate response"),
+        ClientToHost::DelegateResponse {
+            id: second_delegate_id,
+            result: WireResult::Ok {
+                value: codex_code_mode_protocol::host::DelegateResponse::NotificationDelivered,
+            },
+        }
+    );
+    assert_eq!(delegate.notifications.load(Ordering::Relaxed), 1);
+
+    harness
+        .event_tx
+        .send(DriverEvent::HostMessage(HostToClient::Response {
+            id: RequestId::new(/*value*/ 2),
+            result: WireResult::Ok {
+                value: HostResponse::ExecutionStarted {
+                    cell_id: (&first_cell_id).into(),
+                },
+            },
+        }))
+        .await
+        .expect("first execution-started response");
+    let _first_started = first_response_rx
+        .await
+        .expect("first execute response")
+        .expect("first started cell");
+    let first_response = tokio::time::timeout(Duration::from_secs(1), harness.outgoing_rx.recv())
+        .await
+        .expect("first delegate response timeout")
+        .expect("first delegate response frame");
+    assert_eq!(
+        EncodedFrame::decode_framed::<ClientToHost>(&first_response.into_framed_bytes())
+            .expect("decode first delegate response"),
+        ClientToHost::DelegateResponse {
+            id: first_delegate_id,
+            result: WireResult::Ok {
+                value: codex_code_mode_protocol::host::DelegateResponse::NotificationDelivered,
+            },
+        }
+    );
+    assert_eq!(delegate.notifications.load(Ordering::Relaxed), 2);
+    assert!(matches!(
+        harness.outgoing_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(harness.alive.load(Ordering::Relaxed));
+}
+
+#[tokio::test]
 async fn dropped_open_waiter_shuts_down_committed_session() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
@@ -338,6 +532,7 @@ async fn dropped_open_waiter_shuts_down_committed_session() {
         .send(DriverCommand::OpenSession {
             session: session.clone(),
             delegate: Arc::new(RecordingDelegate::default()),
+            limits: Default::default(),
             cleanup,
             caller_cancellation: CancellationToken::new(),
             response_tx: open_tx,
@@ -463,6 +658,73 @@ async fn delegate_cancel_is_best_effort_and_sends_no_late_response() {
 }
 
 #[tokio::test]
+async fn delegate_limit_returns_an_error_without_disconnecting() {
+    let mut harness = DriverHarness::start();
+    let session = remote_session();
+    let delegate = Arc::new(RecordingDelegate::default());
+    harness.open(session.clone(), delegate.clone()).await;
+    let _started = harness
+        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .await;
+
+    for value in 1..=MAX_PENDING_DELEGATE_CALLS {
+        harness
+            .start_tool_delegate(&session, DelegateRequestId::new(value as i64))
+            .await;
+    }
+
+    let overflow_id = DelegateRequestId::new(MAX_PENDING_DELEGATE_CALLS as i64 + 1);
+    harness.start_tool_delegate(&session, overflow_id).await;
+    let response = tokio::time::timeout(Duration::from_secs(5), harness.outgoing_rx.recv())
+        .await
+        .expect("delegate overflow response timeout")
+        .expect("delegate overflow response frame");
+
+    assert_eq!(
+        EncodedFrame::decode_framed::<ClientToHost>(&response.into_framed_bytes())
+            .expect("decode delegate overflow response"),
+        ClientToHost::DelegateResponse {
+            id: overflow_id,
+            result: WireResult::Err {
+                message: format!(
+                    "code-mode host exceeded the limit of {MAX_PENDING_DELEGATE_CALLS} pending delegate calls"
+                ),
+            },
+        }
+    );
+    assert!(harness.alive.load(Ordering::Acquire));
+
+    harness
+        .event_tx
+        .send(DriverEvent::HostMessage(
+            HostToClient::CancelDelegateRequest {
+                id: DelegateRequestId::new(/*value*/ 1),
+            },
+        ))
+        .await
+        .expect("cancel pending delegate");
+    harness
+        .start_tool_delegate(
+            &session,
+            DelegateRequestId::new(MAX_PENDING_DELEGATE_CALLS as i64 + 2),
+        )
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while delegate.invocations.load(Ordering::Relaxed) <= MAX_PENDING_DELEGATE_CALLS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delegate capacity should be available after cancellation");
+    assert_eq!(
+        delegate.invocations.load(Ordering::Relaxed),
+        MAX_PENDING_DELEGATE_CALLS + 1
+    );
+    assert!(harness.alive.load(Ordering::Acquire));
+}
+
+#[tokio::test]
 async fn terminate_closes_cell_without_waiting_for_delegate_cleanup() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
@@ -511,6 +773,7 @@ async fn terminate_closes_cell_without_waiting_for_delegate_cleanup() {
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Terminated {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new("1".to_string()).into(),
                         content_items: Vec::new(),
                     }),
@@ -530,6 +793,7 @@ async fn terminate_closes_cell_without_waiting_for_delegate_cleanup() {
         response_rx.await.expect("terminate reply"),
         Ok(codex_code_mode_protocol::WaitOutcome::LiveCell(
             codex_code_mode_protocol::RuntimeResponse::Terminated {
+                code_mode_host_duration: Some(Duration::ZERO),
                 cell_id: CellId::new("1".to_string()),
                 content_items: Vec::new(),
             }
@@ -726,16 +990,17 @@ async fn delegate_task_panic_becomes_tool_error_without_killing_connection() {
 }
 
 #[tokio::test]
-async fn delegate_for_unknown_cell_fails_connection_without_invocation() {
+async fn delegate_for_unknown_cell_returns_error_without_invocation() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
     harness.open(session.clone(), delegate.clone()).await;
 
+    let id = DelegateRequestId::new(/*value*/ 7);
     harness
         .event_tx
         .send(DriverEvent::HostMessage(HostToClient::DelegateRequest {
-            id: DelegateRequestId::new(/*value*/ 7),
+            id,
             session_id: session.id,
             request: DelegateRequest::InvokeTool {
                 invocation: WireNestedToolCall {
@@ -749,14 +1014,28 @@ async fn delegate_for_unknown_cell_fails_connection_without_invocation() {
         }))
         .await
         .expect("delegate request");
-    tokio::task::yield_now().await;
+    let response = tokio::time::timeout(Duration::from_secs(1), harness.outgoing_rx.recv())
+        .await
+        .expect("delegate response timeout")
+        .expect("delegate response frame");
 
-    assert!(!harness.alive.load(Ordering::Acquire));
+    assert_eq!(
+        EncodedFrame::decode_framed::<ClientToHost>(&response.into_framed_bytes())
+            .expect("decode delegate response"),
+        ClientToHost::DelegateResponse {
+            id,
+            result: WireResult::Err {
+                message: "code-mode host delegated for unknown cell missing in session session-1"
+                    .to_string(),
+            },
+        }
+    );
+    assert!(harness.alive.load(Ordering::Acquire));
     assert_eq!(delegate.invocations.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
-async fn delegate_after_cell_close_fails_connection_without_invocation() {
+async fn delegate_after_cell_close_returns_error_without_invocation() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
@@ -772,10 +1051,11 @@ async fn delegate_after_cell_close_fails_connection_without_invocation() {
         }))
         .await
         .expect("cell close");
+    let id = DelegateRequestId::new(/*value*/ 7);
     harness
         .event_tx
         .send(DriverEvent::HostMessage(HostToClient::DelegateRequest {
-            id: DelegateRequestId::new(/*value*/ 7),
+            id,
             session_id: session.id,
             request: DelegateRequest::Notify {
                 call_id: "notify-1".to_string(),
@@ -785,10 +1065,24 @@ async fn delegate_after_cell_close_fails_connection_without_invocation() {
         }))
         .await
         .expect("delegate request");
-    tokio::task::yield_now().await;
+    let response = tokio::time::timeout(Duration::from_secs(1), harness.outgoing_rx.recv())
+        .await
+        .expect("delegate response timeout")
+        .expect("delegate response frame");
 
-    assert!(!harness.alive.load(Ordering::Acquire));
-    assert_eq!(delegate.invocations.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        EncodedFrame::decode_framed::<ClientToHost>(&response.into_framed_bytes())
+            .expect("decode delegate response"),
+        ClientToHost::DelegateResponse {
+            id,
+            result: WireResult::Err {
+                message: "code-mode host delegated for unknown cell 1 in session session-1"
+                    .to_string(),
+            },
+        }
+    );
+    assert!(harness.alive.load(Ordering::Acquire));
+    assert_eq!(delegate.notifications.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -804,6 +1098,7 @@ async fn mismatched_initial_response_fails_connection_and_closes_cell_once() {
             id: RequestId::new(/*value*/ 2),
             result: WireResult::Ok {
                 value: WireRuntimeResponse::Yielded {
+                    code_mode_host_duration_ns: 0,
                     cell_id: CellId::new("2".to_string()).into(),
                     content_items: Vec::new(),
                 },
@@ -851,6 +1146,7 @@ async fn mismatched_wait_response_fails_connection() {
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Yielded {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new("2".to_string()).into(),
                         content_items: Vec::new(),
                     }),
@@ -895,6 +1191,7 @@ async fn mismatched_terminate_response_fails_connection() {
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::MissingCell(WireRuntimeResponse::Terminated {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new("2".to_string()).into(),
                         content_items: Vec::new(),
                     }),
@@ -947,6 +1244,7 @@ async fn remote_wait_accepts_durations_longer_than_five_minutes() {
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Yielded {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new("1".to_string()).into(),
                         content_items: Vec::new(),
                     }),
@@ -960,11 +1258,98 @@ async fn remote_wait_accepts_durations_longer_than_five_minutes() {
         response_rx.await.expect("wait reply"),
         Ok(codex_code_mode_protocol::WaitOutcome::LiveCell(
             codex_code_mode_protocol::RuntimeResponse::Yielded {
+                code_mode_host_duration: Some(Duration::ZERO),
                 cell_id: CellId::new("1".to_string()),
                 content_items: Vec::new(),
             }
         ))
     );
+}
+
+/// A stalled remote wait must expire even when its request never reaches the host.
+#[tokio::test(start_paused = true)]
+async fn queued_remote_wait_times_out_and_invalidates_the_connection() {
+    let mut harness = DriverHarness::start();
+    let session = remote_session();
+    harness
+        .open(session.clone(), Arc::new(RecordingDelegate::default()))
+        .await;
+    let _started = harness
+        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .await;
+    let connection = Connection {
+        command_tx: harness.command_tx.clone(),
+        execute_claim_tx: harness.execute_claim_tx.clone(),
+        alive: Arc::clone(&harness.alive),
+        failure: Arc::clone(&harness.failure),
+        cancellation: harness.cancellation.clone(),
+        capabilities: CapabilitySet::empty(),
+    };
+    let response = tokio::spawn(async move {
+        let result = connection
+            .wait(
+                session,
+                WaitRequest {
+                    cell_id: CellId::new("1".to_string()),
+                    yield_time_ms: 1,
+                },
+            )
+            .await;
+        (connection, result)
+    });
+    while harness.outgoing_rx.is_empty() {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(DEFAULT_HOST_WAIT_TRANSPORT_TIMEOUT + Duration::from_secs(2)).await;
+
+    let (connection, result) = response.await.expect("wait task");
+    assert_eq!(
+        result,
+        Err("code-mode host timed out waiting for wait response".to_string())
+    );
+    assert!(!harness.alive.load(Ordering::Acquire));
+    assert!(harness.cancellation.is_cancelled());
+    drop(connection);
+}
+
+/// A stalled termination must expire and invalidate the same connection as a stalled wait.
+#[tokio::test(start_paused = true)]
+async fn queued_remote_termination_times_out_and_invalidates_the_connection() {
+    let mut harness = DriverHarness::start();
+    let session = remote_session();
+    harness
+        .open(session.clone(), Arc::new(RecordingDelegate::default()))
+        .await;
+    let _started = harness
+        .start_cell(session.clone(), /*request_id*/ 2, "1")
+        .await;
+    let connection = Connection {
+        command_tx: harness.command_tx.clone(),
+        execute_claim_tx: harness.execute_claim_tx.clone(),
+        alive: Arc::clone(&harness.alive),
+        failure: Arc::clone(&harness.failure),
+        cancellation: harness.cancellation.clone(),
+        capabilities: CapabilitySet::empty(),
+    };
+    let response = tokio::spawn(async move {
+        let result = connection
+            .terminate(session, CellId::new("1".to_string()))
+            .await;
+        (connection, result)
+    });
+    while harness.outgoing_rx.is_empty() {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(DEFAULT_HOST_WAIT_TRANSPORT_TIMEOUT + Duration::from_secs(1)).await;
+
+    let (connection, result) = response.await.expect("termination task");
+    assert_eq!(
+        result,
+        Err("code-mode host timed out waiting for terminate response".to_string())
+    );
+    assert!(!harness.alive.load(Ordering::Acquire));
+    assert!(harness.cancellation.is_cancelled());
+    drop(connection);
 }
 
 #[tokio::test]
@@ -1038,6 +1423,7 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Yielded {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new("1".to_string()).into(),
                         content_items: Vec::new(),
                     }),
@@ -1051,6 +1437,7 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
         second_rx.await.expect("second wait reply"),
         Ok(codex_code_mode_protocol::WaitOutcome::LiveCell(
             codex_code_mode_protocol::RuntimeResponse::Yielded {
+                code_mode_host_duration: Some(Duration::ZERO),
                 cell_id: CellId::new("1".to_string()),
                 content_items: Vec::new(),
             }
@@ -1114,6 +1501,7 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
             id: RequestId::new(/*value*/ 2),
             result: WireResult::Ok {
                 value: WireRuntimeResponse::Terminated {
+                    code_mode_host_duration_ns: 0,
                     cell_id: CellId::new("1".to_string()).into(),
                     content_items: Vec::new(),
                 },
@@ -1128,6 +1516,7 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Terminated {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new("1".to_string()).into(),
                         content_items: Vec::new(),
                     }),
@@ -1213,6 +1602,7 @@ async fn delivered_but_unclaimed_execute_is_terminated_when_the_caller_is_cancel
             id: RequestId::new(/*value*/ 2),
             result: WireResult::Ok {
                 value: WireRuntimeResponse::Terminated {
+                    code_mode_host_duration_ns: 0,
                     cell_id: CellId::new("1".to_string()).into(),
                     content_items: Vec::new(),
                 },
@@ -1228,6 +1618,7 @@ async fn delivered_but_unclaimed_execute_is_terminated_when_the_caller_is_cancel
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Terminated {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new("1".to_string()).into(),
                         content_items: Vec::new(),
                     }),
@@ -1274,6 +1665,7 @@ async fn session_accepts_more_than_4096_cells_without_growing_a_tombstone_set() 
                 id: RequestId::new(request_id),
                 result: WireResult::Ok {
                     value: WireRuntimeResponse::Yielded {
+                        code_mode_host_duration_ns: 0,
                         cell_id: CellId::new(cell_id.clone()).into(),
                         content_items: Vec::new(),
                     },

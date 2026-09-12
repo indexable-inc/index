@@ -113,9 +113,11 @@
   Arguments:
   - `writeNushellApplication`: the caller's `updateScriptWriter`.
   - `nix`: the nix package (for `nix store prefetch-file`, `nix-prefetch-url`
-    and `nix hash convert`). Pass the fork client (`repoPackages.nix-ix`), not
-    stock `pkgs.nix`: see packages/yc/default.nix for why nixpkgs' nix must not
-    end up in an updater's closure.
+    and `nix hash convert`). Pass the ASSEMBLED fork client
+    (`ix.nixPackageFor "<consumer>"`), never stock `pkgs.nix` (see
+    packages/yc/default.nix for why nixpkgs' nix must not end up in an
+    updater's closure) and never `repoPackages.nix-ix` (the un-assembled
+    recipe, which throws un-overridden: its jjTree archive lives in ix).
   - `pname`: package name, for the script name and messages.
   - `relPath`: the pins.json path RELATIVE to the repo root (the updater runs
     from there, as the generated `update` app guarantees), e.g.

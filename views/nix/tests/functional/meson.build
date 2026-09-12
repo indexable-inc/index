@@ -55,6 +55,8 @@ suites = [
       'gc.sh',
       'nix-collect-garbage-d.sh',
       'remote-store.sh',
+      'remote-admission-progress.sh',
+      'legacy-ssh-gc.sh',
       'daemon-signal.sh',
       'legacy-ssh-store.sh',
       'lang.sh',
@@ -62,8 +64,23 @@ suites = [
       'rust-eval-path-to-store.sh',
       'rust-eval-refusal-token.sh',
       'rust-eval-symlink-reads.sh',
-      'rust-eval-shadow-census.sh',
-      'rust-eval-shadow-flake.sh',
+      'rust-eval-host-questions.sh',
+      'rust-eval-command-run.sh',
+      'rust-eval-command-shell.sh',
+      'rust-eval-command-develop.sh',
+      'rust-eval-command-flake-show.sh',
+      'rust-eval-command-search.sh',
+      'rust-eval-build-scheduler.sh',
+      'rust-eval-registry.sh',
+      'rust-eval-import-cache.sh',
+      'rust-eval-import-drv.sh',
+      'rust-eval-command-nix-build.sh',
+      'rust-eval-command-nix-instantiate.sh',
+      'rust-eval-command-help.sh',
+      'rust-eval-builtin-catalogue.sh',
+      'rust-eval-command-flake-metadata.sh',
+      'rust-eval-command-installables.sh',
+      'rust-eval-flake-document.sh',
       'lang-gc.sh',
       'characterisation-test-infra.sh',
       'experimental-features.sh',
@@ -131,7 +148,6 @@ suites = [
       'short-path-literals.sh',
       'absolute-path-literals.sh',
       'no-url-literals.sh',
-      'repl.sh',
       'binary-cache-build-remote.sh',
       'search.sh',
       'logging.sh',
@@ -157,7 +173,8 @@ suites = [
       'write-through-store.sh',
       'write-through-store-ca.sh',
       'function-trace.sh',
-      'formatter.sh',
+      'rust-eval-command-formatter.sh',
+      'rust-eval-command-edit.sh',
       'flamegraph-profiler.sh',
       'eval-store.sh',
       'why-depends.sh',
@@ -192,7 +209,6 @@ suites = [
       'read-only-store.sh',
       'nested-sandboxing.sh',
       'impure-env.sh',
-      'debugger.sh',
       'extra-sandbox-profile.sh',
       'macho-rewrite.sh',
       'help.sh',
@@ -227,16 +243,19 @@ endif
 
 # Plugin tests require shared libraries support.
 nix_expr = dependency('nix-expr', required : false)
-if nix_expr.found() and get_option('default_library') != 'static'
+nix_cmd = dependency('nix-cmd', required : false)
+if nix_expr.found() and nix_cmd.found() and get_option('default_library') != 'static'
   add_languages('cpp')
   subdir('plugins')
   suites += {
     'name' : 'plugins',
     'deps' : [
       libplugintest,
+      libpathrootlookup,
     ],
     'tests' : [
       'plugins.sh',
+      'rust-eval-find-file-root.sh',
     ],
     'workdir' : meson.current_source_dir(),
   }
@@ -265,6 +284,7 @@ subdir('dyn-drv')
 subdir('flakes')
 subdir('git')
 subdir('git-hashing')
+subdir('jj-tree')
 subdir('local-overlay-store')
 
 foreach suite : suites
@@ -304,7 +324,12 @@ foreach suite : suites
         'pipefail',
         script,
       ],
-      suite : suite_name,
+      # Every rust-eval-*.sh test also belongs to the `rust-eval` suite, by
+      # name rather than by a second list: the package's parity check runs
+      # that suite whole (`index/packages/nix/default.nix`), so a new
+      # rust-eval test is in CI the moment it is registered here, and there
+      # is no roster for it to be missing from.
+      suite : script.startswith('rust-eval-') ? [suite_name, 'rust-eval'] : [suite_name],
       env : {
         'ASAN_OPTIONS' : asan_options,
         '_NIX_TEST_SOURCE_DIR' : meson.current_source_dir(),

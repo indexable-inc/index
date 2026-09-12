@@ -14,6 +14,28 @@ using Co = nix::Goal::Co;
 using promise_type = nix::Goal::promise_type;
 using ChildEvents = decltype(promise_type::childEvents);
 
+void promise_type::unhandled_exception()
+{
+    if (!goal->worker.independentRequests)
+        throw;
+    try {
+        throw;
+    } catch (Error & error) {
+        // A malformed derivation or nonexistent output belongs to the
+        // request that reached it. Leave other users of shared waitees
+        // attached, and let normal failure propagation notify our waiters.
+        for (auto & waitee : goal->waitees)
+            waitee->waiters.erase(goal->shared_from_this());
+        goal->waitees.clear();
+        (void) goal->doneFailure(Goal::ecFailed, BuildResult::Failure{{
+            .status = BuildResult::Failure::MiscFailure,
+            .msg = error.msg(),
+        }});
+    }
+    // Interrupted derives from BaseError, not Error. It and exceptions
+    // such as bad_alloc still unwind the whole operation.
+}
+
 void ChildEvents::pushChildEvent(ChildOutput event)
 {
     if (childTimeout)
@@ -232,7 +254,7 @@ Goal::Done Goal::amDone(ExitCode result)
 
             if (goal->waitees.empty()) {
                 worker.wakeUp(goal);
-            } else if (result == ecFailed && !worker.settings.keepGoing) {
+            } else if (result == ecFailed && !worker.keepGoing) {
                 /* If we failed and keepGoing is not set, we remove all
                    remaining waitees. */
                 for (auto & g : goal->waitees) {

@@ -16,10 +16,6 @@
   # Writer for `passthru.updateScript` (flake-package path only; the package
   # is not registered in the overlay). Same nullable-writer pattern as
   # blender-mcp / vector-bin.
-  # The fork client rather than stock `pkgs.nix`; see packages/yc/default.nix
-  # for why an updater must not pull nixpkgs' nix into its closure. Empty on
-  # the overlay path, which omits the updateScript anyway.
-  repoPackages ? {},
   updateScriptWriter ? null,
 }: let
   # Rev + SRI hash live in the sibling pins.json, never inline here (repo
@@ -28,7 +24,7 @@
   pin = ix.pins.loadPin ./pins.json "blender-lab-mcp";
   updateScript = ix.pins.mkOptionalUpdater {
     writeNushellApplication = updateScriptWriter;
-    nix = repoPackages.nix-ix;
+    nix = ix.nixPackageFor "packages/blender-lab-mcp: updateScript";
     pname = "blender-lab-mcp";
     relPath = "packages/blender-lab-mcp/pins.json";
   };

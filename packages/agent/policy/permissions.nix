@@ -53,6 +53,14 @@
   # enumeration to keep in sync as the CLI grows tools, and unlike a bare-name
   # deny it can carry a message telling the agent where to go instead.
   kernelOnly ? false,
+  # Kernel-superseded native tools a consumer keeps anyway, by Claude tool
+  # name. Subtracted from the `indexKernelBaked` and `exaSearchBaked` denies
+  # only: `kernelOnly` re-denies them, because strict mode is the choice to
+  # give the native surface up, and an exemption there would be the hole the
+  # wrapper's `systemTools` ordering exists to close. A name outside the
+  # superseded rows throws: an entry that denies nothing is a typo, not a
+  # no-op.
+  keepClaudeTools ? [],
 }: let
   # One list of protected-merge command globs; the Claude render wraps them in
   # Bash(...) deny patterns, the codex render ships them verbatim for hook use.
@@ -98,6 +106,12 @@
     ];
     codexFeatures.standalone_web_search = false;
   };
+
+  unknownKeptTools = lib.subtractLists (kernelClaudeTools ++ exaSuperseded.claudeTools) keepClaudeTools;
+  checkKeptTools = lib.throwIf (unknownKeptTools != []) (
+    "agent/policy/permissions.nix: keepClaudeTools names no superseded tool: "
+    + lib.concatStringsSep ", " unknownKeptTools
+  );
 
   # Unconditional house policy: no browser/computer/media surfaces in baked
   # wrappers, independent of which MCP servers ride along.
@@ -169,7 +183,7 @@
     + "so without the index kernel baked the agent would have no tools at all."
   );
 in
-  checkKernelOnly {
+  checkKernelOnly (checkKeptTools {
     claude = {
       # `lib.unique`, because `kernelOnly` deliberately re-states rows the
       # narrower gates may already have contributed: strict mode asserts the
@@ -178,8 +192,10 @@ in
       deniedToolPatterns = lib.unique (
         map (pattern: "Bash(${pattern})") protectedMergeCommandPatterns
         ++ claudeBundledSkillDenies
-        ++ lib.optionals exaSearchBaked exaSuperseded.claudeTools
-        ++ lib.optionals indexKernelBaked (kernelClaudeTools ++ claudeHouseDeniedTools)
+        ++ lib.optionals exaSearchBaked (lib.subtractLists keepClaudeTools exaSuperseded.claudeTools)
+        ++ lib.optionals indexKernelBaked (
+          lib.subtractLists keepClaudeTools kernelClaudeTools ++ claudeHouseDeniedTools
+        )
         ++ lib.optionals kernelOnly claudeKernelOnlyDenies
       );
       # Read by policy/hooks.nix to arm the `kernel-only-guard` PreToolUse hook,
@@ -223,4 +239,4 @@ in
         ++ lib.optional kernelOnly "Shell(*)";
       kernelOnlySupported = false;
     };
-  }
+  })

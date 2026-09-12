@@ -10,6 +10,8 @@
 #include "nix/util/configuration.hh"
 #include "nix/util/error.hh"
 #include "nix/util/experimental-features.hh"
+#include "nix/util/file-system.hh"
+#include "nix/util/finally.hh"
 
 namespace nix {
 
@@ -17,50 +19,41 @@ namespace nix {
 
 TEST(parseFlakeRef, path)
 {
+    auto features = experimentalFeatureSettings.experimentalFeatures.get();
+    Finally restoreFeatures([&] { experimentalFeatureSettings.experimentalFeatures = features; });
     experimentalFeatureSettings.experimentalFeatures.get().insert(Xp::Flakes);
-
     fetchers::Settings fetchSettings;
+    auto directory = createTempDir();
+    AutoDelete cleanup(directory, true);
+    writeFile(directory / "flake.nix", "{ outputs = _: {}; }");
+    auto path = directory.string();
+
+    // Bare filesystem paths inspect the real directory to select an input scheme.
+    EXPECT_THROW(parseFlakeRef(fetchSettings, path + "/missing"), Error);
+    ASSERT_EQ(parseFlakeRef(fetchSettings, path).to_string(), "path:" + path);
+    ASSERT_EQ(
+        parseFlakeRef(fetchSettings, path + "?revCount=123&rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").to_string(),
+        "path:" + path + "?rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&revCount=123");
+    EXPECT_THROW(parseFlakeRef(fetchSettings, path + "?xyzzy=123"), Error);
+    EXPECT_THROW(parseFlakeRef(fetchSettings, path + "#bla"), Error);
 
     {
-        auto s = "/foo/bar";
-        auto flakeref = parseFlakeRef(fetchSettings, s);
-        ASSERT_EQ(flakeref.to_string(), "path:/foo/bar");
-    }
-
-    {
-        auto s = "/foo/bar?revCount=123&rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        auto flakeref = parseFlakeRef(fetchSettings, s);
-        ASSERT_EQ(flakeref.to_string(), "path:/foo/bar?rev=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&revCount=123");
-    }
-
-    {
-        auto s = "/foo/bar?xyzzy=123";
-        EXPECT_THROW(parseFlakeRef(fetchSettings, s), Error);
-    }
-
-    {
-        auto s = "/foo/bar#bla";
-        EXPECT_THROW(parseFlakeRef(fetchSettings, s), Error);
-    }
-
-    {
-        auto s = "/foo/bar#bla";
-        auto [flakeref, fragment] = parseFlakeRefWithFragment(fetchSettings, s);
-        ASSERT_EQ(flakeref.to_string(), "path:/foo/bar");
+        auto [flakeref, fragment] = parseFlakeRefWithFragment(fetchSettings, path + "#bla");
+        ASSERT_EQ(flakeref.to_string(), "path:" + path);
         ASSERT_EQ(fragment, "bla");
     }
-
     {
-        auto s = "/foo/bar?revCount=123#bla";
-        auto [flakeref, fragment] = parseFlakeRefWithFragment(fetchSettings, s);
-        ASSERT_EQ(flakeref.to_string(), "path:/foo/bar?revCount=123");
+        auto [flakeref, fragment] = parseFlakeRefWithFragment(fetchSettings, path + "?revCount=123#bla");
+        ASSERT_EQ(flakeref.to_string(), "path:" + path + "?revCount=123");
         ASSERT_EQ(fragment, "bla");
     }
-
     {
-        auto s = "/foo bar/baz?dir=bla space";
-        auto flakeref = parseFlakeRef(fetchSettings, s);
-        ASSERT_EQ(flakeref.to_string(), "path:/foo%20bar/baz?dir=bla%20space");
+        auto spaced = directory / "foo bar" / "baz";
+        createDirs(spaced / "bla space");
+        writeFile(spaced / "flake.nix", "{ outputs = _: {}; }");
+        writeFile(spaced / "bla space" / "flake.nix", "{ outputs = _: {}; }");
+        auto flakeref = parseFlakeRef(fetchSettings, spaced.string() + "?dir=bla space");
+        ASSERT_EQ(flakeref.to_string(), "path:" + path + "/foo%20bar/baz?dir=bla%20space");
         ASSERT_EQ(flakeref.toAttrs().at("dir"), fetchers::Attr("bla space"));
     }
 }

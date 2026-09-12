@@ -3,17 +3,7 @@
   stdenv,
   fetchurl,
   autoPatchelfHook,
-  # The fork client (`nix-ix`, packages/nix), not stock `pkgs.nix`: the repo
-  # overlay patches curl, so `pkgs.nix` matches no binary cache and every
-  # consumer cold-builds nix -- and nix's own C API unit tests abort on any
-  # darwin host that has root channels, because stock 2.34 stats
-  # /nix/var/nix/profiles/per-user/root/channels with the throwing
-  # std::filesystem::exists() and the sandbox answers EPERM. That is the exact
-  # abort the fork's "treat inaccessible default lookup-path entries as absent"
-  # patch fixes, and `nix-ix` is cross-built and cached for darwin, so the
-  # updater substitutes instead of cold-building a nix that cannot pass its own
-  # tests here. Empty on the overlay path, which omits the updateScript anyway.
-  repoPackages ? {},
+  ix,
   # Writer used to build `passthru.updateScript`. Bound to a real builder only on
   # the flake-package path (lib/packages.nix), which is where
   # `nix run .#yc.updateScript` resolves; the overlay path leaves it null, so
@@ -54,7 +44,17 @@
     else
       updateScriptWriter {
         name = "yc-update";
-        runtimeInputs = [repoPackages.nix-ix];
+        # The ASSEMBLED fork client (`ix.nixPackageFor`), not stock `pkgs.nix`:
+        # the repo overlay patches curl, so `pkgs.nix` matches no binary cache
+        # and every consumer cold-builds nix -- and nix's own C API unit tests
+        # abort on any darwin host that has root channels, because stock 2.34
+        # stats /nix/var/nix/profiles/per-user/root/channels with the throwing
+        # std::filesystem::exists() and the sandbox answers EPERM. That is the
+        # exact abort the fork's "treat inaccessible default lookup-path
+        # entries as absent" patch fixes, and the fork is cross-built and
+        # cached for darwin, so the updater substitutes instead of
+        # cold-building a nix that cannot pass its own tests here.
+        runtimeInputs = [(ix.nixPackageFor "packages/yc: updateScript")];
         meta.description = "Refresh packages/yc/manifest.json to the latest YC CLI release";
         text = ''
           # nu

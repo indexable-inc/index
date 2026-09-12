@@ -2,16 +2,20 @@
 //! Tokio task. Separated from `message_processor.rs` to keep that file small
 //! and to make future feature-growth easier to manage.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::active_turn_registry::ActiveTurnRegistry;
 use crate::exec_approval::handle_exec_approval_request;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::OutgoingNotificationMeta;
 use crate::patch_approval::handle_patch_approval_request;
 use codex_core::CodexThread;
 use codex_core::NewThread;
+use codex_core::StartIfIdleSubmission;
+use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
+use codex_core::TurnInputRequest;
+use codex_core::TurnInputSubmission;
 use codex_core::config::Config as CodexConfig;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentMessageEvent;
@@ -19,15 +23,12 @@ use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
-use codex_protocol::protocol::Op;
-use codex_protocol::protocol::Submission;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::user_input::UserInput;
 use rmcp::model::CallToolResult;
-use rmcp::model::Content;
+use rmcp::model::ContentBlock;
 use rmcp::model::RequestId;
 use serde_json::json;
-use tokio::sync::Mutex;
 
 /// To adhere to MCP `tools/call` response format, include the Codex
 /// `threadId` in the `structured_content` field of the response.
@@ -39,7 +40,7 @@ pub(crate) fn create_call_tool_result_with_thread_id(
     is_error: Option<bool>,
 ) -> CallToolResult {
     let content_text = text;
-    let content = vec![Content::text(content_text.clone())];
+    let content = vec![ContentBlock::text(content_text.clone())];
     let structured_content = json!({
         "threadId": thread_id,
         "content": content_text,
@@ -48,6 +49,14 @@ pub(crate) fn create_call_tool_result_with_thread_id(
     result.is_error = is_error;
     result.structured_content = Some(structured_content);
     result
+}
+
+fn prompt_request(prompt: String) -> TurnInputRequest {
+    TurnInputRequest::user_input(vec![UserInput::Text {
+        text: prompt,
+        // MCP tool prompts are plain text with no UI element ranges.
+        text_elements: Vec::new(),
+    }])
 }
 
 /// Run a complete Codex session and stream events back to the client.
@@ -60,19 +69,22 @@ pub async fn run_codex_tool_session(
     config: CodexConfig,
     outgoing: Arc<OutgoingMessageSender>,
     thread_manager: Arc<ThreadManager>,
-    running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    active_turns: Arc<ActiveTurnRegistry>,
 ) {
     let NewThread {
         thread_id,
         thread,
         session_configured,
-    } = match thread_manager.start_thread(config.clone()).await {
+    } = match thread_manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+    {
         Ok(res) => res,
         Err(e) => {
-            let result = CallToolResult::error(vec![Content::text(format!(
+            let result = CallToolResult::error(vec![ContentBlock::text(format!(
                 "Failed to start Codex session: {e}"
             ))]);
-            outgoing.send_response(id.clone(), result).await;
+            outgoing.send_response(id.clone(), result);
             return;
         }
     };
@@ -82,62 +94,43 @@ pub async fn run_codex_tool_session(
         id: "".to_string(),
         msg: EventMsg::SessionConfigured(session_configured.clone()),
     };
-    outgoing
-        .send_event_as_notification(
-            &session_configured_event,
-            Some(OutgoingNotificationMeta {
-                request_id: Some(id.clone()),
-                thread_id: Some(thread_id),
-            }),
-        )
-        .await;
+    outgoing.send_event_as_notification(
+        &session_configured_event,
+        Some(OutgoingNotificationMeta {
+            request_id: Some(id.clone()),
+            thread_id: Some(thread_id),
+        }),
+    );
 
-    // Use the original MCP request ID as the `sub_id` for the Codex submission so that
-    // any events emitted for this tool-call can be correlated with the
-    // originating `tools/call` request.
-    let sub_id = id.to_string();
-    running_requests_id_to_codex_uuid
-        .lock()
+    let turn_id = match thread
+        .start_turn_if_idle(prompt_request(initial_prompt))
         .await
-        .insert(id.clone(), thread_id);
-    let submission = Submission {
-        id: sub_id.clone(),
-        op: Op::UserInput {
-            items: vec![UserInput::Text {
-                text: initial_prompt.clone(),
-                // MCP tool prompts are plain text with no UI element ranges.
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        },
-        client_user_message_id: None,
-        trace: None,
+    {
+        Ok(StartIfIdleSubmission::Started { turn_id }) => turn_id,
+        Ok(StartIfIdleSubmission::NotSubmitted { reason }) => {
+            tracing::error!("Failed to submit initial prompt: {reason:?}");
+            let result = create_call_tool_result_with_thread_id(
+                thread_id,
+                format!("Failed to submit initial prompt: {reason:?}"),
+                Some(true),
+            );
+            outgoing.send_response(id.clone(), result);
+            return;
+        }
+        Err(e) => {
+            tracing::error!("Failed to submit initial prompt: {e}");
+            let result = create_call_tool_result_with_thread_id(
+                thread_id,
+                format!("Failed to submit initial prompt: {e}"),
+                Some(true),
+            );
+            outgoing.send_response(id.clone(), result);
+            return;
+        }
     };
+    active_turns.register(id.clone(), thread_id, turn_id);
 
-    if let Err(e) = thread.submit_with_id(submission).await {
-        tracing::error!("Failed to submit initial prompt: {e}");
-        let result = create_call_tool_result_with_thread_id(
-            thread_id,
-            format!("Failed to submit initial prompt: {e}"),
-            Some(true),
-        );
-        outgoing.send_response(id.clone(), result).await;
-        // unregister the id so we don't keep it in the map
-        running_requests_id_to_codex_uuid.lock().await.remove(&id);
-        return;
-    }
-
-    run_codex_tool_session_inner(
-        thread_id,
-        thread,
-        outgoing,
-        id,
-        running_requests_id_to_codex_uuid,
-    )
-    .await;
+    run_codex_tool_session_inner(thread_id, thread, outgoing, id, active_turns).await;
 }
 
 pub async fn run_codex_tool_session_reply(
@@ -146,49 +139,36 @@ pub async fn run_codex_tool_session_reply(
     outgoing: Arc<OutgoingMessageSender>,
     request_id: RequestId,
     prompt: String,
-    running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    active_turns: Arc<ActiveTurnRegistry>,
 ) {
-    running_requests_id_to_codex_uuid
-        .lock()
-        .await
-        .insert(request_id.clone(), thread_id);
-    if let Err(e) = thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: prompt,
-                // MCP tool prompts are plain text with no UI element ranges.
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-    {
-        tracing::error!("Failed to submit user input: {e}");
-        let result = create_call_tool_result_with_thread_id(
-            thread_id,
-            format!("Failed to submit user input: {e}"),
-            Some(true),
-        );
-        outgoing.send_response(request_id.clone(), result).await;
-        // unregister the id so we don't keep it in the map
-        running_requests_id_to_codex_uuid
-            .lock()
-            .await
-            .remove(&request_id);
-        return;
-    }
+    let turn_id = match thread.start_or_steer_turn(prompt_request(prompt)).await {
+        Ok(TurnInputSubmission::Started { turn_id } | TurnInputSubmission::Steered { turn_id }) => {
+            turn_id
+        }
+        Ok(TurnInputSubmission::NotSubmitted { reason }) => {
+            tracing::error!("Failed to submit user input: {reason:?}");
+            let result = create_call_tool_result_with_thread_id(
+                thread_id,
+                format!("Failed to submit user input: {reason:?}"),
+                Some(true),
+            );
+            outgoing.send_response(request_id.clone(), result);
+            return;
+        }
+        Err(e) => {
+            tracing::error!("Failed to submit user input: {e}");
+            let result = create_call_tool_result_with_thread_id(
+                thread_id,
+                format!("Failed to submit user input: {e}"),
+                Some(true),
+            );
+            outgoing.send_response(request_id.clone(), result);
+            return;
+        }
+    };
+    active_turns.register(request_id.clone(), thread_id, turn_id);
 
-    run_codex_tool_session_inner(
-        thread_id,
-        thread,
-        outgoing,
-        request_id,
-        running_requests_id_to_codex_uuid,
-    )
-    .await;
+    run_codex_tool_session_inner(thread_id, thread, outgoing, request_id, active_turns).await;
 }
 
 async fn run_codex_tool_session_inner(
@@ -196,7 +176,7 @@ async fn run_codex_tool_session_inner(
     thread: Arc<CodexThread>,
     outgoing: Arc<OutgoingMessageSender>,
     request_id: RequestId,
-    running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
+    active_turns: Arc<ActiveTurnRegistry>,
 ) {
     let request_id_str = request_id.to_string();
 
@@ -205,26 +185,27 @@ async fn run_codex_tool_session_inner(
     loop {
         match thread.next_event().await {
             Ok(event) => {
-                outgoing
-                    .send_event_as_notification(
-                        &event,
-                        Some(OutgoingNotificationMeta {
-                            request_id: Some(request_id.clone()),
-                            thread_id: Some(thread_id),
-                        }),
-                    )
-                    .await;
+                outgoing.send_event_as_notification(
+                    &event,
+                    Some(OutgoingNotificationMeta {
+                        request_id: Some(request_id.clone()),
+                        thread_id: Some(thread_id),
+                    }),
+                );
 
                 match event.msg {
                     EventMsg::ExecApprovalRequest(ev) => {
                         let approval_id = ev.effective_approval_id();
                         let ExecApprovalRequestEvent {
+                            kind: _,
                             turn_id: _,
                             environment_id: _,
                             started_at_ms: _,
                             command,
                             cwd,
                             call_id,
+                            plugin_id: _,
+                            script_path: _,
                             approval_id: _,
                             reason: _,
                             proposed_execpolicy_amendment: _,
@@ -236,7 +217,7 @@ async fn run_codex_tool_session_inner(
                         } = ev;
                         handle_exec_approval_request(
                             command,
-                            cwd.to_path_buf(),
+                            std::path::PathBuf::from(cwd.into_string()),
                             outgoing.clone(),
                             thread.clone(),
                             request_id.clone(),
@@ -260,10 +241,14 @@ async fn run_codex_tool_session_inner(
                             err_event.message,
                             Some(true),
                         );
-                        outgoing.send_response(request_id.clone(), result).await;
+                        active_turns.finish(&request_id, || {
+                            outgoing.send_response(request_id.clone(), result);
+                        });
                         break;
                     }
                     EventMsg::Warning(_)
+                    | EventMsg::AuthRecoveryStarted(_)
+                    | EventMsg::AuthRecoveryCompleted(_)
                     | EventMsg::GuardianWarning(_)
                     | EventMsg::ModelVerification(_)
                     | EventMsg::SafetyBuffering(_)
@@ -310,19 +295,16 @@ async fn run_codex_tool_session_inner(
                         let result = create_call_tool_result_with_thread_id(
                             thread_id, text, /*is_error*/ None,
                         );
-                        outgoing.send_response(request_id.clone(), result).await;
-                        // unregister the id so we don't keep it in the map
-                        running_requests_id_to_codex_uuid
-                            .lock()
-                            .await
-                            .remove(&request_id);
+                        active_turns.finish(&request_id, || {
+                            outgoing.send_response(request_id.clone(), result);
+                        });
                         break;
                     }
                     EventMsg::SessionConfigured(_) => {
                         tracing::error!("unexpected SessionConfigured event");
                     }
-                    EventMsg::ThreadGoalUpdated(_) => {
-                        // Ignore thread goal metadata updates in MCP tool runner.
+                    EventMsg::ThreadGoalUpdated(_) | EventMsg::ThreadQueueChanged(_) => {
+                        // Ignore thread-scoped metadata updates in MCP tool runner.
                     }
                     EventMsg::McpStartupUpdate(_) | EventMsg::McpStartupComplete(_) => {
                         // Ignored in MCP tool runner.
@@ -333,6 +315,8 @@ async fn run_codex_tool_session_inner(
                     EventMsg::AgentReasoningRawContent(_)
                     | EventMsg::TurnStarted(_)
                     | EventMsg::ThreadSettingsApplied(_)
+                    | EventMsg::EnvironmentConnected(_)
+                    | EventMsg::EnvironmentDisconnected(_)
                     | EventMsg::TokenCount(_)
                     | EventMsg::AgentReasoning(_)
                     | EventMsg::AgentReasoningSectionBreak(_)
@@ -358,6 +342,7 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::ImageGenerationEnd(_)
                     | EventMsg::ViewImageToolCall(_)
                     | EventMsg::RawResponseItem(_)
+                    | EventMsg::RawResponseCompleted(_)
                     | EventMsg::EnteredReviewMode(_)
                     | EventMsg::ItemStarted(_)
                     | EventMsg::ItemCompleted(_)
@@ -405,7 +390,9 @@ async fn run_codex_tool_session_inner(
                     format!("Codex runtime error: {e}"),
                     Some(true),
                 );
-                outgoing.send_response(request_id.clone(), result).await;
+                active_turns.finish(&request_id, || {
+                    outgoing.send_response(request_id.clone(), result);
+                });
                 break;
             }
         }

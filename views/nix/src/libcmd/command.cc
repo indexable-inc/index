@@ -10,7 +10,6 @@
 #include "nix/store/derivations.hh"
 #include "nix/expr/nixexpr.hh"
 #include "nix/store/profiles.hh"
-#include "nix/cmd/repl.hh"
 #include "nix/util/strings.hh"
 #include "nix/util/environment-variables.hh"
 
@@ -140,15 +139,7 @@ ref<Store> CopyCommand::getDstStore()
     return !dstUri ? openStore() : openStore(StoreReference{*dstUri});
 }
 
-EvalCommand::EvalCommand()
-{
-    addFlag({
-        .longName = "debugger",
-        .description = "Start an interactive environment if evaluation fails.",
-        .category = MixEvalArgs::category,
-        .handler = {&startReplOnEvalErrors, true},
-    });
-}
+EvalCommand::EvalCommand() = default;
 
 EvalCommand::~EvalCommand()
 {
@@ -166,21 +157,10 @@ ref<Store> EvalCommand::getEvalStore()
 ref<EvalState> EvalCommand::getEvalState()
 {
     if (!evalState) {
-        if (startReplOnEvalErrors && evalSettings.evalCores != 1U) {
-            // Disable parallel eval if the debugger is enabled, since
-            // they're incompatible at the moment.
-            warn("using the debugger disables multi-threaded evaluation");
-            evalSettings.evalCores = 1;
-        }
-
         evalState = std::allocate_shared<EvalState>(
             traceable_allocator<EvalState>(), lookupPath, getEvalStore(), fetchSettings, evalSettings, getStore());
 
         evalState->repair = repair;
-
-        if (startReplOnEvalErrors) {
-            evalState->debugRepl = &AbstractNixRepl::runSimple;
-        };
     }
     return ref<EvalState>(evalState);
 }

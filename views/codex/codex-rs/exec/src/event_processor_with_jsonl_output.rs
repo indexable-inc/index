@@ -121,6 +121,7 @@ impl EventProcessorWithJsonOutput {
         Usage {
             input_tokens: usage.total.input_tokens,
             cached_input_tokens: usage.total.cached_input_tokens,
+            cache_write_input_tokens: usage.total.cache_write_input_tokens,
             output_tokens: usage.total.output_tokens,
             reasoning_output_tokens: usage.total.reasoning_output_tokens,
         }
@@ -243,6 +244,10 @@ impl EventProcessorWithJsonOutput {
                 id: make_id(),
                 details: ThreadItemDetails::CollabToolCall(CollabToolCallItem {
                     tool: match tool {
+                        CollabAgentTool::SendMessage
+                        | CollabAgentTool::FollowupTask
+                        | CollabAgentTool::InterruptAgent
+                        | CollabAgentTool::ListAgents => return None,
                         CollabAgentTool::SpawnAgent => CollabTool::SpawnAgent,
                         CollabAgentTool::SendInput => CollabTool::SendInput,
                         CollabAgentTool::ResumeAgent => CollabTool::Wait,
@@ -290,6 +295,7 @@ impl EventProcessorWithJsonOutput {
                         CollabAgentToolCallStatus::InProgress => CollabToolCallStatus::InProgress,
                         CollabAgentToolCallStatus::Completed => CollabToolCallStatus::Completed,
                         CollabAgentToolCallStatus::Failed => CollabToolCallStatus::Failed,
+                        CollabAgentToolCallStatus::Interrupted => return None,
                     },
                 }),
             }),

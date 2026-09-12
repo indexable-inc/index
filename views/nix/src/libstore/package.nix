@@ -15,6 +15,9 @@
   nlohmann_json,
   sqlite,
   cmake, # for resolving aws-crt-cpp dep
+  cargo,
+  rustc,
+  rustPlatform,
 
   busybox-sandbox-shell ? null,
 
@@ -51,6 +54,7 @@ mkMesonLibrary (finalAttrs: {
     ./unix/meson.build
     ./unix/include/nix/store/meson.build
     ./windows/meson.build
+    ../../rust/nix-host-rs
     (fileset.fileFilter (file: file.hasExt "cc") ./.)
     (fileset.fileFilter (file: file.hasExt "hh") ./.)
     (fileset.fileFilter (file: file.hasExt "sb") ./.)
@@ -59,7 +63,11 @@ mkMesonLibrary (finalAttrs: {
   ];
 
   nativeBuildInputs =
-    lib.optional withAWS cmake ++ lib.optional embeddedSandboxShell unixtools.hexdump;
+    [cargo rustc rustPlatform.cargoSetupHook]
+    ++ lib.optional withAWS cmake ++ lib.optional embeddedSandboxShell unixtools.hexdump;
+
+  cargoRoot = "../../rust/nix-host-rs";
+  cargoDeps = rustPlatform.importCargoLock {lockFile = ../../rust/nix-host-rs/Cargo.lock;};
 
   buildInputs = [
     boost
@@ -84,7 +92,7 @@ mkMesonLibrary (finalAttrs: {
   ];
 
   meta = {
-    platforms = lib.platforms.unix ++ lib.platforms.windows;
+    platforms = lib.platforms.linux ++ lib.platforms.darwin;
   };
 
 })

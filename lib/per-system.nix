@@ -1021,8 +1021,8 @@
       };
     };
 
-    # Scoped lane inputs: only the files a lane's tools read or rewrite,
-    # intersected with the tracked set. An edit outside a lane's fileset
+    # Scoped lane inputs: only the files a lane's tools read or rewrite. An
+    # edit outside a lane's fileset
     # leaves that lane's input (hence, content-addressed, its output)
     # untouched -- the whole-tree cache invalidation fix from #3431. The
     # filesets must stay pairwise disjoint: `unite` treats a path emitted by
@@ -1030,7 +1030,6 @@
     # include tracked files under hidden directories (.github): a deliberate
     # superset, since hidden-and-tracked is still shipped code.
     sources = let
-      tracked = fs.gitTracked paths.root;
       # The vendored roots come out of every lane, for a sharper reason than
       # they come out of the check stages: a lane REWRITES the tree it is
       # given. `lint --fix` running alejandra over an imported upstream copy is
@@ -1042,7 +1041,7 @@
       laneSource = fileset:
         fs.toSource {
           inherit (paths) root;
-          fileset = fs.difference (fs.intersection tracked fileset) vendored;
+          fileset = fs.difference fileset vendored;
         };
     in {
       nix = laneSource (
@@ -1171,229 +1170,249 @@
   # the package schema gate. This replaces two competing self-hosted claims
   # without running two 16-worker clients side by side (which has OOM-killed a
   # 96 GiB runner before). `check closure` remains the manual closure probe.
-  check = ix.writeNushellApplication pkgs {
-    name = "check";
-    meta.description = "Run CI gates: default checks, `required` checks plus publishable closure, or `closure` only";
-    text = ''
-      # Patched nix-fast-build (packages/nix-fast-build): stock --skip-cached
-      # only skips a job whose nix-eval-jobs cacheStatus is `cached` (in a remote
-      # substituter); a `local` output (already in this warm runner's store but
-      # never pushed) falls through and is re-realized every run. On this CI the
-      # rust units and image closures are floating-CA and resolve to `local`, so
-      # the patch makes --skip-cached skip `local` too. nixpkgs' 1.5.0 tag is the
-      # same commit (7f185e0) the flake ref used to pin, so this is a like-for-like
-      # source swap plus the patch. Invoked directly by store path, not `nix run`.
-      const fast_build = "${lib.getExe repoPackages.nix-fast-build}"
-      # nix-eval-jobs is linked to the stable Nix 2.34 components the fleet
-      # daemon runs. Built for x86_64-linux (the CI gate system); `check` itself
-      # is x86_64-linux-only.
-      const eval_jobs = "${lib.getExe repoPackages.nix-eval-jobs}"
+  #
+  # Refused at evaluation when this flake carries no guest Nix (`ix.nixPackage`
+  # is null: index evaluated standalone, which is what the public mirror's
+  # check.yml does). Every mode below forces image closures -- `main` through
+  # `ciChecks` (`eval`, `base-image-nix-db`, `nvim-startup`) and the package
+  # schema pass over `base`/`vcfs-guest-eval`, `main required` through every
+  # `closure-*` root of `requiredGateRoots` -- and each of those throws
+  # `modules/profiles/base: no guest Nix was injected` when forced. Letting the
+  # gate run would spend a 16-worker evaluator pool discovering that one
+  # refusal per image, then report the images as failed checks. One refusal
+  # here names where the gate actually runs instead.
+  check =
+    if ix.nixPackage == null
+    then
+      throw ''
+        packages.${system}.check: this flake was evaluated with no guest Nix (`ix.nixPackage` is null), and every mode of `check` forces image closures that need it (`ciChecks.eval`, `packages.base`, every `closure-*` root of `requiredGateRoots`).
 
-      # Shared build gate: build every derivation under $flake with
-      # nix-fast-build and exit 1 on any failure, after replaying each failed
-      # build's log. `main` runs it over ciChecks, `main required` over the
-      # namespaced union of checks and cache-push roots, and `main closure` over
-      # cache-push roots alone.
-      def build-gate [flake: string] {
-        # ca-derivations: the rust workspace units default to
-        # `contentAddressed = true` (lib/rust/cargo-unit.nix), so evaluating
-        # the target set resolves floating content-addressed drvs. The
-        # evaluator (nix-eval-jobs, which nix-fast-build wraps) needs the
-        # `ca-derivations` experimental feature, or it aborts with
-        # "experimental Nix feature 'ca-derivations' is disabled". The caller
-        # owns cache policy: developers may accept the flake config, while
-        # self-hosted CI ignores its restricted cache settings. Pin only the CA
-        # feature here so nested evaluator processes remain self-contained.
-        # --result-format json --result-file emits one record per attr per phase
-        # ({attr, type: EVAL|BUILD, duration, success, error, outputs}) into the
-        # cwd. blast-radius consumes this on a later PR via `--timings` to
-        # annotate the rebuilt-checks list with wall-clock seconds. The path is
-        # relative to the runner cwd; check.yml uploads it as an artifact.
-        # nix-fast-build prints "Cannot build <drv>" for a failed check but not the
-        # build's own output, so a clippy lint or a test panic surfaces only as a
-        # bare "build exited with 1" with no diagnostic to act on. Catch the
-        # failure, then replay each failed build's log via `nix log` so the actual
-        # clippy/test output lands in the CI log. The failed attrs are read from
-        # the --result-file this just wrote (one {attr,type,success,...} record
-        # per attr per phase); it is written even on failure.
-        # `try` returns false on success and the `catch` returns true, so the
-        # failure is carried in an immutable binding (nushell forbids mutating an
-        # outer `mut` from inside the catch closure).
-        let build_failed = (
-          try {
-            ^$fast_build ...[
-              "--flake" $flake
-              # Drive nix-fast-build with the daemon-family-compatible
-              # evaluator rather than its nixpkgs default.
-              "--nix-eval-jobs" $eval_jobs
-              "--eval-max-memory-size" "6144"
-              "--eval-workers" "16"
-              "--skip-cached"
-              # Stop scheduling new checks as soon as one fails (in-flight
-              # builds still finish). Default nix-fast-build behavior is to
-              # build every remaining check and only report at the end, which
-              # spends the full wall time before flake-check goes red (#2128).
-              # The failed-attr log replay below still works: the result file
-              # is written on failure with the records collected so far.
-              "--fail-fast"
-              "--no-nom"
-              "--no-link"
-              "--result-format" "json"
-              "--result-file" "check-results.json"
-              "--option" "eval-cache" "false"
-              "--option" "extra-experimental-features" "ca-derivations"
-            ]
-            false
-          } catch {
-            true
-          }
-        )
+        index cannot assemble that Nix on its own (lib/default.nix `nixPackage`: the jj tree ABI archive the fork links lives in the ix repository). ix instantiates this flake with it (`index.withNixPackage`, ix nix/flake/outputs/workspace.nix `index`) and its required gate absorbs `requiredGateRoots.x86_64-linux` as the `index-*` jobs of `packages.x86_64-linux.required-ci-checks`. Run the gate there, or evaluate one root through ix's `index` flake output.
+      ''
+    else
+      ix.writeNushellApplication pkgs {
+        name = "check";
+        meta.description = "Run CI gates: default checks, `required` checks plus publishable closure, or `closure` only";
+        text = ''
+          # Patched nix-fast-build (packages/nix-fast-build): stock --skip-cached
+          # only skips a job whose nix-eval-jobs cacheStatus is `cached` (in a remote
+          # substituter); a `local` output (already in this warm runner's store but
+          # never pushed) falls through and is re-realized every run. On this CI the
+          # rust units and image closures are floating-CA and resolve to `local`, so
+          # the patch makes --skip-cached skip `local` too. nixpkgs' 1.5.0 tag is the
+          # same commit (7f185e0) the flake ref used to pin, so this is a like-for-like
+          # source swap plus the patch. Invoked directly by store path, not `nix run`.
+          const fast_build = "${lib.getExe repoPackages.nix-fast-build}"
+          # nix-eval-jobs is linked to the stable Nix 2.34 components the fleet
+          # daemon runs. Built for x86_64-linux (the CI gate system); `check` itself
+          # is x86_64-linux-only.
+          const eval_jobs = "${lib.getExe repoPackages.nix-eval-jobs}"
 
-        if ("check-results.json" | path exists) {
-          let failed = (
-            open check-results.json
-            | get results
-            | where type == "BUILD" and success == false
-          )
-          for f in $failed {
-            # GitHub Actions log group so a long clippy dump stays collapsible;
-            # harmless plain text in a local `nix run .#check`.
-            print --stderr $"::group::build log: ($f.attr)"
-            let inst = $"($flake).($f.attr)"
-            # Fast path: replay the retained build log via `nix log` (works for
-            # input-addressed checks like the browser smoke test).
-            let drv = (
-              ^nix eval --raw
-                --option extra-experimental-features ca-derivations
-                $"($inst).drvPath"
-              | complete
-            )
-            let logged = if $drv.exit_code == 0 and (($drv.stdout | str trim) | is-not-empty) {
-              ^nix log ($drv.stdout | str trim) | complete
-            } else {
-              { exit_code: 1, stdout: "" }
-            }
-            if $logged.exit_code == 0 and (($logged.stdout | str trim) | is-not-empty) {
-              print --stderr $logged.stdout
-              # The tail as an annotation too: raw log downloads are blocked
-              # from automation, and the checks API only carries annotations.
-              let tail = (
-                $logged.stdout | lines | last 10 | str join " | " | str substring 0..600
-              )
-              print $"::error title=($f.attr) build log tail::($tail)"
-            } else {
-              # A content-addressed build (the rust units default to CA) keeps
-              # its log under the *resolved* drv, which `nix log` cannot fetch by
-              # the original -- so re-run the one failed check with -L to stream
-              # the diagnostic (clippy lint / test output). nix does not cache
-              # failures, so this just re-attempts that single check.
-              let rebuilt = (do {
-                ^nix build ...[
-                  $inst
-                  "-L"
+          # Shared build gate: build every derivation under $flake with
+          # nix-fast-build and exit 1 on any failure, after replaying each failed
+          # build's log. `main` runs it over ciChecks, `main required` over the
+          # namespaced union of checks and cache-push roots, and `main closure` over
+          # cache-push roots alone.
+          def build-gate [flake: string] {
+            # ca-derivations: the rust workspace units default to
+            # `contentAddressed = true` (lib/rust/cargo-unit.nix), so evaluating
+            # the target set resolves floating content-addressed drvs. The
+            # evaluator (nix-eval-jobs, which nix-fast-build wraps) needs the
+            # `ca-derivations` experimental feature, or it aborts with
+            # "experimental Nix feature 'ca-derivations' is disabled". The caller
+            # owns cache policy: developers may accept the flake config, while
+            # self-hosted CI ignores its restricted cache settings. Pin only the CA
+            # feature here so nested evaluator processes remain self-contained.
+            # --result-format json --result-file emits one record per attr per phase
+            # ({attr, type: EVAL|BUILD, duration, success, error, outputs}) into the
+            # cwd. blast-radius consumes this on a later PR via `--timings` to
+            # annotate the rebuilt-checks list with wall-clock seconds. The path is
+            # relative to the runner cwd; check.yml uploads it as an artifact.
+            # nix-fast-build prints "Cannot build <drv>" for a failed check but not the
+            # build's own output, so a clippy lint or a test panic surfaces only as a
+            # bare "build exited with 1" with no diagnostic to act on. Catch the
+            # failure, then replay each failed build's log via `nix log` so the actual
+            # clippy/test output lands in the CI log. The failed attrs are read from
+            # the --result-file this just wrote (one {attr,type,success,...} record
+            # per attr per phase); it is written even on failure.
+            # `try` returns false on success and the `catch` returns true, so the
+            # failure is carried in an immutable binding (nushell forbids mutating an
+            # outer `mut` from inside the catch closure).
+            let build_failed = (
+              try {
+                ^$fast_build ...[
+                  "--flake" $flake
+                  # Drive nix-fast-build with the daemon-family-compatible
+                  # evaluator rather than its nixpkgs default.
+                  "--nix-eval-jobs" $eval_jobs
+                  "--eval-max-memory-size" "6144"
+                  "--eval-workers" "16"
+                  "--skip-cached"
+                  # Stop scheduling new checks as soon as one fails (in-flight
+                  # builds still finish). Default nix-fast-build behavior is to
+                  # build every remaining check and only report at the end, which
+                  # spends the full wall time before flake-check goes red (#2128).
+                  # The failed-attr log replay below still works: the result file
+                  # is written on failure with the records collected so far.
+                  "--fail-fast"
+                  "--no-nom"
                   "--no-link"
+                  "--result-format" "json"
+                  "--result-file" "check-results.json"
+                  "--option" "eval-cache" "false"
                   "--option" "extra-experimental-features" "ca-derivations"
                 ]
-              } | complete)
-              print --stderr $rebuilt.stdout
-              print --stderr $rebuilt.stderr
-              let tail = (
-                $"($rebuilt.stdout)\n($rebuilt.stderr)"
-                | lines | where {|l| ($l | str trim) | is-not-empty }
-                | last 10 | str join " | " | str substring 0..600
-              )
-              print $"::error title=($f.attr) build log tail::($tail)"
-            }
-            print --stderr "::endgroup::"
-          }
-          # One workflow error annotation per failed attr (EVAL and BUILD),
-          # carrying the recorded error text. check.yml cats this log to the
-          # step's stdout on failure, where the runner parses `::error::`
-          # lines into check-run annotations -- the only failure surface
-          # reachable when raw log downloads are blocked (annotations ride
-          # the checks API). Harmless plain text in a local run.
-          let annotated = (
-            open check-results.json
-            | get results
-            | where success == false
-          )
-          for f in $annotated {
-            let err = (
-              ($f | get -o error | default "")
-              | str replace --all "\n" " | "
-              | str substring 0..500
+                false
+              } catch {
+                true
+              }
             )
-            print $"::error title=($f.attr) ($f.type)::($err)"
+
+            if ("check-results.json" | path exists) {
+              let failed = (
+                open check-results.json
+                | get results
+                | where type == "BUILD" and success == false
+              )
+              for f in $failed {
+                # GitHub Actions log group so a long clippy dump stays collapsible;
+                # harmless plain text in a local `nix run .#check`.
+                print --stderr $"::group::build log: ($f.attr)"
+                let inst = $"($flake).($f.attr)"
+                # Fast path: replay the retained build log via `nix log` (works for
+                # input-addressed checks like the browser smoke test).
+                let drv = (
+                  ^nix eval --raw
+                    --option extra-experimental-features ca-derivations
+                    $"($inst).drvPath"
+                  | complete
+                )
+                let logged = if $drv.exit_code == 0 and (($drv.stdout | str trim) | is-not-empty) {
+                  ^nix log ($drv.stdout | str trim) | complete
+                } else {
+                  { exit_code: 1, stdout: "" }
+                }
+                if $logged.exit_code == 0 and (($logged.stdout | str trim) | is-not-empty) {
+                  print --stderr $logged.stdout
+                  # The tail as an annotation too: raw log downloads are blocked
+                  # from automation, and the checks API only carries annotations.
+                  let tail = (
+                    $logged.stdout | lines | last 10 | str join " | " | str substring 0..600
+                  )
+                  print $"::error title=($f.attr) build log tail::($tail)"
+                } else {
+                  # A content-addressed build (the rust units default to CA) keeps
+                  # its log under the *resolved* drv, which `nix log` cannot fetch by
+                  # the original -- so re-run the one failed check with -L to stream
+                  # the diagnostic (clippy lint / test output). nix does not cache
+                  # failures, so this just re-attempts that single check.
+                  let rebuilt = (do {
+                    ^nix build ...[
+                      $inst
+                      "-L"
+                      "--no-link"
+                      "--option" "extra-experimental-features" "ca-derivations"
+                    ]
+                  } | complete)
+                  print --stderr $rebuilt.stdout
+                  print --stderr $rebuilt.stderr
+                  let tail = (
+                    $"($rebuilt.stdout)\n($rebuilt.stderr)"
+                    | lines | where {|l| ($l | str trim) | is-not-empty }
+                    | last 10 | str join " | " | str substring 0..600
+                  )
+                  print $"::error title=($f.attr) build log tail::($tail)"
+                }
+                print --stderr "::endgroup::"
+              }
+              # One workflow error annotation per failed attr (EVAL and BUILD),
+              # carrying the recorded error text. check.yml cats this log to the
+              # step's stdout on failure, where the runner parses `::error::`
+              # lines into check-run annotations -- the only failure surface
+              # reachable when raw log downloads are blocked (annotations ride
+              # the checks API). Harmless plain text in a local run.
+              let annotated = (
+                open check-results.json
+                | get results
+                | where success == false
+              )
+              for f in $annotated {
+                let err = (
+                  ($f | get -o error | default "")
+                  | str replace --all "\n" " | "
+                  | str substring 0..500
+                )
+                print $"::error title=($f.attr) ($f.type)::($err)"
+              }
+            }
+
+            if $build_failed {
+              exit 1
+            }
           }
-        }
 
-        if $build_failed {
-          exit 1
-        }
-      }
+          def eval-package-schema [] {
+            let tmp = (mktemp --directory --tmpdir "ix-check.XXXXXX")
+            let report = ($tmp | path join "flake-schema-eval.jsonl")
+            do --capture-errors {
+              ^$eval_jobs ...[
+                "--flake" ".#packages.x86_64-linux"
+                "--workers" "16"
+                "--gc-roots-dir" ($tmp | path join "flake-schema-eval-gc")
+                "--option" "eval-cache" "false"
+                # See the ca-derivations note above: the package set also resolves
+                # content-addressed rust units, so this eval needs the feature too.
+                "--option" "extra-experimental-features" "ca-derivations"
+              ]
+            } | tee { save --raw --force $report }
 
-      def eval-package-schema [] {
-        let tmp = (mktemp --directory --tmpdir "ix-check.XXXXXX")
-        let report = ($tmp | path join "flake-schema-eval.jsonl")
-        do --capture-errors {
-          ^$eval_jobs ...[
-            "--flake" ".#packages.x86_64-linux"
-            "--workers" "16"
-            "--gc-roots-dir" ($tmp | path join "flake-schema-eval-gc")
-            "--option" "eval-cache" "false"
-            # See the ca-derivations note above: the package set also resolves
-            # content-addressed rust units, so this eval needs the feature too.
-            "--option" "extra-experimental-features" "ca-derivations"
-          ]
-        } | tee { save --raw --force $report }
+            # nix-eval-jobs exits 0 even when an attribute fails to evaluate, so this
+            # error-line check is the gate; a nonzero exit already aborted above. The
+            # report is left in place on failure for inspection.
+            if (open --raw $report | lines | any {|line| $line | str contains '"error":' }) {
+              print --stderr "flake schema evaluation failed; see the error lines above"
+              exit 1
+            }
+            rm --recursive --force $tmp
+          }
 
-        # nix-eval-jobs exits 0 even when an attribute fails to evaluate, so this
-        # error-line check is the gate; a nonzero exit already aborted above. The
-        # report is left in place on failure for inspection.
-        if (open --raw $report | lines | any {|line| $line | str contains '"error":' }) {
-          print --stderr "flake schema evaluation failed; see the error lines above"
-          exit 1
-        }
-        rm --recursive --force $tmp
-      }
+          def main [] {
+            build-gate ".#ciChecks.x86_64-linux"
+            eval-package-schema
+          }
 
-      def main [] {
-        build-gate ".#ciChecks.x86_64-linux"
-        eval-package-schema
-      }
+          # Required PR/merge-group gate. One nix-fast-build invocation evaluates
+          # and builds both check roots and publishable closure roots with the same
+          # bounded pool; a second package-schema pass retains the broader eval gate.
+          def "main required" [] {
+            build-gate ".#requiredGateRoots.x86_64-linux"
+            eval-package-schema
+          }
 
-      # Required PR/merge-group gate. One nix-fast-build invocation evaluates
-      # and builds both check roots and publishable closure roots with the same
-      # bounded pool; a second package-schema pass retains the broader eval gate.
-      def "main required" [] {
-        build-gate ".#requiredGateRoots.x86_64-linux"
-        eval-package-schema
-      }
-
-      # Pre-merge closure gate (closure-gate.yml, #1873): the same build gate
-      # over the roots the post-merge cache-push linux lane publishes, darwin
-      # cross closure included -- the set #2690 broke while flake-check stayed
-      # green, back when packages were eval-gated only.
-      #
-      # That last clause is history, not the current state, and it read as
-      # current for long enough to mislead: `main required` above builds
-      # `requiredGateRoots`, which carries the package closures, so a linux
-      # package IS built on every pull request. Believing otherwise argues for
-      # holding a pin bump that the required gate already covers.
-      #
-      # What this lane still uniquely covers is darwin. The required gate is
-      # `x86_64-linux` only and this workflow is `workflow_dispatch:`, so no
-      # automatically triggered run builds a darwin closure. A flake-input bump
-      # therefore gets linux assurance from its own pull request and darwin
-      # assurance from nobody unless someone dispatches this.
-      #
-      # --skip-cached keeps it O(changed): on the warm-store pool only drvs new
-      # relative to main's already-built closure realise.
-      def "main closure" [] {
-        build-gate ".#cachePushRoots.x86_64-linux"
-      }
-    '';
-  };
+          # Pre-merge closure gate (closure-gate.yml, #1873): the same build gate
+          # over the roots the post-merge cache-push linux lane publishes, darwin
+          # cross closure included -- the set #2690 broke while flake-check stayed
+          # green, back when packages were eval-gated only.
+          #
+          # That last clause is history, not the current state, and it read as
+          # current for long enough to mislead: `main required` above builds
+          # `requiredGateRoots`, which carries the package closures, so a linux
+          # package IS built on every pull request. Believing otherwise argues for
+          # holding a pin bump that the required gate already covers.
+          #
+          # What this lane still uniquely covers is darwin. The required gate is
+          # `x86_64-linux` only and this workflow is `workflow_dispatch:`, so no
+          # automatically triggered run builds a darwin closure. A flake-input bump
+          # therefore gets linux assurance from its own pull request and darwin
+          # assurance from nobody unless someone dispatches this.
+          #
+          # --skip-cached keeps it O(changed): on the warm-store pool only drvs new
+          # relative to main's already-built closure realise.
+          def "main closure" [] {
+            build-gate ".#cachePushRoots.x86_64-linux"
+          }
+        '';
+      };
 
   updateMods = ix.writePythonApplication pkgs {
     name = "update-mods";
@@ -1509,8 +1528,8 @@
   };
 
   # `paths.site` is the git-filtered `site` subtree input (a store copy, not
-  # a local path), so `lib.fileset`/`gitTracked` cannot apply to it; the input
-  # already scopes source identity to the subtree.
+  # a local path), so no fileset scoping applies to it; the input already
+  # scopes source identity to the subtree.
   siteSrc = paths.site;
 
   siteTests = ix.buildNpmVitest pkgs {
@@ -1688,27 +1707,13 @@
     in
       lib.mergeAttrsList (map rootsForTarget crossTargets)
   );
-  # A package whose build rides a distinct `cargoUnit.buildWorkspace` instead
-  # of the shared `crossWorkspace` (codex's codex-rs; ix2nix-wasm's
-  # wasm32-unknown-unknown graph) exposes that workspace's unit-graph IFD
-  # artifacts via `passthru.workspaceIfdRoots`. `crossIfdRoots` only covers
-  # the shared workspace, so harvest these too -- otherwise a consumer
-  # substituting the package output re-vendors/re-renders that graph at eval
-  # and hits the #1890 trap on drvs it cannot build (Darwin for codex;
-  # scaffolded `ix init` evals for the wasm converter, #4127 -- and, since
-  # the converter went back to IFD on 2026-07-25, EVERY `.ix` eval).
-  # Generic over the whole `packageSet` (crossPackages included), so any
-  # package exposing the passthru joins with no hand-kept list.
-  workspacePackageIfdRoots = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
-    lib.concatMapAttrs (
-      name: pkg:
-        lib.mapAttrs' (
-          rootName: drv: lib.nameValuePair "workspace-ifd-${name}-${rootName}" drv
-        )
-        (pkg.passthru.workspaceIfdRoots or {})
-    )
-    packageSet
-  );
+  # Producer declarations keep helper discovery out of unrelated package
+  # values, especially NixOS toplevels. Package/job membership is unchanged.
+  workspacePackageIfdRoots = import ./workspace-ifd-roots.nix {
+    inherit lib system packageRegistry;
+    isLinux = pkgs.stdenv.hostPlatform.isLinux;
+    packages = packageSet;
+  };
   darwinPackageAliases = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux (
     lib.genAttrs (lib.attrNames darwinTargetsBySystem) (
       darwinSystem: let
@@ -1850,7 +1855,7 @@
     inherit pkgs mkCheck crossPackages;
   };
   astlogRuleChecks = import (paths.root + "/astlog-rules/checks.nix") {
-    inherit lib pkgs paths mkCheck;
+    inherit lib pkgs mkCheck;
     inherit (repoPackages) astlog;
   };
   agentSurfaceChecks = import (paths.packagesRoot + "/agent/checks.nix") {
@@ -1867,7 +1872,7 @@
     inherit (repoPackages) scipql;
   };
   personalConfigChecks = import (paths.users + "/andrewgazelka/checks.nix") {
-    inherit lib pkgs ix paths mkCheck;
+    inherit lib pkgs ix mkCheck;
     inherit (repoPackages) nushell;
   };
 
@@ -2267,9 +2272,10 @@
 
   # The example fan-out keys need the `.ix` converter, and cargo-unit builds
   # that converter from this workspace, so merely enumerating those keys plans
-  # every workspace member manifest. The jj-views validate lane checks out a
-  # sparse tree that deliberately leaves index/packages/tree-sitter-nix (and
-  # every view but jj/nix) unhydrated, so the legacyPackages spine -- which
+  # every workspace member manifest. The (since retired) jj-views validate
+  # lane checked out a sparse tree that deliberately left
+  # index/packages/tree-sitter-nix (and every view but jj/nix) unhydrated, so
+  # the legacyPackages spine -- which
   # nix-ix's installable resolution probes on every CLI invocation -- died on
   # the absent manifest and blocked every view PR (runs 31014582142 and
   # 31015350748; still the head-of-main failure in run 31144625873; surfaced
@@ -2325,12 +2331,49 @@ in {
     # Per-node `health-check-*` lifecycle packages and the two
     # `health-checks{,-zellij}` runners all share the `health-check` prefix.
     isHealthCheck = lib.hasPrefix "health-check";
+    # THE GUEST-NIX FENCE. Standalone (`ix.nixPackage == null`) this attrset
+    # is the PUBLIC root set: the ci-dispatcher's public-cache-push unit
+    # evaluates exactly this attr from the public index subtree and fails
+    # closed on any eval-error row. The entries named here (and the example
+    # node toplevels below) need the guest Nix to evaluate at all, and the
+    # injected nix-ix embeds the team-tier jj tree ABI archive, so their
+    # closures must never reach the public cache regardless of evaluability:
+    # they are fenced OUT of the standalone set rather than left to throw
+    # into a permanently red publisher. With the guest Nix injected (ix's
+    # instantiation) they are present, which is what puts the image
+    # `closure-*` roots in ix's absorbed required gate. A name list, and
+    # deliberately so: a NEW guest-Nix-dependent entry that is not added here
+    # turns the public publisher loudly red (it fails closed on the error
+    # row) instead of silently shrinking the push set, and that alarm is the
+    # review event. Re-admitting an image to the public cache is a tier
+    # decision (public-cache-push.nix `rootsAttr`), not an edit here.
+    needsGuestNix = [
+      "base"
+      "check"
+      "harivansh-dev-system"
+      # Links the assembled fork's C++ components (its default.nix has the
+      # class story) -- and its closure carries the team-tier jj tree ABI
+      # archive, so it must stay off the public cache like the images.
+      "nix-eval-jobs"
+      # Its script text embeds the assembled fork client (`getExe`), same
+      # class and same tier consequence as nix-eval-jobs.
+      "nix-ninja-build-nix"
+      # Its dag spec embeds every registry updateScript, each of which runs
+      # the assembled fork client (`ix.nixPackageFor`).
+      "update"
+      "vcfs-guest-eval"
+    ];
+    publishablePackageSet =
+      if ix.nixPackage == null
+      then builtins.removeAttrs packageSet needsGuestNix
+      else packageSet;
     imagesAsClosures = lib.mapAttrs (_: p: p.passthru.toplevel or p) (
-      lib.filterAttrs (name: _: !isHealthCheck name) packageSet
+      lib.filterAttrs (name: _: !isHealthCheck name) publishablePackageSet
     );
     # `fleet.systemPackages` keys each node's toplevel as `<node>-system`; the
     # fleet-name prefix keeps nodes sharing a name across fleets distinct.
-    exampleNodeToplevels =
+    # Guest-Nix images like the entries above, so the same fence applies.
+    exampleNodeToplevels = lib.optionalAttrs (ix.nixPackage != null) (
       lib.concatMapAttrs (
         fleetName: fleet:
           lib.mapAttrs' (
@@ -2338,7 +2381,8 @@ in {
           )
           fleet.systemPackages
       )
-      exampleFleets;
+      exampleFleets
+    );
     # Native analog of `crossIfdRoots` (adjustment 4). `crossWorkspace` with no
     # target override IS the host workspace, so these are exactly the drvs a
     # Darwin consumer's eval of the native wrappers imports.

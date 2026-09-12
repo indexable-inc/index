@@ -27,6 +27,20 @@ const StringSet hashAlgorithms = {"blake3", "md5", "sha1", "sha256", "sha512"};
 
 const StringSet hashFormats = {"base64", "nix32", "base16", "sri"};
 
+const ExperimentalFeatureSettings & nativeIdXpSettings()
+{
+    struct NativeIdSettings : ExperimentalFeatureSettings
+    {
+        NativeIdSettings()
+        {
+            set("experimental-features", "blake3-hashes");
+        }
+    };
+
+    static const NativeIdSettings settings;
+    return settings;
+}
+
 Hash::Hash(HashAlgorithm algo, const ExperimentalFeatureSettings & xpSettings)
     : algo(algo)
 {
@@ -257,9 +271,9 @@ Hash::parseAnyReturningFormat(std::string_view original, std::optional<HashAlgor
     });
 }
 
-Hash Hash::parseNonSRIUnprefixed(std::string_view s, HashAlgorithm algo)
+Hash Hash::parseNonSRIUnprefixed(std::string_view s, HashAlgorithm algo, const ExperimentalFeatureSettings & xpSettings)
 {
-    return parseExplicitFormatUnprefixed(s, algo, baseFromSize(s, algo));
+    return parseExplicitFormatUnprefixed(s, algo, baseFromSize(s, algo), xpSettings);
 }
 
 Hash Hash::parseExplicitFormatUnprefixed(

@@ -87,7 +87,6 @@ jj-lib = { workspace = true }
 # default-features are off in the workspace declaration, so name the
 # transports explicitly. `fuse` is added for Linux in the target table below.
 jj-vfs = { workspace = true, optional = true, features = ["nfs"] }
-jj-views = { workspace = true, optional = true }
 maplit = { workspace = true }
 mimalloc = { workspace = true }
 once_cell = { workspace = true }
@@ -146,20 +145,15 @@ test-case = { workspace = true }
 testutils = { workspace = true }
 # https://github.com/rust-lang/cargo/issues/2911#issuecomment-1483256987
 jj-cli = { path = ".", features = ["test-fakes"], default-features = false }
-jj-views = { workspace = true }
 
 [features]
-default = ["watchman", "git", "fs", "views"]
+default = ["watchman", "git", "fs"]
 bench = ["dep:criterion"]
 # Serve a revision as a mounted filesystem (`jj fs mount`). The command
 # itself is additionally cfg(unix): it reports unix uid/gid and drives
 # mount(8)/umount(8), so on Windows the feature resolves to nothing.
 fs = ["dep:jj-vfs"]
 git = ["jj-lib/git", "dep:gix"]
-# Publish path prefixes of this repository as repositories of their own
-# (`jj views push`). Derives from and pushes out of the Git store, so it
-# implies `git`.
-views = ["dep:jj-views", "git"]
 test-fakes = ["jj-lib/testing"]
 watchman = ["jj-lib/watchman"]
 

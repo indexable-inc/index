@@ -1,3 +1,5 @@
+//! Control socket startup, guarded rendezvous paths, and WebSocket acceptance.
+
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
@@ -26,9 +28,21 @@ pub async fn start_control_socket_acceptor(
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
 ) -> IoResult<JoinHandle<()>> {
+    #[cfg(windows)]
+    let (socket_path, directory_guard) = {
+        if let Some(parent) = socket_path.as_path().parent() {
+            codex_uds::prepare_private_socket_directory(parent).await?;
+        }
+        let (path, guard) = codex_uds::validate_private_socket_path(socket_path.as_path())?;
+        (AbsolutePathBuf::from_absolute_path_checked(path)?, guard)
+    };
     prepare_control_socket_path(socket_path.as_path()).await?;
     let listener = UnixListener::bind(socket_path.as_path()).await?;
-    let socket_guard = ControlSocketFileGuard { socket_path };
+    let socket_guard = ControlSocketFileGuard {
+        socket_path,
+        #[cfg(windows)]
+        _directory_guard: directory_guard,
+    };
     set_control_socket_permissions(socket_guard.socket_path.as_path()).await?;
     info!(
         socket_path = %socket_guard.socket_path.display(),
@@ -94,6 +108,13 @@ pub async fn prepare_control_socket_path(socket_path: &Path) -> IoResult<()> {
     if let Some(parent) = socket_path.parent() {
         codex_uds::prepare_private_socket_directory(parent).await?;
     }
+
+    #[cfg(windows)]
+    let (socket_path, _directory_guard) = codex_uds::validate_private_socket_path(socket_path)?;
+    #[cfg(windows)]
+    let socket_path = AbsolutePathBuf::from_absolute_path_checked(socket_path)?;
+    #[cfg(windows)]
+    let socket_path = socket_path.as_path();
 
     match UnixStream::connect(socket_path).await {
         Ok(_stream) => {
@@ -173,6 +194,9 @@ async fn set_control_socket_permissions(_socket_path: &Path) -> IoResult<()> {
 
 struct ControlSocketFileGuard {
     socket_path: AbsolutePathBuf,
+    // Keep the directory pinned until after the socket file is removed in Drop.
+    #[cfg(windows)]
+    _directory_guard: std::os::windows::io::OwnedHandle,
 }
 
 impl Drop for ControlSocketFileGuard {

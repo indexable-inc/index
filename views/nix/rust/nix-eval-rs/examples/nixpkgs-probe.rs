@@ -51,10 +51,10 @@
 //! the time.
 //!
 //! The embedder then stopped refusing it. `rustFindFile` in
-//! `src/nix/rust-eval-session.cc` resolves the lookup, notices the answer came
+//! `src/libcmd/rust-eval-session.cc` resolves the lookup, notices the answer came
 //! from an accessor that is not `rootFS`, reads the bytes and hands them over
-//! with `ixe_add_virtual_file`, so the evaluator reads `corepkgs` from memory
-//! and `builtins.toString <nix/fetchurl.nix>` is `/fetchurl.nix` on both arms.
+//! in the answer, so the evaluator serves `corepkgs` from memory and
+//! `builtins.toString <nix/fetchurl.nix>` is `/fetchurl.nix` on both arms.
 //! The refusal here outlived that by long enough to stop the probe at stdenv
 //! bootstrap on every expression that reaches `fetchurl`, which is most of
 //! nixpkgs. This file now does what the bridge does, from the same one file
@@ -144,35 +144,40 @@ const COREPKGS_FETCHURL: &str = include_str!("../../../src/libexpr/fetchurl.nix"
 /// `<nixpkgs>` and `<nixpkgs/...>` resolve against the tree under test, and
 /// `<nix/fetchurl.nix>` is served from memory the way the embedder serves it.
 ///
-/// The embedder's rule (`src/nix/rust-eval-session.cc`, `rustFindFile`) is not
+/// The embedder's rule (`src/libcmd/rust-eval-session.cc`, `rustFindFile`) is not
 /// "refuse what is not on disk". It is: resolve, and when the answer came from
-/// an accessor that is not `rootFS`, read the bytes and register them with
-/// `ixe_add_virtual_file` under the path cppnix reports. So the evaluator sees
-/// `/fetchurl.nix`, the file is readable, and `builtins.toString
-/// <nix/fetchurl.nix>` matches the cpp arm. Mirroring that is what keeps this
+/// an accessor that is not `rootFS`, hand the bytes over with the path cppnix
+/// reports, and the host serves the path from them. Here the one such file is
+/// known up front, so it is in the host's `virtual_files` from the start. So
+/// the evaluator sees `/fetchurl.nix`, the file is readable, and
+/// `builtins.toString <nix/fetchurl.nix>` matches the cpp arm. Mirroring that is what keeps this
 /// probe neither more nor less capable than the binary; refusing it made the
 /// probe stop at stdenv bootstrap while the binary walked past.
 ///
 /// `corepkgs` holds exactly one file, so any other name under `nix/` resolves
 /// to the accessor and then fails to read, which the embedder reports as a
 /// refusal rather than a miss (`rustFindFile`'s code 2). Same here.
-fn find_file(_entries: &[SearchPathEntry], name: &str) -> Result<String, LookupError> {
+fn find_file(
+    _entries: &[SearchPathEntry],
+    name: &str,
+) -> Result<nix_eval_rs::value2::PathValue, LookupError> {
     let Some(root) = nixpkgs_root() else {
         return Err(LookupError::NoResolver);
     };
     if name == "nixpkgs" {
-        return Ok(root.to_owned());
+        return Ok(nix_eval_rs::value2::PathValue::ambient(root));
     }
     if let Some(rest) = name.strip_prefix("nixpkgs/") {
-        return Ok(format!("{root}/{rest}"));
+        return Ok(nix_eval_rs::value2::PathValue::ambient(format!(
+            "{root}/{rest}"
+        )));
     }
     if let Some(rest) = name.strip_prefix("nix/") {
         // `CanonPath(path.substr(3))` in cppnix's `findFile`, so the path the
         // evaluator sees is the name minus `nix`, leading slash and all.
         let abs = format!("/{rest}");
         if rest == "fetchurl.nix" {
-            nix_eval_rs::host::add_virtual_file(&abs, COREPKGS_FETCHURL);
-            return Ok(abs);
+            return Ok(nix_eval_rs::value2::PathValue::ambient(abs));
         }
         return Err(LookupError::Unsupported(format!(
             "reading '<{name}>' from an accessor that is not the real filesystem: \
@@ -187,6 +192,14 @@ fn find_file(_entries: &[SearchPathEntry], name: &str) -> Result<String, LookupE
     Err(LookupError::NotFound(format!(
         "file '{name}' was not found in the Nix search path (add it using $NIX_PATH or -I)"
     )))
+}
+
+/// cppnix's in-memory `corepkgs`, as the bytes the host serves `/fetchurl.nix`
+/// from: what `rustFindFile` hands over lazily, known up front here.
+fn corepkgs() -> nix_eval_rs::host::VirtualFiles {
+    let files = nix_eval_rs::host::VirtualFiles::default();
+    files.insert("/fetchurl.nix", COREPKGS_FETCHURL);
+    files
 }
 
 fn nix_path() -> Result<Vec<SearchPathEntry>, LookupError> {
@@ -205,7 +218,8 @@ fn nix_path() -> Result<Vec<SearchPathEntry>, LookupError> {
 /// evaluator refuses interpolations the real binary answers, and a probe that
 /// refuses more than the binary is only marginally better than one that
 /// refuses less.
-fn copy_to_store(path: &str) -> Result<String, String> {
+fn copy_to_store(path: &nix_eval_rs::value2::PathValue) -> Result<String, String> {
+    let path = path.accessor_path();
     if !store_enabled() {
         return Err("--no-store was given, so no path can be copied".to_owned());
     }
@@ -357,9 +371,12 @@ fn store_filtered(request: &FilteredCopy) -> Result<String, String> {
     let expected = match &request.expected_sha256 {
         None => None,
         Some(sri) => {
-            let hash =
-                nix_eval_rs::nixhash::parse_any(sri, Some(nix_eval_rs::nixhash::HashAlgo::Sha256))
-                    .map_err(|e| format!("parsing the sha256 attribute {sri:?}: {e}"))?;
+            let hash = nix_eval_rs::nixhash::parse_any(
+                sri,
+                Some(nix_eval_rs::nixhash::HashAlgo::Sha256),
+                false,
+            )
+            .map_err(|e| format!("parsing the sha256 attribute {sri:?}: {e}"))?;
             let ca = match request.method {
                 PathMethod::NixArchive => nix_eval_rs::drvpath::CaMethod::NixArchive,
                 PathMethod::Flat => nix_eval_rs::drvpath::CaMethod::Flat,
@@ -384,7 +401,7 @@ fn store_filtered(request: &FilteredCopy) -> Result<String, String> {
         // archive a symlink node instead, which is a different store path --
         // this arm got that wrong before `builtins.path { path = <symlink>; }`
         // was put in the differential.
-        None => std::fs::canonicalize(&request.root)
+        None => std::fs::canonicalize(request.root.accessor_path())
             .map_err(|e| format!("resolving {:?}: {e}", request.root))?,
         Some(accepted) => {
             if request.method == PathMethod::Flat {
@@ -404,11 +421,11 @@ fn store_filtered(request: &FilteredCopy) -> Result<String, String> {
             // first version of this staged that case as an empty directory
             // for a regular file too, and landed on a store path
             // `nix-instantiate` disagreed with.
-            let root_is_dir = std::fs::symlink_metadata(&request.root)
+            let root_is_dir = std::fs::symlink_metadata(request.root.accessor_path())
                 .map(|m| m.is_dir())
                 .unwrap_or(false);
             if root_is_dir {
-                stage(&request.root, accepted)?
+                stage(request.root.accessor_path(), accepted)?
             } else {
                 if !accepted.is_empty() {
                     return Err(format!(
@@ -418,7 +435,7 @@ fn store_filtered(request: &FilteredCopy) -> Result<String, String> {
                         request.root
                     ));
                 }
-                std::path::PathBuf::from(&request.root)
+                std::path::PathBuf::from(request.root.accessor_path())
             }
         }
     };
@@ -436,7 +453,7 @@ fn store_filtered(request: &FilteredCopy) -> Result<String, String> {
         .arg(&source)
         .output()
         .map_err(|e| format!("running `nix store add {}`: {e}", source.display()))?;
-    if source != std::path::Path::new(&request.root) {
+    if source != std::path::Path::new(request.root.accessor_path()) {
         let _ = std::fs::remove_dir_all(&source);
     }
     if !out.status.success() {
@@ -504,8 +521,9 @@ fn fetch(request: &FetchRequest) -> Result<String, String> {
             request.kind.who()
         ));
     };
-    let hash = nix_eval_rs::nixhash::parse_any(sri, Some(nix_eval_rs::nixhash::HashAlgo::Sha256))
-        .map_err(|e| format!("parsing the sha256 attribute {sri:?}: {e}"))?;
+    let hash =
+        nix_eval_rs::nixhash::parse_any(sri, Some(nix_eval_rs::nixhash::HashAlgo::Sha256), false)
+            .map_err(|e| format!("parsing the sha256 attribute {sri:?}: {e}"))?;
     let ca = match request.kind.method() {
         PathMethod::NixArchive => nix_eval_rs::drvpath::CaMethod::NixArchive,
         PathMethod::Flat => nix_eval_rs::drvpath::CaMethod::Flat,
@@ -727,6 +745,7 @@ fn main() -> std::process::ExitCode {
     // needs the same answers throughout, so this is a value it carries rather
     // than a process it configures.
     let host = host::FnHost {
+        virtual_files: corepkgs(),
         find_file: Some(find_file),
         nix_path: Some(nix_path),
         store_copy: Some(copy_to_store),
@@ -872,13 +891,19 @@ mod tests {
             Some("/tmp/nixpkgs-probe-test/lib")
         );
 
-        // corepkgs: answered from memory under the path cppnix reports, and
-        // then readable, which is the half a bare `Ok` would not prove.
+        // corepkgs: answered under the path cppnix reports, and then readable
+        // through the probe's host -- the half a bare `Ok` would not prove.
+        // Through the host and not `RealFs`: the bytes are the host's, and
+        // no filesystem holds `/fetchurl.nix`.
         assert_eq!(
             find_file(&[], "nix/fetchurl.nix").ok().as_deref(),
             Some("/fetchurl.nix")
         );
-        let contents = nix_eval_rs::host::RealFs.read_file("/fetchurl.nix");
+        let host = nix_eval_rs::host::FnHost {
+            virtual_files: super::corepkgs(),
+            ..nix_eval_rs::host::FnHost::default()
+        };
+        let contents = host.read_file(&nix_eval_rs::value2::ambient_path("/fetchurl.nix"));
         assert!(
             matches!(&contents, Ok(text) if text.contains("derivation")),
             "the registered corepkgs file must be readable through Host; got {contents:?}"

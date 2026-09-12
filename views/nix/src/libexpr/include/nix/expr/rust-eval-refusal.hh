@@ -36,18 +36,16 @@ namespace nix {
  * one vocabulary whichever side of that line they land on.
  */
 namespace refusalTokens {
-constexpr std::string_view apply = "command-apply";
 constexpr std::string_view writeTo = "command-write-to";
 constexpr std::string_view xmlOutput = "command-xml-output";
-constexpr std::string_view lazyPrint = "command-lazy-print";
 constexpr std::string_view stdinSource = "command-stdin";
-constexpr std::string_view args = "command-args";
 constexpr std::string_view installable = "command-installable";
 constexpr std::string_view outputSelection = "command-output-selection";
 constexpr std::string_view file = "command-file";
 constexpr std::string_view unsupported = "command-unsupported";
 constexpr std::string_view notADerivation = "command-not-a-derivation";
 constexpr std::string_view outputsToInstall = "command-outputs-to-install";
+constexpr std::string_view notAnApp = "command-not-an-app";
 } // namespace refusalTokens
 
 /**
@@ -63,18 +61,16 @@ constexpr std::string_view outputsToInstall = "command-outputs-to-install";
 inline const std::vector<std::string_view> & allCommandRefusalTokens()
 {
     static const std::vector<std::string_view> tokens{
-        refusalTokens::apply,
         refusalTokens::writeTo,
         refusalTokens::xmlOutput,
-        refusalTokens::lazyPrint,
         refusalTokens::stdinSource,
-        refusalTokens::args,
         refusalTokens::installable,
         refusalTokens::outputSelection,
         refusalTokens::file,
         refusalTokens::unsupported,
         refusalTokens::notADerivation,
         refusalTokens::outputsToInstall,
+        refusalTokens::notAnApp,
     };
     return tokens;
 }
@@ -89,6 +85,15 @@ inline const std::vector<std::string_view> & allCommandRefusalTokens()
  * gap worth seeing in the histogram rather than hiding.
  */
 constexpr std::string_view unrecordedRefusal = "unrecorded";
+
+/**
+ * What `refuse` throws: an `Error` a catch site can tell apart from every
+ * other failure, because a refusal is the evaluator declining, and no caller
+ * that recovers from ordinary failures (a shell falling back to plain bash)
+ * may recover from that -- it would be the C++ evaluator's behaviour served
+ * under a setting that promised the Rust one, silently.
+ */
+MakeError(RustEvalRefusal, Error);
 
 /**
  * Refuse, naming the kind as well as the reason.
@@ -112,7 +117,7 @@ template<typename... Args>
     // message can never disagree about what was refused.
     auto detail = nix::fmt(format, args...);
     RefusalCensus::record(token, detail);
-    throw Error("rust-eval unimplemented: %s", detail);
+    throw RustEvalRefusal("rust-eval unimplemented: %s", detail);
 }
 
 /**

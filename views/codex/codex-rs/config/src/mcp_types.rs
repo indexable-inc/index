@@ -1,9 +1,14 @@
 //! MCP server configuration types.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use codex_protocol::config_types::ToolExposureSurface;
 use codex_utils_path_uri::LegacyAppPathString;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -24,6 +29,22 @@ pub enum AppToolApproval {
     Prompt,
     Writes,
     Approve,
+}
+
+impl AppToolApproval {
+    /// Requires approval whenever either policy could require it.
+    ///
+    /// `Auto` and `Writes` are incomparable: each can require approval for a
+    /// tool the other would approve. Their conservative intersection is `Prompt`.
+    pub fn restrict_to(self, requested: Self) -> Self {
+        match (self, requested) {
+            (Self::Prompt, _) | (_, Self::Prompt) => Self::Prompt,
+            (Self::Approve, mode) | (mode, Self::Approve) => mode,
+            (Self::Auto, Self::Auto) => Self::Auto,
+            (Self::Writes, Self::Writes) => Self::Writes,
+            (Self::Auto, Self::Writes) | (Self::Writes, Self::Auto) => Self::Prompt,
+        }
+    }
 }
 
 /// Human-readable reason a configured MCP server was disabled after requirements
@@ -51,13 +72,24 @@ impl fmt::Display for McpServerDisabledReason {
     }
 }
 
-/// Per-tool approval settings for a single MCP server tool.
+/// Per-tool settings for a single MCP server tool.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct McpServerToolConfig {
     /// Approval mode for this tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<AppToolApproval>,
+
+    /// Token budget for this tool's output, before the standard 20% serialization allowance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_token_limit: Option<NonZeroUsize>,
+}
+
+impl McpServerToolConfig {
+    /// Applies the stricter explicit output budget without changing approval policy.
+    pub fn restrict_output_token_limit(&mut self, limit: Option<NonZeroUsize>) {
+        self.output_token_limit = self.output_token_limit.into_iter().chain(limit).min();
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
@@ -125,6 +157,14 @@ pub struct McpServerOAuthConfig {
     /// Explicit OAuth client identifier to present during authorization and token exchange.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+
+    /// Registered callback URL associated with this OAuth client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_url: Option<String>,
+
+    /// Fixed callback port that takes precedence over Codex's global OAuth callback port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_port: Option<u16>,
 }
 
 /// Authentication flow Codex attempts after resolving an HTTP MCP server's
@@ -177,6 +217,11 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub supports_parallel_tool_calls: bool,
 
+    /// Model-facing surfaces from which this server's tools must be omitted.
+    /// `None` leaves lower-priority configuration unchanged; an empty list clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omit_tools_from: Option<Vec<ToolExposureSurface>>,
+
     /// Reason this server was disabled after applying requirements.
     #[serde(skip)]
     pub disabled_reason: Option<McpServerDisabledReason>,
@@ -217,7 +262,7 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_resource: Option<String>,
 
-    /// Per-tool approval settings keyed by tool name.
+    /// Per-tool settings keyed by tool name.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tools: HashMap<String, McpServerToolConfig>,
 }
@@ -227,10 +272,40 @@ impl McpServerConfig {
         self.environment_id == DEFAULT_MCP_SERVER_ENVIRONMENT_ID
     }
 
+    /// Keeps local OAuth credentials compatible while reserving managed credential namespaces.
+    pub fn oauth_credential_name<'a>(&self, server_name: &'a str) -> Cow<'a, str> {
+        if self.is_local_environment() {
+            if server_name.starts_with("executor:")
+                || server_name.starts_with("local:")
+                || server_name.starts_with("ema-idp:")
+            {
+                Cow::Owned(format!("local:{server_name}"))
+            } else {
+                Cow::Borrowed(server_name)
+            }
+        } else {
+            let environment = URL_SAFE_NO_PAD.encode(self.environment_id.as_bytes());
+            let server = URL_SAFE_NO_PAD.encode(server_name.as_bytes());
+            Cow::Owned(format!("executor:{environment}:{server}"))
+        }
+    }
+
     pub fn oauth_client_id(&self) -> Option<&str> {
         self.oauth
             .as_ref()
             .and_then(|oauth| oauth.client_id.as_deref())
+    }
+
+    pub fn oauth_callback_port(&self, global_callback_port: Option<u16>) -> Option<u16> {
+        let callback_port = self.oauth.as_ref().and_then(|oauth| oauth.callback_port);
+        if let Some(callback_port) = callback_port {
+            tracing::info!(
+                callback_port,
+                ?global_callback_port,
+                "using plugin-specific MCP OAuth callback port instead of the global callback port"
+            );
+        }
+        callback_port.or(global_callback_port)
     }
 }
 
@@ -265,6 +340,7 @@ pub struct RawMcpServerConfig {
     #[schemars(skip)]
     pub bearer_token: Option<String>,
     pub bearer_token_env_var: Option<String>,
+    pub http_headers_helper: Option<String>,
 
     // shared
     #[serde(default)]
@@ -284,6 +360,8 @@ pub struct RawMcpServerConfig {
     pub required: Option<bool>,
     #[serde(default)]
     pub supports_parallel_tool_calls: Option<bool>,
+    #[serde(default)]
+    pub omit_tools_from: Option<Vec<ToolExposureSurface>>,
     #[serde(default)]
     pub default_tools_approval_mode: Option<AppToolApproval>,
     #[serde(default)]
@@ -318,6 +396,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             url,
             bearer_token,
             bearer_token_env_var,
+            http_headers_helper,
             environment_id,
             auth,
             startup_timeout_sec,
@@ -326,6 +405,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             enabled,
             required,
             supports_parallel_tool_calls,
+            omit_tools_from,
             default_tools_approval_mode,
             enabled_tools,
             disabled_tools,
@@ -359,6 +439,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
                 bearer_token_env_var.as_ref(),
             )?;
             throw_if_set("stdio", "bearer_token", bearer_token.as_ref())?;
+            throw_if_set("stdio", "http_headers_helper", http_headers_helper.as_ref())?;
             throw_if_set("stdio", "http_headers", http_headers.as_ref())?;
             throw_if_set("stdio", "env_http_headers", env_http_headers.as_ref())?;
             throw_if_set("stdio", "oauth", oauth.as_ref())?;
@@ -381,11 +462,27 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             throw_if_set("streamable_http", "env_vars", env_vars.as_ref())?;
             throw_if_set("streamable_http", "cwd", cwd.as_ref())?;
             throw_if_set("streamable_http", "bearer_token", bearer_token.as_ref())?;
+            if http_headers_helper
+                .as_deref()
+                .is_some_and(|command| command.trim().is_empty())
+            {
+                return Err("http_headers_helper must not be empty".to_string());
+            }
+            if environment_id
+                .as_deref()
+                .is_some_and(|environment_id| environment_id != DEFAULT_MCP_SERVER_ENVIRONMENT_ID)
+                && http_headers_helper.is_some()
+            {
+                return Err(
+                    "http_headers_helper is only supported for local MCP servers".to_string(),
+                );
+            }
             McpServerTransportConfig::StreamableHttp {
                 url,
                 bearer_token_env_var,
                 http_headers,
                 env_http_headers,
+                http_headers_helper,
             }
         } else {
             return Err("invalid transport".to_string());
@@ -403,6 +500,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             enabled: enabled.unwrap_or_else(default_enabled),
             required: required.unwrap_or_default(),
             supports_parallel_tool_calls: supports_parallel_tool_calls.unwrap_or_default(),
+            omit_tools_from,
             disabled_reason: None,
             default_tools_approval_mode,
             enabled_tools,
@@ -459,6 +557,10 @@ pub enum McpServerTransportConfig {
         /// HTTP headers where the value is sourced from an environment variable.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env_http_headers: Option<HashMap<String, String>>,
+        /// Local-only shell command that prints a JSON object of dynamic HTTP headers.
+        /// The command may be visible to local process inspection; do not embed credentials.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        http_headers_helper: Option<String>,
     },
 }
 

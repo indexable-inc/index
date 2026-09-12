@@ -1,6 +1,6 @@
 //! Builtin functions. The table index is the IR-level contract: a compiled
-//! module referencing builtin N means entry N of this table, so entries are
-//! append-only once a module format ships.
+//! module referencing builtin N means entry N of this table. The compiler
+//! fingerprint invalidates cached modules whenever this source changes.
 //!
 //! A builtin is either `Pure` -- every argument arrives already forced and the
 //! result needs no further evaluation -- or `Start`, which returns a
@@ -486,6 +486,7 @@ pub static TABLE: &[Builtin] = &[
     start_bi!("import", 1, host::bi_import, &[(0, ArgType::Any)]),
     start_bi!("readFile", 1, host::bi_read_file, &[(0, ArgType::Any)]),
     start_bi!("pathExists", 1, host::bi_path_exists, &[(0, ArgType::Any)]),
+    start_bi!("storePath", 1, host::bi_store_path, &[(0, ArgType::Any)]),
     start_bi!("readDir", 1, host::bi_read_dir, &[(0, ArgType::Any)]),
     start_bi!(
         "readFileType",
@@ -517,15 +518,17 @@ pub static TABLE: &[Builtin] = &[
         &[(0, ArgType::Attrs)]
     ),
     // The algorithm is validated between the two arguments for the same
-    // reason as `hashString` below, and the path argument is `Any` because
-    // `realisePath` accepts the whole path family (a set with `outPath`, a
-    // string with context), which no single tag spells.
-    start_bi!(
-        "hashFile",
-        2,
-        host::bi_hash_file,
-        &[(0, ArgType::StrNoCtx), (1, ArgType::Any)]
-    ),
+    // reason as `hashString` below: cppnix parses it before it touches the
+    // path (`prim_hashFile`), so a refused algorithm never forces the path.
+    // The path position is therefore not in this list at all -- the body
+    // coerces it through `coerce_for_read`, which accepts the whole path
+    // family (a set with `outPath`, a string with context) that no single
+    // tag spells, and only after the algorithm has been accepted.
+    start_bi!("hashFile", 2, host::bi_hash_file, &[(0, ArgType::StrNoCtx)]),
+    // The config set is forced and checked by the machine; `path` and
+    // `function` inside it are forced by the body, in cppnix's order, and
+    // the argument is never forced here at all -- the guest decides.
+    start_bi!("wasm", 2, crate::wasm::bi_wasm, &[(0, ArgType::Attrs)]),
     pure_bi!(
         "hashString",
         2,
@@ -673,8 +676,7 @@ pub static TABLE: &[Builtin] = &[
     // type cppnix never names.
     start_bi!("toXML", 1, pure::bi_to_xml, &[]),
     // cppnix's `fetchFinalTree`, which is `.internal = true` and therefore in
-    // neither `builtins` nor the global scope -- `CPP_PRIMOP_GATES` records
-    // that as `Gate::Never` and `primop_registered` enforces it. A table entry
+    // neither `builtins` nor the global scope; the owned catalogue marks it internal. A table entry
     // all the same, because the table index is how a compiled module names a
     // builtin and this one has to be nameable: `ixe_internal_primop` hands a
     // value built from this index to the embedder, which is cppnix's
@@ -690,29 +692,9 @@ pub static TABLE: &[Builtin] = &[
     // (`settings.cc:14`) and `flake-primops.cc` declares
     // `experimentalFeature = Xp::Flakes`.
     //
-    // **It still gets no entry in `CPP_PRIMOP_GATES`, and that is not an
-    // oversight.** The generator scans the primops.cc family, so `getFlake`
-    // is not in `CPP_PRIMOP_NAMES` and the sources it reads declare no gate;
-    // two tests refuse a hand-added one, which is how the first version of
-    // this line was caught. The behaviour agrees: registration is
-    // unconditional because `configureEvalSettings` runs at startup, and the
-    // feature check is at CALL time inside `callFlake`. Measured on this Mac
-    // with `experimental-features = rust-eval nix-command`, i.e. flakes off:
-    // `builtins ? getFlake` is `true` on both arms, and calling it errors
-    // with "experimental Nix feature 'flakes' is disabled" on both.
-    //
-    // The argument is `StrNoCtx` because `prim_getFlake` opens with
-    // `forceStringNoCtx`.
+    // Public flake helpers are exposed only when the flakes feature is enabled.
     start_bi!("getFlake", 1, host::bi_get_flake, &[(0, ArgType::StrNoCtx)]),
-    // Registered from libflake like `getFlake` above, with the same
-    // non-gate: `flake::Settings` pushes both onto `extraPrimOps`
-    // unconditionally, and the flakes feature check is at CALL time --
-    // measured on this repo's cppnix with flakes off, `builtins ?
-    // parseFlakeRef` is `true` and calling either errors with "experimental
-    // Nix feature 'flakes' is disabled". That call-time check lives behind
-    // the host hook (`rust-eval-session.cc`), where cppnix checks it.
-    //
-    // `StrNoCtx` because `prim_parseFlakeRef` opens with `forceStringNoCtx`.
+    // Flake reference helpers share the same feature gate as getFlake.
     start_bi!(
         "parseFlakeRef",
         1,
@@ -739,20 +721,11 @@ pub fn global_index(name: &str) -> Option<u16> {
     TABLE.iter().position(|b| b.name == name).map(|i| i as u16)
 }
 
-/// cppnix registers every primop under its registered spelling as a global
-/// (plus a few non-primop globals); names we have no implementation for
-/// compile to a slot that reports unimplemented on use, so coverage gaps
-/// count as `unimplemented`, never as `undefined variable` mismatches.
-///
-/// A primop cppnix skipped is in neither scope nor the set, so a name whose
-/// gate is off is *not* a global here either: it has to reach the same
-/// `undefined variable` cppnix raises, and not this crate's
-/// `unimplemented` report, which would be a different failure for the same
-/// text (ENG-12717).
-pub fn is_cpp_global(settings: &crate::eval::Settings, name: &str) -> bool {
-    (crate::builtins_gen::CPP_PRIMOP_NAMES.contains(&name)
-        || crate::builtins_gen::CPP_EXTRA_GLOBALS.contains(&name))
-        && crate::eval::primop_registered(settings, name)
+/// Whether the language catalogue exposes this global under the active settings.
+pub fn is_global(settings: &crate::eval::Settings, name: &str) -> bool {
+    (crate::builtin_catalogue::GLOBAL_NAMES.contains(&name)
+        || crate::builtin_catalogue::EXTRA_GLOBALS.contains(&name))
+        && crate::builtin_catalogue::enabled(settings, name)
 }
 
 pub fn mk_value(idx: u16) -> Value {
@@ -848,13 +821,7 @@ fn legacy_base_name_of(path: &[u8]) -> &[u8] {
 fn bi_dir_of(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
     let v = argv(args, 0)?;
     match &v {
-        Value::Path(p) => Ok(Begin::Done(Value::Path(
-            // Slicing valid UTF-8 at an ASCII slash keeps it valid, so this
-            // error path is unreachable; named rather than panicked on.
-            String::from_utf8(dir_of(p.as_bytes()))
-                .map_err(|_| VmError::eval("internal: dirOf of a path produced non-UTF-8"))?
-                .into(),
-        ))),
+        Value::Path(p) => Ok(Begin::Done(Value::Path(Rc::new(p.parent())))),
         // A string needs no machine: coercing one is the identity, so this is
         // the same answer one round trip earlier.
         Value::Str(s) => Ok(Begin::Done(Value::Str(NixStr::with_context(
@@ -895,25 +862,11 @@ fn dir_of(path: &[u8]) -> Vec<u8> {
 pub fn set_member_names(
     settings: &crate::eval::Settings,
 ) -> impl Iterator<Item = &'static str> + use<'_> {
-    crate::builtins_gen::CPP_PRIMOP_NAMES
+    TABLE
         .iter()
-        // Filtered on the registered spelling, which is what carries the
-        // gate, and stripped afterwards: `__fetchClosure` is the name
-        // `CPP_PRIMOP_GATES` and cppnix's `RegisterPrimOp` both use, while
-        // `fetchClosure` is the name the set binds.
-        .filter(|name| crate::eval::primop_registered(settings, name))
-        .map(|name| name.strip_prefix("__").unwrap_or(name))
-        // The extras through the same filter, not appended raw. They used to
-        // be appended, which is how `currentSystem` stayed in the set under
-        // `pure-eval` -- `primop_registered` had learned to drop it and this
-        // chain never asked.
-        .chain(
-            crate::builtins_gen::CPP_BUILTINS_EXTRA
-                .iter()
-                .copied()
-                .filter(|name| crate::eval::primop_registered(settings, name)),
-        )
-        // cppnix's `addConstant` puts these in the set as well as in scope.
+        .map(|builtin| builtin.name)
+        .chain(crate::builtin_catalogue::EXTRA_MEMBERS.iter().copied())
+        .filter(|name| crate::builtin_catalogue::enabled(settings, name))
         .chain(["true", "false", "null", "builtins"])
 }
 
@@ -944,7 +897,7 @@ fn member_index_among(name: &str, members: impl Iterator<Item = &'static str>) -
 }
 
 /// The slot `builtins.<name>` is bound to. One rule for every member, so the
-/// value a name has does not depend on which generated list it came from.
+/// value a name has does not depend on how the compiler selects it.
 fn member_slot(vm: &mut Vm, name: &str) -> crate::vm::Result<Slot> {
     Ok(match name {
         // cppnix's `addConstant("derivation", ...)` puts one value in both the
@@ -971,19 +924,8 @@ fn member_slot(vm: &mut Vm, name: &str) -> crate::vm::Result<Slot> {
     })
 }
 
-/// The `builtins` attrset: every cppnix builtin name is present, bound to
-/// the real implementation where one exists and to an unimplemented-on-use
-/// slot otherwise. Absent names would surface as `attribute missing`, which
-/// the differ counts as a semantic mismatch; present-but-unimplemented is
-/// the honest state.
-/// Fallible because `builtins.derivation` is a compiled Nix source file
-/// rather than a table entry, so building the set can now surface a compile
-/// error. Reaching that means the embedded wrapper does not compile, which is
-/// a bug in this crate and not a gap in it, so it is raised rather than turned
-/// into an `unimplemented` slot that would read as a coverage hole.
-///
-/// Call `Vm::builtins_value`, not this, from anywhere on an evaluation path:
-/// this builds the whole set every time, and the VM keeps one.
+/// Build the available builtin set. The VM retains it for this settings snapshot.
+/// Fallible because the derivation wrapper is compiled lazily.
 pub fn builtins_set(vm: &mut Vm) -> crate::vm::Result<Value> {
     let mut map = BTreeMap::new();
     let names: Vec<&'static str> = set_member_names(vm.settings()).collect();
@@ -1052,7 +994,7 @@ fn constant(settings: &crate::eval::Settings, name: &str) -> Option<Value> {
 /// builtins.builtins is self-referential in cppnix; a second level is
 /// enough for the corpus and avoids a cyclic Rc.
 fn builtins_set_marker() -> Value {
-    Value::Attrs(Rc::new(Attrs::new(BTreeMap::new())))
+    Value::Attrs(Rc::new(Attrs::default()))
 }
 
 #[cfg(test)]
@@ -1062,7 +1004,7 @@ mod purity_tests {
     /// Impure cppnix primops that do NOT currently route through `Host`, and
     /// so would be invisible to a recorded read set.
     ///
-    /// Enumerated from cppnix's own primop list (`builtins_gen::CPP_PRIMOP_NAMES`)
+    /// Enumerated from cppnix's own primop list (`builtin_catalogue::GLOBAL_NAMES`)
     /// rather than from imagination, because the mistake this guards against is
     /// implementing one of these without noticing that a memoised result keyed
     /// on a read set would then be wrong. Both spellings are listed: cppnix
@@ -1076,8 +1018,6 @@ mod purity_tests {
         "fetchClosure",
         "__fetchClosure",
         "fetchMercurial",
-        "storePath",
-        "__storePath",
         "derivation",
         // The bare spelling is implemented and routed (see below); this one
         // is not implemented at all, so it stays here.
@@ -1112,6 +1052,8 @@ mod purity_tests {
         "readFile",
         "readDir",
         "pathExists",
+        "storePath",
+        "__storePath",
         "readFileType",
         "getEnv",
         // Reaches the store, for the path case and for a set whose `outPath`
@@ -1265,7 +1207,7 @@ mod purity_tests {
     fn every_process_global_constant_is_listed() {
         // `constant()` is private to the parent module and answers `None` for
         // anything it does not serve, which is what makes this enumerable.
-        let unlisted: Vec<&&str> = crate::builtins_gen::CPP_BUILTINS_EXTRA
+        let unlisted: Vec<&&str> = crate::builtin_catalogue::EXTRA_MEMBERS
             .iter()
             .filter(|name| {
                 super::constant(&crate::eval::Settings::default(), name).is_some()
@@ -1304,7 +1246,7 @@ mod purity_tests {
     /// table's own names.
     ///
     /// `compile.rs`'s bare-global resolution strips a leading `__` before it
-    /// looks the name up (`is_cpp_global` then `global_index(impl_name)`), so
+    /// looks the name up (`is_global` then `global_index(impl_name)`), so
     /// implementing `toFile` implements the global `__toFile` in the same
     /// commit. A guard reading only `TABLE` cannot see that half, and did
     /// not: `__toFile` sat in `UNROUTED_IMPURITIES` while
@@ -1313,7 +1255,7 @@ mod purity_tests {
     /// purity lists, so both have to be checked against them.
     ///
     /// The `__` spelling is included only when cppnix registers it, because
-    /// that is the condition `is_cpp_global` tests: `derivationStrict` is
+    /// that is the condition `is_global` tests: `derivationStrict` is
     /// registered bare, so `__derivationStrict` is not a global here and its
     /// row in `UNROUTED_IMPURITIES` is describing a name that really is
     /// unimplemented.
@@ -1321,7 +1263,7 @@ mod purity_tests {
         let mut out: Vec<&'static str> = Vec::new();
         for builtin in TABLE {
             out.push(builtin.name);
-            if let Some(prefixed) = crate::builtins_gen::CPP_PRIMOP_NAMES
+            if let Some(prefixed) = crate::builtin_catalogue::GLOBAL_NAMES
                 .iter()
                 .find(|cpp| cpp.strip_prefix("__") == Some(builtin.name))
             {
@@ -1706,8 +1648,7 @@ mod set_tests {
             set_member_index(&crate::eval::Settings::default(), "nope"),
             None
         );
-        // A member cppnix has and this evaluator does not: has to keep
-        // reporting unimplemented when forced, not resolve to nothing.
+        // Unsupported names cannot fold to a builtin implementation.
         assert!(
             !TABLE.iter().any(|b| b.name == "fetchMercurial"),
             "fetchMercurial became implemented; pick another unimplemented member"
@@ -1716,5 +1657,50 @@ mod set_tests {
             set_member_index(&crate::eval::Settings::default(), "fetchMercurial"),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod rooted_path_tests {
+    use super::{bi_base_name_of, bi_dir_of};
+    use crate::primops_pure::Begin;
+    use crate::value2::{NixStr, PathValue, Root, Slot, Value};
+    use crate::vm::Vm;
+    use std::rc::Rc;
+
+    #[test]
+    fn dir_of_keeps_a_paths_root_and_base_name_remains_text() {
+        let mount = "/nix/store/00000000000000000000000000000000-source";
+        let path = Value::Path(Rc::new(PathValue::new(
+            Root::mounted(mount),
+            format!("{mount}/dir/file"),
+        )));
+        let args = [Slot::value(path)];
+        let mut vm = Vm::with_settings(crate::eval::Settings::default());
+        let dir = bi_dir_of(&mut vm, &args);
+        assert!(matches!(
+            dir,
+            Ok(Begin::Done(Value::Path(path)))
+                if path.root == Root::mounted(mount)
+                    && path.as_ref().as_ref() == format!("{mount}/dir")
+        ));
+        // `baseNameOf` receives what the driver coerced the path to -- its
+        // visible spelling, root and all -- and answers text.
+        let coerced = [Slot::value(Value::Str(NixStr::from(
+            format!("{mount}/dir/file").as_str(),
+        )))];
+        let base = bi_base_name_of(&mut vm, &coerced);
+        assert!(matches!(base, Ok(Value::Str(text)) if text.bytes() == b"file"));
+
+        let root_args = [Slot::value(Value::Path(Rc::new(PathValue::new(
+            Root::mounted(mount),
+            mount,
+        ))))];
+        let root_dir = bi_dir_of(&mut vm, &root_args);
+        assert!(matches!(
+            root_dir,
+            Ok(Begin::Done(Value::Path(path)))
+                if path.root == Root::mounted(mount) && path.path.as_ref() == mount
+        ));
     }
 }

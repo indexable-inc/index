@@ -9,11 +9,11 @@
 //!
 //! # What the key covers, and why it covers so much
 //!
-//! `H(format version, compiler fingerprint, base directory, origin, the
-//! settings the compiler reads, source text)`.
+//! `H(format version, compiler fingerprint, base directory, origin, settings
+//! fingerprint, source text)`.
 //!
-//! The source text is obvious. The other three are the ones that go wrong if
-//! left out:
+//! The source text is obvious. The others are the ones that go wrong if left
+//! out:
 //!
 //! * The **base directory** changes the module. `compile_source` makes path
 //!   literals absolute against it, so the same text in two directories
@@ -24,10 +24,17 @@
 //!   inserting a builtin silently changes what an already-compiled op means.
 //!   Hashing the whole crate over-invalidates and never under-invalidates,
 //!   which is the only direction a cache is allowed to be wrong in.
-//! * The **settings the compiler reads** are the names cppnix's own `builtins`
-//!   has, which decide which bare globals resolve. The same text compiles to
-//!   `undefined variable '__fetchClosure'` under one configuration and to a
-//!   builtin reference under another.
+//! * The **settings fingerprint** is [`crate::eval::Settings::fingerprint`]:
+//!   every setting, not the ones the compiler reads. The compiler reads seven
+//!   (the names cppnix registered as builtins, which decide whether a bare
+//!   global resolves or is `undefined variable '__fetchClosure'`; `pure-eval`;
+//!   the home directory `~` literals expand against; the three path-literal
+//!   lints; `pipe-operators`), and a key that listed them by hand carried two
+//!   of the seven (the two that had been noticed: ENG-12717, ENG-12939), so
+//!   text compiled with and without `pipe-operators` shared a row. The whole
+//!   fingerprint over-invalidates -- a `--max-call-depth` change recompiles --
+//!   and never under-invalidates, which is the only direction a cache is
+//!   allowed to be wrong in.
 //! * The **origin** is the file the text came from, which `__curPos` compiles
 //!   to a constant of. The base directory is not enough: two files in one
 //!   directory with the same text are one key by base directory and two
@@ -40,17 +47,16 @@
 //! answer.
 
 use crate::ir::{AttrSite, CodeUnit, Const, Formal, Module, NO_POS, Op, Param, SrcOrigin};
-use crate::refusal::{Refusal, RefusalToken};
 use ix_kernel::canon::{self, CanonValue, DecodeError};
 use ix_kernel::cas::Cas;
-use ix_kernel::dispatch::{Outcome, PerformCtx, on_perform};
-use ix_kernel::rows::{DirRows, Lookup};
-use ix_kernel::{Domain, EffectLock, KernelConfig, KernelError, MemoTable, ObjId, Policy};
+use ix_kernel::dispatch::Outcome;
+use ix_kernel::rows::Lookup;
+use ix_kernel::{Domain, Entry, KernelError, MemoTable, ObjId, Policy, Provenance};
 use std::rc::Rc;
 
 /// Bumped when this file's encoding changes shape. Distinct from the compiler
 /// fingerprint, which changes when the thing being encoded changes.
-pub const MODULE_FORMAT_VERSION: &str = "ixe-module-v1";
+pub const MODULE_FORMAT_VERSION: &str = "ixe-module-v4";
 
 /// Hash of every source file in this crate, computed at build time. See the
 /// module header for why the whole crate and not just the compiler.
@@ -103,6 +109,7 @@ pub fn encode_module(module: &Module) -> Result<Vec<u8>, canon::CanonError> {
 
 fn module_value(module: &Module) -> CanonValue {
     CanonValue::map([
+        ("format", CanonValue::str(MODULE_FORMAT_VERSION)),
         (
             "consts",
             CanonValue::Array(module.consts.iter().map(const_value).collect()),
@@ -141,6 +148,7 @@ fn module_value(module: &Module) -> CanonValue {
                 }
             },
         ),
+        ("root", CanonValue::str(module.root.wire_name())),
     ])
 }
 
@@ -157,7 +165,11 @@ fn const_value(konst: &Const) -> CanonValue {
         Const::Bool(b) => CanonValue::array([CanonValue::int(2), CanonValue::Bool(*b)]),
         Const::Null => CanonValue::array([CanonValue::int(3)]),
         Const::Str(s) => CanonValue::array([CanonValue::int(4), CanonValue::str(s.as_str())]),
-        Const::Path(p) => CanonValue::array([CanonValue::int(5), CanonValue::str(p.as_str())]),
+        Const::Path(path) => CanonValue::array([
+            CanonValue::int(5),
+            CanonValue::str(path.root.wire_name()),
+            CanonValue::str(path.path.as_ref()),
+        ]),
     }
 }
 
@@ -216,6 +228,7 @@ fn unit_value(unit: &CodeUnit) -> CanonValue {
                                     })
                                     .collect(),
                             ),
+                            CanonValue::int(site.static_count),
                         ])
                     })
                     .collect(),
@@ -243,7 +256,6 @@ fn op_value(op: &Op) -> CanonValue {
         ]),
         Op::Builtin { idx } => unary(4, u32::from(idx)),
         Op::BuiltinsSet => nullary(5),
-        Op::UnimplementedGlobal { sym } => unary(6, sym),
         Op::DerivationGlobal => nullary(43),
         Op::NixPathGlobal => nullary(44),
         Op::Thunk { unit } => unary(7, unit),
@@ -268,10 +280,10 @@ fn op_value(op: &Op) -> CanonValue {
         Op::ConcatStrings { n } => unary(26, u32::from(n)),
         Op::MkList { n } => unary(27, u32::from(n)),
         Op::ConcatLists => nullary(28),
-        Op::MkAttrs { n, rec } => CanonValue::array([
+        Op::MkAttrs { statics, dynamics } => CanonValue::array([
             CanonValue::int(29),
-            CanonValue::int(n),
-            CanonValue::Bool(rec),
+            CanonValue::int(statics),
+            CanonValue::int(dynamics),
         ]),
         Op::Update => nullary(30),
         Op::Select { sym } => unary(31, sym),
@@ -370,6 +382,12 @@ fn at<'a>(
 }
 
 fn module_from(value: &CanonValue) -> Result<Module, ModuleDecodeError> {
+    let format = text(field(value, "format")?, "module format")?;
+    if format != MODULE_FORMAT_VERSION {
+        return shape(format!(
+            "format is {format:?}, expected {MODULE_FORMAT_VERSION:?}"
+        ));
+    }
     let consts = items(field(value, "consts")?, "consts")?
         .iter()
         .map(const_from)
@@ -380,7 +398,7 @@ fn module_from(value: &CanonValue) -> Result<Module, ModuleDecodeError> {
         .collect::<Result<Vec<_>, _>>()?;
     let units = items(field(value, "units")?, "units")?
         .iter()
-        .map(unit_from)
+        .map(|unit| unit_from(unit, &symbols))
         .collect::<Result<Vec<_>, _>>()?;
     let entry = small(field(value, "entry")?, "entry")?;
     // A module whose entry names no unit would fault the first time it ran,
@@ -401,13 +419,18 @@ fn module_from(value: &CanonValue) -> Result<Module, ModuleDecodeError> {
         1 => SrcOrigin::File(text(at(origin_parts, 1, "origin path")?, "origin path")?),
         other => return shape(format!("unknown origin tag {other}")),
     };
+    let root = crate::value2::Root::from_wire_name(&text(field(value, "root")?, "root")?)
+        .map_err(ModuleDecodeError::Shape)?;
     Ok(Module {
         consts,
         symbols,
         units,
         entry,
         origin,
+        root,
         line_starts,
+        dynamic_attr_origins: crate::value2::DynamicAttrOriginSlab::default(),
+        linked: crate::value2::LinkedSymbols::default(),
     })
 }
 
@@ -434,15 +457,24 @@ fn const_from(value: &CanonValue) -> Result<Const, ModuleDecodeError> {
         )?)),
         3 => Ok(Const::Null),
         4 => Ok(Const::Str(text(at(parts, 1, "str const")?, "str const")?)),
-        5 => Ok(Const::Path(text(
-            at(parts, 1, "path const")?,
-            "path const",
-        )?)),
+        5 => {
+            let root = crate::value2::Root::from_wire_name(&text(
+                at(parts, 1, "path root")?,
+                "path root",
+            )?)
+            .map_err(ModuleDecodeError::Shape)?;
+            let path = text(at(parts, 2, "path const")?, "path const")?;
+            // A cached constant is bytes from disk: a mounted path outside
+            // its root is a corrupt module, reported as one.
+            crate::value2::PathValue::try_new(root, path)
+                .map(Const::Path)
+                .map_err(ModuleDecodeError::Shape)
+        }
         other => shape(format!("unknown const tag {other}")),
     }
 }
 
-fn unit_from(value: &CanonValue) -> Result<CodeUnit, ModuleDecodeError> {
+fn unit_from(value: &CanonValue, symbols: &[String]) -> Result<CodeUnit, ModuleDecodeError> {
     let ops = items(field(value, "ops")?, "ops")?
         .iter()
         .map(op_from)
@@ -476,18 +508,37 @@ fn unit_from(value: &CanonValue) -> Result<CodeUnit, ModuleDecodeError> {
                     ))
                 })
                 .collect::<Result<Vec<_>, ModuleDecodeError>>()?;
+            let static_count = small(
+                at(parts, 2, "attr site static count")?,
+                "attr site static count",
+            )?;
+            let Ok(static_count_index) = usize::try_from(static_count) else {
+                return shape("attr site static count does not fit usize");
+            };
+            if static_count_index > names.len() {
+                return shape("attr site static count exceeds its entries");
+            }
             Ok(AttrSite {
                 ip: small(at(parts, 0, "attr site ip")?, "attr site ip")?,
                 names,
+                static_count,
+                by_name: Box::default(),
             })
         })
         .collect::<Result<Vec<_>, ModuleDecodeError>>()?;
-    Ok(CodeUnit {
+    let mut unit = CodeUnit {
         ops,
         param,
         spans,
         attr_sites,
-    })
+    };
+    // The VM names a set's static attributes from its site, so a site that
+    // does not match its op is a WRONG SET, not a missing position. Fail
+    // closed here; a miss costs a compile. The text index is derived here,
+    // never read from the row.
+    unit.link_attr_sites(symbols)
+        .map_err(ModuleDecodeError::Shape)?;
+    Ok(unit)
 }
 
 fn param_from(value: &CanonValue) -> Result<Option<Param>, ModuleDecodeError> {
@@ -543,9 +594,6 @@ fn op_from(value: &CanonValue) -> Result<Op, ModuleDecodeError> {
             idx: one_narrow("builtin index")?,
         }),
         5 => Ok(Op::BuiltinsSet),
-        6 => Ok(Op::UnimplementedGlobal {
-            sym: one("symbol")?,
-        }),
         43 => Ok(Op::DerivationGlobal),
         44 => Ok(Op::NixPathGlobal),
         7 => Ok(Op::Thunk { unit: one("unit")? }),
@@ -581,8 +629,8 @@ fn op_from(value: &CanonValue) -> Result<Op, ModuleDecodeError> {
         }),
         28 => Ok(Op::ConcatLists),
         29 => Ok(Op::MkAttrs {
-            n: narrow(at(parts, 1, "attr count")?, "attr count")?,
-            rec: boolean(at(parts, 2, "rec")?, "rec")?,
+            statics: narrow(at(parts, 1, "static attr count")?, "static attr count")?,
+            dynamics: narrow(at(parts, 2, "dynamic attr count")?, "dynamic attr count")?,
         }),
         30 => Ok(Op::Update),
         31 => Ok(Op::Select {
@@ -620,7 +668,7 @@ fn op_from(value: &CanonValue) -> Result<Op, ModuleDecodeError> {
 // ------------------------------------------------------------------- cache
 
 /// The request a compile is keyed by. Encoded canonically, so the key is a
-/// function of these four fields and nothing else.
+/// function of these fields and nothing else.
 fn request(
     base_dir: &str,
     source: &str,
@@ -631,27 +679,12 @@ fn request(
         ("format", CanonValue::str(MODULE_FORMAT_VERSION)),
         ("compiler", CanonValue::str(compiler_fingerprint())),
         ("base_dir", CanonValue::str(base_dir)),
-        // Which primops cppnix registered is configuration, and the compiler
-        // reads it: a name cppnix skipped is not a global, so the same text
-        // compiles to `undefined variable '__fetchClosure'` under one
-        // configuration and to a builtin reference under another
-        // (ENG-12717). Without this the second would be served the first
-        // one's module.
-        (
-            "cpp_builtins",
-            CanonValue::str(settings.cpp_builtin_names.as_deref().unwrap_or("")),
-        ),
-        // The other half of the same rule, and it was missing. `pure-eval`
-        // reaches the compiler through the same `primop_registered` the line
-        // above is about: under it, cppnix registers no impure-only constant,
-        // so `__currentSystem` is `undefined variable` rather than a global
-        // reference. A key carrying `cpp_builtins` and not this one would
-        // serve a module compiled under impure evaluation to a pure one, and
-        // the served module resolves a name cppnix refuses. ENG-12939.
-        (
-            "pure_eval",
-            CanonValue::str(if settings.pure_eval { "1" } else { "0" }),
-        ),
+        // Every setting, not the ones the compiler reads today: see the module
+        // header for the two that a hand-written list carried and the five it
+        // did not. Hex rather than the digest bytes because the request is a
+        // map of strings, and a second scalar shape is a second thing to
+        // canonicalise.
+        ("settings", CanonValue::str(settings.fingerprint().to_hex())),
         // `__curPos` compiles to the file name of the token, so the same text
         // at two paths is two modules. Without this the second path would be
         // served the first one's constant, and `meta.position` is a string
@@ -660,7 +693,15 @@ fn request(
             "origin",
             CanonValue::str(match origin {
                 crate::compile::Origin::String => "",
-                crate::compile::Origin::File(path) => path,
+                crate::compile::Origin::File(path)
+                | crate::compile::Origin::MountedFile { path, .. } => path,
+            }),
+        ),
+        (
+            "origin_root",
+            CanonValue::str(match origin {
+                crate::compile::Origin::MountedFile { mount_point, .. } => mount_point,
+                crate::compile::Origin::String | crate::compile::Origin::File(_) => "",
             }),
         ),
         // The source text itself rather than a hash of it: the kernel hashes
@@ -672,21 +713,26 @@ fn request(
 
 /// A compile cache over a content-addressed store.
 ///
-/// The memo table lives in memory for the life of this struct; the store is
-/// whatever `Cas` it was handed, so a `DirCas` makes compiled modules outlive
-/// the process while a `MemoryCas` keeps them to it.
-pub struct ModuleCache<'a, C: Cas + ?Sized> {
-    cas: &'a C,
+/// The memo table lives in memory for the life of this struct; the objects
+/// live in whatever backs it, so a store on disk makes compiled modules
+/// outlive the process while a `MemoryCas` keeps them to it.
+///
+/// Owned, not borrowed. The [`crate::vm::Vm`] holds one for its whole life and
+/// compiles every `import` through it, and a machine that borrowed its cache
+/// would carry the lender's lifetime into every signature that names a VM. A
+/// [`crate::store::Store`] is a handle (paths and a cap), so owning a clone of
+/// the session's store is owning the same cache.
+pub struct ModuleCache {
+    backing: Backing,
     table: MemoTable,
-    /// Keyed rows pin nothing, so this is a scratch lock that stays empty. It
-    /// exists because `PerformCtx` wants one.
-    lock: EffectLock,
-    config: KernelConfig,
-    /// Where rows are written so the next process starts warm. Without it the
-    /// objects still survive in a `DirCas` and nothing can find them, because
-    /// what a new process lacks is not the bytes but the mapping from request
-    /// to address.
-    rows: Option<&'a DirRows>,
+    /// The modules this cache has handed out, by object. A hit on the table
+    /// alone would decode the object again -- 30 KB of CBOR per `import` of
+    /// a file the machine already holds, tens of thousands of times in one
+    /// nixpkgs evaluation -- and would hand out a second `Rc` for the same
+    /// module, so the module a value's thunks point at and the module the
+    /// next import gets would be two copies. One decode per object per cache,
+    /// and one identity.
+    loaded: std::collections::BTreeMap<ObjId, Rc<Module>>,
     /// Corruption found while reading the store, drained by the caller.
     ///
     /// Kept rather than printed because a library that picks its own logging
@@ -698,11 +744,113 @@ pub struct ModuleCache<'a, C: Cas + ?Sized> {
     misses: u64,
 }
 
+/// Where a cache keeps its objects, and whether its rows outlive the process.
+enum Backing {
+    /// Objects die with the cache: tests, and an evaluation whose cache
+    /// directory was not configured or would not open.
+    Memory(ix_kernel::cas::MemoryCas),
+    /// Objects and rows on disk. Without the rows the objects would still
+    /// survive in the `DirCas` and nothing could find them, because what a new
+    /// process lacks is not the bytes but the mapping from request to address.
+    Persistent(crate::store::Store),
+}
+
+impl ModuleCache {
+    /// A cache whose objects live and die with it.
+    #[must_use]
+    pub fn in_memory() -> Self {
+        Self::over(Backing::Memory(ix_kernel::cas::MemoryCas::new()))
+    }
+
+    /// A cache backed by one store's objects and rows.
+    #[must_use]
+    pub fn persistent(store: crate::store::Store) -> Self {
+        Self::over(Backing::Persistent(store))
+    }
+
+    fn over(backing: Backing) -> Self {
+        Self {
+            backing,
+            table: MemoTable::new(),
+            loaded: std::collections::BTreeMap::new(),
+            corruption: Vec::new(),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn cas(&self) -> &dyn Cas {
+        match &self.backing {
+            Backing::Memory(cas) => cas,
+            Backing::Persistent(store) => store.cas(),
+        }
+    }
+
+    /// The store this cache publishes rows to; `None` for an in-memory one.
+    ///
+    /// Also how a session learns whether it has an on-disk cache at all. The
+    /// machine owns the cache, so the cache is where that fact lives, and a
+    /// session that opened the store itself would have two answers to keep
+    /// in agreement.
+    #[must_use]
+    pub fn store(&self) -> Option<&crate::store::Store> {
+        match &self.backing {
+            Backing::Memory(_) => None,
+            Backing::Persistent(store) => Some(store),
+        }
+    }
+
+    /// Every module this cache has handed out and still holds.
+    pub fn loaded(&self) -> impl Iterator<Item = &Rc<Module>> {
+        self.loaded.values()
+    }
+}
+
 /// What a cached compile did and produced.
 pub struct Compiled {
     pub module: Rc<Module>,
     pub outcome: Outcome,
     pub id: ObjId,
+}
+
+enum ModuleObjectFailure {
+    Missing,
+    Invalid(String),
+}
+
+impl ModuleObjectFailure {
+    fn kind(&self) -> crate::perf::CacheCorruption {
+        match self {
+            Self::Missing => crate::perf::CacheCorruption::ObjectMissing,
+            Self::Invalid(_) => crate::perf::CacheCorruption::ObjectInvalid,
+        }
+    }
+}
+
+/// Test hooks into `compile_with_hooks`, each run once at the named point.
+/// Outside the tests that race the store there they are [`CompileHooks::none`].
+struct CompileHooks<V: FnOnce(), C: FnOnce(), O: FnOnce()> {
+    after_validation: V,
+    during_compile: C,
+    after_object: O,
+}
+
+fn nothing() {}
+
+impl CompileHooks<fn(), fn(), fn()> {
+    fn none() -> Self {
+        CompileHooks {
+            after_validation: nothing,
+            during_compile: nothing,
+            after_object: nothing,
+        }
+    }
+}
+
+enum CachedModule {
+    Missing,
+    Stale,
+    Hit { id: ObjId, module: Rc<Module> },
 }
 
 /// Why a cached compile failed.
@@ -714,12 +862,6 @@ pub enum CacheError {
     Compile(crate::compile::CompileError),
     /// The store or the table failed.
     Kernel(KernelError),
-    /// An object came back from the store and was not a module. This is
-    /// corruption, not a miss: the address said what the bytes were.
-    Corrupt {
-        id: ObjId,
-        detail: ModuleDecodeError,
-    },
     /// The store does not have an object its own table points at.
     Dangling { id: ObjId },
 }
@@ -729,9 +871,6 @@ impl core::fmt::Display for CacheError {
         match self {
             Self::Compile(detail) => write!(f, "{detail:?}"),
             Self::Kernel(source) => write!(f, "{source}"),
-            Self::Corrupt { id, detail } => {
-                write!(f, "object {id} is not a compiled module: {detail}")
-            }
             Self::Dangling { id } => write!(f, "the compile cache points at absent object {id}"),
         }
     }
@@ -745,70 +884,98 @@ impl From<KernelError> for CacheError {
     }
 }
 
-impl<'a, C: Cas + ?Sized> ModuleCache<'a, C> {
-    pub fn new(cas: &'a C) -> Self {
-        Self {
-            cas,
-            table: MemoTable::new(),
-            lock: EffectLock::new(),
-            config: KernelConfig::default(),
-            rows: None,
-            corruption: Vec::new(),
-            hits: 0,
-            misses: 0,
-        }
+impl ModuleCache {
+    fn complain(&mut self, kind: crate::perf::CacheCorruption, detail: String) {
+        crate::perf::note_cache_corruption(kind);
+        self.corruption.push(detail);
     }
 
-    /// Open a cache warmed from rows a previous process wrote.
-    ///
-    /// Returns the load report alongside, because a store whose rows were all
-    /// refused behaves exactly like a cold one and the caller is the only
-    /// place that can say so out loud.
-    /// Open a cache backed by rows a previous process wrote.
-    ///
-    /// Nothing is read here. Rows are fetched one key at a time, when a
-    /// request asks for one, because loading the domain up front costs every
-    /// process O(everything anybody ever cached) to answer whatever it
-    /// actually asked. Measured: the eager version made a warm store 3.4%
-    /// slower than no store at all on a corpus of cheap files, which is the
-    /// whole feature inverted.
-    pub fn persistent(cas: &'a C, rows: &'a DirRows) -> Self {
-        let mut cache = Self::new(cas);
-        cache.rows = Some(rows);
-        cache
-    }
-
-    /// Bring one key in from disk if this process has not seen it.
-    ///
-    /// A row naming an object the store does not have is dropped here rather
-    /// than at use: objects and rows are swept independently, so a row can
-    /// outlive what it points at.
-    fn warm(&mut self, key: ix_kernel::Key) {
-        let Some(rows) = self.rows else { return };
-        if self.table.get(compile_domain(), key).is_some() {
-            return;
-        }
-        match rows.get(compile_domain(), key) {
-            Lookup::Missing => {}
-            Lookup::Refused(reason) => self.corruption.push(reason.to_string()),
-            Lookup::Found(output) => {
-                if self.cas.has(output).unwrap_or(false) {
-                    self.table.insert(
-                        compile_domain(),
-                        key,
-                        ix_kernel::Entry {
-                            output,
-                            policy: Policy::Keyed,
-                            provenance: ix_kernel::Provenance::Deterministic,
-                        },
-                    );
-                } else {
-                    self.corruption.push(format!(
-                        "a compile row names object {output}, which the store does not have"
-                    ));
+    /// Return only fully validated hits. Persistent rows are not copied into
+    /// memory until their object has been read, re-hashed, and decoded, so a
+    /// sweep between the row read and object read leaves no stale hit behind.
+    fn cached_module(
+        &mut self,
+        key: ix_kernel::Key,
+        after_validation: impl FnOnce(),
+    ) -> CachedModule {
+        let output = match self.table.get(compile_domain(), key) {
+            Some(entry) => entry.output,
+            None => {
+                let Some(rows) = self.store().map(crate::store::Store::rows) else {
+                    return CachedModule::Missing;
+                };
+                match rows.get(compile_domain(), key) {
+                    Lookup::Missing => return CachedModule::Missing,
+                    Lookup::Refused(reason) => {
+                        self.complain(
+                            crate::perf::CacheCorruption::WitnessRefused,
+                            reason.to_string(),
+                        );
+                        return CachedModule::Stale;
+                    }
+                    Lookup::Found(output) => output,
                 }
             }
+        };
+        // A module already handed out is valid whatever the disk does: the
+        // object was verified when it was decoded, and a sweep since then took
+        // bytes this cache no longer needs.
+        if let Some(module) = self.loaded.get(&output) {
+            let module = Rc::clone(module);
+            after_validation();
+            return CachedModule::Hit { id: output, module };
         }
+        match self.load_module(output) {
+            Ok(module) => {
+                // `module` owns its decoded contents now. A concurrent sweep
+                // can remove the backing object after this point without
+                // making this hit partial or invalid.
+                let module = Rc::new(module);
+                self.loaded.insert(output, Rc::clone(&module));
+                after_validation();
+                self.table.insert(
+                    compile_domain(),
+                    key,
+                    Entry {
+                        output,
+                        policy: Policy::Keyed,
+                        provenance: Provenance::Deterministic,
+                    },
+                );
+                CachedModule::Hit { id: output, module }
+            }
+            Err(failure) => {
+                let detail = match &failure {
+                    ModuleObjectFailure::Missing => "the store does not have it",
+                    ModuleObjectFailure::Invalid(detail) => detail,
+                };
+                self.complain(
+                    failure.kind(),
+                    format!(
+                        "object {output} for a compiled module was unusable ({detail}); recompiling"
+                    ),
+                );
+                self.table.remove(compile_domain(), key);
+                CachedModule::Stale
+            }
+        }
+    }
+
+    fn serve_hit(&mut self, key: ix_kernel::Key, id: ObjId, module: Rc<Module>) -> Compiled {
+        self.hits += 1;
+        crate::perf::note_compile_hit();
+        if let Some(rows) = self.store().map(crate::store::Store::rows) {
+            rows.touch(compile_domain(), key);
+        }
+        Compiled {
+            module,
+            outcome: Outcome::Hit,
+            id,
+        }
+    }
+
+    pub(crate) fn note_cache_warning(&mut self, message: String) {
+        self.corruption.push(message);
     }
 
     /// Take the corruption found since the last call. Empty is the normal
@@ -831,12 +998,14 @@ impl<'a, C: Cas + ?Sized> ModuleCache<'a, C> {
     /// Compile, or return the module a previous compile of the same request
     /// produced.
     ///
-    /// The decode happens on both paths, not just the hit path. On a miss the
-    /// module is encoded, stored, and then read back and decoded rather than
-    /// being returned directly, so a module that does not survive the round
-    /// trip fails on the run that created it instead of on somebody's next
-    /// run. Costing one decode per compile is worth never shipping a
-    /// write-only encoder.
+    /// The decode happens on a miss too, not just on a persistent hit. On a
+    /// miss the module is encoded, stored, and then read back and decoded
+    /// rather than being returned directly, so a module that does not survive
+    /// the round trip fails on the run that created it instead of on
+    /// somebody's next run. Costing one decode per compile is worth never
+    /// shipping a write-only encoder. The one path that does not decode is a
+    /// repeat hit on an object this cache already holds in `loaded`: that is
+    /// the module the earlier decode validated, shared.
     pub fn compile(
         &mut self,
         source: &str,
@@ -844,139 +1013,185 @@ impl<'a, C: Cas + ?Sized> ModuleCache<'a, C> {
         origin: crate::compile::Origin<'_>,
         settings: &crate::eval::Settings,
     ) -> Result<Compiled, CacheError> {
+        self.compile_with_hooks(source, base_dir, origin, settings, CompileHooks::none())
+    }
+
+    #[cfg(test)]
+    fn compile_with_publication_hook(
+        &mut self,
+        source: &str,
+        base_dir: &str,
+        origin: crate::compile::Origin<'_>,
+        settings: &crate::eval::Settings,
+        after_object: impl FnOnce(),
+    ) -> Result<Compiled, CacheError> {
+        self.compile_with_hooks(
+            source,
+            base_dir,
+            origin,
+            settings,
+            CompileHooks {
+                after_validation: || {},
+                during_compile: || {},
+                after_object,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn compile_with_validation_hook(
+        &mut self,
+        source: &str,
+        base_dir: &str,
+        origin: crate::compile::Origin<'_>,
+        settings: &crate::eval::Settings,
+        after_validation: impl FnOnce(),
+    ) -> Result<Compiled, CacheError> {
+        self.compile_with_hooks(
+            source,
+            base_dir,
+            origin,
+            settings,
+            CompileHooks {
+                after_validation,
+                during_compile: || {},
+                after_object: || {},
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn compile_with_compilation_hook(
+        &mut self,
+        source: &str,
+        base_dir: &str,
+        origin: crate::compile::Origin<'_>,
+        settings: &crate::eval::Settings,
+        during_compile: impl FnOnce(),
+    ) -> Result<Compiled, CacheError> {
+        self.compile_with_hooks(
+            source,
+            base_dir,
+            origin,
+            settings,
+            CompileHooks {
+                after_validation: || {},
+                during_compile,
+                after_object: || {},
+            },
+        )
+    }
+
+    fn compile_with_hooks(
+        &mut self,
+        source: &str,
+        base_dir: &str,
+        origin: crate::compile::Origin<'_>,
+        settings: &crate::eval::Settings,
+        hooks: CompileHooks<impl FnOnce(), impl FnOnce(), impl FnOnce()>,
+    ) -> Result<Compiled, CacheError> {
+        let CompileHooks {
+            after_validation,
+            during_compile,
+            after_object,
+        } = hooks;
         let encoded_request = canon::encode(&request(base_dir, source, origin, settings))
             .map_err(KernelError::from)?;
-        self.warm(ix_kernel::Key::mint(compile_domain(), &encoded_request));
-
-        // The kernel's effect channel flattens a failure to text, and three
-        // of this compiler's failures are three different exceptions on the
-        // other side of the C ABI: a parse error, an undefined variable and
-        // an unimplemented construct. Catching the error here on its way past
-        // keeps the class, which going through the text would not: `nix eval`
-        // with a cache directory used to report every one of them as a plain
-        // evaluation error reading "effect in domain <64 hex> failed:
-        // Parse(...)", while the same expression without a cache reported a
-        // parse error with cppnix's own wording.
-        let mut rejected: Option<crate::compile::CompileError> = None;
-        let performed = on_perform(
-            PerformCtx {
-                table: &mut self.table,
-                lock: &mut self.lock,
-                cas: self.cas,
-                config: &self.config,
-                // Keyed rows carry Deterministic provenance and record no pin,
-                // so neither of these reaches the table.
-                performed_at: "",
-                blessed_by: "",
-            },
-            compile_domain(),
-            &Policy::Keyed,
-            &encoded_request,
-            || {
-                crate::compile::compile_source(source, base_dir, origin, settings)
-                    .map_err(|e| {
-                        let text = format!("{e:?}");
-                        rejected = Some(e);
-                        text
-                    })
-                    .and_then(|module| {
-                        encode_module(&module).map_err(|e| format!("cannot encode module: {e}"))
-                    })
-            },
-        );
-        let performed = match performed {
-            Ok(performed) => performed,
-            // Only a failure the compiler itself raised is a Compile error.
-            // A store that broke while performing is still a Kernel error,
-            // and `rejected` is what tells the two apart.
-            Err(error) => {
-                return Err(match rejected {
-                    Some(compile_error) => CacheError::Compile(compile_error),
-                    None => CacheError::Kernel(error),
-                });
-            }
+        let key = ix_kernel::Key::mint(compile_domain(), &encoded_request);
+        let stale = match self.cached_module(key, after_validation) {
+            CachedModule::Hit { id, module } => return Ok(self.serve_hit(key, id, module)),
+            CachedModule::Missing => false,
+            CachedModule::Stale => true,
         };
 
-        match performed.outcome {
-            Outcome::Hit => {
-                self.hits += 1;
-                // Mark the row used, so a sweep evicting by recency keeps the
-                // working set rather than whatever was written most recently.
-                if let Some(rows) = self.rows {
-                    rows.touch(compile_domain(), performed.key);
-                }
-            }
-            _ => {
-                self.misses += 1;
-                // Only a fresh row needs writing; a hit is already on disk, or
-                // came from an in-memory table this process filled.
-                if let Some(rows) = self.rows {
-                    rows.put(compile_domain(), &encoded_request, performed.output)?;
-                }
-            }
+        // Compilation and encoding can dominate evaluation. They deliberately
+        // happen before the store-wide guard; only the short publication that
+        // makes bytes and their row visible together excludes the sweeper.
+        #[cfg(test)]
+        let module = crate::compile::compile_source_with_test_hook(
+            source,
+            base_dir,
+            origin,
+            settings,
+            during_compile,
+        )
+        .map_err(CacheError::Compile)?;
+        #[cfg(not(test))]
+        let module = {
+            let _ = during_compile;
+            crate::compile::compile_source(source, base_dir, origin, settings)
+                .map_err(CacheError::Compile)?
+        };
+        let bytes = encode_module(&module).map_err(|error| {
+            CacheError::Kernel(KernelError::Perform {
+                domain: compile_domain(),
+                detail: format!("cannot encode module: {error}"),
+            })
+        })?;
+
+        let _publication = self
+            .store()
+            .map(crate::store::Store::publication_guard)
+            .transpose()
+            .map_err(|source| KernelError::Io {
+                doing: "locking the evaluation store for module publication".to_owned(),
+                source,
+            })?;
+
+        // Another process may have published while this candidate compiled.
+        // Re-read under the guard before writing, but never trust an object
+        // merely because its row or filename exists.
+        if !stale && let CachedModule::Hit { id, module } = self.cached_module(key, || {}) {
+            return Ok(self.serve_hit(key, id, module));
         }
 
-        match self.load_module(performed.output) {
-            Ok(module) => Ok(Compiled {
-                module: Rc::new(module),
-                outcome: performed.outcome,
-                id: performed.output,
+        let id = self.cas().put(&bytes)?;
+        let module = self.load_module(id).map_err(|failure| match failure {
+            ModuleObjectFailure::Missing => CacheError::Dangling { id },
+            ModuleObjectFailure::Invalid(detail) => CacheError::Kernel(KernelError::Perform {
+                domain: compile_domain(),
+                detail: format!("CAS did not preserve compiled module {id}: {detail}"),
             }),
-            Err(detail) => {
-                // An unusable object makes the row worthless, not the request
-                // unanswerable. Keyed means re-performing is always safe, so
-                // the row is dropped and the compile is redone rather than
-                // failing a build over a damaged cache. The only way this can
-                // recur is a compiler that does not round-trip, which the
-                // second attempt would surface as a real error.
-                self.corruption.push(format!(
-                    "object {} for a compiled module was unusable ({detail}); recompiling",
-                    performed.output
-                ));
-                // The row said hit and the object did not deliver, so this was
-                // not one. Leaving the counter alone would report a cache that
-                // recomputes everything as a cache that serves everything,
-                // which is the one number anybody checks to see if it works.
-                if performed.outcome == Outcome::Hit {
-                    self.hits = self.hits.saturating_sub(1);
-                    self.misses += 1;
-                }
-                self.table.remove(compile_domain(), performed.key);
-                let module = crate::compile::compile_source(source, base_dir, origin, settings)
-                    .map_err(CacheError::Compile)?;
-                // A module that will not encode is this crate's bug, not the
-                // user's source, so it keeps the compiler's own error kind
-                // only for the source half above.
-                let bytes = encode_module(&module).map_err(|e| {
-                    CacheError::Compile(crate::compile::CompileError::Unimplemented(Refusal::new(
-                        RefusalToken::UnsupportedOp,
-                        format!("cannot encode module: {e}"),
-                    )))
-                })?;
-                let id = self.cas.put(&bytes)?;
-                Ok(Compiled {
-                    module: Rc::new(module),
-                    outcome: performed.outcome,
-                    id,
-                })
-            }
+        })?;
+        let module = Rc::new(module);
+        self.loaded.insert(id, Rc::clone(&module));
+        self.table.insert(
+            compile_domain(),
+            key,
+            Entry {
+                output: id,
+                policy: Policy::Keyed,
+                provenance: Provenance::Deterministic,
+            },
+        );
+        after_object();
+        if let Some(rows) = self.store().map(crate::store::Store::rows) {
+            rows.put(compile_domain(), &encoded_request, id)?;
         }
+        self.misses += 1;
+        Ok(Compiled {
+            module,
+            outcome: Outcome::Performed,
+            id,
+        })
     }
 
     /// Read one object back as a module, refusing anything the address does
     /// not vouch for. `DirCas` names files by address but does not re-hash on
     /// read, so without this a truncated or swapped file would be decoded as
     /// though the address had checked it.
-    fn load_module(&self, id: ObjId) -> Result<Module, String> {
-        let bytes = self
-            .cas
-            .get(id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "the store does not have it".to_owned())?;
-        if ObjId::of(&bytes) != id {
-            return Err("it does not hash to its address".to_owned());
-        }
-        decode_module(&bytes).map_err(|e| e.to_string())
+    fn load_module(&self, id: ObjId) -> Result<Module, ModuleObjectFailure> {
+        let bytes = match self.cas().get_verified(id) {
+            Err(error) => return Err(ModuleObjectFailure::Invalid(error.to_string())),
+            Ok(ix_kernel::cas::Verified::Missing) => return Err(ModuleObjectFailure::Missing),
+            Ok(ix_kernel::cas::Verified::Corrupt) => {
+                return Err(ModuleObjectFailure::Invalid(
+                    "it does not hash to its address".to_owned(),
+                ));
+            }
+            Ok(ix_kernel::cas::Verified::Found(bytes)) => bytes,
+        };
+        decode_module(&bytes).map_err(|error| ModuleObjectFailure::Invalid(error.to_string()))
     }
 }
 
@@ -989,7 +1204,6 @@ mod tests {
     use crate::ir::OpKind;
     use crate::value2::Value;
     use crate::vm::Vm;
-    use ix_kernel::MemoryCas;
     use std::collections::BTreeSet;
 
     /// One source for every op the compiler can emit, so the round-trip tests
@@ -1035,15 +1249,12 @@ mod tests {
         "!true",
         "1 != 2",
         "1 <= 2",
-        // The four below were added by the coverage guard above, which found
+        // These were added by the coverage guard above, which found
         // that nothing in this corpus reached them.
         // The two globals that are neither primop nor constant, and so get an
         // op each rather than a table index.
         "derivation",
         "__nixPath",
-        // A global cppnix registers and this evaluator has no entry for, which
-        // compiles to a report rather than to a missing variable.
-        "fetchMercurial",
         // Dynamic select with a default: the guarded sibling of the
         // `.${s}` shape above, which compiles to a different op.
         "let s = \"a\"; in { a = 1; }.${s} or 7",
@@ -1188,6 +1399,15 @@ mod tests {
     }
 
     #[test]
+    fn removed_global_placeholder_tag_is_rejected() {
+        let obsolete = CanonValue::Array(vec![CanonValue::Int(6), CanonValue::Int(0)]);
+        assert!(op_from(&obsolete).is_err());
+        assert!(
+            matches!(build("fetchMercurial"), Err(error) if error.contains("UndefinedVariable"))
+        );
+    }
+
+    #[test]
     fn every_shape_round_trips_to_the_same_bytes() -> Result<(), Box<dyn core::error::Error>> {
         for src in SHAPES {
             let module = build(src)?;
@@ -1195,6 +1415,38 @@ mod tests {
             let back = decode_module(&bytes)?;
             assert_eq!(encode_module(&back)?, bytes, "source {src}");
         }
+        Ok(())
+    }
+
+    /// `by_name` is derived at decode and never encoded, so the byte round
+    /// trip above cannot see it and evaluation compares values, not
+    /// positions: the decoded index has to equal the compiled one directly.
+    #[test]
+    fn a_decoded_module_carries_the_compiled_text_index() -> Result<(), Box<dyn core::error::Error>>
+    {
+        let mut indexed_sites = 0;
+        for src in SHAPES {
+            let fresh = build(src)?;
+            let decoded = decode_module(&encode_module(&fresh)?)?;
+            assert_eq!(fresh.units.len(), decoded.units.len(), "source {src}");
+            for (a, b) in fresh.units.iter().zip(&decoded.units) {
+                assert_eq!(a.attr_sites.len(), b.attr_sites.len(), "source {src}");
+                for (x, y) in a.attr_sites.iter().zip(&b.attr_sites) {
+                    assert_eq!(x.by_name, y.by_name, "source {src} ip {}", x.ip);
+                    assert_eq!(
+                        x.by_name.len(),
+                        x.static_names().len(),
+                        "source {src} ip {}",
+                        x.ip
+                    );
+                    indexed_sites += usize::from(!x.by_name.is_empty());
+                }
+            }
+        }
+        assert!(
+            indexed_sites > 0,
+            "SHAPES has no set literal with static names"
+        );
         Ok(())
     }
 
@@ -1212,8 +1464,7 @@ mod tests {
 
     #[test]
     fn the_second_compile_of_one_source_is_a_hit() -> Result<(), Box<dyn core::error::Error>> {
-        let cas = MemoryCas::new();
-        let mut cache = ModuleCache::new(&cas);
+        let mut cache = ModuleCache::in_memory();
         let first = cache.compile(
             "1 + 2",
             "/base",
@@ -1239,8 +1490,7 @@ mod tests {
     #[test]
     fn the_same_source_under_two_base_dirs_does_not_share_a_row()
     -> Result<(), Box<dyn core::error::Error>> {
-        let cas = MemoryCas::new();
-        let mut cache = ModuleCache::new(&cas);
+        let mut cache = ModuleCache::in_memory();
         let here = cache.compile(
             "./x.nix",
             "/one",
@@ -1272,8 +1522,7 @@ mod tests {
     #[test]
     fn the_same_source_at_two_paths_does_not_share_a_row() -> Result<(), Box<dyn core::error::Error>>
     {
-        let cas = MemoryCas::new();
-        let mut cache = ModuleCache::new(&cas);
+        let mut cache = ModuleCache::in_memory();
         let source = "__curPos";
         let one = cache.compile(
             source,
@@ -1323,8 +1572,7 @@ mod tests {
     /// key is not accidentally constant.
     #[test]
     fn different_sources_do_not_share_a_row() -> Result<(), Box<dyn core::error::Error>> {
-        let cas = MemoryCas::new();
-        let mut cache = ModuleCache::new(&cas);
+        let mut cache = ModuleCache::in_memory();
         assert_ne!(
             cache
                 .compile(
@@ -1374,9 +1622,30 @@ mod tests {
         ));
     }
 
+    /// A v1 object had no format inside the object. The compile request's
+    /// format cannot protect decoding when a stale or corrupt row points at an
+    /// old canonical object, so the decoder itself must reject it.
+    #[test]
+    fn a_module_without_an_embedded_format_is_refused() -> Result<(), Box<dyn core::error::Error>> {
+        let module = build("{ a = 1; }")?;
+        let mut value = module_value(&module);
+        let CanonValue::Map(entries) = &mut value else {
+            unreachable!("a module encodes as a map")
+        };
+        entries.retain(|(key, _)| !matches!(key, CanonValue::Str(name) if name == "format"));
+
+        let error = decode_module(&canon::encode(&value)?).expect_err("v1 module decoded as v4");
+        assert!(
+            matches!(&error, ModuleDecodeError::Shape(detail) if detail.contains("missing field 'format'")),
+            "unexpected refusal: {error}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn an_entry_naming_no_unit_is_refused() -> Result<(), Box<dyn core::error::Error>> {
         let value = CanonValue::map([
+            ("format", CanonValue::str(MODULE_FORMAT_VERSION)),
             ("consts", CanonValue::Array(Vec::new())),
             ("symbols", CanonValue::Array(Vec::new())),
             ("units", CanonValue::Array(Vec::new())),
@@ -1679,7 +1948,6 @@ mod tests {
     // ---- persistence -----------------------------------------------------
 
     use ix_kernel::cas::{Cas, DirCas};
-    use ix_kernel::rows::DirRows;
     use std::path::PathBuf;
 
     fn scratch(label: &str) -> PathBuf {
@@ -1692,11 +1960,10 @@ mod tests {
     fn a_new_cache_over_a_warm_store_hits() -> Result<(), Box<dyn core::error::Error>> {
         let dir = scratch("warm");
         let result = (|| -> Result<(), Box<dyn core::error::Error>> {
-            let cas = DirCas::open(dir.join("objects"))?;
-            let rows = DirRows::open(dir.join("index"))?;
+            let store = crate::store::Store::open(&dir)?;
 
             let first = {
-                let mut cache = ModuleCache::persistent(&cas, &rows);
+                let mut cache = ModuleCache::persistent(store.clone());
                 let compiled = cache.compile(
                     "1 + 2",
                     "/base",
@@ -1709,7 +1976,7 @@ mod tests {
 
             // Everything from the first cache is dropped here; only the
             // directories survive, which is what a second process sees.
-            let mut cache = ModuleCache::persistent(&cas, &rows);
+            let mut cache = ModuleCache::persistent(store.clone());
             let second = cache.compile(
                 "1 + 2",
                 "/base",
@@ -1732,16 +1999,15 @@ mod tests {
     fn a_new_cache_misses_when_the_source_changed() -> Result<(), Box<dyn core::error::Error>> {
         let dir = scratch("edited");
         let result = (|| -> Result<(), Box<dyn core::error::Error>> {
-            let cas = DirCas::open(dir.join("objects"))?;
-            let rows = DirRows::open(dir.join("index"))?;
-            ModuleCache::persistent(&cas, &rows).compile(
+            let store = crate::store::Store::open(&dir)?;
+            ModuleCache::persistent(store.clone()).compile(
                 "1 + 2",
                 "/base",
                 crate::compile::Origin::String,
                 &crate::eval::Settings::default(),
             )?;
 
-            let mut cache = ModuleCache::persistent(&cas, &rows);
+            let mut cache = ModuleCache::persistent(store.clone());
             let changed = cache.compile(
                 "1 + 3",
                 "/base",
@@ -1760,11 +2026,11 @@ mod tests {
     /// wrong module. Keyed means recompiling is always safe.
     #[test]
     fn a_truncated_object_is_recompiled_and_reported() -> Result<(), Box<dyn core::error::Error>> {
+        crate::perf::reset();
         let dir = scratch("truncated");
         let result = (|| -> Result<(), Box<dyn core::error::Error>> {
-            let cas = DirCas::open(dir.join("objects"))?;
-            let rows = DirRows::open(dir.join("index"))?;
-            let id = ModuleCache::persistent(&cas, &rows)
+            let store = crate::store::Store::open(&dir)?;
+            let id = ModuleCache::persistent(store.clone())
                 .compile(
                     "1 + 2",
                     "/base",
@@ -1778,7 +2044,7 @@ mod tests {
             let bytes = std::fs::read(&path)?;
             std::fs::write(&path, bytes.get(..2).unwrap_or(&[]))?;
 
-            let mut cache = ModuleCache::persistent(&cas, &rows);
+            let mut cache = ModuleCache::persistent(store.clone());
             let compiled = cache.compile(
                 "1 + 2",
                 "/base",
@@ -1800,6 +2066,11 @@ mod tests {
             );
             // And it counted as a miss, not the hit the row claimed.
             assert_eq!((cache.hits(), cache.misses()), (0, 1));
+            assert_eq!(
+                crate::perf::snapshot().cache_objects_invalid,
+                u64::from(cfg!(feature = "perf")),
+                "the invalid object did not reach the stats snapshot"
+            );
             Ok(())
         })();
         drop(std::fs::remove_dir_all(&dir));
@@ -1813,10 +2084,9 @@ mod tests {
     fn a_swapped_but_valid_object_is_refused() -> Result<(), Box<dyn core::error::Error>> {
         let dir = scratch("swapped");
         let result = (|| -> Result<(), Box<dyn core::error::Error>> {
-            let cas = DirCas::open(dir.join("objects"))?;
-            let rows = DirRows::open(dir.join("index"))?;
+            let store = crate::store::Store::open(&dir)?;
             let (one, other) = {
-                let mut cache = ModuleCache::persistent(&cas, &rows);
+                let mut cache = ModuleCache::persistent(store.clone());
                 (
                     cache
                         .compile(
@@ -1840,7 +2110,7 @@ mod tests {
             let other_bytes = std::fs::read(dir.join("objects").join(other.hash().to_hex()))?;
             std::fs::write(dir.join("objects").join(one.hash().to_hex()), &other_bytes)?;
 
-            let mut cache = ModuleCache::persistent(&cas, &rows);
+            let mut cache = ModuleCache::persistent(store.clone());
             let compiled = cache.compile(
                 "1 + 2",
                 "/base",
@@ -1855,15 +2125,17 @@ mod tests {
         result
     }
 
-    /// A row whose object was swept is dropped, with a reason, and the work
-    /// is redone.
+    /// A row whose object is gone is dropped, with a reason and a count, and
+    /// the work is redone. The object is removed by hand: a sweep evicts the
+    /// row along with it, so this is the window a reader sees when a sweep
+    /// runs between its row read and its object read.
     #[test]
     fn a_row_whose_object_was_swept_is_refused() -> Result<(), Box<dyn core::error::Error>> {
+        crate::perf::reset();
         let dir = scratch("swept");
         let result = (|| -> Result<(), Box<dyn core::error::Error>> {
-            let cas = DirCas::open(dir.join("objects"))?;
-            let rows = DirRows::open(dir.join("index"))?;
-            let id = ModuleCache::persistent(&cas, &rows)
+            let store = crate::store::Store::open(&dir)?;
+            let id = ModuleCache::persistent(store.clone())
                 .compile(
                     "1 + 2",
                     "/base",
@@ -1873,7 +2145,7 @@ mod tests {
                 .id;
             std::fs::remove_file(dir.join("objects").join(id.hash().to_hex()))?;
 
-            let mut cache = ModuleCache::persistent(&cas, &rows);
+            let mut cache = ModuleCache::persistent(store.clone());
             let compiled = cache.compile(
                 "1 + 2",
                 "/base",
@@ -1889,6 +2161,11 @@ mod tests {
                     .is_some_and(|r| r.contains("does not have")),
                 "{reported:?}"
             );
+            assert_eq!(
+                crate::perf::snapshot().cache_objects_missing,
+                u64::from(cfg!(feature = "perf")),
+                "the missing object did not reach the stats snapshot"
+            );
             Ok(())
         })();
         drop(std::fs::remove_dir_all(&dir));
@@ -1901,9 +2178,8 @@ mod tests {
     fn a_misfiled_row_is_refused_at_lookup() -> Result<(), Box<dyn core::error::Error>> {
         let dir = scratch("misfiled");
         let result = (|| -> Result<(), Box<dyn core::error::Error>> {
-            let cas = DirCas::open(dir.join("objects"))?;
-            let rows = DirRows::open(dir.join("index"))?;
-            ModuleCache::persistent(&cas, &rows).compile(
+            let store = crate::store::Store::open(&dir)?;
+            ModuleCache::persistent(store.clone()).compile(
                 "1 + 2",
                 "/base",
                 crate::compile::Origin::String,
@@ -1920,10 +2196,12 @@ mod tests {
             std::fs::rename(&only, &target)?;
 
             // Ask for the key the row now claims to be. It must be refused.
-            let mut cache = ModuleCache::persistent(&cas, &rows);
-            cache.warm(ix_kernel::Key::from_hash(ix_kernel::Hash::from_hex(
-                &"0".repeat(64),
-            )?));
+            let mut cache = ModuleCache::persistent(store.clone());
+            let key = ix_kernel::Key::from_hash(ix_kernel::Hash::from_hex(&"0".repeat(64))?);
+            assert!(matches!(
+                cache.cached_module(key, || {}),
+                CachedModule::Stale
+            ));
             let reported = cache.take_corruption();
             assert!(
                 reported.first().is_some_and(|r| r.contains("wrong key")),
@@ -1935,6 +2213,206 @@ mod tests {
         result
     }
 
+    /// A sweep cannot reclaim a compiled module after its object is visible
+    /// but before the compile row that roots it is visible.
+    #[test]
+    fn a_sweep_cannot_observe_half_of_a_module_record() -> Result<(), Box<dyn core::error::Error>> {
+        let dir = scratch("module-record-sweep");
+        let store = crate::store::Store::open(&dir)?;
+        let (start_sweep, wait_for_module) = std::sync::mpsc::sync_channel(0);
+        let (attempted_lock, wait_for_attempt) = std::sync::mpsc::sync_channel(0);
+        let sweeping_store = store.clone();
+        let sweep = std::thread::spawn(move || -> std::io::Result<_> {
+            wait_for_module.recv().map_err(std::io::Error::other)?;
+            let blocked = match sweeping_store.try_publication_guard() {
+                Ok(guard) => {
+                    drop(guard);
+                    false
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+                Err(error) => return Err(error),
+            };
+            attempted_lock
+                .send(blocked)
+                .map_err(std::io::Error::other)?;
+            sweeping_store.sweep(u64::MAX)
+        });
+
+        let mut cache = ModuleCache::persistent(store.clone());
+        let first = cache.compile_with_publication_hook(
+            "1 + 2",
+            "/base",
+            crate::compile::Origin::String,
+            &crate::eval::Settings::default(),
+            || {
+                start_sweep
+                    .send(())
+                    .expect("the sweep thread stopped before the sequencing point");
+                assert!(
+                    wait_for_attempt
+                        .recv()
+                        .expect("the sweep thread did not report its lock attempt"),
+                    "sweep acquired the store after the module object was published but before its row"
+                );
+            },
+        )?;
+        assert_eq!(first.outcome, Outcome::Performed);
+        sweep.join().expect("the sweep thread panicked")?;
+
+        let mut reopened = ModuleCache::persistent(store.clone());
+        let second = reopened.compile(
+            "1 + 2",
+            "/base",
+            crate::compile::Origin::String,
+            &crate::eval::Settings::default(),
+        )?;
+        assert_eq!(
+            second.outcome,
+            Outcome::Hit,
+            "the compile row did not survive"
+        );
+        assert_eq!(second.id, first.id);
+        assert_eq!(evaluate(&second.module), "3");
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A module already decoded and validated is independent of its CAS file,
+    /// even if a sweep removes that file before the hit is used, and the
+    /// cache that decoded it keeps serving it from memory without a disk
+    /// read. A cache that has not decoded it finds nothing on disk (a sweep
+    /// takes the row along with the object), so it must compile outside the
+    /// publication lock and republish both the object and the persistent row.
+    #[test]
+    fn a_module_swept_after_validation_is_used_then_republished()
+    -> Result<(), Box<dyn core::error::Error>> {
+        let dir = scratch("module-lookup-sweep");
+        let store = crate::store::Store::open(&dir)?;
+        let mut cache = ModuleCache::persistent(store.clone());
+        let first = cache.compile(
+            "1 + 2",
+            "/base",
+            crate::compile::Origin::String,
+            &crate::eval::Settings::default(),
+        )?;
+        assert_eq!(first.outcome, Outcome::Performed);
+
+        let validated_hit = cache.compile_with_validation_hook(
+            "1 + 2",
+            "/base",
+            crate::compile::Origin::String,
+            &crate::eval::Settings::default(),
+            || {
+                let guard = store
+                    .try_publication_guard()
+                    .expect("an in-memory hit held the publication lock");
+                drop(guard);
+                store
+                    .sweep(0)
+                    .expect("the sweep failed after module validation");
+            },
+        )?;
+        assert_eq!(
+            validated_hit.outcome,
+            Outcome::Hit,
+            "a fully validated owned module became stale when its CAS file was swept"
+        );
+        assert_eq!(validated_hit.id, first.id);
+        assert_eq!(evaluate(&validated_hit.module), "3");
+        assert!(
+            !store.cas().has(first.id)?,
+            "the validation hook did not remove the module object"
+        );
+
+        // The cache that decoded the module still has it: served from memory,
+        // no compile, and the object stays gone because a hit never touches
+        // the disk.
+        let compiled_again = core::cell::Cell::new(false);
+        let from_memory = cache.compile_with_compilation_hook(
+            "1 + 2",
+            "/base",
+            crate::compile::Origin::String,
+            &crate::eval::Settings::default(),
+            || compiled_again.set(true),
+        )?;
+        assert_eq!(from_memory.outcome, Outcome::Hit);
+        assert!(
+            !compiled_again.get(),
+            "a module this cache had decoded was compiled again"
+        );
+        assert_eq!(from_memory.id, first.id);
+        assert!(
+            !store.cas().has(first.id)?,
+            "a memory hit wrote the swept object back"
+        );
+
+        // A cache that has not decoded it finds neither the row nor the
+        // object: the sweep evicts rows first and then whatever nothing names.
+        // The control for the lock assertion below: the hook is the only place
+        // that checks the lock is free during compilation, so a hook that
+        // never ran would leave that check silently unexecuted.
+        let mut cache = ModuleCache::persistent(store.clone());
+        let compile_hook_ran = core::cell::Cell::new(false);
+        let republished = cache.compile_with_compilation_hook(
+            "1 + 2",
+            "/base",
+            crate::compile::Origin::String,
+            &crate::eval::Settings::default(),
+            || {
+                compile_hook_ran.set(true);
+                let guard = store
+                    .try_publication_guard()
+                    .expect("module compilation ran while holding the publication lock");
+                drop(guard);
+            },
+        )?;
+        assert!(
+            compile_hook_ran.get(),
+            "the compilation hook never ran, so the lock-free-compilation check was not exercised"
+        );
+        assert_eq!(republished.outcome, Outcome::Performed);
+        assert_eq!(republished.id, first.id);
+        assert_eq!(evaluate(&republished.module), "3");
+        assert!(
+            store.cas().has(republished.id)?,
+            "publication did not restore the swept module object"
+        );
+        let encoded_request = canon::encode(&request(
+            "/base",
+            "1 + 2",
+            crate::compile::Origin::String,
+            &crate::eval::Settings::default(),
+        ))?;
+        let key = ix_kernel::Key::mint(compile_domain(), &encoded_request);
+        assert!(
+            matches!(
+                store.rows().get(compile_domain(), key),
+                Lookup::Found(id) if id == republished.id
+            ),
+            "publication did not restore the persistent module row"
+        );
+
+        store.sweep(u64::MAX)?;
+        let mut reopened = ModuleCache::persistent(store.clone());
+        let served = reopened.compile(
+            "1 + 2",
+            "/base",
+            crate::compile::Origin::String,
+            &crate::eval::Settings::default(),
+        )?;
+        assert_eq!(
+            served.outcome,
+            Outcome::Hit,
+            "the repaired row did not survive"
+        );
+        assert_eq!(served.id, republished.id);
+        assert_eq!(evaluate(&served.module), "3");
+
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
     /// Objects written by one cache are addressable by the other, which is
     /// the half of persistence the CAS already provided; this pins it.
     #[test]
@@ -1942,9 +2420,8 @@ mod tests {
         let dir = scratch("objects");
         let result = (|| -> Result<(), Box<dyn core::error::Error>> {
             let id = {
-                let cas = DirCas::open(dir.join("objects"))?;
-                let rows = DirRows::open(dir.join("index"))?;
-                ModuleCache::persistent(&cas, &rows)
+                let store = crate::store::Store::open(&dir)?;
+                ModuleCache::persistent(store.clone())
                     .compile(
                         "1 + 2",
                         "/base",

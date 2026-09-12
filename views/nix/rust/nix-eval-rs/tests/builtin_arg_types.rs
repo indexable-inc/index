@@ -128,6 +128,10 @@ const UNFORCED: &[(&str, &[usize])] = &[
     // infinite recursion (ENG-13124). The callee is forced at the
     // application instead, by `ApplyChain`.
     ("mapAttrs", &[0]),
+    // `prim_hashFile` validates the algorithm before it touches the path,
+    // so a bad algorithm name is reported even when the path diverges. The
+    // body forces position 1 itself once the name has passed.
+    ("hashFile", &[1]),
     ("deepSeq", &[0, 1]),
     ("tryEval", &[0]),
     ("toJSON", &[0]),
@@ -158,6 +162,13 @@ const UNFORCED: &[(&str, &[usize])] = &[
     // a non-function filter ahead of a `__toString` that throws. The machine
     // drives both in cppnix's order instead (`bi_filter_source`).
     ("filterSource", &[0, 1]),
+    // The guest decides. `builtins.wasm` hands its argument to the module as
+    // a handle, and the module forces exactly what it inspects (`get_type`
+    // on a thunk forces it, `copy_list` into a sizing buffer does not), so
+    // `builtins.wasm cfg [ (throw "a") 1 ]` can answer `2` where a strict
+    // position 1 would throw before the guest ran. The config set at 0 is
+    // read by the machine itself and stays strict.
+    ("wasm", &[1]),
 ];
 
 /// Every `strict` list names each position at most once and none out of
@@ -257,10 +268,6 @@ fn the_untagged_positions_are_the_ones_named_here() {
         ("trace", 0),
         // `functionArgs` raises its own message rather than `forceFunction`'s.
         ("functionArgs", 0),
-        // The path family: string, path, or a set coercing through
-        // `__toString` or `outPath` (ENG-12669). A coercion, not a type.
-        // `hashFile`'s path is position 1, after the algorithm name.
-        ("hashFile", 1),
         ("import", 0),
         ("readFile", 0),
         ("pathExists", 0),
@@ -270,6 +277,11 @@ fn the_untagged_positions_are_the_ones_named_here() {
         // (`coerceToPath`, primops.cc), so a set with `outPath` and a bare
         // string are both accepted and a tag would reject them.
         ("toPath", 0),
+        // `prim_storePath` coerces with the argument's string context kept:
+        // a store-path string that carries a `.drv` reference hands that
+        // reference on to its result without realising it. The `Coerce`
+        // tag yields a bare path, so the body does the coercion.
+        ("storePath", 0),
         // An attribute set, but `Attrs` is not the tag either:
         // `prim_flakeRefToString` uses `forceAttrs` with its own error
         // context, and the body's `want_attrs` raises that same message at

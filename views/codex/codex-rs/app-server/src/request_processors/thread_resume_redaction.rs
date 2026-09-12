@@ -73,6 +73,8 @@ mod tests {
                 text: "kept".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             },
             ThreadItem::McpToolCall {
                 id: "mcp-1".to_string(),
@@ -85,11 +87,11 @@ mod tests {
                     link_id: Some("link_calendar".to_string()),
                     resource_uri: Some("ui://widget/lookup.html".to_string()),
                     app_name: Some("Calendar".to_string()),
-                    template_id: Some("calendar_template".to_string()),
                     action_name: Some("lookup".to_string()),
                 }),
                 mcp_app_resource_uri: Some("ui://widget/lookup.html".to_string()),
                 plugin_id: Some("sample@test".to_string()),
+                read_only_hint: None,
                 result: Some(Box::new(McpToolCallResult {
                     content: vec![serde_json::json!({
                         "type": "text",
@@ -106,7 +108,10 @@ mod tests {
                 status: "completed".to_string(),
                 revised_prompt: Some("revised".to_string()),
                 result: "base64-result".to_string(),
+                transparent_background: None,
+                failure: None,
                 saved_path: Some(test_path_buf("/tmp/ig-1.png").abs()),
+                imagegen_request_id: None,
             }),
         ]);
 
@@ -120,6 +125,8 @@ mod tests {
                 text: "kept".to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
+                questions: None,
             }
         );
         assert_eq!(
@@ -135,11 +142,11 @@ mod tests {
                     link_id: Some("link_calendar".to_string()),
                     resource_uri: Some("ui://widget/lookup.html".to_string()),
                     app_name: Some("Calendar".to_string()),
-                    template_id: Some("calendar_template".to_string()),
                     action_name: Some("lookup".to_string()),
                 }),
                 mcp_app_resource_uri: Some("ui://widget/lookup.html".to_string()),
                 plugin_id: Some("sample@test".to_string()),
+                read_only_hint: None,
                 result: Some(Box::new(redacted_mcp_tool_call_result())),
                 error: None,
                 duration_ms: Some(8),
@@ -158,6 +165,7 @@ mod tests {
             app_context: None,
             mcp_app_resource_uri: None,
             plugin_id: None,
+            read_only_hint: None,
             result: None,
             error: Some(McpToolCallError {
                 message: "secret error".to_string(),
@@ -178,6 +186,7 @@ mod tests {
                 app_context: None,
                 mcp_app_resource_uri: None,
                 plugin_id: None,
+                read_only_hint: None,
                 result: None,
                 error: Some(McpToolCallError {
                     message: REDACTED_PAYLOAD.to_string(),
@@ -189,6 +198,8 @@ mod tests {
 
     fn test_thread(items: Vec<ThreadItem>) -> Thread {
         Thread {
+            originator: None,
+            environments: None,
             id: "thread-1".to_string(),
             extra: None,
             session_id: "session-1".to_string(),
@@ -196,8 +207,13 @@ mod tests {
             parent_thread_id: None,
             preview: "preview".to_string(),
             ephemeral: false,
+            section: None,
+            section_entered_at: None,
+            project_id: None,
             history_mode: Default::default(),
             model_provider: "mock_provider".to_string(),
+            model: None,
+            reasoning_effort: None,
             created_at: 0,
             updated_at: 0,
             recency_at: Some(0),
@@ -206,6 +222,7 @@ mod tests {
             cwd: test_path_buf("/tmp").abs(),
             cli_version: "0.0.0".to_string(),
             source: SessionSource::Cli,
+            can_accept_direct_input: None,
             thread_source: None,
             agent_nickname: None,
             agent_role: None,

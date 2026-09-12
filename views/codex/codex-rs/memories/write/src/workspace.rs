@@ -3,6 +3,8 @@ use codex_git_utils::GitBaselineDiff;
 use codex_git_utils::diff_since_latest_init;
 use codex_git_utils::ensure_git_baseline_repository;
 use codex_git_utils::reset_git_repository;
+#[cfg(windows)]
+use std::os::windows::fs::FileTypeExt;
 use std::path::Path;
 
 /// Prepares the memory directory for git-baseline diffing.
@@ -11,9 +13,9 @@ use std::path::Path;
 /// metadata is missing or unusable, and removes any stale generated `phase2_workspace_diff.md` file
 /// so that the next diff does not include a previous prompt artifact.
 pub async fn prepare_memory_workspace(root: &Path) -> anyhow::Result<()> {
-    tokio::fs::create_dir_all(root)
+    crate::ensure_layout(root)
         .await
-        .with_context(|| format!("create memory workspace {}", root.display()))?;
+        .with_context(|| format!("prepare memory workspace {}", root.display()))?;
     remove_workspace_diff(root).await?;
     ensure_git_baseline_repository(root).await?;
     Ok(())
@@ -43,6 +45,73 @@ pub async fn write_workspace_diff(root: &Path, diff: &GitBaselineDiff) -> anyhow
 pub async fn reset_memory_workspace_baseline(root: &Path) -> anyhow::Result<()> {
     remove_workspace_diff(root).await?;
     reset_git_repository(root).await
+}
+
+/// Verifies that a completed consolidation run left the required memory artifacts in place.
+pub async fn validate_consolidation_artifacts(root: &Path) -> anyhow::Result<()> {
+    let removed_symlinks = remove_memory_symlinks(root).await?;
+    anyhow::ensure!(
+        removed_symlinks == 0,
+        "removed {removed_symlinks} symbolic links from consolidated memory workspace"
+    );
+
+    let memory_path = root.join("MEMORY.md");
+    let memory_metadata = tokio::fs::metadata(&memory_path).await.with_context(|| {
+        format!(
+            "read consolidated memory artifact {}",
+            memory_path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        memory_metadata.is_file(),
+        "consolidated memory artifact is not a file: {}",
+        memory_path.display()
+    );
+
+    let summary_path = root.join("memory_summary.md");
+    let summary = tokio::fs::read_to_string(&summary_path)
+        .await
+        .with_context(|| format!("read memory summary artifact {}", summary_path.display()))?;
+    anyhow::ensure!(
+        summary.lines().next() == Some("v1"),
+        "memory summary artifact does not start with v1: {}",
+        summary_path.display()
+    );
+
+    Ok(())
+}
+
+pub(crate) async fn remove_memory_symlinks(root: &Path) -> std::io::Result<usize> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut removed = 0;
+
+    while let Some(directory) = directories.pop() {
+        let mut entries = tokio::fs::read_dir(directory).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let file_type = entry.file_type().await?;
+            if file_type.is_symlink() {
+                #[cfg(windows)]
+                if file_type.is_symlink_dir() {
+                    tokio::fs::remove_dir(&path).await?;
+                } else {
+                    tokio::fs::remove_file(&path).await?;
+                }
+                #[cfg(not(windows))]
+                tokio::fs::remove_file(&path).await?;
+
+                tracing::warn!(
+                    "removed symbolic link from memory workspace: {}",
+                    path.display()
+                );
+                removed += 1;
+            } else if file_type.is_dir() {
+                directories.push(path);
+            }
+        }
+    }
+
+    Ok(removed)
 }
 
 /// Removes the generated `phase2_workspace_diff.md` prompt artifact.

@@ -80,6 +80,9 @@
   #   systemTools.Workflow = true;  workflow commands
   #   protectedMergeGuard = true;  false drops the protected-merge gh pr merge --admin/--force Bash denies (pair with omitting the forceMerge prompt rule)
   #   kernelOnly = false;  option kernelOnly; strict mode: deny every built-in tool and every non-index MCP server, leaving the index Elixir kernel as the only tool surface
+  #   keepNativeTools = [ ];  kernel-superseded native tools (Read, Write, Edit, Glob, Grep, WebSearch, WebFetch) this consumer keeps despite the baked kernel, by name; kernelOnly denies them regardless
+  #   chrome = true;  false bakes --no-chrome: the Claude in Chrome bridge stays off regardless of ~/.claude.json's claudeInChromeDefaultEnabled (#4312)
+  #   managedMcp = false;  true bakes no --mcp-config because the host's managed-mcp.json carries the set and 2.1.228 refuses to start with both; guard attestation and by-name denies still derive from the intended set
   #   addDirs = [ ];  option addDirs; --add-dir=<dir> flags: file access plus <dir>/.claude/skills and CLAUDE.md loading
   #   pluginDirs = [ ];  option pluginDirs; --plugin-dir=<dir> flags: namespaced plugin bundles (the house plugin rides this layer)
   #   primaryCheckouts = <"/home/*/index", "/home/*/ix">;  option primaryCheckouts; globs the PreToolUse worktree guard denies edits under
@@ -95,7 +98,7 @@
   #   updateScriptWriter = null;  plumbing: writer for passthru.updateScript (flake package set only)
   # END claude-code wrapper knob reference
 
-  # BEGIN claude-code env reference (extracted from Claude Code cli.js 2.1.228)
+  # BEGIN claude-code env reference (extracted from Claude Code cli.js 2.1.259)
   # Every documented environment variable the pinned CLI reads, one line
   # each: uncomment into a consuming machine's programs.claude-code.defaults
   # under `env` (settings env is read at CC startup even when the launch env
@@ -103,7 +106,7 @@
   # where the CLI or this wrapper bakes one; "" means unset. Vars owned by a
   # typed wrapper knob point at the knob instead of duplicating it. Sources:
   # the env-var registry inside the shipped cli.js, extracted mechanically
-  # to packages/claude-code/env-registry.tsv (all 844 names with
+  # to packages/claude-code/env-registry.tsv (all 987 names with
   # accessor types; regenerate with `nix build .#claude-code.envRegistry`),
   # cross-checked against https://code.claude.com/docs/en/env-vars. The
   # undocumented remainder in the TSV is internal experiment gates and

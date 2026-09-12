@@ -16,6 +16,39 @@
 }: let
   cfg = config.ix.profiles.base;
 
+  # The guest Nix, refused rather than defaulted when the injection is absent.
+  # Same shape and same reason as `fromIx` in packages/nix/default.nix, which
+  # is where the throw this one replaces used to surface from: a null here is
+  # a consumer that could not assemble the fork, and quietly substituting
+  # nixpkgs' Nix would trade this eval error for `attribute 'wasm' missing`
+  # inside a booted VM.
+  requireNixPackage = value:
+    if value != null
+    then value
+    else
+      throw ''
+        modules/profiles/base: no guest Nix was injected (`ix.nixPackage`).
+
+        Every image built through `index.lib` runs this profile, and its
+        `nix.package` is the evaluator `ix apply` needs (`builtins.wasm` for
+        `.ix` modules, the jj fetcher for jj-addressed inputs). Assembling it
+        needs the jj tree ABI archive from the ix repository, outside index's
+        source root, so it is supplied at the flake boundary and reaches
+        `import ./lib` as `nixPackage`:
+
+            inputs.index.withNixPackage { nixPackage = <the assembled nix-ix>; }
+
+        ix does that once (nix/flake/outputs/workspace.nix `index`) and exposes
+        the instantiated surface as its `index` flake output; a flake that
+        applies an image (the examples, `ix init` scaffolds) reads `ix.index`
+        rather than the bare index flake, which has no guest Nix by construction.
+
+        There is deliberately no fallback. An image shipping nixpkgs' Nix
+        boots, accepts the generated project, and then fails inside the guest
+        on `attribute 'wasm' missing`, which is the late failure this profile
+        exists to prevent.
+      '';
+
   # Claude Code refuses bypass-permissions mode for the root user unless it is
   # told it is sandboxed (`getuid() === 0 && IS_SANDBOX !== "1"` exits with
   # "cannot be used with root/sudo privileges"), and guest sessions run as
@@ -121,7 +154,15 @@ in {
       # managed builder and workload VM must provide IX's patched Nix. Leaving
       # this at nixpkgs' default makes `ix apply` accept the generated project,
       # create a builder, and then fail late with `attribute 'wasm' missing`.
-      package = ix.packages.nix-ix;
+      #
+      # Injected, not `ix.packages.nix-ix`: assembling that package needs the
+      # jj tree ABI archive, whose crate lives in the ix repository outside
+      # index's source root, so the assembled value has to reach this module
+      # from whoever holds the archive. `ix.nixPackage` is that binding (one
+      # formal on lib/default.nix, supplied at flake.nix). Reaching into
+      # `ix.packages` from here instead would put the choice inside a NixOS
+      # module, where no consumer of `index.lib` can override it.
+      package = requireNixPackage ix.nixPackage;
 
       settings = {
         substituters = lib.mkBefore [ix.cache.url];
@@ -229,14 +270,11 @@ in {
           "./.zshrc" = ".zshrc";
           "./.zprofile" = ".zprofile";
         }
-        // lib.listToAttrs (
-          map (
-            name:
-              lib.nameValuePair
-              "${config.programs.nushell.configDir}/${name}"
-              ".config/nushell/${name}"
-          )
-          nushellRcFiles
+        // lib.genAttrs' nushellRcFiles (
+          name:
+            lib.nameValuePair
+            "${config.programs.nushell.configDir}/${name}"
+            ".config/nushell/${name}"
         );
 
       configFileRcs = {
@@ -303,8 +341,8 @@ in {
       # `durable` persistence so an in-guest edit is never clobbered by a later
       # activation. Do not "clean this up" back into plain `home.file`: the
       # symlink IS the defect.
-      home.file = lib.mapAttrs (_: _: {enable = false;}) homeFileRcs;
-      xdg.configFile = lib.mapAttrs (_: _: {enable = false;}) configFileRcs;
+      home.file = lib.genAttrs (lib.attrNames homeFileRcs) (_: {enable = false;});
+      xdg.configFile = lib.genAttrs (lib.attrNames configFileRcs) (_: {enable = false;});
 
       mutable.files =
         lib.mapAttrs' (

@@ -350,6 +350,11 @@ StorePath BinaryCacheStore::addToStoreFromDump(
     // inconvenient order. Could fetch after uploading, however.
     if (hashMethod.getFileIngestionMethod() == FileIngestionMethod::Git)
         unsupported("addToStoreFromDump");
+    if (hashMethod == ContentAddressMethod::Raw::JjTree)
+        throw TreeIdNotComputable(
+            "cannot add '%s' to the store by its Jujutsu tree id from a dump: Nix does not compute those; "
+            "a caller holding the id uses Store::addToStoreWithKnownCA",
+            name);
 
     if (auto * dump2p = dynamic_cast<StringSource *>(&dump)) {
         auto & dump2 = *dump2p;

@@ -14,7 +14,7 @@ can write `node_modules`, caches, and HMR state outside the Nix store.
 
 Arguments:
 - `src`: project root containing `package.json` and the selected lockfile, or
-  `sourceRoot`: a repo path to filter with `fileset.gitTracked`.
+  `sourceRoot`: a repo path imported whole.
   `package.json`'s `name` and `version` are the derivation identity.
 - `packageManager`: `npm` or `bun`.
 - `buildScript`: package script for the production build.
@@ -53,7 +53,7 @@ pkgs: {
     else
       lib.fileset.toSource {
         root = sourceRoot;
-        fileset = lib.fileset.gitTracked sourceRoot;
+        fileset = sourceRoot;
       };
   packageJsonRoot =
     if sourceRoot == null

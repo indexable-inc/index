@@ -15,7 +15,7 @@ defmodule IxMcp.Forge.Runs do
     * `queue.json` is a LAGGING snapshot: an entry can be absent from it
       while its run is live, so "not in the queue" never means "not landed".
       A poll for absence reports a landing that has not happened.
-    * `jj ix forge dump` is authoritative and takes 100-160s under load
+    * `jj forge dump` is authoritative and takes 100-160s under load
       while holding the repo, which is longer than any sane poll cadence.
 
   A run record cannot lie either way, because it is written by the thing

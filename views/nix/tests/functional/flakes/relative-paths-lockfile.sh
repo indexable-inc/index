@@ -18,7 +18,14 @@ depFlakeA="$TEST_ROOT/depFlakeA"
 depFlakeB="$TEST_ROOT/depFlakeB"
 
 rm -rf "$rootFlake"
-mkdir -p "$rootFlake" "$subflake" "$depFlakeA" "$depFlakeB"
+jjFlakeDir "$rootFlake"
+jjFlakeDir "$depFlakeA"
+jjFlakeDir "$depFlakeB"
+
+# `sub` is only ever reached through its parent: as `./sub` from the root
+# flake, and as a subdirectory of the root workspace on the command line.
+# It is part of that workspace's tree, so it gets no workspace of its own.
+mkdir -p "$subflake"
 
 cat > "$depFlakeA/flake.nix" <<EOF
 {
@@ -41,7 +48,7 @@ EOF
 
 cat > "$subflake/flake.nix" <<EOF
 {
-  inputs.dep.url = "path:$depFlakeA";
+  inputs.dep.url = "jj+file://$depFlakeA";
   outputs = { self, dep }: {
     inherit (dep) x;
     y = self.x - 1;
@@ -62,9 +69,11 @@ EOF
 [[ $(nix eval "$subflake#y") = 10 ]]
 [[ $(nix eval "$rootFlake#y") = 5 ]]
 
-nix flake update --flake "path:$subflake" --override-input dep "$depFlakeB"
+# The subflake is addressed bare: it has no identity of its own, so
+# flakeref.cc resolves it through the root workspace that contains it.
+nix flake update --flake "$subflake" --override-input dep "$depFlakeB"
 
-[[ $(nix eval "path:$subflake#y") = 12 ]]
+[[ $(nix eval "$subflake#y") = 12 ]]
 
 # Changes to sub/flake.lock are propagated to the root flake (#7730):
 # the child's own lock file is authoritative for the subtree of a
@@ -95,14 +104,14 @@ cmp "$TEST_ROOT/lock-stable" "$rootFlake/flake.lock"
 # required argument 'dep2'" (indexable-inc/index#3627).
 cat > "$subflake/flake.nix" <<EOF
 {
-  inputs.dep.url = "path:$depFlakeA";
-  inputs.dep2.url = "path:$depFlakeB";
+  inputs.dep.url = "jj+file://$depFlakeA";
+  inputs.dep2.url = "jj+file://$depFlakeB";
   outputs = { self, dep, dep2 }: {
     y = dep.x + dep2.x;
   };
 }
 EOF
-nix flake lock "path:$subflake"
+nix flake lock "$subflake"
 [[ $(nix eval "$rootFlake#y") = 13 ]]
 
 # And the refreshed parent lock is again stable.

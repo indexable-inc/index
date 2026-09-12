@@ -133,7 +133,7 @@ struct LockedFlake
      * lockFlake(); in particular, the root node and the overridden
      * inputs.
      */
-    std::map<ref<Node>, SourcePath> nodePaths;
+    std::map<NodeId, SourcePath> nodePaths;
 
     std::optional<Fingerprint> getFingerprint(Store & store, const fetchers::Settings & fetchSettings) const;
 };
@@ -217,19 +217,7 @@ struct LockFlags
 LockedFlake
 lockFlake(const Settings & settings, EvalState & state, const FlakeRef & flakeRef, const LockFlags & lockFlags);
 
-void callFlake(EvalState & state, const LockedFlake & lockedFlake, Value & v);
-
-/**
- * The text of `call-flake.nix`, the ordinary Nix program `callFlake` applies
- * to a lock file, an overrides set and `fetchFinalTree`.
- *
- * Exported so that a second evaluator can run the same program rather than a
- * copy of it. `callFlake` above evaluates it through cppnix; the Rust backend
- * hands these bytes to its own compiler and applies the same three arguments
- * (`rustEvaluandOf`). Two copies of a 105-line program that decides which
- * tree every flake input resolves to is a divergence waiting for the first
- * person to edit one of them.
- */
+/** The Nix entry program evaluated by the Rust flake evaluator. */
 std::string_view callFlakeSource();
 
 /**
@@ -244,7 +232,7 @@ void emitTreeAttrs(
     const StorePath & storePath,
     const fetchers::Input & input,
     Value & v,
-    bool emptyRevFallback = false,
+    bool emptyRevCountFallback = false,
     bool forceDirty = false);
 
 /**

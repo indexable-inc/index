@@ -1,0 +1,23 @@
+# vim: filetype=meson
+
+# The jj fetcher reads jj's native object store in-process through
+# `libjj_tree.a` (crate `jj-tree-abi`, header `include/jj_tree.h`). The crate
+# lives in the ix repository, outside this tree, so it is always handed in
+# prebuilt: another derivation compiles the archive and installs the header,
+# the same seam `rust-eval-prefix` uses for the Rust evaluator (src/nix). There
+# is deliberately no cargo path here and no empty default: a nix without the
+# library has no jj fetcher, and that is a configure-time error, not a
+# runtime one.
+option(
+  'jj-tree-prefix',
+  type : 'string',
+  value : '',
+  description : 'prefix holding a prebuilt lib/libjj_tree.a and include/jj_tree.h (required)',
+)
+
+option(
+  'rust-host-prefix',
+  type : 'string',
+  value : '',
+  description : 'exact prefix of the evaluator-independent nix-host-rs runtime',
+)

@@ -32,7 +32,6 @@ suites += {
     'nix-shell.sh',
     'post-hook.sh',
     'recursive.sh',
-    'repl.sh',
     'selfref-gc.sh',
     'signatures.sh',
     'substitute.sh',

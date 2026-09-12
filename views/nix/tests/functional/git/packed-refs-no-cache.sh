@@ -41,7 +41,9 @@ nix eval --impure --raw --expr "builtins.fetchGit { url = \"file://$repo\"; }"
 
 # Validate that refs/heads/master exists
 shopt -s nullglob
-matches=("$TEST_HOME/.cache/nix/gitv3/*/refs/heads/master")
+# Unquoted so the glob actually expands: quoted, the array always holds the
+# one literal pattern and the emptiness check below can never fire.
+matches=("$TEST_HOME"/.cache/nix/gitv3/*/refs/heads/master)
 shopt -u nullglob
 
 if [[ ${#matches[@]} -eq 0 ]]; then

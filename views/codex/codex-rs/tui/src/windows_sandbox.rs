@@ -9,6 +9,8 @@
 use crate::legacy_core::config::Config;
 use codex_config::types::WindowsSandboxModeToml;
 use codex_features::Feature;
+#[cfg(target_os = "windows")]
+use codex_otel::SessionTelemetry;
 use codex_protocol::config_types::WindowsSandboxLevel;
 #[cfg(target_os = "windows")]
 use codex_protocol::models::PermissionProfile;
@@ -19,6 +21,22 @@ use std::collections::HashMap;
 use std::path::Path;
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
+
+#[cfg(target_os = "windows")]
+pub(crate) fn record_world_writable_scan_result(
+    session_telemetry: &SessionTelemetry,
+    result: &anyhow::Result<usize>,
+) {
+    let (flagged_count, result) = match result {
+        Ok(flagged_count) => (*flagged_count as i64, "success"),
+        Err(_) => (0, "error"),
+    };
+    session_telemetry.histogram(
+        "codex.windows_sandbox.world_writable_scan_flagged_directories",
+        flagged_count,
+        &[("result", result)],
+    );
+}
 
 pub(crate) fn level_from_config(config: &Config) -> WindowsSandboxLevel {
     match config.permissions.windows_sandbox_mode {
@@ -43,26 +61,33 @@ pub(crate) fn sandbox_setup_is_complete(_codex_home: &Path) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn run_elevated_setup(
+pub(crate) fn prepare_elevated_sandbox(
     permission_profile: &PermissionProfile,
     workspace_roots: &[AbsolutePathBuf],
     command_cwd: &Path,
     env_map: &HashMap<String, String>,
     codex_home: &Path,
 ) -> anyhow::Result<()> {
-    let permissions = codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
-        permission_profile,
-        workspace_roots,
-    )?;
-    codex_windows_sandbox::run_elevated_setup(
-        codex_windows_sandbox::SandboxSetupRequest {
+    if !sandbox_setup_is_complete(codex_home) {
+        let permissions = codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+            permission_profile,
+            workspace_roots,
+        )?;
+        codex_windows_sandbox::run_elevated_setup(codex_windows_sandbox::SandboxSetupRequest {
             permissions: &permissions,
             command_cwd,
             env_map,
             codex_home,
             proxy_enforced: false,
-        },
-        codex_windows_sandbox::SetupRootOverrides::default(),
+        })?;
+    }
+    codex_windows_sandbox::run_setup_refresh(
+        permission_profile,
+        workspace_roots,
+        command_cwd,
+        env_map,
+        codex_home,
+        /*proxy_enforced*/ false,
     )
 }
 

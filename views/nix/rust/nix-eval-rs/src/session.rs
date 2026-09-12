@@ -14,9 +14,9 @@
 
 use crate::compile::CompileError;
 use crate::compile::Origin;
-use crate::eval::{EvalError, drive};
+use crate::eval::EvalError;
 use crate::host::Host;
-use crate::modcache::{CacheError, ModuleCache};
+use crate::modcache::CacheError;
 use crate::readset::{Complaint, EvalId, EvalResult, RecordingHost, ResultCache};
 use crate::refusal::{Refusal, RefusalToken};
 use crate::value2::Value;
@@ -46,6 +46,8 @@ pub const PARSE: &str = "parse";
 pub const EVAL: &str = "eval";
 pub const THROWN: &str = "thrown";
 pub const ASSERTION: &str = "assertion";
+pub const IMPORT_FROM_DERIVATION: &str = "import-from-derivation";
+pub const MISSING_ARGUMENT: &str = "missing-argument";
 
 #[must_use]
 pub fn result_of(error: &EvalError) -> EvalResult {
@@ -63,6 +65,12 @@ pub fn result_of(error: &EvalError) -> EvalResult {
         EvalError::Eval(ErrKind::Eval, message, _) => (EVAL, message.clone()),
         EvalError::Eval(ErrKind::Thrown, message, _) => (THROWN, message.clone()),
         EvalError::Eval(ErrKind::Assertion, message, _) => (ASSERTION, message.clone()),
+        EvalError::Eval(ErrKind::ImportFromDerivation, message, _) => {
+            (IMPORT_FROM_DERIVATION, message.clone())
+        }
+        EvalError::Eval(ErrKind::MissingArgument, message, _) => {
+            (MISSING_ARGUMENT, message.clone())
+        }
     };
     EvalResult {
         status: status.to_owned(),
@@ -97,6 +105,10 @@ pub fn error_of(result: &EvalResult) -> Option<EvalError> {
         PARSE => Some(EvalError::Parse(message)),
         THROWN => Some(EvalError::Eval(ErrKind::Thrown, message, pos)),
         ASSERTION => Some(EvalError::Eval(ErrKind::Assertion, message, pos)),
+        IMPORT_FROM_DERIVATION => {
+            Some(EvalError::Eval(ErrKind::ImportFromDerivation, message, pos))
+        }
+        MISSING_ARGUMENT => Some(EvalError::Eval(ErrKind::MissingArgument, message, pos)),
         // Anything unrecognised is treated as a plain evaluation error rather
         // than trusted: a status this build does not know is a store written
         // by a different one.
@@ -104,15 +116,16 @@ pub fn error_of(result: &EvalResult) -> Option<EvalError> {
     }
 }
 
-/// Compile and evaluate one source, using whatever caches are supplied.
+/// Compile and evaluate one source.
 ///
-/// `results` is optional because result memoisation is a separate opt-in from
-/// compilation caching: the first is only sound with a recorded read set, and
-/// a caller that does not want the recording overhead can have the compile
-/// cache alone.
+/// The compile cache is the machine's own ([`Vm::modules`]), the one its
+/// imports go through, so a top-level program and the files it imports are
+/// cached alike. `results` is optional because result memoisation is a
+/// separate opt-in from compilation caching: the first is only sound with a
+/// recorded read set, and a caller that does not want the recording overhead
+/// can have the compile cache alone.
 pub fn evaluate(
     vm: &mut Vm,
-    modules: &mut ModuleCache<'_, dyn Cas>,
     results: Option<&mut ResultCache<'_, dyn Cas>>,
     host: &dyn Host,
     source: &str,
@@ -121,12 +134,12 @@ pub fn evaluate(
 ) -> (EvalResult, Reuse) {
     let mut reuse = Reuse::default();
 
-    let before = modules.hits();
-    let compiled = match modules.compile(source, base_dir, origin, vm.settings()) {
+    let before = vm.modules().hits();
+    let compiled = match vm.compile(source, base_dir, origin) {
         Ok(compiled) => compiled,
         Err(error) => return (compile_failure(&error), reuse),
     };
-    reuse.compile_hit = modules.hits() > before;
+    reuse.compile_hit = vm.modules().hits() > before;
     let module_id = *compiled.id.hash();
 
     let Some(results) = results else {
@@ -169,7 +182,9 @@ pub fn evaluate(
     } else {
         RecordingHost::new(host)
     };
+    let previous_import_cache = vm.set_import_cache_enabled(verifying.is_none());
     let mut result = run(vm, &compiled.module, &recorder);
+    vm.set_import_cache_enabled(previous_import_cache);
     let read_set = recorder.take();
     result.emissions = recorder.take_emissions();
     settle(
@@ -313,7 +328,7 @@ pub fn settle(
     // A result that could not be recorded is a slower next run, not a wrong
     // answer, so the failure is reported through the corruption channel the
     // caller already drains rather than replacing the answer.
-    if let Err(error) = results.record(identity, read_set, result) {
+    if let Err(error) = results.record(identity, read_set, result, host, settings) {
         results.note_record_failure(format!("could not memoise: {error}"));
         return;
     }
@@ -404,21 +419,22 @@ pub(crate) fn compile_failure(error: &CacheError) -> EvalResult {
         // and has no uncached counterpart to match: there is no such failure
         // when there is no cache. Reported as an evaluation error rather than
         // blamed on the user's syntax.
-        CacheError::Kernel(_) | CacheError::Corrupt { .. } | CacheError::Dangling { .. } => {
-            EvalResult {
-                status: EVAL.to_owned(),
-                value: error.to_string(),
-                emissions: Vec::new(),
-                token: None,
-                pos: None,
-            }
-        }
+        CacheError::Kernel(_) | CacheError::Dangling { .. } => EvalResult {
+            status: EVAL.to_owned(),
+            value: error.to_string(),
+            emissions: Vec::new(),
+            token: None,
+            pos: None,
+        },
     }
 }
 
 fn run(vm: &mut Vm, module: &std::rc::Rc<crate::ir::Module>, host: &dyn Host) -> EvalResult {
-    let rendered = run_to_value(vm, module, host)
-        .and_then(|value| render(vm, host, value, RenderMode::Plain))
+    // One memo across the evaluation and the render of it: the printer forces
+    // too, and both answer into the one recording the caller holds.
+    let mut memo = crate::eval::JobMemo::default();
+    let rendered = run_to_value_with(vm, module, host, &mut memo)
+        .and_then(|value| render_with(vm, host, value, RenderMode::Plain, &mut memo))
         .and_then(|bytes| {
             // The serve row's answer is text today (the cache encodes it as
             // a string); a non-UTF-8 rendering refuses by name here rather
@@ -441,13 +457,27 @@ fn run(vm: &mut Vm, module: &std::rc::Rc<crate::ir::Module>, host: &dyn Host) ->
 
 /// Run a compiled module and stop at its value, in weak head normal form.
 ///
-/// The one place a user's expression starts the VM. [`run`] renders what this
-/// returns; [`evaluate_value`] hands it to an embedder as a live value. Two
-/// callers, one loop.
+/// The one place a user's expression starts the VM, through
+/// [`run_to_value_with`]: [`run`] renders what it returns, the handle API's
+/// questions (`capi`) hand it to the embedder as handles, and
+/// [`evaluate_value`] as a live value. One loop for all of them.
 pub(crate) fn run_to_value(
     vm: &mut Vm,
     module: &std::rc::Rc<crate::ir::Module>,
     host: &dyn Host,
+) -> Result<Value, EvalError> {
+    let mut memo = crate::eval::JobMemo::default();
+    run_to_value_with(vm, module, host, &mut memo)
+}
+
+/// [`run_to_value`] with the evaluation's memo lent by the caller, for a
+/// caller holding one recording across several drives
+/// ([`crate::eval::drive_with`] says who).
+pub(crate) fn run_to_value_with(
+    vm: &mut Vm,
+    module: &std::rc::Rc<crate::ir::Module>,
+    host: &dyn Host,
+    memo: &mut crate::eval::JobMemo,
 ) -> Result<Value, EvalError> {
     // The ceiling is applied here, at the one point a user's expression
     // starts, and deliberately not where each embedder builds its VM.
@@ -471,7 +501,7 @@ pub(crate) fn run_to_value(
     // earlier evaluation and is about to be asked for another.
     vm.clear_interrupted();
     vm.start_module(module);
-    drive(vm, host).map_err(crate::eval::map_vm_error)
+    crate::eval::drive_with(vm, host, memo).map_err(crate::eval::map_vm_error)
 }
 
 /// How a value is turned into the bytes a command prints.
@@ -489,6 +519,13 @@ pub(crate) fn run_to_value(
 pub enum RenderMode {
     /// `nix-instantiate --eval --strict`: cppnix's `printAmbiguous`.
     Plain,
+    /// `nix-instantiate --eval` without `--strict`: cppnix prints the value
+    /// forced to weak head normal form and writes `<CODE>` for every child
+    /// still a thunk. Which children are thunks is evaluator-internal, so
+    /// this backend serves only the values that have no children -- a
+    /// string, a number, a Boolean, null, a path -- for which lazy and
+    /// strict printing are one answer, and refuses the rest by name.
+    PlainLazy,
     /// `nix eval` with no output flag: cppnix's `ValuePrinter`. A different
     /// function from `printAmbiguous` and not everywhere the same one, so it
     /// is a different mode rather than the same one reused. See
@@ -522,7 +559,7 @@ pub enum RenderMode {
 /// live value and a live value is not an answer until somebody has said which
 /// part of it and in what shape. That was read as "a handle walk does not
 /// have the whole question up front" (ENG-12470), which is true of the handle
-/// *table* and false of every *command* that uses one: `rustEvalSelect` and
+/// *table* and false of every *command* that uses one: `rustEvalRender` and
 /// `rustEvalDerivations` each know all of it before they open a session. The
 /// key was being built one layer below the layer that knew the question, so
 /// it could only ever serve the one caller whose question never varies.
@@ -543,6 +580,46 @@ pub enum Question {
     /// Perform `selection`, then report the derivation there. `nix build`,
     /// which wants a drvPath and an output set rather than printable bytes.
     Derivation { selection: Selection },
+    /// Walk EVERY attribute path of `selection` -- a list to visit, not a
+    /// ladder of candidates -- and report every derivation reachable from
+    /// each the way cppnix's `getDerivations` reaches them. `nix-build`,
+    /// whose `-A a -A b` builds both from one evaluation of the root. A
+    /// different question from [`Question::Derivation`] because the same
+    /// selection answers differently: one derivation's outputs there, the
+    /// closure of a set walk here.
+    DerivationSet { selection: Selection },
+    /// Perform `selection`, then report only the derivation path.
+    DerivationPath { selection: Selection },
+    /// Perform `selection`, then report the executable and its dependencies.
+    Application { selection: Selection },
+    /// Select a package and read its authoritative `meta.position` location.
+    SourcePosition { selection: Selection },
+    /// Unfiltered package metadata. Filtering and presentation do not change evaluation.
+    SearchPackages {
+        selection: Selection,
+        scope: SearchScope,
+    },
+    /// Strict validation with independently captured Hydra/regular IFD policy.
+    FlakeCheck {
+        selection: Selection,
+        options: crate::flake_check::Options,
+    },
+    /// Lazily classify a flake's output tree. `flags` carries the two show
+    /// options, which affect the answer and therefore belong in the key.
+    FlakeShow { selection: Selection, flags: i32 },
+    /// Read the expression as a `flake.nix`: the document
+    /// [`crate::flake_doc::flake_document`] produces, which is what cppnix's
+    /// `readFlake` reads off the value. No selection and no render mode --
+    /// the whole file is the question -- so the tag alone distinguishes it;
+    /// the module digest, the settings and the read set are the rest of the
+    /// row as for every question.
+    FlakeDocument,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchScope {
+    Selected,
+    FlakeDefaults,
 }
 
 /// The walk a question performs on the value before it reads anything out.
@@ -572,6 +649,54 @@ pub struct Selection {
     /// carries arguments and indexes lists it stops holding silently -- one
     /// tag is cheaper than the invariant.
     pub index_lists: bool,
+    /// `nix eval --apply`: an expression applied to the selected value
+    /// before the question is answered, with the directory it is parsed
+    /// under (cppnix parses it under `rootPath(".")`, the working
+    /// directory). In the key, text and base both: the answer is the
+    /// application's, and a relative path inside the expression means
+    /// something else under another directory.
+    pub apply: Option<Apply>,
+    /// `--arg` and `--argstr`, in command-line order: cppnix's `autoArgs`.
+    /// They decide what a function met on the walk is applied to
+    /// (`findAlongAttrPath` auto-calls before every component, and
+    /// `getDerivations` at every level), so a walk with different arguments
+    /// is a different walk, and the arguments are in the key whole: a
+    /// `--arg` is an expression and its base directory, a `--argstr` is its
+    /// bytes.
+    pub auto_args: Vec<AutoArg>,
+    /// Whether the selected value itself is auto-called at the end, which
+    /// `nix-instantiate --eval` does when it has arguments (`processExpr`)
+    /// and `nix eval` never does. cppnix skips the call when there are no
+    /// arguments, and so does the evaluator; the flag is in the key
+    /// regardless, because keying it only when it matters is a rule a
+    /// reader would have to rediscover.
+    pub auto_call: bool,
+}
+
+/// An expression to apply to the selected value, and where it is parsed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Apply {
+    pub text: String,
+    pub base: String,
+}
+
+/// One `--arg name expr` or `--argstr name string`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoArg {
+    pub name: String,
+    pub value: AutoArgValue,
+}
+
+/// What an auto-argument binds the name to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AutoArgValue {
+    /// `--arg`: an expression, parsed under `base` (cppnix's
+    /// `rootPath(".")`, the working directory) and evaluated lazily -- one
+    /// thunk shared by every formal it is bound to, so `--arg a (trace ..)`
+    /// traces once however many functions take `a`.
+    Expr { text: String, base: String },
+    /// `--argstr`: the bytes, as a string with no context.
+    Str(String),
 }
 
 impl Selection {
@@ -581,6 +706,9 @@ impl Selection {
         Self {
             attr_paths: vec![attr_path.into()],
             index_lists: true,
+            apply: None,
+            auto_args: Vec::new(),
+            auto_call: false,
         }
     }
 }
@@ -712,6 +840,41 @@ impl Question {
                 parts.push(b"derivation".to_vec());
                 selection.extend(&mut parts);
             }
+            Question::DerivationSet { selection } => {
+                parts.push(b"derivation-set".to_vec());
+                selection.extend(&mut parts);
+            }
+            Question::DerivationPath { selection } => {
+                parts.push(b"derivation-path".to_vec());
+                selection.extend(&mut parts);
+            }
+            Question::Application { selection } => {
+                parts.push(b"application".to_vec());
+                selection.extend(&mut parts);
+            }
+            Question::SourcePosition { selection } => {
+                parts.push(b"source-position".to_vec());
+                selection.extend(&mut parts);
+            }
+            Question::SearchPackages { selection, scope } => {
+                parts.push(b"search-packages".to_vec());
+                selection.extend(&mut parts);
+                parts.push(match scope {
+                    SearchScope::Selected => b"selected".to_vec(),
+                    SearchScope::FlakeDefaults => b"flake-defaults".to_vec(),
+                });
+            }
+            Question::FlakeCheck { selection, options } => {
+                parts.push(b"flake-check".to_vec());
+                selection.extend(&mut parts);
+                parts.push(options.flags().to_be_bytes().to_vec());
+            }
+            Question::FlakeShow { selection, flags } => {
+                parts.push(b"flake-show".to_vec());
+                selection.extend(&mut parts);
+                parts.push(flags.to_be_bytes().to_vec());
+            }
+            Question::FlakeDocument => parts.push(b"flake-document".to_vec()),
         }
         let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
         // `hash::tagged` length-prefixes every field, so an attribute path
@@ -727,6 +890,9 @@ impl Selection {
         let Self {
             attr_paths,
             index_lists,
+            apply,
+            auto_args,
+            auto_call,
         } = self;
         // The count first: `hash::tagged` length-prefixes each part, so two
         // ladders cannot merge, but a ladder followed by the render tag and a
@@ -741,6 +907,41 @@ impl Selection {
         } else {
             b"attrs-only".to_vec()
         });
+        // Three parts or one, so "no apply" cannot spell an apply whose text
+        // and base happen to be empty.
+        match apply {
+            Some(Apply { text, base }) => {
+                parts.push(b"apply".to_vec());
+                parts.push(text.as_bytes().to_vec());
+                parts.push(base.as_bytes().to_vec());
+            }
+            None => parts.push(b"no-apply".to_vec()),
+        }
+        // The count first, as for the ladder, then each argument as its
+        // name, its kind, and the kind's own parts: a `--arg` is text and
+        // base, a `--argstr` is text alone. The kind tag decides how many
+        // parts follow it, so `--arg a x` and `--argstr a x` are different
+        // sequences even where their bytes agree.
+        parts.push((auto_args.len() as u64).to_be_bytes().to_vec());
+        for AutoArg { name, value } in auto_args {
+            parts.push(name.as_bytes().to_vec());
+            match value {
+                AutoArgValue::Expr { text, base } => {
+                    parts.push(b"arg".to_vec());
+                    parts.push(text.as_bytes().to_vec());
+                    parts.push(base.as_bytes().to_vec());
+                }
+                AutoArgValue::Str(text) => {
+                    parts.push(b"argstr".to_vec());
+                    parts.push(text.as_bytes().to_vec());
+                }
+            }
+        }
+        parts.push(if *auto_call {
+            b"auto-call".to_vec()
+        } else {
+            b"no-auto-call".to_vec()
+        });
     }
 }
 
@@ -751,6 +952,7 @@ impl Selection {
 fn render_tag(mode: RenderMode) -> &'static [u8] {
     match mode {
         RenderMode::Plain => b"plain",
+        RenderMode::PlainLazy => b"plain-lazy",
         RenderMode::ValuePrinter => b"value-printer",
         RenderMode::Json => b"json",
         RenderMode::Raw => b"raw",
@@ -769,16 +971,50 @@ pub fn render(
     value: Value,
     mode: RenderMode,
 ) -> Result<Vec<u8>, EvalError> {
+    let mut memo = crate::eval::JobMemo::default();
+    render_with(vm, host, value, mode, &mut memo)
+}
+
+/// [`render`] with the evaluation's memo lent by the caller
+/// ([`crate::eval::drive_with`] says who lends one).
+pub(crate) fn render_with(
+    vm: &mut Vm,
+    host: &dyn Host,
+    value: Value,
+    mode: RenderMode,
+    memo: &mut crate::eval::JobMemo,
+) -> Result<Vec<u8>, EvalError> {
     match mode {
         RenderMode::Plain => {
             vm.start_print(value);
-            finish_string(vm, host, "printer")
+            finish_string(vm, host, memo, "printer")
+        }
+        RenderMode::PlainLazy => {
+            if !matches!(
+                value,
+                Value::Str(_)
+                    | Value::Int(_)
+                    | Value::Float(_)
+                    | Value::Bool(_)
+                    | Value::Null
+                    | Value::Path(_)
+            ) {
+                return Err(EvalError::Unimplemented(crate::refusal::Refusal::new(
+                    crate::refusal::RefusalToken::LazyPrint,
+                    format!(
+                        "lazy top-level printing of {} (run with --strict)",
+                        crate::value2::type_name(&value)
+                    ),
+                )));
+            }
+            vm.start_print(value);
+            finish_string(vm, host, memo, "printer")
         }
         RenderMode::ValuePrinter => {
             vm.start_task(crate::task::Task::Print(
                 crate::print::Print::value_printer(value),
             ));
-            finish_string(vm, host, "printer")
+            finish_string(vm, host, memo, "printer")
         }
         RenderMode::Json => {
             let Some(idx) = crate::builtins::TABLE
@@ -795,7 +1031,7 @@ pub fn render(
                 idx,
                 vec![crate::value2::Slot::value(value)],
             ));
-            finish_string(vm, host, "toJSON")
+            finish_string(vm, host, memo, "toJSON")
         }
         // Through `builtins.toXML`'s own walker, the way `Json` goes through
         // `toJSON`'s: cppnix's `--xml` and `prim_toXML` are one function,
@@ -817,7 +1053,7 @@ pub fn render(
                 idx,
                 vec![crate::value2::Slot::value(value)],
             ));
-            finish_string(vm, host, "toXML")
+            finish_string(vm, host, memo, "toXML")
         }
         // cppnix's `--raw` calls coerceToString with coerceMore = false, so
         // an integer or a Boolean is an error here even though `toString`
@@ -863,8 +1099,13 @@ pub fn render(
 
 /// Drive the machine to a `Value::Str` and unwrap its bytes. Every renderer
 /// above ends in one, so a non-string here is this crate's bug and says so.
-fn finish_string(vm: &mut Vm, host: &dyn Host, what: &str) -> Result<Vec<u8>, EvalError> {
-    match drive(vm, host) {
+fn finish_string(
+    vm: &mut Vm,
+    host: &dyn Host,
+    memo: &mut crate::eval::JobMemo,
+    what: &str,
+) -> Result<Vec<u8>, EvalError> {
+    match crate::eval::drive_with(vm, host, memo) {
         Ok(Value::Str(text)) => Ok(text.bytes().to_vec()),
         Ok(other) => Err(EvalError::eval(
             ErrKind::Eval,
@@ -900,15 +1141,14 @@ fn finish_string(vm: &mut Vm, host: &dyn Host, what: &str) -> Result<Vec<u8>, Ev
 /// ENG-12470, ENG-12830.
 pub fn evaluate_value(
     vm: &mut Vm,
-    modules: &mut ModuleCache<'_, dyn Cas>,
     host: &dyn Host,
     source: &str,
     base_dir: &str,
     origin: Origin<'_>,
 ) -> (Result<Value, EvalError>, Reuse) {
     let mut reuse = Reuse::default();
-    let before = modules.hits();
-    let compiled = match modules.compile(source, base_dir, origin, vm.settings()) {
+    let before = vm.modules().hits();
+    let compiled = match vm.compile(source, base_dir, origin) {
         Ok(compiled) => compiled,
         Err(error) => {
             let failure = compile_failure(&error);
@@ -917,122 +1157,58 @@ pub fn evaluate_value(
             return (Err(error), reuse);
         }
     };
-    reuse.compile_hit = modules.hits() > before;
+    reuse.compile_hit = vm.modules().hits() > before;
     (run_to_value(vm, &compiled.module, host), reuse)
 }
 
-/// Evaluate one source with a store on disk, the shape an embedder that runs
-/// one expression per process needs.
+/// Evaluate one source, the shape an embedder that runs one expression per
+/// process needs. The machine's compile cache decides whether there is a store
+/// ([`crate::modcache::ModuleCache::store`]); with one, the result memo is
+/// consulted and published too.
 ///
-/// Everything is built per call. That is affordable because nothing is loaded
-/// eagerly: rows are point lookups by key, so opening the store is creating
-/// three paths. The win is not within the process, it is that the next process
-/// finds this one's work.
+/// Everything else is built per call. That is affordable because nothing is
+/// loaded eagerly: rows are point lookups by key, so the result cache over an
+/// open store is three paths. The win is not within the process, it is that
+/// the next process finds this one's work.
 ///
 /// Warnings about damaged store entries are returned rather than printed, so
 /// the embedder decides where they go.
-// Eight because the machine and the host joined the six that were already
-// here. Both are arguments for the reason this change exists: who evaluates
-// and who answers a read are the caller's to choose, and the previous
-// six-argument shape got them from process state instead. Bundling them into
-// a pair struct would hide a distinction the signature is here to make.
-#[allow(clippy::too_many_arguments)]
 pub fn evaluate_once(
     vm: &mut Vm,
     host: &dyn Host,
     source: &str,
     base_dir: &str,
     origin: Origin<'_>,
-    cache_dir: Option<&std::path::Path>,
     memoise_results: bool,
     verify_rate: u32,
 ) -> (Result<String, EvalError>, Vec<Complaint>) {
-    let Some(cache_dir) = cache_dir else {
+    // Cloned out of the machine because the result cache borrows the store for
+    // the length of the run while the machine is borrowed mutably. A `Store`
+    // is a handle, so the clone is the same cache.
+    let Some(store) = vm.modules().store().cloned() else {
         return (
             crate::eval::eval_str_on(source, base_dir, origin, vm, host),
             Vec::new(),
         );
     };
 
-    let mut warnings = Vec::new();
-    let store = match crate::store::Store::open(cache_dir) {
-        Ok(store) => store,
-        Err(error) => {
-            // A store that will not open is a cache that is not there. The
-            // evaluation is still owed an answer, so fall back rather than
-            // failing an expression over a directory.
-            warnings.push(Complaint::warning(format!(
-                "cannot open the evaluation cache at {}: {error}; evaluating without it",
-                cache_dir.display()
-            )));
-            return (
-                crate::eval::eval_str_on(source, base_dir, origin, vm, host),
-                warnings,
-            );
-        }
-    };
-
-    let cas = match ix_kernel::cas::DirCas::open(store.objects_dir()) {
-        Ok(cas) => cas,
-        Err(error) => {
-            warnings.push(Complaint::warning(format!(
-                "cannot open the cache's object store: {error}; evaluating without it"
-            )));
-            return (
-                crate::eval::eval_str_on(source, base_dir, origin, vm, host),
-                warnings,
-            );
-        }
-    };
-    let rows = match ix_kernel::rows::DirRows::open(store.index_dir()) {
-        Ok(rows) => rows,
-        Err(error) => {
-            warnings.push(Complaint::warning(format!(
-                "cannot open the cache's index: {error}; evaluating without it"
-            )));
-            return (
-                crate::eval::eval_str_on(source, base_dir, origin, vm, host),
-                warnings,
-            );
-        }
-    };
-    let witness = match crate::readset::DirWitness::open(store.witness_dir()) {
-        Ok(witness) => witness,
-        Err(error) => {
-            warnings.push(Complaint::warning(format!(
-                "cannot open the cache's witness store: {error}; evaluating without it"
-            )));
-            return (
-                crate::eval::eval_str_on(source, base_dir, origin, vm, host),
-                warnings,
-            );
-        }
-    };
-
-    let cas: &dyn Cas = &cas;
-    let mut modules = ModuleCache::persistent(cas, &rows);
-    let mut results = ResultCache::persistent(cas, &rows, &witness);
+    let mut results = ResultCache::persistent(&store);
     results.set_verify_rate(verify_rate);
-    let (result, _) = if memoise_results {
-        evaluate(
-            vm,
-            &mut modules,
-            Some(&mut results),
-            host,
-            source,
-            base_dir,
-            origin,
-        )
-    } else {
-        evaluate(vm, &mut modules, None, host, source, base_dir, origin)
-    };
-
-    warnings.extend(
-        modules
-            .take_corruption()
-            .into_iter()
-            .map(Complaint::warning),
+    let (result, _) = evaluate(
+        vm,
+        memoise_results.then_some(&mut results),
+        host,
+        source,
+        base_dir,
+        origin,
     );
+
+    let mut warnings: Vec<Complaint> = vm
+        .modules_mut()
+        .take_corruption()
+        .into_iter()
+        .map(Complaint::warning)
+        .collect();
     warnings.extend(results.take_corruption());
 
     let answer = match error_of(&result) {
@@ -1042,8 +1218,7 @@ pub fn evaluate_once(
     (answer, warnings)
 }
 
-/// Evaluate one source to a live value, with the on-disk compile cache when
-/// the embedder configured one.
+/// Evaluate one source to a live value, through the machine's compile cache.
 ///
 /// The value-shaped twin of [`evaluate_once`], and the reason it takes the VM
 /// rather than making one: the value it returns points into that VM's modules
@@ -1053,76 +1228,62 @@ pub fn evaluate_once(
 ///
 /// Warnings about damaged cache entries are returned, not printed, for the
 /// same reason they are there: the embedder owns where they go.
+///
+/// This path publishes modules but never a result, so no `record` runs the
+/// cap sweep for it; it sweeps once itself at the end, so a store reached
+/// only through the handle API is bounded by its cap (0: never) like every
+/// other.
 pub fn evaluate_value_once(
     vm: &mut Vm,
     host: &dyn Host,
     source: &str,
     base_dir: &str,
     origin: Origin<'_>,
-    cache_dir: Option<&std::path::Path>,
 ) -> (Result<Value, EvalError>, Vec<Complaint>) {
-    let mut warnings = Vec::new();
-
-    // No cache dir, or a cache dir that will not open: evaluate anyway with
-    // an in-memory one. A cache is an optimisation, and an expression is
-    // still owed an answer when it is missing.
-    let opened = cache_dir.and_then(|dir| match open_store(dir) {
-        Ok(store) => Some(store),
-        Err(reason) => {
-            warnings.push(Complaint::warning(format!(
-                "{reason}; evaluating without it"
-            )));
-            None
-        }
-    });
-
-    let memory;
-    let (cas, rows): (&dyn Cas, Option<&ix_kernel::rows::DirRows>) = match &opened {
-        Some(store) => (&store.cas, Some(&store.rows)),
-        None => {
-            memory = ix_kernel::cas::MemoryCas::new();
-            (&memory, None)
-        }
-    };
-    let mut modules = match rows {
-        Some(rows) => ModuleCache::persistent(cas, rows),
-        None => ModuleCache::new(cas),
-    };
-
-    let (answer, _) = evaluate_value(vm, &mut modules, host, source, base_dir, origin);
-    warnings.extend(
-        modules
-            .take_corruption()
-            .into_iter()
-            .map(Complaint::warning),
-    );
+    let (answer, _) = evaluate_value(vm, host, source, base_dir, origin);
+    let mut warnings: Vec<Complaint> = vm
+        .modules_mut()
+        .take_corruption()
+        .into_iter()
+        .map(Complaint::warning)
+        .collect();
+    warnings.extend(vm.modules().store().and_then(crate::readset::sweep_to_cap));
     (answer, warnings)
 }
 
-/// The three on-disk pieces one evaluation cache is made of, opened together
-/// so a caller cannot hold half of one.
-struct OpenStore {
-    cas: ix_kernel::cas::DirCas,
-    rows: ix_kernel::rows::DirRows,
-    witness: crate::readset::DirWitness,
-}
-
-fn open_store(dir: &std::path::Path) -> Result<OpenStore, String> {
-    let store = crate::store::Store::open(dir).map_err(|error| {
+fn open_store(dir: &std::path::Path) -> Result<crate::store::Store, String> {
+    crate::store::Store::open(dir).map_err(|error| {
         format!(
             "cannot open the evaluation cache at {}: {error}",
             dir.display()
         )
-    })?;
-    let cas = ix_kernel::cas::DirCas::open(store.objects_dir())
-        .map_err(|error| format!("cannot open the cache's object store: {error}"))?;
-    let rows = ix_kernel::rows::DirRows::open(store.index_dir())
-        .map_err(|error| format!("cannot open the cache's index: {error}"))?;
-    // Rows without witnesses is a cache holding answers it cannot address, so
-    // the witness store is opened with the other two rather than on demand.
-    let witness = crate::readset::DirWitness::open(store.witness_dir())
-        .map_err(|error| format!("cannot open the cache's witness store: {error}"))?;
-    Ok(OpenStore { cas, rows, witness })
+    })
+}
+
+/// Open the on-disk cache at `dir`, capped at `cache_max_bytes` (0 for no
+/// cap), or say why not.
+///
+/// A cache is an optimisation and an expression is still owed an answer when
+/// it is missing, so a directory that will not open is a warning and no store,
+/// never a failure; `None` for `dir` is the embedder choosing no cache, and is
+/// silent. The caller puts the store behind its machine
+/// ([`crate::modcache::ModuleCache::persistent`] into [`Vm::with_modules`]);
+/// from then on the machine is the one place that knows whether there is a
+/// cache, which is what lets [`evaluate_once`] take a VM and nothing else.
+pub fn open_cache(
+    dir: Option<&std::path::Path>,
+    cache_max_bytes: u64,
+) -> (Option<crate::store::Store>, Option<Complaint>) {
+    match dir.map(open_store) {
+        None => (None, None),
+        Some(Ok(store)) => (Some(store.with_max_bytes(cache_max_bytes)), None),
+        Some(Err(reason)) => (
+            None,
+            Some(Complaint::warning(format!(
+                "{reason}; evaluating without it"
+            ))),
+        ),
+    }
 }
 
 /// The on-disk evaluation cache a handle-API session memoises into.
@@ -1133,12 +1294,14 @@ fn open_store(dir: &std::path::Path) -> Result<OpenStore, String> {
 /// sampler all have to survive in between. [`evaluate_once`] needs none of
 /// that and keeps building its pieces per call.
 ///
-/// The [`ResultCache`] itself is still built per half. It borrows the three
-/// pieces, so a struct owning both would be self-referential; building one is
-/// three field assignments, and the only state that has to cross is the
-/// sampler's, which is carried explicitly below.
+/// The [`ResultCache`] itself is still built per half. It borrows the store,
+/// so a struct owning both would be self-referential. The sampler and optional
+/// bounded decoded-witness owner are carried explicitly across halves. A CAPI
+/// cache handle can share that owner across fresh sessions without retaining
+/// VM values or host contexts.
 pub struct QuestionCache {
-    store: OpenStore,
+    store: crate::store::Store,
+    retained: Option<crate::readset::retained::Shared>,
     verify_rate: u32,
     /// The sampler's xorshift state, carried between the halves and between
     /// questions.
@@ -1149,24 +1312,48 @@ pub struct QuestionCache {
     /// same way everywhere, and looks on.
     verify_state: u64,
     complaints: Vec<Complaint>,
+    /// What the last [`QuestionCache::serve`] answered from, for
+    /// [`QuestionCache::forget_served`]: the identity and the row key the
+    /// replayed read set produced.
+    last_served: Option<(crate::readset::EvalId, ix_kernel::Key)>,
 }
 
 impl QuestionCache {
-    /// Open the cache at `dir`, or say why not.
-    pub fn open(dir: &std::path::Path, verify_rate: u32) -> Result<Self, String> {
+    /// Open the cache at `dir`, capped at `cache_max_bytes` (0 for no cap),
+    /// or say why not.
+    pub fn open(
+        dir: &std::path::Path,
+        verify_rate: u32,
+        cache_max_bytes: u64,
+    ) -> Result<Self, String> {
         Ok(Self {
-            store: open_store(dir)?,
+            store: open_store(dir)?.with_max_bytes(cache_max_bytes),
+            retained: None,
             verify_rate,
             // The same seed `ResultCache::new` uses: any non-zero value will
             // do, and a fixed one makes a run that finds something repeatable.
             verify_state: 0x2545_f491_4f6c_dd1d,
             complaints: Vec::new(),
+            last_served: None,
         })
     }
 
-    /// The compile cache backed by this store.
-    pub fn modules(&self) -> ModuleCache<'_, dyn Cas> {
-        ModuleCache::persistent(&self.store.cas, &self.store.rows)
+    pub(crate) fn with_retained(
+        mut self,
+        retained: Option<crate::readset::retained::Shared>,
+    ) -> Self {
+        self.retained = retained;
+        self
+    }
+
+    /// The filtered-copy memo backed by this store, for the recorder of a
+    /// question ([`crate::readset::RecordingHost::with_copy_memo`]). The
+    /// store directory is the embedder's ([`crate::eval::store_dir`]), the
+    /// same one the replay's sealing uses.
+    #[must_use]
+    pub fn copy_memo(&self) -> crate::readset::CopyMemo {
+        self.store
+            .copy_memo(crate::eval::store_dir().map(str::to_owned))
     }
 
     /// [`serve`], against this store.
@@ -1176,7 +1363,30 @@ impl QuestionCache {
         host: &dyn Host,
         settings: &crate::eval::Settings,
     ) -> Served {
-        self.with_results(|results| serve(results, identity, host, settings))
+        let (served, key) = self.with_results(|results| {
+            let served = serve(results, identity, host, settings);
+            (served, results.served_key())
+        });
+        self.last_served = key.map(|key| (*identity, key));
+        served
+    }
+
+    /// What the last [`QuestionCache::serve`] answered from, if it answered.
+    #[must_use]
+    pub fn last_served(&self) -> Option<(crate::readset::EvalId, ix_kernel::Key)> {
+        self.last_served
+    }
+
+    /// Forget a row this cache (or another process's) served, because the
+    /// embedder could not use the answer. See [`ResultCache::forget`].
+    pub fn forget(
+        &mut self,
+        identity: &crate::readset::EvalId,
+        key: ix_kernel::Key,
+        why: &str,
+    ) -> Result<(), String> {
+        let result = self.with_results(|results| results.forget(identity, key, why));
+        result.map_err(|error| error.to_string())
     }
 
     /// [`settle`], against this store.
@@ -1212,12 +1422,13 @@ impl QuestionCache {
         // borrow of the sampler are of different fields.
         let Self {
             store,
+            retained,
             verify_rate,
             verify_state,
             complaints,
+            last_served: _,
         } = self;
-        let cas: &dyn Cas = &store.cas;
-        let mut results = ResultCache::persistent(cas, &store.rows, &store.witness);
+        let mut results = ResultCache::persistent(store).with_retained(retained.clone());
         results.set_verify_rate(*verify_rate);
         results.set_verify_state(*verify_state);
         let answer = body(&mut results);
@@ -1324,13 +1535,58 @@ mod question_key {
             ("select ab/plain", select("ab", RenderMode::Plain)),
             ("derivation ''", derivation("")),
             ("derivation a", derivation("a")),
+            (
+                "derivation-set a",
+                Question::DerivationSet {
+                    selection: Selection::one("a"),
+                },
+            ),
+            (
+                "derivation-path a",
+                Question::DerivationPath {
+                    selection: Selection::one("a"),
+                },
+            ),
+            (
+                "application a",
+                Question::Application {
+                    selection: Selection::one("a"),
+                },
+            ),
+            (
+                "source-position a",
+                Question::SourcePosition {
+                    selection: Selection::one("a"),
+                },
+            ),
+            (
+                "source-position b",
+                Question::SourcePosition {
+                    selection: Selection::one("b"),
+                },
+            ),
+            (
+                "flake-show/default",
+                Question::FlakeShow {
+                    selection: Selection::one(""),
+                    flags: 0,
+                },
+            ),
+            (
+                "flake-show/legacy",
+                Question::FlakeShow {
+                    selection: Selection::one(""),
+                    flags: 1,
+                },
+            ),
+            ("flake-document", Question::FlakeDocument),
         ];
         all_distinct(
             questions
                 .iter()
                 .map(|(label, question)| ((*label).to_owned(), question.fingerprint()))
                 .collect(),
-            11,
+            19,
             "question",
         );
     }
@@ -1385,6 +1641,9 @@ mod question_key {
                 selection: Selection {
                     attr_paths: paths.iter().map(|p| (*p).to_owned()).collect(),
                     index_lists: false,
+                    apply: None,
+                    auto_args: Vec::new(),
+                    auto_call: false,
                 },
                 render: RenderMode::Raw,
             }
@@ -1404,6 +1663,111 @@ mod question_key {
         );
     }
 
+    /// `--apply` moves the key by its text AND by the directory it is
+    /// parsed under: `x: x` and `x: x + 1` are two answers, and so are one
+    /// expression naming `./f` from two directories.
+    #[test]
+    fn the_apply_expression_and_its_base_are_in_the_key() {
+        let with = |apply: Option<(&str, &str)>| {
+            Question::Select {
+                selection: Selection {
+                    attr_paths: vec!["a".to_owned()],
+                    index_lists: true,
+                    apply: apply.map(|(text, base)| Apply {
+                        text: text.to_owned(),
+                        base: base.to_owned(),
+                    }),
+                    auto_args: Vec::new(),
+                    auto_call: false,
+                },
+                render: RenderMode::Raw,
+            }
+            .fingerprint()
+        };
+        let keys = vec![
+            ("none".to_owned(), with(None)),
+            ("identity".to_owned(), with(Some(("x: x", "/w")))),
+            ("plus one".to_owned(), with(Some(("x: x + 1", "/w")))),
+            ("identity elsewhere".to_owned(), with(Some(("x: x", "/v")))),
+            ("empty".to_owned(), with(Some(("", "")))),
+        ];
+        all_distinct(keys, 5, "apply");
+    }
+
+    /// `--arg`/`--argstr` and the final auto-call are in the key: the same
+    /// bytes bound by the two flags, the same expression under two
+    /// directories, two names, two orders, and with or without the call.
+    #[test]
+    fn the_auto_arguments_and_the_auto_call_are_in_the_key() {
+        let arg = |name: &str, text: &str, base: &str| AutoArg {
+            name: name.to_owned(),
+            value: AutoArgValue::Expr {
+                text: text.to_owned(),
+                base: base.to_owned(),
+            },
+        };
+        let str_arg = |name: &str, text: &str| AutoArg {
+            name: name.to_owned(),
+            value: AutoArgValue::Str(text.to_owned()),
+        };
+        let with = |auto_args: Vec<AutoArg>, auto_call: bool| {
+            Question::Select {
+                selection: Selection {
+                    attr_paths: vec![String::new()],
+                    index_lists: true,
+                    apply: None,
+                    auto_args,
+                    auto_call,
+                },
+                render: RenderMode::Plain,
+            }
+            .fingerprint()
+        };
+        let keys = vec![
+            ("none".to_owned(), with(vec![], false)),
+            ("none, called".to_owned(), with(vec![], true)),
+            ("arg".to_owned(), with(vec![arg("a", "1", "/w")], true)),
+            (
+                "arg elsewhere".to_owned(),
+                with(vec![arg("a", "1", "/v")], true),
+            ),
+            ("argstr".to_owned(), with(vec![str_arg("a", "1")], true)),
+            (
+                "other name".to_owned(),
+                with(vec![arg("b", "1", "/w")], true),
+            ),
+            (
+                "uncalled".to_owned(),
+                with(vec![arg("a", "1", "/w")], false),
+            ),
+            (
+                "two".to_owned(),
+                with(vec![arg("a", "1", "/w"), arg("b", "2", "/w")], true),
+            ),
+            (
+                "two, swapped".to_owned(),
+                with(vec![arg("b", "2", "/w"), arg("a", "1", "/w")], true),
+            ),
+            // An empty text under an empty base is still an `--arg`, not
+            // the absence of one.
+            ("empty arg".to_owned(), with(vec![arg("a", "", "")], true)),
+        ];
+        all_distinct(keys, 10, "auto-args");
+    }
+
+    /// `nix-build`'s set walk and `nix build`'s single derivation are two
+    /// rows for one selection.
+    #[test]
+    fn the_derivation_set_walk_is_its_own_question() {
+        let selection = Selection::one("");
+        let single = Question::Derivation {
+            selection: selection.clone(),
+        }
+        .fingerprint();
+        let set = Question::DerivationSet { selection }.fingerprint();
+        assert_ne!(single, set, "one selection, two questions, one key");
+    }
+
     /// The list-indexing rule is in the key.
     ///
     /// `xs.0` is the first element of a list under `--expr`'s walker and a
@@ -1418,6 +1782,9 @@ mod question_key {
                 selection: Selection {
                     attr_paths: vec!["xs.0".to_owned()],
                     index_lists,
+                    apply: None,
+                    auto_args: Vec::new(),
+                    auto_call: false,
                 },
                 render: RenderMode::Raw,
             }
@@ -1558,22 +1925,22 @@ mod question_key {
         let settings = crate::eval::Settings::default();
         let none = Arguments::none();
         assert_ne!(
-            EvalId::of(&module, &settings, &none, &select("a", RenderMode::Raw)),
-            EvalId::of(&module, &settings, &none, &select("b", RenderMode::Raw)),
+            EvalId::of(&module, &settings, &none, &select("a", RenderMode::Raw),),
+            EvalId::of(&module, &settings, &none, &select("b", RenderMode::Raw),),
             "two attribute paths of one module are one cache entry"
         );
         let one = Arguments::new(vec![Argument::Json(r#"{"nodes":{"a":1}}"#.to_owned())]);
         let two = Arguments::new(vec![Argument::Json(r#"{"nodes":{"b":1}}"#.to_owned())]);
         let question = select("packages.x86_64-linux.hello", RenderMode::Raw);
         assert_ne!(
-            EvalId::of(&module, &settings, &one, &question),
-            EvalId::of(&module, &settings, &two, &question),
+            EvalId::of(&module, &settings, &one, &question,),
+            EvalId::of(&module, &settings, &two, &question,),
             "two flakes asking one module for one attribute are one cache entry: \
              the applied arguments are not reaching EvalId"
         );
         assert_ne!(
-            EvalId::of(&module, &settings, &none, &question),
-            EvalId::of(&module, &settings, &one, &question),
+            EvalId::of(&module, &settings, &none, &question,),
+            EvalId::of(&module, &settings, &one, &question,),
             "applying an argument and applying none are one cache entry"
         );
     }
@@ -1583,6 +1950,7 @@ mod question_key {
 mod tests {
     use super::*;
     use crate::host::{Host, RealFs};
+    use crate::modcache::ModuleCache;
     use ix_kernel::cas::MemoryCas;
 
     fn once(source: &str) -> (EvalResult, Reuse) {
@@ -1592,12 +1960,10 @@ mod tests {
     fn once_under(settings: &crate::eval::Settings, source: &str) -> (EvalResult, Reuse) {
         let cas = MemoryCas::new();
         let cas: &dyn Cas = &cas;
-        let mut modules = ModuleCache::new(cas);
         let mut results = ResultCache::new(cas);
         let mut vm = Vm::with_settings(settings.clone());
         evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &RealFs,
             source,
@@ -1643,8 +2009,9 @@ mod tests {
             heard: RefCell<Vec<String>>,
         }
         impl Host for Warner {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -1666,16 +2033,32 @@ mod tests {
                 nix_path,
                 trace
             );
-            fn read_file(&self, _p: &str) -> Result<String, String> {
+            fn read_file(&self, _p: &crate::value2::PathValue) -> Result<String, String> {
                 Err("no".to_owned())
             }
-            fn read_dir(&self, _p: &str) -> Result<Vec<(String, crate::host::FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> Result<Vec<(String, crate::host::FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                false
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(false)
             }
-            fn file_type(&self, _p: &str) -> Result<Option<crate::host::FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> Result<Option<crate::host::FileType>, String> {
                 Err("no".to_owned())
             }
             fn warn(&self, message: &str) {
@@ -1696,12 +2079,10 @@ mod tests {
         };
         let cas = MemoryCas::new();
         let cas: &dyn Cas = &cas;
-        let mut modules = ModuleCache::new(cas);
         let mut results = ResultCache::new(cas);
         let mut vm = Vm::with_settings(crate::eval::settings_with_store());
         let (first, first_reuse) = evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &host,
             source,
@@ -1711,7 +2092,6 @@ mod tests {
         let said_first = core::mem::take(&mut *host.heard.borrow_mut());
         let (second, second_reuse) = evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &host,
             source,
@@ -1762,7 +2142,6 @@ mod tests {
         let source = "builtins.foldl' (a: b: a + b) 0 (builtins.genList (x: x) 200000)";
         let cas = MemoryCas::new();
         let cas: &dyn Cas = &cas;
-        let mut modules = ModuleCache::new(cas);
         let mut results = ResultCache::new(cas);
 
         // The flag reaches exactly one machine, so this test arms nothing
@@ -1777,7 +2156,6 @@ mod tests {
         });
         let (interrupted, _) = evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &RealFs,
             source,
@@ -1798,7 +2176,6 @@ mod tests {
         let mut vm = vm;
         let (second, reuse) = evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &RealFs,
             source,
@@ -1820,7 +2197,6 @@ mod tests {
         // cannot see because they only check that answers stay right.
         let (third, reuse) = evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &RealFs,
             source,
@@ -1849,7 +2225,6 @@ mod tests {
         let _held = crate::eval::globals_shared();
         let cas = MemoryCas::new();
         let cas: &dyn Cas = &cas;
-        let mut modules = ModuleCache::new(cas);
         let mut results = ResultCache::new(cas);
         let mut vm = Vm::with_settings(crate::eval::Settings::default());
         let source = "1 + 2";
@@ -1860,15 +2235,7 @@ mod tests {
         // which is correct, and means the poison has to get there first.
         // `1 + 2` asks the host nothing, so its read set is empty and the key
         // an honest run computes is the one written here.
-        let module_id = *modules
-            .compile(
-                source,
-                "/base",
-                Origin::String,
-                &crate::eval::Settings::default(),
-            )?
-            .id
-            .hash();
+        let module_id = *vm.compile(source, "/base", Origin::String)?.id.hash();
         // The same settings the VM below runs under. `evaluate` builds the
         // identity from `vm.settings()`, so a key minted from
         // `Settings::current()` here would only match by luck (ENG-12939).
@@ -1889,12 +2256,13 @@ mod tests {
                 value: "4".to_owned(),
                 ..EvalResult::default()
             },
+            &RealFs,
+            &crate::eval::Settings::default(),
         )?;
 
         results.set_verify_rate(1);
         let (served, reuse) = evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &RealFs,
             source,
@@ -1951,14 +2319,12 @@ mod tests {
         let _held = crate::eval::globals_shared();
         let cas = MemoryCas::new();
         let cas: &dyn Cas = &cas;
-        let mut modules = ModuleCache::new(cas);
         let mut results = ResultCache::new(cas);
         let mut vm = Vm::with_settings(crate::eval::Settings::default());
         results.set_verify_rate(1);
 
         let (result, _) = evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &RealFs,
             "1 + 2",
@@ -1984,13 +2350,11 @@ mod tests {
         let _held = crate::eval::globals_shared();
         let cas = MemoryCas::new();
         let cas: &dyn Cas = &cas;
-        let mut modules = ModuleCache::new(cas);
         let mut results = ResultCache::new(cas);
         let mut vm = Vm::with_settings(crate::eval::Settings::default());
         for _ in 0..3 {
             evaluate(
                 &mut vm,
-                &mut modules,
                 Some(&mut results),
                 &RealFs,
                 "1 + 2",
@@ -2018,8 +2382,9 @@ mod tests {
 
         struct Warner(RefCell<Vec<String>>);
         impl Host for Warner {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -2041,16 +2406,32 @@ mod tests {
                 nix_path,
                 trace
             );
-            fn read_file(&self, _p: &str) -> Result<String, String> {
+            fn read_file(&self, _p: &crate::value2::PathValue) -> Result<String, String> {
                 Err("no".to_owned())
             }
-            fn read_dir(&self, _p: &str) -> Result<Vec<(String, crate::host::FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> Result<Vec<(String, crate::host::FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                false
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(false)
             }
-            fn file_type(&self, _p: &str) -> Result<Option<crate::host::FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> Result<Option<crate::host::FileType>, String> {
                 Err("no".to_owned())
             }
             fn warn(&self, message: &str) {
@@ -2066,13 +2447,11 @@ mod tests {
         let host = Warner(RefCell::new(Vec::new()));
         let cas = MemoryCas::new();
         let cas: &dyn Cas = &cas;
-        let mut modules = ModuleCache::new(cas);
         let mut results = ResultCache::new(cas);
         let mut vm = Vm::with_settings(crate::eval::settings_with_store());
 
         evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &host,
             source,
@@ -2085,7 +2464,6 @@ mod tests {
         results.set_verify_rate(1);
         let (_, reuse) = evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &host,
             source,
@@ -2112,7 +2490,7 @@ mod tests {
     /// The class has to survive memoisation, or a served `throw` would be
     /// reported as a plain evaluation error on the second run only.
     #[test]
-    fn every_failure_class_round_trips_through_a_memoised_result() {
+    fn language_failure_classes_round_trip_through_a_memoised_result() {
         let _held = crate::eval::globals_shared();
         for (source, want) in [
             ("throw \"boom\"", THROWN),
@@ -2121,16 +2499,13 @@ mod tests {
         ] {
             let cas = MemoryCas::new();
             let cas: &dyn Cas = &cas;
-            let mut modules = ModuleCache::new(cas);
             let mut results = ResultCache::new(cas);
             let mut vm = Vm::with_settings(crate::eval::Settings::default());
-            let go = |vm: &mut Vm,
-                      m: &mut ModuleCache<'_, dyn Cas>,
-                      r: &mut ResultCache<'_, dyn Cas>| {
-                evaluate(vm, m, Some(r), &RealFs, source, "/base", Origin::String)
+            let go = |vm: &mut Vm, r: &mut ResultCache<'_, dyn Cas>| {
+                evaluate(vm, Some(r), &RealFs, source, "/base", Origin::String)
             };
-            let (first, _) = go(&mut vm, &mut modules, &mut results);
-            let (second, reuse) = go(&mut vm, &mut modules, &mut results);
+            let (first, _) = go(&mut vm, &mut results);
+            let (second, reuse) = go(&mut vm, &mut results);
             assert_eq!(first.status, want, "source {source}");
             assert_eq!(
                 second.status, want,
@@ -2143,17 +2518,173 @@ mod tests {
         }
     }
 
+    /// `builtins.storePath` keeps the context its argument carried and adds
+    /// the store object it validated, without realising anything: cppnix's
+    /// `prim_storePath` calls `coerceToPath` and never `realiseContext`
+    /// (primops.cc:2029-2047). The realise hook here denies every build, so
+    /// a route that realised the argument's `.drv` context would fail the
+    /// evaluation rather than answer.
+    #[test]
+    fn store_path_preserves_input_context_without_realising_it() {
+        use crate::host::{FnHost, StoreError, StorePathResult};
+
+        fn validate(path: &crate::value2::PathValue) -> Result<StorePathResult, String> {
+            Ok(StorePathResult {
+                path: path.to_string(),
+                store_path: path.to_string(),
+            })
+        }
+        fn deny(
+            _context: &[crate::value2::ContextElem],
+        ) -> Result<std::collections::BTreeMap<String, String>, StoreError> {
+            Err(StoreError::ImportFromDerivation(
+                "a build would be import from derivation".to_owned(),
+            ))
+        }
+        fn present(_path: &str) -> Result<(), String> {
+            Ok(())
+        }
+        let host = FnHost {
+            store_path: Some(validate),
+            store_ensure: Some(present),
+            realise: Some(deny),
+            ..FnHost::default()
+        };
+        let source = concat!(
+            "builtins.getContext (builtins.storePath (builtins.appendContext ",
+            "\"/nix/store/00000000000000000000000000000000-a\" ",
+            "{ \"/nix/store/11111111111111111111111111111111-x.drv\" = { outputs = [ \"out\" ]; }; }))"
+        );
+        let cas = MemoryCas::new();
+        let cas: &dyn Cas = &cas;
+        let mut results = ResultCache::new(cas);
+        let mut vm = Vm::with_settings(crate::eval::settings_with_store());
+        let (result, _) = evaluate(
+            &mut vm,
+            Some(&mut results),
+            &host,
+            source,
+            "/base",
+            Origin::String,
+        );
+        assert_eq!(
+            result.status, OK,
+            "storePath realised or failed: {}",
+            result.value
+        );
+        assert!(
+            result
+                .value
+                .contains("11111111111111111111111111111111-x.drv"),
+            "the argument's derivation context was dropped: {}",
+            result.value
+        );
+        assert!(
+            result.value.contains("00000000000000000000000000000000-a")
+                && result.value.contains("path = true"),
+            "the validated store object is not in the result's context: {}",
+            result.value
+        );
+    }
+
+    /// An IFD refusal is its own exception class before and after a persistent
+    /// memo hit. The second cache is fresh, so its hit can only come from
+    /// replaying the witness and serving the row recorded by the first one.
+    #[test]
+    fn a_served_ifd_failure_keeps_its_typed_error_class() -> Result<(), Box<dyn core::error::Error>>
+    {
+        use crate::host::{FnHost, StoreError};
+
+        const DENIED: &str = "import from derivation is disabled";
+        const WITH_CONTEXT: &str = r#"builtins.appendContext "/nix/store/00000000000000000000000000000000-out" { "/nix/store/11111111111111111111111111111111-x.drv" = { outputs = [ "out" ]; }; }"#;
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn ensure_path(_path: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn deny_ifd(
+            _context: &[crate::value2::ContextElem],
+        ) -> Result<std::collections::BTreeMap<String, String>, StoreError> {
+            Err(StoreError::ImportFromDerivation(DENIED.to_owned()))
+        }
+
+        fn assert_ifd(result: &EvalResult) {
+            assert_eq!(result.status, IMPORT_FROM_DERIVATION);
+            assert!(matches!(
+                error_of(result),
+                Some(EvalError::Eval(
+                    ErrKind::ImportFromDerivation,
+                    message,
+                    _
+                )) if message == DENIED
+            ));
+        }
+
+        let _held = crate::eval::globals_shared();
+        let scratch =
+            Scratch(std::env::temp_dir().join(format!("ixe-served-ifd-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&scratch.0);
+        let store = crate::store::Store::open(&scratch.0)?;
+        let settings = crate::eval::settings_with_store();
+        let source = format!("builtins.readFile ({WITH_CONTEXT})");
+        let host = FnHost {
+            store_ensure: Some(ensure_path),
+            realise: Some(deny_ifd),
+            ..FnHost::default()
+        };
+
+        let first = {
+            let mut results = ResultCache::persistent(&store);
+            let mut vm = Vm::with_modules(settings.clone(), ModuleCache::persistent(store.clone()));
+            evaluate(
+                &mut vm,
+                Some(&mut results),
+                &host,
+                &source,
+                "/base",
+                Origin::String,
+            )
+        };
+        assert!(!first.1.memo_hit, "the recording run was already served");
+        assert_ifd(&first.0);
+
+        let served = {
+            let mut results = ResultCache::persistent(&store);
+            let mut vm = Vm::with_modules(settings, ModuleCache::persistent(store.clone()));
+            evaluate(
+                &mut vm,
+                Some(&mut results),
+                &host,
+                &source,
+                "/base",
+                Origin::String,
+            )
+        };
+        assert!(
+            served.1.memo_hit,
+            "the fresh cache did not serve the IFD row"
+        );
+        assert_eq!(served.0.value, first.0.value);
+        assert_ifd(&served.0);
+        Ok(())
+    }
+
     #[test]
     fn the_second_evaluation_is_served_without_running_the_vm() {
         let _held = crate::eval::globals_shared();
         let cas = MemoryCas::new();
         let cas: &dyn Cas = &cas;
-        let mut modules = ModuleCache::new(cas);
         let mut results = ResultCache::new(cas);
         let mut vm = Vm::with_settings(crate::eval::Settings::default());
         let first = evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &RealFs,
             "1 + 2",
@@ -2162,7 +2693,6 @@ mod tests {
         );
         let second = evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &RealFs,
             "1 + 2",
@@ -2179,23 +2709,12 @@ mod tests {
     /// correct rather than merely slower.
     #[test]
     fn compilation_caching_alone_still_answers() {
-        let cas = MemoryCas::new();
-        let cas: &dyn Cas = &cas;
-        let mut modules = ModuleCache::new(cas);
         let mut vm = Vm::with_settings(crate::eval::Settings::default());
         for _ in 0..3 {
-            let (result, _) = evaluate(
-                &mut vm,
-                &mut modules,
-                None,
-                &RealFs,
-                "1 + 2",
-                "/base",
-                Origin::String,
-            );
+            let (result, _) = evaluate(&mut vm, None, &RealFs, "1 + 2", "/base", Origin::String);
             assert_eq!(result.value, "3");
         }
-        assert_eq!(modules.hits(), 2);
+        assert_eq!(vm.modules().hits(), 2);
     }
 
     /// The compile cache must not change what a bad expression is reported
@@ -2299,8 +2818,9 @@ mod eng12543_e2e_probe {
         reads: RefCell<Vec<String>>,
     }
     impl Host for Counting {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -2322,17 +2842,30 @@ mod eng12543_e2e_probe {
             find_file,
             nix_path
         );
-        fn read_file(&self, path: &str) -> Result<String, String> {
-            self.reads.borrow_mut().push(path.to_owned());
+        fn read_file(&self, path: &crate::value2::PathValue) -> Result<String, String> {
+            self.reads.borrow_mut().push(path.to_string());
             Ok("secret".to_owned())
         }
-        fn read_dir(&self, _p: &str) -> Result<Vec<(String, FileType)>, String> {
+        fn read_dir(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> Result<Vec<(String, FileType)>, String> {
             Ok(Vec::new())
         }
-        fn path_exists(&self, _p: &str) -> bool {
-            true
+        fn path_exists_checked(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(true)
         }
-        fn file_type(&self, _p: &str) -> Result<Option<FileType>, String> {
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
+        }
+        fn file_type(&self, _p: &crate::value2::PathValue) -> Result<Option<FileType>, String> {
             Ok(Some(FileType::Regular))
         }
         fn get_env(&self, _n: &str) -> Option<String> {
@@ -2350,7 +2883,6 @@ mod eng12543_e2e_probe {
         };
         let cas = MemoryCas::new();
         let cas: &dyn Cas = &cas;
-        let mut modules = ModuleCache::new(cas);
         let mut results = ResultCache::new(cas);
         let source = "builtins.readFile /etc/shadow";
 
@@ -2367,7 +2899,6 @@ mod eng12543_e2e_probe {
         let mut vm = Vm::with_settings(impure);
         let (first, _) = evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &host,
             source,
@@ -2381,7 +2912,6 @@ mod eng12543_e2e_probe {
         let mut vm = Vm::with_settings(pure);
         let (second, reuse) = evaluate(
             &mut vm,
-            &mut modules,
             Some(&mut results),
             &host,
             source,

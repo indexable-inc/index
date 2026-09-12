@@ -46,10 +46,9 @@ struct PluginSettings : Config
           A list of plugin files to be loaded by Nix. Each of these files is
           dlopened by Nix. If they contain the symbol `nix_plugin_entry()`,
           this symbol is called. Alternatively, they can affect execution
-          through static initialization. In particular, these plugins may construct
-          static instances of RegisterPrimOp to add new primops or constants to the
-          expression language, RegisterStoreImplementation to add new store
-          implementations, RegisterCommand to add new subcommands to the `nix`
+          through static initialization. Plugins may construct static instances of
+          RegisterStoreImplementation to add new store implementations,
+          RegisterCommand to add new subcommands to the `nix`
           command, and RegisterSetting to add new nix config settings. See the
           constructors for those types for more details.
 

@@ -96,15 +96,15 @@ async fn restricted_read_implicitly_allows_helper_executables() -> std::io::Resu
     let policy = config.permissions.file_system_sandbox_policy();
 
     assert!(
-        policy.can_read_path_with_cwd(expected_zsh.as_path(), &cwd),
+        policy.can_read_local_path_with_cwd(expected_zsh.as_path(), &cwd),
         "expected zsh helper path to be readable, policy: {policy:?}"
     );
     assert!(
-        policy.can_read_path_with_cwd(expected_allowed_arg0_dir.as_path(), &cwd),
+        policy.can_read_local_path_with_cwd(expected_allowed_arg0_dir.as_path(), &cwd),
         "expected active arg0 helper dir to be readable, policy: {policy:?}"
     );
     assert!(
-        !policy.can_read_path_with_cwd(expected_sibling_arg0_dir.as_path(), &cwd),
+        !policy.can_read_local_path_with_cwd(expected_sibling_arg0_dir.as_path(), &cwd),
         "expected sibling arg0 helper dir to remain unreadable, policy: {policy:?}"
     );
 
@@ -467,6 +467,56 @@ fn compile_permission_profile_workspace_roots_resolves_enabled_entries() -> std:
 }
 
 #[test]
+fn legacy_project_roots_restrictions_do_not_fail_open() -> std::io::Result<()> {
+    let permissions = toml::from_str::<PermissionsToml>(
+        r#"
+[read_deny.filesystem]
+":root" = "read"
+":project_roots" = "none"
+
+[write_deny.filesystem]
+":root" = "write"
+":project_roots" = "none"
+
+[write_read.filesystem]
+":root" = "write"
+
+[write_read.filesystem.":project_roots"]
+docs = "read"
+"#,
+    )
+    .expect("legacy project roots profiles should deserialize");
+    let cwd = TempDir::new()?;
+    let docs = cwd.path().join("docs");
+    let mut startup_warnings = Vec::new();
+
+    let (read_deny_policy, _) =
+        compile_permission_profile(&permissions, "read_deny", &mut startup_warnings)?;
+    assert_eq!(
+        read_deny_policy.resolve_access_for_local_path_with_cwd(cwd.path(), cwd.path()),
+        FileSystemAccessMode::Deny
+    );
+
+    let (write_deny_policy, _) =
+        compile_permission_profile(&permissions, "write_deny", &mut startup_warnings)?;
+    assert!(!write_deny_policy.has_full_disk_write_access());
+    assert_eq!(
+        write_deny_policy.resolve_access_for_local_path_with_cwd(cwd.path(), cwd.path()),
+        FileSystemAccessMode::Deny
+    );
+
+    let (write_read_policy, _) =
+        compile_permission_profile(&permissions, "write_read", &mut startup_warnings)?;
+    assert!(!write_read_policy.has_full_disk_write_access());
+    assert_eq!(
+        write_read_policy.resolve_access_for_local_path_with_cwd(&docs, cwd.path()),
+        FileSystemAccessMode::Read
+    );
+
+    Ok(())
+}
+
+#[test]
 fn read_write_glob_warnings_skip_supported_deny_read_globs_and_trailing_subpaths() {
     let filesystem = FilesystemPermissionsToml {
         glob_scan_max_depth: None,
@@ -577,6 +627,7 @@ fn read_write_trailing_glob_suffix_compiles_as_subpath() -> std::io::Result<()> 
                 value: FileSystemSpecialPath::project_roots(Some("docs".into())),
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         }]),
         "trailing /** should compile as a subtree path instead of a glob pattern"
     );

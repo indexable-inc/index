@@ -24,7 +24,6 @@ struct InputCache
     {
         Input lockedInput;
         ref<SourceAccessor> accessor;
-        Attrs extraAttrs;
     };
 
     virtual std::optional<CachedInput> lookup(const Input & originalInput) const = 0;

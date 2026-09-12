@@ -3,6 +3,9 @@ use std::sync::Arc;
 
 use chrono::DateTime;
 use chrono::Utc;
+use codex_app_server_protocol::CodexErrorInfo;
+use codex_app_server_protocol::ThreadTimelineEntry;
+use codex_protocol::SanitizedGitUrl;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -12,13 +15,14 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GitInfo;
+use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::MultiAgentVersion;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode as MemoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_rollout::RolloutItem;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -94,6 +98,10 @@ pub struct CreateThreadParams {
     pub multi_agent_version: Option<MultiAgentVersion>,
     /// Persisted thread history contract selected when the thread was created.
     pub history_mode: ThreadHistoryMode,
+    /// Exclusive prefix of another paginated rollout inherited by this thread.
+    pub history_base: Option<HistoryPosition>,
+    /// First rollout ordinal that belongs to this subagent's projected history.
+    pub subagent_history_start_ordinal: Option<u64>,
     /// Initial context-window identity captured when the thread was created.
     pub initial_window_id: String,
     /// Metadata captured for the newly created thread.
@@ -159,6 +167,78 @@ pub struct StoredThreadHistory {
     pub items: Vec<RolloutItem>,
 }
 
+/// Persisted rollout items needed to reconstruct the latest model-visible context.
+///
+/// Local stores may return only a resumable suffix while stores without targeted reads may return
+/// the full persisted history. In either case, `items` remain in replay order and are suitable for
+/// the existing rollout reconstruction path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StoredModelContext {
+    /// Thread id represented by the model context.
+    pub thread_id: ThreadId,
+    /// Persisted rollout items in replay order.
+    pub items: Vec<RolloutItem>,
+}
+
+/// Requested boundary for inheriting a paginated thread's history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForkBoundary {
+    /// Inherit the source thread's latest durable state.
+    Latest,
+    /// Inherit history through the newest visible occurrence of this turn.
+    ThroughTurn(String),
+    /// Inherit history preceding the original visible occurrence of this turn.
+    BeforeTurn(String),
+}
+
+/// Parameters for freezing the source history used to initialize a fork.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrepareForkParams {
+    /// Immediate source thread whose metadata and approval settings are inherited.
+    pub thread_id: ThreadId,
+    /// Requested inclusive or exclusive fork boundary.
+    pub boundary: ForkBoundary,
+}
+
+/// Parameters for reverting a paginated thread's durable history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevertThreadParams {
+    /// Stable logical thread to revert.
+    pub thread_id: ThreadId,
+    /// First turn excluded from the retained history.
+    pub before_turn_id: String,
+}
+
+/// Frozen source history and model context for a reference-backed fork.
+#[derive(Debug)]
+pub struct PreparedFork {
+    /// Immediate source thread, even when the normalized history base names an ancestor.
+    pub source_thread_id: ThreadId,
+    /// Frozen physical rollout prefix inherited by the child.
+    pub history_base: Option<HistoryPosition>,
+    /// Bounded model context selected by the requested fork boundary.
+    pub model_context: Arc<Vec<RolloutItem>>,
+    /// Blocks source deletion until the child's history reference is durable.
+    _source_reservation: Box<dyn std::fmt::Debug + Send>,
+}
+
+impl PreparedFork {
+    /// Creates a frozen fork snapshot while retaining a backend-owned source reservation.
+    pub fn new(
+        source_thread_id: ThreadId,
+        history_base: Option<HistoryPosition>,
+        model_context: Arc<Vec<RolloutItem>>,
+        source_reservation: impl std::fmt::Debug + Send + 'static,
+    ) -> Self {
+        Self {
+            source_thread_id,
+            history_base,
+            model_context,
+            _source_reservation: Box::new(source_reservation),
+        }
+    }
+}
+
 /// Parameters for reading a thread summary and optionally its replay history.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadThreadParams {
@@ -191,6 +271,8 @@ pub enum ThreadSortKey {
     UpdatedAt,
     /// Sort by the thread's product recency timestamp.
     RecencyAt,
+    /// Sort by the thread's persisted position within its section.
+    SectionPosition,
 }
 
 /// The direction to use when listing stored threads.
@@ -231,6 +313,12 @@ pub struct ListThreadsParams {
     /// Optional cwd filters. `None` means all working directories, while an empty vector matches no
     /// threads.
     pub cwd_filters: Option<Vec<PathBuf>>,
+    /// Omit to include every section, set to `None` to match unsectioned
+    /// threads, or provide a section ID to match that section.
+    pub section: Option<Option<String>>,
+    /// Omit to include every project, set to None for unassigned threads,
+    /// or provide a project ID to match that project.
+    pub project_id: ClearableField<String>,
     /// Whether archived threads should be listed instead of active threads.
     pub archived: bool,
     /// Optional substring/full-text search term for thread title/preview.
@@ -292,8 +380,6 @@ pub enum StoredTurnItemsView {
     /// Return display summary items for each turn.
     #[default]
     Summary,
-    /// Return every persisted item available for each turn.
-    Full,
 }
 
 /// Store-owned status for a persisted turn.
@@ -311,9 +397,12 @@ pub enum StoredTurnStatus {
 
 /// Store-owned error details for a failed persisted turn.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StoredTurnError {
     /// User-visible error message.
     pub message: String,
+    /// Structured Codex error classification, when available.
+    pub codex_error_info: Option<CodexErrorInfo>,
     /// Optional additional detail for clients that expose expanded error context.
     pub additional_details: Option<String>,
 }
@@ -340,13 +429,8 @@ pub struct ListTurnsParams {
 pub struct StoredTurn {
     /// Turn id.
     pub turn_id: String,
-    /// Persisted rollout items associated with this turn, according to `items_view`.
-    pub items: Vec<RolloutItem>,
-    /// Opaque serialized turn metadata supplied by a projected durable store.
-    pub metadata_json: Option<Vec<u8>>,
-    /// Semantic turn creation timestamp in milliseconds, when supplied by a projected durable
-    /// store.
-    pub turn_created_at_ms: Option<i64>,
+    /// Projected app-server item snapshots associated with this turn, according to `items_view`.
+    pub items: Vec<StoredThreadItem>,
     /// Amount of item detail included in `items`.
     pub items_view: StoredTurnItemsView,
     /// Store-owned status for API layer projection.
@@ -385,18 +469,36 @@ pub struct ListItemsParams {
     pub cursor: Option<String>,
     /// Maximum number of items to return.
     pub page_size: usize,
-    /// Sort direction requested by the caller.
+    /// Direction to sort items by the selected ordinal.
     pub sort_direction: SortDirection,
+    /// Ordinal to sort items by. Update-ordinal sorting requires an update watermark.
+    pub sort_key: ItemSortKey,
+    /// Filters out items with an update ordinal less than or equal to the provided value.
+    pub after_updated_at_ordinal: Option<u64>,
+}
+
+/// The ordinal to use when listing persisted items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ItemSortKey {
+    /// Sort by the ordinal where the item was first projected.
+    CreatedAtOrdinal,
+    /// Sort by the ordinal where the item was last updated.
+    UpdatedAtOrdinal,
 }
 
 /// A projected app-server `ThreadItem` snapshot within a turn.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredThreadItem {
-    pub turn_id: Option<String>,
-    pub item_key: String,
-    pub item_ordinal: u64,
-    pub item_created_at_ms: i64,
-    pub materialized_thread_item_json: Vec<u8>,
+    /// Turn containing this item.
+    pub turn_id: String,
+    /// Stable item identifier within the turn.
+    pub item_id: String,
+    /// Rollout ordinal of the latest persisted update to this item.
+    pub updated_at_ordinal: u64,
+    /// Unix timestamp (milliseconds) when this logical item was first projected.
+    pub created_at_ms: i64,
+    /// Serialized app-server ThreadItem snapshot.
+    pub item_json: Vec<u8>,
 }
 
 /// A page of persisted items within a thread, optionally filtered to a turn.
@@ -410,9 +512,66 @@ pub struct ItemPage {
     pub backwards_cursor: Option<String>,
 }
 
+/// Parameters for reading a bounded mixed thread timeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListTimelineParams {
+    pub thread_id: ThreadId,
+    pub cursor: Option<String>,
+    pub page_size: usize,
+}
+
+/// Ordinary items, realtime facts, and the session state preceding their page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimelinePage {
+    pub items: Vec<ThreadTimelineEntry>,
+    pub next_cursor: Option<String>,
+    pub active_realtime_session_at_page_start: Option<String>,
+}
+
+/// Parameters for searching visible message occurrences within one paginated thread.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchThreadOccurrencesParams {
+    /// Thread id to search.
+    pub thread_id: ThreadId,
+    /// Case-insensitive literal substring to find.
+    pub search_term: String,
+    /// Opaque cursor returned by a previous search call.
+    pub cursor: Option<String>,
+    /// Maximum number of occurrences to return.
+    pub page_size: usize,
+}
+
+/// UTF-16 code-unit range within `snippet`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchTextRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// One visible message occurrence within a stored thread.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredThreadOccurrence {
+    pub turn_id: String,
+    pub item_id: String,
+    pub snippet: String,
+    pub snippet_match_range: SearchTextRange,
+    /// Inclusive cursor accepted by `thread/turns/list` for this turn.
+    pub turn_cursor: String,
+}
+
+/// A page of visible message occurrences within one stored thread.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThreadOccurrenceSearchPage {
+    pub items: Vec<StoredThreadOccurrence>,
+    pub next_cursor: Option<String>,
+}
+
 /// Store-owned thread metadata used by list/read/resume responses.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredThread {
+    /// Originator recorded at creation, if available from the backing store.
+    #[serde(default)]
+    pub originator: Option<String>,
     /// Thread id.
     pub thread_id: ThreadId,
     /// Optional extra configuration fields for the thread.
@@ -441,6 +600,17 @@ pub struct StoredThread {
     pub recency_at: DateTime<Utc>,
     /// Thread archive timestamp, if archived.
     pub archived_at: Option<DateTime<Utc>>,
+    /// The user-selected section for this thread, if any.
+    pub section: Option<codex_state::ThreadSection>,
+    /// The server-owned ordering position within the thread's section.
+    #[serde(default)]
+    pub section_position: Option<i64>,
+    /// The time when the thread most recently entered its current section.
+    #[serde(default)]
+    pub section_entered_at: Option<DateTime<Utc>>,
+    /// Canonical project assignment owned by app-server, if any.
+    #[serde(default)]
+    pub project_id: Option<String>,
     /// Working directory captured for the thread.
     pub cwd: PathBuf,
     /// CLI version captured for the thread.
@@ -497,7 +667,7 @@ pub struct GitInfoPatch {
         skip_serializing_if = "Option::is_none",
         with = "optional_option"
     )]
-    pub origin_url: ClearableField<String>,
+    pub origin_url: ClearableField<SanitizedGitUrl>,
 }
 
 impl GitInfoPatch {
@@ -520,7 +690,7 @@ impl GitInfoPatch {
 
 /// Patch for thread metadata.
 ///
-/// Every field is literal: `None` leaves that field unchanged, while `Some`
+/// Unless noted otherwise, `None` leaves a field unchanged, while `Some`
 /// applies the supplied value. Fields whose value may itself be cleared use an
 /// inner `Option`, where `Some(None)` clears the field.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -543,7 +713,12 @@ pub struct ThreadMetadataPatch {
     /// Latest observed model.
     pub model: Option<String>,
     /// Latest observed reasoning effort.
-    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_option"
+    )]
+    pub reasoning_effort: ClearableField<ReasoningEffort>,
     /// Creation timestamp when known.
     pub created_at: Option<DateTime<Utc>>,
     /// Last update timestamp for this metadata observation.
@@ -552,6 +727,8 @@ pub struct ThreadMetadataPatch {
     pub advance_recency_at: Option<DateTime<Utc>>,
     /// Session source.
     pub source: Option<SessionSource>,
+    /// Recorded creation-time originator. Only fills a missing stored value.
+    pub originator: Option<String>,
     /// Optional analytics source classification.
     #[serde(
         default,
@@ -596,6 +773,13 @@ pub struct ThreadMetadataPatch {
     pub git_info: Option<GitInfoPatch>,
     /// Thread memory behavior.
     pub memory_mode: Option<MemoryMode>,
+    /// Initial project assignment supplied with thread creation.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_option"
+    )]
+    pub project_id: ClearableField<String>,
 }
 
 impl ThreadMetadataPatch {
@@ -638,6 +822,9 @@ impl ThreadMetadataPatch {
         if next.source.is_some() {
             self.source = next.source;
         }
+        if next.originator.is_some() {
+            self.originator = next.originator;
+        }
         if next.thread_source.is_some() {
             self.thread_source = next.thread_source;
         }
@@ -676,6 +863,9 @@ impl ThreadMetadataPatch {
         if next.memory_mode.is_some() {
             self.memory_mode = next.memory_mode;
         }
+        if next.project_id.is_some() {
+            self.project_id = next.project_id;
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -690,6 +880,7 @@ impl ThreadMetadataPatch {
             && self.updated_at.is_none()
             && self.advance_recency_at.is_none()
             && self.source.is_none()
+            && self.originator.is_none()
             && self.thread_source.is_none()
             && self.agent_nickname.is_none()
             && self.agent_role.is_none()
@@ -702,6 +893,7 @@ impl ThreadMetadataPatch {
             && self.first_user_message.is_none()
             && self.git_info.is_none()
             && self.memory_mode.is_none()
+            && self.project_id.is_none()
     }
 }
 
@@ -716,6 +908,17 @@ pub struct UpdateThreadMetadataParams {
     pub include_archived: bool,
 }
 
+/// Parameters for moving a thread to, within, or out of a server-ordered section.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveThreadToSectionParams {
+    /// Thread to move.
+    pub thread_id: ThreadId,
+    /// Destination section, or `None` to remove the thread from its section.
+    pub section: Option<String>,
+    /// Existing section member to insert before, or `None` to append.
+    pub before_thread_id: Option<ThreadId>,
+}
+
 /// Parameters for archiving or unarchiving a thread.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveThreadParams {
@@ -723,11 +926,29 @@ pub struct ArchiveThreadParams {
     pub thread_id: ThreadId,
 }
 
+/// Parameters for archiving a set of threads as one store operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveThreadsParams {
+    /// Thread ids to archive, in the order their persisted data should be moved.
+    pub thread_ids: Vec<ThreadId>,
+    /// Thread ids whose paginated writer ownership must be checked before archiving, including
+    /// descendants whose rollout has not materialized yet.
+    #[serde(default)]
+    pub writer_lock_thread_ids: Vec<ThreadId>,
+}
+
 /// Parameters for deleting a thread.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteThreadParams {
     /// Thread id to delete.
     pub thread_id: ThreadId,
+}
+
+/// Parameters for deleting a set of threads as one store operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteThreadsParams {
+    /// Thread ids to delete, in the order their persisted data should be removed.
+    pub thread_ids: Vec<ThreadId>,
 }
 
 #[cfg(test)]
@@ -741,6 +962,7 @@ mod tests {
     fn thread_metadata_patch_round_trips_optional_clears() {
         let patch = ThreadMetadataPatch {
             name: Some(None),
+            reasoning_effort: Some(None),
             thread_source: Some(None),
             agent_nickname: Some(None),
             agent_role: Some(None),
@@ -750,6 +972,7 @@ mod tests {
 
         let value = serde_json::to_value(&patch).expect("serialize patch");
         assert_eq!(value["name"], json!(null));
+        assert_eq!(value["reasoning_effort"], json!(null));
         assert_eq!(value["thread_source"], json!(null));
         assert_eq!(value["agent_nickname"], json!(null));
         assert_eq!(value["agent_role"], json!(null));
@@ -758,6 +981,7 @@ mod tests {
         let decoded: ThreadMetadataPatch =
             serde_json::from_value(value).expect("deserialize patch");
         assert_eq!(decoded.name, Some(None));
+        assert_eq!(decoded.reasoning_effort, Some(None));
         assert_eq!(decoded.thread_source, Some(None));
         assert_eq!(decoded.agent_nickname, Some(None));
         assert_eq!(decoded.agent_role, Some(None));

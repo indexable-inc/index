@@ -1,3 +1,13 @@
+//! Experimental controls with popup-owned discovery and configured enablement.
+//! Only changed, supported controls are submitted to the existing writer.
+
+use codex_app_server_protocol::ExperimentalFeature;
+use codex_app_server_protocol::ExperimentalFeatureStage;
+use codex_features::FEATURES;
+use std::time::Duration;
+use std::time::Instant;
+use tokio::sync::oneshot;
+
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -14,6 +24,7 @@ use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::key_hint;
 use crate::key_hint::KeyBindingListExt;
+use crate::keymap::ListAction;
 use crate::keymap::ListKeymap;
 use crate::render::Insets;
 use crate::render::RectExt as _;
@@ -32,7 +43,7 @@ use super::selection_popup_common::measure_rows_height;
 use super::selection_popup_common::render_rows;
 
 pub(crate) struct ExperimentalFeatureItem {
-    pub feature: Feature,
+    pub feature: Option<Feature>,
     pub name: String,
     pub description: String,
     pub enabled: bool,
@@ -40,10 +51,12 @@ pub(crate) struct ExperimentalFeatureItem {
 
 pub(crate) struct ExperimentalFeaturesView {
     features: Vec<ExperimentalFeatureItem>,
+    initial_enabled: Vec<bool>,
+    catalog_rx: Option<oneshot::Receiver<Result<Vec<ExperimentalFeature>, String>>>,
+    discovery_status: &'static str,
     state: ScrollState,
     complete: bool,
     app_event_tx: AppEventSender,
-    header: Box<dyn Renderable>,
     footer_hint: Line<'static>,
     keymap: ListKeymap,
 }
@@ -51,26 +64,41 @@ pub(crate) struct ExperimentalFeaturesView {
 impl ExperimentalFeaturesView {
     pub(crate) fn new(
         features: Vec<ExperimentalFeatureItem>,
+        catalog_rx: Option<oneshot::Receiver<Result<Vec<ExperimentalFeature>, String>>>,
         app_event_tx: AppEventSender,
         keymap: ListKeymap,
     ) -> Self {
-        let mut header = ColumnRenderable::new();
-        header.push(Line::from("Experimental features".bold()));
-        header.push(Line::from(
-            "Toggle experimental features. Changes are saved to config.toml.".dim(),
-        ));
-
         let mut view = Self {
+            discovery_status: if catalog_rx.is_some() {
+                "Loading server experiments…"
+            } else {
+                ""
+            },
+            catalog_rx,
+            initial_enabled: features.iter().map(|item| item.enabled).collect(),
             features,
             state: ScrollState::new(),
             complete: false,
             app_event_tx,
-            header: Box::new(header),
-            footer_hint: experimental_popup_hint_line(),
+            footer_hint: experimental_popup_hint_line(&keymap),
             keymap,
         };
         view.initialize_selection();
         view
+    }
+
+    fn header(&self, width: u16) -> impl Renderable {
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from("Experimental features".bold()));
+        for text in [
+            "Checked features are configured on. Some experimental features take effect only in new tasks or after restarting the Codex server.",
+            self.discovery_status,
+        ].into_iter().filter(|text| !text.is_empty()) {
+            for line in textwrap::wrap(text, usize::from(width.max(1))) {
+                header.push(Line::from(line.into_owned().dim()));
+            }
+        }
+        header
     }
 
     fn initialize_selection(&mut self) {
@@ -95,10 +123,16 @@ impl ExperimentalFeaturesView {
                 ' '
             };
             let marker = if item.enabled { 'x' } else { ' ' };
-            let name = format!("{prefix} [{marker}] {}", item.name);
+            let read_only = if item.feature.is_none() {
+                " (read-only)"
+            } else {
+                ""
+            };
+            let name = format!("{prefix} [{marker}] {}{read_only}", item.name);
             rows.push(GenericDisplayRow {
                 name,
                 description: Some(item.description.clone()),
+                is_disabled: item.feature.is_none(),
                 ..Default::default()
             });
         }
@@ -153,7 +187,9 @@ impl ExperimentalFeaturesView {
             return;
         };
 
-        if let Some(item) = self.features.get_mut(selected_idx) {
+        if let Some(item) = self.features.get_mut(selected_idx)
+            && item.feature.is_some()
+        {
             item.enabled = !item.enabled;
         }
     }
@@ -164,6 +200,69 @@ impl ExperimentalFeaturesView {
 }
 
 impl BottomPaneView for ExperimentalFeaturesView {
+    fn pre_draw_tick(&mut self, _now: Instant) -> bool {
+        let Some(receiver) = self.catalog_rx.as_mut() else {
+            return false;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(oneshot::error::TryRecvError::Empty) => return false,
+            Err(oneshot::error::TryRecvError::Closed) => {
+                Err("Discovery was interrupted".to_string())
+            }
+        };
+        self.catalog_rx = None;
+        match result {
+            Ok(features) => {
+                let mut count = 0;
+                for feature in features {
+                    if feature.stage != ExperimentalFeatureStage::Beta {
+                        continue;
+                    }
+                    // The existing writer uses local defaults and Feature IDs. A new
+                    // server control or a changed default must wait for config-write migration.
+                    let writable = FEATURES
+                        .iter()
+                        .find(|spec| {
+                            spec.key == feature.name
+                                && spec.stage.experimental_menu_name().is_some()
+                                && spec.default_enabled == feature.default_enabled
+                        })
+                        .map(|spec| spec.id);
+                    self.initial_enabled.push(feature.enabled);
+                    self.features.push(ExperimentalFeatureItem {
+                        feature: writable,
+                        name: feature.display_name.unwrap_or(feature.name),
+                        description: feature.description.unwrap_or_default(),
+                        enabled: feature.enabled,
+                    });
+                    count += 1;
+                }
+                self.discovery_status = if count == 0 {
+                    "No server experiments available."
+                } else {
+                    ""
+                };
+                self.initialize_selection();
+            }
+            Err(error) => {
+                tracing::warn!(%error, "experimental feature discovery failed");
+                self.discovery_status = "Server experiments unavailable. Reopen /experimental to retry; restart this Codex client if requests remain unanswered.";
+            }
+        }
+        true
+    }
+
+    fn next_frame_delay(&self) -> Option<Duration> {
+        self.catalog_rx
+            .as_ref()
+            .map(|_| Duration::from_millis(/*millis*/ 100))
+    }
+
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         match key_event {
             _ if self.keymap.move_up.is_pressed(key_event) => self.move_up(),
@@ -191,13 +290,14 @@ impl BottomPaneView for ExperimentalFeaturesView {
     }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
-        // Save the updates
-        if !self.features.is_empty() {
-            let updates = self
-                .features
-                .iter()
-                .map(|item| (item.feature, item.enabled))
-                .collect();
+        let updates: Vec<_> = self
+            .features
+            .iter()
+            .zip(&self.initial_enabled)
+            .filter(|(item, initial)| item.enabled != **initial)
+            .filter_map(|(item, _)| item.feature.map(|feature| (feature, item.enabled)))
+            .collect();
+        if !updates.is_empty() {
             self.app_event_tx
                 .send(AppEvent::UpdateFeatureFlags { updates });
         }
@@ -220,9 +320,8 @@ impl Renderable for ExperimentalFeaturesView {
             .style(user_message_style())
             .render(content_area, buf);
 
-        let header_height = self
-            .header
-            .desired_height(content_area.width.saturating_sub(4));
+        let header = self.header(content_area.width.saturating_sub(4));
+        let header_height = header.desired_height(content_area.width.saturating_sub(4));
         let rows = self.build_rows();
         let rows_width = Self::rows_width(content_area.width);
         let rows_height = measure_rows_height(
@@ -238,9 +337,9 @@ impl Renderable for ExperimentalFeaturesView {
         ])
         .areas(content_area.inset(Insets::vh(/*v*/ 1, /*h*/ 2)));
 
-        self.header.render(header_area, buf);
+        header.render(header_area, buf);
 
-        if list_area.height > 0 {
+        if list_area.height > 0 && (!rows.is_empty() || self.catalog_rx.is_none()) {
             let render_area = Rect {
                 x: list_area.x.saturating_sub(2),
                 y: list_area.y,
@@ -276,18 +375,26 @@ impl Renderable for ExperimentalFeaturesView {
             rows_width.saturating_add(1),
         );
 
-        let mut height = self.header.desired_height(width.saturating_sub(4));
+        let mut height = self
+            .header(width.saturating_sub(4))
+            .desired_height(width.saturating_sub(4));
         height = height.saturating_add(rows_height + 3);
         height.saturating_add(1)
     }
 }
 
-fn experimental_popup_hint_line() -> Line<'static> {
-    Line::from(vec![
+fn experimental_popup_hint_line(keymap: &ListKeymap) -> Line<'static> {
+    let mut spans = vec![
         "Press ".into(),
         key_hint::plain(KeyCode::Char(' ')).into(),
-        " to select or ".into(),
-        key_hint::plain(KeyCode::Enter).into(),
-        " to save for next conversation".into(),
-    ])
+        " to select".into(),
+    ];
+    if let Some(accept) = keymap.primary_hint(ListAction::Accept) {
+        spans.extend([" or ".into(), accept.into(), " to save".into()]);
+    }
+    Line::from(spans)
 }
+
+#[cfg(test)]
+#[path = "experimental_features_view_tests.rs"]
+mod tests;

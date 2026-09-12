@@ -1,4 +1,4 @@
-# claude-code positional argv tokens, extracted from Claude Code cli.js 2.1.228
+# claude-code positional argv tokens, extracted from Claude Code cli.js 2.1.259
 # by packages/claude-code/extract-subcommands.py. Regenerate with
 #   nix run .#claude-code.updateScript -- <version>
 # token	source
@@ -10,6 +10,7 @@
 --daemon-worker	hidden
 --preload	hidden
 agents	help
+attach	help
 auth	help
 auto-mode	help
 bridge	hidden
@@ -18,6 +19,8 @@ doctor	help
 gateway	help
 import-conversations	hidden
 install	help
+kill	help
+logs	help
 mcp	help
 plugin	help
 plugins	help
@@ -25,7 +28,10 @@ project	help
 rc	hidden
 remote	hidden
 remote-control	hidden
+respawn	help
+rm	help
 setup-token	help
+stop	help
 sync	hidden
 ultrareview	help
 update	help

@@ -8,6 +8,14 @@ use toml::Value as TomlValue;
 
 use super::stack::RequirementsCompositionError;
 
+// Authentication requirements that cloud-managed layers cannot set.
+const LOCAL_ONLY_AUTH_REQUIREMENTS: &[&str] = &[
+    "allowed_login_methods",
+    "allowed_chatgpt_workspaces",
+    "cli_auth_credentials_store",
+    "chatgpt_base_url",
+];
+
 #[derive(Clone, Debug)]
 pub struct RequirementsLayerEntry {
     pub(super) source: RequirementSource,
@@ -35,6 +43,19 @@ impl RequirementsLayerEntry {
     pub fn with_base_dir(mut self, base_dir: AbsolutePathBuf) -> Self {
         self.base_dir = Some(base_dir);
         self
+    }
+
+    pub(crate) fn into_raw_parts(
+        self,
+    ) -> Result<(RequirementSource, TomlValue, Option<AbsolutePathBuf>), RequirementsCompositionError>
+    {
+        let Self {
+            source,
+            toml,
+            base_dir,
+        } = self;
+        let toml = parse_layer_toml(&toml, &source)?;
+        Ok((source, toml, base_dir))
     }
 }
 
@@ -65,8 +86,19 @@ impl ComposableRequirementsLayer {
             let _guard = base_dir
                 .as_ref()
                 .map(|base_dir| AbsolutePathBufGuard::new(base_dir.as_path()));
-            let regular_toml = parse_layer_toml(&toml, &source)?;
-            let requirements = parse_layer_requirements(&toml, &source)?;
+            let mut regular_toml = parse_layer_toml(&toml, &source)?;
+
+            // These fields can only be set locally; ignore them before validating cloud policy.
+            if matches!(source, RequirementSource::EnterpriseManaged { .. }) {
+                for field in LOCAL_ONLY_AUTH_REQUIREMENTS {
+                    remove_top_level_field(&mut regular_toml, field);
+                }
+            }
+
+            let requirements = parse_layer_requirements(
+                &RequirementsLayerToml::Value(regular_toml.clone()),
+                &source,
+            )?;
             (regular_toml, requirements)
         };
 
@@ -77,6 +109,7 @@ impl ComposableRequirementsLayer {
             .as_ref()
             .and_then(|_| hostname_resolver());
         requirements.apply_remote_sandbox_config(hostname.as_deref());
+        materialize_resolved_path_requirements(&mut regular_toml, &requirements)?;
         materialize_remote_sandbox_config(&mut regular_toml, &requirements)?;
         strip_special_fields(&mut regular_toml);
 
@@ -87,6 +120,7 @@ impl ComposableRequirementsLayer {
                 rules: requirements.rules,
                 hooks: requirements.hooks,
                 permissions: requirements.permissions,
+                auto_review: requirements.auto_review,
             },
         })
     }
@@ -97,6 +131,7 @@ pub(super) struct DomainMergedRequirementsFields {
     pub(super) rules: Option<RequirementsExecPolicyToml>,
     pub(super) hooks: Option<ManagedHooksRequirementsToml>,
     pub(super) permissions: Option<crate::config_requirements::PermissionsRequirementsToml>,
+    pub(super) auto_review: Option<crate::config_requirements::AutoReviewRequirementsToml>,
 }
 
 fn parse_layer_toml(
@@ -140,6 +175,30 @@ fn parse_layer_requirements(
     }
 }
 
+fn materialize_resolved_path_requirements(
+    layer_toml: &mut TomlValue,
+    requirements: &ConfigRequirementsToml,
+) -> Result<(), RequirementsCompositionError> {
+    let Some(table) = layer_toml.as_table_mut() else {
+        return Ok(());
+    };
+
+    for (key, value) in [
+        ("sqlite_home", requirements.sqlite_home.as_ref()),
+        ("log_dir", requirements.log_dir.as_ref()),
+        (
+            "model_catalog_json",
+            requirements.model_catalog_json.as_ref(),
+        ),
+    ] {
+        if let Some(value) = value {
+            table.insert(key.to_string(), toml_value_from_serializable(value)?);
+        }
+    }
+
+    Ok(())
+}
+
 fn materialize_remote_sandbox_config(
     layer_toml: &mut TomlValue,
     requirements: &ConfigRequirementsToml,
@@ -170,6 +229,7 @@ fn strip_special_fields(layer_toml: &mut TomlValue) {
     remove_top_level_field(layer_toml, "rules");
     remove_top_level_field(layer_toml, "hooks");
     remove_nested_field_and_prune_empty(layer_toml, &["permissions", "filesystem", "deny_read"]);
+    remove_nested_field_and_prune_empty(layer_toml, &["auto_review", "required_on_models"]);
 }
 
 fn remove_top_level_field(value: &mut TomlValue, key: &str) -> Option<TomlValue> {

@@ -21,6 +21,26 @@
   nu-jupyter-kernel-src,
   nix-ninja-src,
   snix-src,
+  # The Nix every image runs as `nix.package` (modules/profiles/base). Injected
+  # rather than read out of `packages` inside the module: the package the
+  # module would otherwise reach for, `nix-ix`, links the jj tree ABI
+  # (`libjj_tree.a`), whose crate lives in the ix repository outside this
+  # flake's source root. `packages/nix/default.nix` takes that archive as an
+  # argument and throws when it is forced without one, so `nix-ix` is
+  # assembled by whoever HAS the archive and handed in here. One formal, no
+  # default. The flake supplies it: `null` for index's own outputs, the
+  # assembled fork through `index.withNixPackage { nixPackage = ...; }`
+  # (flake.nix `outputsWith`), which is the only place a consumer hands it
+  # in; nothing imports this file with a hand-picked Nix. Its readers, all
+  # of them: modules/profiles/base consumes it (`nix.package`, refusing a
+  # null), `nixPackageFor` below hands it to the packages that need the
+  # ASSEMBLED client (the nix-eval-jobs build, every prebuilt-pin
+  # updateScript), lib/per-system.nix null-checks it twice (the `check`
+  # app's eval refusal, and the `needsGuestNix` fence on `cachePushRoots`),
+  # and tests/default.nix asserts the injected value is the one an image
+  # binds. No other package path reads it, which is why the standalone
+  # surface evaluates everything except images and that consumer class.
+  nixPackage,
   # The flake's own source (`self`), carrying `.outPath` (a `-source` store
   # path with string context, so it roots into a closure like `nixpkgs`) and
   # `.narHash`. Only the flake scope sees these, so they are plumbed down to
@@ -99,6 +119,37 @@
     writeProcessComposeApplication
     ;
   netCidr = import ./util/net-cidr.nix {inherit lib;};
+
+  /**
+  The assembled guest/fork Nix for a consumer that needs the CLIENT or its
+  components -- the CI evaluator that links the fork's C++ libraries
+  (packages/nix-eval-jobs), and the prebuilt-pin updaters that must prefetch
+  with blake3 in the ix dialect (lib/util/pins.nix and friends) -- refused
+  with the injection story when this instantiation has none. `consumer`
+  names the call site so the refusal reads as who needed it, not a bare
+  null error.
+
+  Distinct from `packageSetFor`'s `nix-ix` on purpose: that stays the
+  un-assembled RECIPE, because ix overrides it with the jj tree ABI archive
+  to BUILD the value this returns. Consumers read here, the assembler reads
+  there; giving both jobs the one name `repoPackages.nix-ix` is how the
+  required gate found nix-eval-jobs throwing "jjTree was not supplied" from
+  five frames down (required-ci-checks -> ci-shell-tools-floor-check ->
+  github-actions-shell-tools -> nix-eval-jobs -> nix-fetchers).
+  */
+  nixPackageFor = consumer:
+    if nixPackage == null
+    then
+      throw ''
+        ${consumer}: no guest Nix was injected (`ix.nixPackage`).
+
+        This consumer needs the assembled fork client (nix-ix with the jj
+        tree ABI archive), and index evaluated standalone has none: the
+        archive's crate lives in the ix repository. ix instantiates this
+        flake with the assembled client (`index.withNixPackage`); read this
+        surface through ix's `index` flake output.
+      ''
+    else nixPackage;
   securityRoots = import ./security-roots.nix {inherit lib;};
   # Force `allowSubstitutes = true` on a trivial-builder derivation that must be
   # substitutable (darwin cross-lane eval-time IFD nodes). See its doc comment.
@@ -793,7 +844,7 @@
   ixSpecialArgs =
     sharedHelpers
     // {
-      inherit buildRustPackage islandsTheme;
+      inherit buildRustPackage islandsTheme nixPackage nixPackageFor;
       packages = packageSetFor pkgs;
       # The flox CLI as built by flox's own flake (own nixpkgs pin, so the
       # derivation is exactly what cache.flox.dev serves). Consumed by
@@ -955,6 +1006,8 @@
         mkPackageSet
         mkVm
         mkVmFor
+        nixPackage
+        nixPackageFor
         nixosModules
         overlay
         overlays

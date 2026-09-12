@@ -173,13 +173,15 @@ jobs:
       # The count of genuinely native (non-cross-aliased) rows is the #3586
       # ratchet: it should only ever shrink as packages gain `cross = true`.
       #
-      # Report-only, deliberately. The deleted lane's own filter was
-      # `select(.error == null and ...)`, i.e. it tolerated error rows and
-      # never recorded how many there were, so there is no trustworthy
-      # baseline to fail against and a fail-closed gate here would just red
-      # main on pre-existing breakage. Two or three green runs establish the
-      # real numbers; commit them as budgets and turn both counts into hard
-      # gates then (#3586).
+      # ERROR ROWS FAIL. This step was report-only while no trustworthy
+      # baseline existed, but a tolerated error row is exactly how a root
+      # leaves the set invisibly: the guest-Nix injection made every
+      # image-backed root an error row on standalone evals, nothing here went
+      # red, and the ratchet would have read the shrink as progress. Those
+      # roots are now fenced out of the standalone attrset by name
+      # (lib/per-system.nix `needsGuestNix`), so a clean eval is the expected
+      # state again and any error row is a regression, not baseline noise.
+      # The native COUNT stays a notice until #3586 commits it as a budget.
       - name: Evaluate cachePushRoots.aarch64-darwin
         if: matrix.shard == 0
         shell: bash
@@ -189,6 +191,14 @@ jobs:
           workdir="$(mktemp -d)"
           trap 'rm -rf "$workdir"' EXIT
 
+          # Refused on the standalone tree since the guest-Nix injection:
+          # nix-eval-jobs links the ASSEMBLED fork's components
+          # (`ix.nixPackageFor`, lib/default.nix), so this step is where the
+          # workflow now stops, loudly, on the public mirror. The forge-era
+          # successor carries the evaluator in from ix's instantiation
+          # (ix nix/modules/services/host/ci-dispatcher/public-cache-push.nix);
+          # reviving THIS workflow means doing the same or retiring it
+          # (flake.nix's standalone disposition list).
           eval_jobs="$(nix build .#nix-eval-jobs --no-link --print-out-paths)/bin/nix-eval-jobs"
           jq="$(nix build '.#jq^bin' --no-link --print-out-paths)/bin/jq"
 
@@ -204,8 +214,9 @@ jobs:
           native="$("$jq" -rs '[.[] | select(.system == "aarch64-darwin")] | length' "$rows")"
           echo "::notice::cache-push: cachePushRoots.aarch64-darwin evaluates; ${native} root(s) still native-only (#3586 ratchet)"
           if [ "$errors" -gt 0 ]; then
-            "$jq" -rs '.[] | select(.error != null) | "::warning::darwin eval failed: \(.attr): \(.error | split("\n")[0])"' "$rows"
-            echo "::warning::cache-push: ${errors} root(s) in cachePushRoots.aarch64-darwin do not evaluate"
+            "$jq" -rs '.[] | select(.error != null) | "::error::darwin eval failed: \(.attr): \(.error | split("\n")[0])"' "$rows"
+            echo "::error::cache-push: ${errors} root(s) in cachePushRoots.aarch64-darwin do not evaluate; a tolerated error row is a root silently leaving the cache and a false #3586 shrink"
+            exit 1
           fi
 
       - name: Publish this shard's packages to cache.ix.dev
@@ -273,6 +284,14 @@ jobs:
           # Flake-pinned tools: runner PATH has nix + coreutils but no
           # findutils. ^bin/^out pick one output from multi-output packages.
           tools_t=$SECONDS
+          # Refused on the standalone tree since the guest-Nix injection:
+          # nix-eval-jobs links the ASSEMBLED fork's components
+          # (`ix.nixPackageFor`, lib/default.nix), so this step is where the
+          # workflow now stops, loudly, on the public mirror. The forge-era
+          # successor carries the evaluator in from ix's instantiation
+          # (ix nix/modules/services/host/ci-dispatcher/public-cache-push.nix);
+          # reviving THIS workflow means doing the same or retiring it
+          # (flake.nix's standalone disposition list).
           eval_jobs="$(nix build .#nix-eval-jobs --no-link --print-out-paths)/bin/nix-eval-jobs"
           attic="$(nix build .#attic-client --no-link --print-out-paths)/bin/attic"
           jq="$(nix build '.#jq^bin' --no-link --print-out-paths)/bin/jq"
@@ -293,13 +312,30 @@ jobs:
           outs="$workdir/outs.txt"
           roots="$workdir/roots.tsv"
           eval_t=$SECONDS
+          # Rows to a file first, then fail closed on error rows: nix-eval-jobs
+          # reports a per-attribute failure as a JSON `error` row and exits 0,
+          # so the old in-pipeline `select(.drvPath != null)` silently dropped
+          # every failing root and pushed the survivors -- a green run
+          # publishing less than the attr claims. Same shape as the
+          # ci-dispatcher's public-cache-push.sh, which replaced this workflow
+          # on the forge.
+          rows="$workdir/rows.jsonl"
+          eval_status=0
           "$eval_jobs" \
             --flake .#cachePushRoots.x86_64-linux \
             --workers 3 \
             --max-memory-size 4096 \
             2>"$workdir/eval.err" \
-            | "$jq" -r 'select(.drvPath != null) | [.drvPath, (.outputs.out // "")] | @tsv' \
-            | sort -u > "$all_roots" || true
+            > "$rows" || eval_status=$?
+          errors="$("$jq" -rs '[.[] | select(.error != null)] | length' "$rows")"
+          if [ "$eval_status" -ne 0 ] || [ "$errors" -gt 0 ]; then
+            "$jq" -rs '.[] | select(.error != null) | "::error::eval failed: \(.attr): \(.error | split("\n")[0])"' "$rows"
+            echo "::error::cache-push: cachePushRoots.x86_64-linux did not fully evaluate (nix-eval-jobs exit ${eval_status}, ${errors} error row(s)); refusing to push the survivors"
+            tail -n 40 "$workdir/eval.err" || true
+            exit 1
+          fi
+          "$jq" -r 'select(.drvPath != null) | [.drvPath, (.outputs.out // "")] | @tsv' "$rows" \
+            | sort -u > "$all_roots"
           # The bootstrap client cannot sit in cachePushRoots: evaluating that
           # flake requires the client this local view provides. The action
           # above has already realized it without evaluating the parent flake.

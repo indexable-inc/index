@@ -73,10 +73,11 @@ json=$(nix flake metadata flake1 --json | jq .)
 hash1=$(echo "$json" | jq -r .revision)
 [[ -n $(echo "$json" | jq -r .fingerprint) ]]
 
+# A staged-but-uncommitted change is not a revision, so the flake has no
+# identity to report and is refused rather than described as "dirty".
 echo foo > "$flake1Dir/foo"
 git -C "$flake1Dir" add "$flake1Dir"/foo
-[[ $(nix flake metadata flake1 --json --refresh | jq -r .dirtyRevision) == "$hash1-dirty" ]]
-[[ "$(nix flake metadata flake1 --json | jq -r .fingerprint)" != null ]]
+expectStderr 1 nix flake metadata flake1 --json --refresh | grepQuiet "has uncommitted changes"
 
 echo -n '# foo' >> "$flake1Dir/flake.nix"
 flake1OriginalCommit=$(git -C "$flake1Dir" rev-parse HEAD)
@@ -84,8 +85,8 @@ git -C "$flake1Dir" commit -a -m 'Foo'
 # shellcheck disable=SC2034
 flake1NewCommit=$(git -C "$flake1Dir" rev-parse HEAD)
 hash2=$(nix flake metadata flake1 --json --refresh | jq -r .revision)
-[[ $(nix flake metadata flake1 --json --refresh | jq -r .dirtyRevision) == "null" ]]
 [[ $hash1 != "$hash2" ]]
+[[ "$(nix flake metadata flake1 --json | jq -r .fingerprint)" != null ]]
 
 # Test 'nix build' on a flake.
 nix build -o "$TEST_ROOT/result" flake1#foo
@@ -98,7 +99,9 @@ nix build -o "$TEST_ROOT/result" flake1
 nix build -o "$TEST_ROOT/result" "$flake1Dir"
 nix build -o "$TEST_ROOT/result" "git+file://$flake1Dir"
 (cd "$flake1Dir" && nix build -o "$TEST_ROOT/result" ".")
-(cd "$flake1Dir" && nix build -o "$TEST_ROOT/result" "path:.")
+# A raw `path:` fetch of a repository is refused: it would strip the identity
+# the repository already has, and the error names the scheme that keeps it.
+(cd "$flake1Dir" && expectStderr 1 nix build -o "$TEST_ROOT/result" "path:." | grepQuiet "is a Git working tree")
 (cd "$flake1Dir" && nix build -o "$TEST_ROOT/result" "git+file:.")
 
 # Test explicit packages.default.
@@ -136,10 +139,14 @@ nix build -o "$TEST_ROOT/result" --expr "(builtins.getFlake \"git+file://$flake1
 # Regression test for baseNameOf on the root of the flake.
 [[ $(nix eval --raw flake1#baseName) =~ ^[a-z0-9]+-source$ ]]
 
-# Test that the root of a tree returns a path named /nix/store/<hash1>-<hash2>-source.
-# This behavior is *not* desired, but has existed for a while.
-# Issue #10627 what to do about it.
-[[ $(nix eval --raw flake1#root) =~ ^.*/[a-z0-9]+-[a-z0-9]+-source$ ]]
+# The root of a tree, as a path value, is the tree's own store object: the
+# path the flake is mounted at, not a second copy of it under the doubled
+# name /nix/store/<hash1>-<hash2>-source that NixOS/nix#10627 records as
+# unwanted (one tree, one store path). The shape check keeps the equality
+# honest: two wrong values could still be equal.
+rootAsPath=$(nix eval --raw flake1#root)
+[[ $rootAsPath = $(nix flake metadata --json flake1 | jq -r .path) ]]
+[[ $rootAsPath =~ /[a-z0-9]{32}-source$ ]]
 
 # Building a flake with an unlocked dependency should fail in pure mode.
 (! nix build -o "$TEST_ROOT/result" flake2#bar --no-registries)
@@ -182,9 +189,13 @@ nix build -o "$TEST_ROOT/result" flake2#bar
 nix build -o "$TEST_ROOT/result" --no-registries "git+file://$percentEncodedFlake2Dir#bar" --refresh
 nix build -o "$TEST_ROOT/result" --no-use-registries "git+file://$percentEncodedFlake2Dir#bar" --refresh
 
-# Test whether indirect dependencies work.
-nix build -o "$TEST_ROOT/result" "$flake3Dir#xyzzy"
-git -C "$flake3Dir" add flake.lock
+# Test whether indirect dependencies work. flake3 is a git source, which
+# takes its lock file only as a commit (flakes/lock-file-writes.sh), so every
+# command below that writes one carries --commit-lock-file and leaves the
+# tree clean; the manual add/commit choreography this file used to do is
+# nix's own commit now.
+nix build -o "$TEST_ROOT/result" "$flake3Dir#xyzzy" --commit-lock-file
+[[ -z $(git -C "$flake3Dir" status --porcelain) ]]
 
 # Add dependency to flake3.
 rm "$flake3Dir/flake.nix"
@@ -204,15 +215,16 @@ git -C "$flake3Dir" add flake.nix
 git -C "$flake3Dir" commit -m 'Update flake.nix'
 
 # Check whether `nix build` works with an incomplete lockfile
-nix build -o "$TEST_ROOT"/result "$flake3Dir#sth sth"
+commitsBefore=$(git -C "$flake3Dir" rev-list --count HEAD)
+nix build -o "$TEST_ROOT"/result "$flake3Dir#sth sth" --commit-lock-file
+
+# Check whether it saved (and committed) the lockfile
+[[ $(git -C "$flake3Dir" rev-list --count HEAD) -eq $((commitsBefore + 1)) ]]
+[[ -z $(git -C "$flake3Dir" status --porcelain) ]]
+
+# The percent-encoded spelling of the same attribute names the same output.
+# It runs after the commit because the fetch needs a revision to lock to.
 nix build -o "$TEST_ROOT"/result "$flake3Dir#sth%20sth"
-
-# Check whether it saved the lockfile
-[[ -n $(git -C "$flake3Dir" diff master) ]]
-
-git -C "$flake3Dir" add flake.lock
-
-git -C "$flake3Dir" commit -m 'Add lockfile'
 
 # Test whether registry caching works.
 nix registry list --flake-registry "file://$registry" | grepQuiet flake3
@@ -254,8 +266,10 @@ nix build -o "$TEST_ROOT/result" flake3#xyzzy
 nix flake lock "$flake3Dir"
 [[ -z $(git -C "$flake3Dir" diff master || echo failed) ]]
 
-nix flake update --flake "$flake3Dir" --override-flake flake2 nixpkgs
-[[ -n $(git -C "$flake3Dir" diff master || echo failed) ]]
+updateBefore=$(git -C "$flake3Dir" rev-parse HEAD)
+nix flake update --flake "$flake3Dir" --override-flake flake2 nixpkgs --commit-lock-file
+# The update changed the lock, i.e. committed something.
+[[ $(git -C "$flake3Dir" rev-parse HEAD) != "$updateBefore" ]]
 
 # Test `nix registry` commands.
 nix registry add flake1 flake3
@@ -286,6 +300,11 @@ nix flake clone flake1 --dest "$TEST_ROOT"/flake1-v2
 [ -e "$TEST_ROOT"/flake1-v2/flake.nix ]
 
 # Test 'follows' inputs.
+#
+# flake3 is a Git repository and every command below fetches it again. A
+# working tree with uncommitted changes to tracked files has no revision to be
+# fetched by, so each rewrite of flake.nix is committed before it is used, and
+# each lock update is committed by nix itself (--commit-lock-file).
 cat > "$flake3Dir/flake.nix" <<EOF
 {
   inputs.foo = {
@@ -299,7 +318,8 @@ cat > "$flake3Dir/flake.nix" <<EOF
 }
 EOF
 
-nix flake lock "$flake3Dir"
+git -C "$flake3Dir" commit -a -m 'Update flake.nix'
+nix flake lock "$flake3Dir" --commit-lock-file
 [[ $(jq -c .nodes.root.inputs.bar "$flake3Dir/flake.lock") = '["foo"]' ]]
 
 cat > "$flake3Dir/flake.nix" <<EOF
@@ -311,7 +331,8 @@ cat > "$flake3Dir/flake.nix" <<EOF
 }
 EOF
 
-nix flake lock "$flake3Dir"
+git -C "$flake3Dir" commit -a -m 'Update flake.nix'
+nix flake lock "$flake3Dir" --commit-lock-file
 [[ $(jq -c .nodes.root.inputs.bar "$flake3Dir/flake.lock") = '["flake2","flake1"]' ]]
 
 cat > "$flake3Dir/flake.nix" <<EOF
@@ -323,7 +344,8 @@ cat > "$flake3Dir/flake.nix" <<EOF
 }
 EOF
 
-nix flake lock "$flake3Dir"
+git -C "$flake3Dir" commit -a -m 'Update flake.nix'
+nix flake lock "$flake3Dir" --commit-lock-file
 [[ $(jq -c .nodes.root.inputs.bar "$flake3Dir/flake.lock") = '["flake2"]' ]]
 
 # Test overriding inputs of inputs.
@@ -343,7 +365,8 @@ cat > "$flake3Dir/flake.nix" <<EOF
 }
 EOF
 
-nix flake lock "$flake3Dir"
+git -C "$flake3Dir" commit -a -m 'Update flake.nix'
+nix flake lock "$flake3Dir" --commit-lock-file
 [[ $(jq .nodes.flake1.locked.url "$flake3Dir/flake.lock") =~ flake7 ]]
 
 cat > "$flake3Dir/flake.nix" <<EOF
@@ -356,7 +379,8 @@ cat > "$flake3Dir/flake.nix" <<EOF
 }
 EOF
 
-nix flake update --flake "$flake3Dir"
+git -C "$flake3Dir" commit -a -m 'Update flake.nix'
+nix flake update --flake "$flake3Dir" --commit-lock-file
 # shellcheck disable=SC2076
 [[ $(jq -c .nodes.flake2.inputs.flake1 "$flake3Dir/flake.lock") =~ '["foo"]' ]]
 [[ $(jq .nodes.foo.locked.url "$flake3Dir/flake.lock") =~ flake7 ]]
@@ -366,13 +390,23 @@ rm -rf "$flakeGitBare"
 git clone --bare "$flake1Dir" "$flakeGitBare"
 nix build -o "$TEST_ROOT"/result git+file://"$flakeGitBare"
 
-# Test path flakes.
+# Test path flakes. `path:` serves store objects only: a directory on the
+# filesystem has no identity a lock file can name, so it is refused rather
+# than copied into the store on every evaluation.
 mkdir -p "$flake5Dir"
 writeDependentFlake "$flake5Dir"
-nix flake lock path://"$flake5Dir"
+expectStderr 1 nix flake lock path://"$flake5Dir" | grepQuiet "has no identity a lock file can name"
+expectStderr 1 nix flake lock path://"$flake5Dir" | grepQuiet "Give it an identity first"
 
-# Test tarball flakes.
-tar cfz "$TEST_ROOT"/flake.tar.gz -C "$TEST_ROOT" flake5
+# Give it one, because the tarball test below needs flake5 locked. A bare
+# path needs no prefix: flakeref.cc routes a directory holding `.jj` to
+# `jj+file://` by itself.
+jjFlakeDir "$flake5Dir"
+nix flake lock "$flake5Dir"
+
+# Test tarball flakes. The workspace metadata is left out: this fixture is
+# about a tarball, and a jj store inside one is not part of the flake.
+tar cfz "$TEST_ROOT"/flake.tar.gz --exclude='*/.jj' -C "$TEST_ROOT" flake5
 
 nix build -o "$TEST_ROOT"/result file://"$TEST_ROOT"/flake.tar.gz
 
@@ -390,14 +424,39 @@ nix build -o "$TEST_ROOT"/result "$url"
 expectStderr 102 nix build -o "$TEST_ROOT"/result "file://$TEST_ROOT/flake.tar.gz?narHash=sha256-qQ2Zz4DNHViCUrp6gTS7EE4+RMqFQtUfWF2UNUtJKS0=" | grep 'NAR hash mismatch'
 
 # Test --override-input.
-git -C "$flake3Dir" reset --hard
-nix flake lock "$flake3Dir" --override-input flake2/flake1 file://"$TEST_ROOT"/flake.tar.gz -vvvvv
+#
+# Upstream this began with `git reset --hard`, and that reset was
+# load-bearing: the follows-section rewrites above were never committed
+# there, so the reset restored the last committed flake.nix -- the one with
+# root inputs {flake1, flake2} -- and every hardcoded node name below
+# (`flake1_2` = flake2's flake1, `flake1` = the root's own) presupposes that
+# shape. A rewrite is a commit now (a dirty tree is not fetchable), HEAD has
+# moved, and a reset restores nothing, so the presupposed flake.nix is
+# restored explicitly.
+cat > "$flake3Dir/flake.nix" <<EOF
+{
+  description = "Fnord";
+
+  outputs = { self, flake1, flake2 }: rec {
+    packages.$system.xyzzy = flake2.packages.$system.bar;
+    packages.$system."sth sth" = flake1.packages.$system.foo;
+  };
+}
+EOF
+git -C "$flake3Dir" commit -a -m 'Restore flake.nix'
+
+# Every command below fetches $flake3Dir again, and a working tree with
+# uncommitted changes to tracked files has no revision to be fetched by, so
+# each lockfile write is a commit (--commit-lock-file; a git source takes it
+# no other way). Committing rather than resetting is what carries an override
+# forward, which the accumulating assertions further down depend on.
+nix flake lock "$flake3Dir" --override-input flake2/flake1 file://"$TEST_ROOT"/flake.tar.gz -vvvvv --commit-lock-file
 [[ $(jq .nodes.flake1_2.locked.url "$flake3Dir/flake.lock") =~ flake.tar.gz ]]
 
-nix flake lock "$flake3Dir" --override-input flake2/flake1 flake1
+nix flake lock "$flake3Dir" --override-input flake2/flake1 flake1 --commit-lock-file
 [[ $(jq -r .nodes.flake1_2.locked.rev "$flake3Dir/flake.lock") =~ $hash2 ]]
 
-nix flake lock "$flake3Dir" --override-input flake2/flake1 flake1/master/"$hash1"
+nix flake lock "$flake3Dir" --override-input flake2/flake1 flake1/master/"$hash1" --commit-lock-file
 [[ $(jq -r .nodes.flake1_2.locked.rev "$flake3Dir/flake.lock") =~ $hash1 ]]
 
 # Test that --override-input with empty input path is rejected (issue #14816).
@@ -407,22 +466,22 @@ expectStderr 1 nix flake lock "$flake3Dir" --override-input '' . | grepQuiet -- 
 expectStderr 1 nix flake lock "$flake3Dir" --update-input '' | grepQuiet -- "--update-input was passed a zero-length input path, which would refer to the flake itself, not an input"
 
 # Test --update-input.
-nix flake lock "$flake3Dir"
+nix flake lock "$flake3Dir" --commit-lock-file
 [[ $(jq -r .nodes.flake1_2.locked.rev "$flake3Dir/flake.lock") = "$hash1" ]]
 
-nix flake update flake2/flake1 --flake "$flake3Dir"
+nix flake update flake2/flake1 --flake "$flake3Dir" --commit-lock-file
 [[ $(jq -r .nodes.flake1_2.locked.rev "$flake3Dir/flake.lock") =~ $hash2 ]]
 
 # Test that 'nix flake update' with empty input path is rejected.
 expectStderr 1 nix flake update '' --flake "$flake3Dir" | grepQuiet -- "input path to be updated cannot be zero-length; it would refer to the flake itself, not an input"
 
 # Test updating multiple inputs.
-nix flake lock "$flake3Dir" --override-input flake1 flake1/master/"$hash1"
-nix flake lock "$flake3Dir" --override-input flake2/flake1 flake1/master/"$hash1"
+nix flake lock "$flake3Dir" --override-input flake1 flake1/master/"$hash1" --commit-lock-file
+nix flake lock "$flake3Dir" --override-input flake2/flake1 flake1/master/"$hash1" --commit-lock-file
 [[ $(jq -r .nodes.flake1.locked.rev "$flake3Dir/flake.lock") =~ $hash1 ]]
 [[ $(jq -r .nodes.flake1_2.locked.rev "$flake3Dir/flake.lock") =~ $hash1 ]]
 
-nix flake update flake1 flake2/flake1 --flake "$flake3Dir"
+nix flake update flake1 flake2/flake1 --flake "$flake3Dir" --commit-lock-file
 [[ $(jq -r .nodes.flake1.locked.rev "$flake3Dir/flake.lock") =~ $hash2 ]]
 [[ $(jq -r .nodes.flake1_2.locked.rev "$flake3Dir/flake.lock") =~ $hash2 ]]
 
@@ -463,8 +522,7 @@ prevFlake2Rev=$(nix flake metadata --json "$flake2Dir" | jq -r .revision)
 echo "# bla" >> "$flake1Dir/flake.nix"
 git -C "$flake1Dir" commit flake.nix -m 'bla'
 
-nix flake update --flake "$flake2Dir"
-git -C "$flake2Dir" commit flake.lock -m 'bla'
+nix flake update --flake "$flake2Dir" --commit-lock-file
 
 newFlake1Rev=$(nix flake metadata --json "$flake1Dir" | jq -r .revision)
 newFlake2Rev=$(nix flake metadata --json "$flake2Dir" | jq -r .revision)
@@ -479,8 +537,9 @@ cat > "$flake3Dir/flake.nix" <<EOF
 EOF
 git -C "$flake3Dir" commit flake.nix -m 'bla'
 
-rm "$flake3Dir/flake.lock"
-nix flake lock "$flake3Dir"
+git -C "$flake3Dir" rm --quiet flake.lock
+git -C "$flake3Dir" commit -m 'Drop lockfile'
+nix flake lock "$flake3Dir" --commit-lock-file
 [[ "$(nix flake metadata --json "$flake3Dir" | jq -r .locks.nodes.flake1.locked.rev)" = "$newFlake1Rev" ]]
 
 cat > "$flake3Dir/flake.nix" <<EOF
@@ -491,11 +550,19 @@ cat > "$flake3Dir/flake.nix" <<EOF
   };
 }
 EOF
+git -C "$flake3Dir" commit -a -m 'bla'
 
-[[ "$(nix flake metadata --json "$flake3Dir" | jq -r .locks.nodes.flake1.locked.rev)" = "$prevFlake1Rev" ]]
+# `nix flake metadata` computes the lock and, like every flake command,
+# writes it when it changed (LockFlags.writeLockFile defaults on); the
+# question here is what the flake WOULD lock to, so the write is declined
+# rather than committed.
+[[ "$(nix flake metadata --no-write-lock-file --json "$flake3Dir" | jq -r .locks.nodes.flake1.locked.rev)" = "$prevFlake1Rev" ]]
 
 baseDir=$TEST_ROOT/$RANDOM
 subdirFlakeDir1=$baseDir/foo1
+# foo1 and foo2 are directories inside baseDir's tree, so baseDir is the only
+# workspace and each subflake is named by a `dir=` on it.
+jjFlakeDir "$baseDir"
 mkdir -p "$subdirFlakeDir1"
 
 writeSimpleFlake "$baseDir"
@@ -508,14 +575,14 @@ cat > "$subdirFlakeDir1"/flake.nix <<EOF
 }
 EOF
 
-nix registry add --registry "$registry" flake2 "path:$baseDir?dir=foo1"
+nix registry add --registry "$registry" flake2 "jj+file://$baseDir?dir=foo1"
 [[ "$(nix eval --flake-registry "$registry" flake2#shouldBeOne)" = 1 ]]
 
 subdirFlakeDir2=$baseDir/foo2
 mkdir -p "$subdirFlakeDir2"
 cat > "$subdirFlakeDir2"/flake.nix <<EOF
 {
-  inputs.foo1.url = "path:$baseDir?dir=foo1";
+  inputs.foo1.url = "jj+file://$baseDir?dir=foo1";
 
   outputs = inputs: { };
 }

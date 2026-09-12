@@ -48,7 +48,6 @@ subdir('nix-meson-build-support/common')
 
 sources = files(
   'derived-path.cc',
-  'error_traces.cc',
   'eval.cc',
   'json.cc',
   'main.cc',
@@ -56,9 +55,7 @@ sources = files(
   'nix_api_external.cc',
   'nix_api_value.cc',
   'nix_api_value_internal.cc',
-  'primops.cc',
   'search-path.cc',
-  'trivial.cc',
   'value/context.cc',
   'value/print.cc',
   'value/value.cc',
@@ -94,10 +91,8 @@ if get_option('benchmarks')
 
   benchmark_sources = files(
     'bench-main.cc',
-    'dynamic-attrs-bench.cc',
-    'get-drvs-bench.cc',
-    'regex-cache-bench.cc',
-  )
+      'get-drvs-bench.cc',
+    )
 
   benchmark_exe = executable(
     'nix-expr-benchmarks',

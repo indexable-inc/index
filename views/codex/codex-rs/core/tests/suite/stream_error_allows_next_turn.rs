@@ -1,7 +1,7 @@
+use codex_core::TurnInputRequest;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -81,6 +81,7 @@ async fn continue_after_stream_error() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     };
 
     let TestCodex { codex, .. } = test_codex()
@@ -93,38 +94,35 @@ async fn continue_after_stream_error() {
         .unwrap();
 
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "first message".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "first message".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
     // Expect an Error followed by TurnComplete so the session is released.
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
+    let EventMsg::Error(error) =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await
+    else {
+        unreachable!("predicate guarantees an error event");
+    };
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await
+    else {
+        unreachable!("predicate guarantees a turn complete event");
+    };
+    assert_eq!(completed.error, Some(error));
 
     // 2) Second turn: now send another prompt that should succeed using the
     // mock server SSE stream. If the agent failed to clear the running task on
     // error above, this submission would be rejected/queued indefinitely.
     codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "follow up".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "follow up".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 

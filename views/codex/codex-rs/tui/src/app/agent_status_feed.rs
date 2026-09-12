@@ -1,4 +1,4 @@
-//! Bounded, best-effort previews for the v2 `/agent` status output.
+//! Bounded, best-effort previews for the v2 `/subagents` status output.
 
 use super::ThreadBufferedEvent;
 use super::ThreadEventStore;
@@ -32,7 +32,7 @@ impl AgentStatusHistoryCell {
 impl HistoryCell for AgentStatusHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = vec![
-            "/agent".magenta().into(),
+            "/subagents".magenta().into(),
             "Sub-agents running".bold().into(),
             "".into(),
         ];
@@ -85,14 +85,12 @@ impl AgentStatusThreadPreview {
         let mut activity = Vec::new();
         for event in events {
             let item = match event {
-                ThreadBufferedEvent::Notification(ServerNotification::ItemCompleted(event)) => {
-                    &event.item
-                }
-                ThreadBufferedEvent::Notification(ServerNotification::ItemStarted(event)) => {
-                    &event.item
-                }
-                ThreadBufferedEvent::Notification(_)
-                | ThreadBufferedEvent::Request(_)
+                ThreadBufferedEvent::Notification(notification) => match notification.as_ref() {
+                    ServerNotification::ItemCompleted(event) => &event.item,
+                    ServerNotification::ItemStarted(event) => &event.item,
+                    _ => continue,
+                },
+                ThreadBufferedEvent::Request(_)
                 | ThreadBufferedEvent::HistoryEntryResponse(_)
                 | ThreadBufferedEvent::FeedbackSubmission(_) => continue,
             };
@@ -160,6 +158,10 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
         }
         ThreadItem::CollabAgentToolCall { tool, .. } => {
             let action = match tool {
+                CollabAgentTool::SendMessage
+                | CollabAgentTool::FollowupTask
+                | CollabAgentTool::InterruptAgent
+                | CollabAgentTool::ListAgents => return None,
                 CollabAgentTool::SpawnAgent => "Spawned an agent",
                 CollabAgentTool::SendInput => "Sent input to an agent",
                 CollabAgentTool::ResumeAgent => "Resumed an agent",
@@ -175,6 +177,7 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
                 SubAgentActivityKind::Started => "Started",
                 SubAgentActivityKind::Interacted => "Contacted",
                 SubAgentActivityKind::Interrupted => "Interrupted",
+                SubAgentActivityKind::Completed => "Completed",
             };
             return bounded_summary(&format!("{action} {agent_path}"));
         }
@@ -191,7 +194,10 @@ fn activity_summary(item: &ThreadItem) -> Option<String> {
         ThreadItem::ContextCompaction { .. } => return Some("Compacted context".to_string()),
         ThreadItem::UserMessage { .. }
         | ThreadItem::HookPrompt { .. }
-        | ThreadItem::Sleep { .. } => return None,
+        | ThreadItem::FunctionCallOutput { .. }
+        | ThreadItem::Sleep(_) => {
+            return None;
+        }
     };
     bounded_summary(summary)
 }

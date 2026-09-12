@@ -444,6 +444,9 @@ static void performOp(
                     // Use NAR; Git is not a serialization method
                     dumpMethod = FileSerialisationMethod::NixArchive;
                     break;
+                case FileIngestionMethod::JjTree:
+                    throw TreeIdNotComputable(
+                        "cannot add '%s' to the store by its Jujutsu tree id: Nix does not compute those", name);
                 default:
                     assert(false);
                 }
@@ -560,10 +563,15 @@ static void performOp(
         break;
     }
 
-    case WorkerProto::Op::BuildPathsWithResults: {
+    case WorkerProto::Op::BuildPathsWithResults:
+    case WorkerProto::Op::BuildPathsWithResultsIndependent: {
         auto drvs = WorkerProto::Serialise<DerivedPaths>::read(*store, rconn);
         BuildMode mode = bmNormal;
         mode = WorkerProto::Serialise<BuildMode>::read(*store, rconn);
+
+        bool independent = op == WorkerProto::Op::BuildPathsWithResultsIndependent;
+        if (independent && !rconn.version.features.contains(WorkerProto::independentBuildResults))
+            throw Error("independent build results were not negotiated with this client");
 
         /* Repairing is not atomic, so disallowed for "untrusted"
            clients.
@@ -573,7 +581,8 @@ static void performOp(
             throw Error("repairing is not allowed because you are not in 'trusted-users'");
 
         logger->startWork();
-        auto results = store->buildPathsWithResults(drvs, mode);
+        auto results = store->buildPathsWithResults(
+            drvs, mode, nullptr, independent ? BuildFailureMode::KeepGoing : BuildFailureMode::Configured);
         logger->stopWork();
 
         WorkerProto::write(*store, wconn, results);

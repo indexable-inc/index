@@ -36,7 +36,7 @@ impl EnvironmentRequestProcessor {
             .environment_manager
             .get_environment(&environment_id)
             .ok_or_else(|| invalid_request(format!("unknown environment id `{environment_id}`")))?;
-        let info = environment.info().await.map_err(|err| {
+        let info = environment.force_info().await.map_err(|err| {
             internal_error(format!(
                 "failed to get info for environment `{environment_id}`: {err}"
             ))
@@ -51,5 +51,28 @@ impl EnvironmentRequestProcessor {
             }
             .into(),
         ))
+    }
+
+    pub(crate) async fn environment_status(
+        &self,
+        params: EnvironmentStatusParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let environment_id = params.environment_id;
+        let (status, error) = match self
+            .environment_manager
+            .get_environment_status(&environment_id)
+            .await
+        {
+            Some(EnvironmentObservedStatus::Ready) => (EnvironmentStatusKind::Ready, None),
+            Some(EnvironmentObservedStatus::Pending) => (EnvironmentStatusKind::Pending, None),
+            Some(EnvironmentObservedStatus::Disconnected { error }) => {
+                (EnvironmentStatusKind::Disconnected, Some(error))
+            }
+            None => (
+                EnvironmentStatusKind::Unknown,
+                Some(format!("unknown environment id `{environment_id}`")),
+            ),
+        };
+        Ok(Some(EnvironmentStatusResponse { status, error }.into()))
     }
 }

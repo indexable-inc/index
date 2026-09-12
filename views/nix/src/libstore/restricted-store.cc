@@ -115,7 +115,8 @@ struct RestrictedStore : public virtual IndirectRootStore, public virtual GcStor
     std::vector<KeyedBuildResult> buildPathsWithResults(
         const std::vector<DerivedPath> & paths,
         BuildMode buildMode = bmNormal,
-        std::shared_ptr<Store> evalStore = nullptr) override;
+        std::shared_ptr<Store> evalStore = nullptr,
+        BuildFailureMode failureMode = BuildFailureMode::Configured) override;
 
     BuildResult
     buildDerivation(const StorePath & drvPath, const BasicDerivation & drv, BuildMode buildMode = bmNormal) override
@@ -261,7 +262,10 @@ void RestrictedStore::buildPaths(
 }
 
 std::vector<KeyedBuildResult> RestrictedStore::buildPathsWithResults(
-    const std::vector<DerivedPath> & paths, BuildMode buildMode, std::shared_ptr<Store> evalStore)
+    const std::vector<DerivedPath> & paths,
+    BuildMode buildMode,
+    std::shared_ptr<Store> evalStore,
+    BuildFailureMode failureMode)
 {
     assert(!evalStore);
 
@@ -276,7 +280,7 @@ std::vector<KeyedBuildResult> RestrictedStore::buildPathsWithResults(
             throw InvalidPath("cannot build '%s' in recursive Nix because path is unknown", req.to_string(*next));
     }
 
-    auto results = next->buildPathsWithResults(paths, buildMode);
+    auto results = next->buildPathsWithResults(paths, buildMode, nullptr, failureMode);
 
     for (auto & result : results) {
         if (auto * successP = result.tryGetSuccess()) {

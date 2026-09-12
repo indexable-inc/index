@@ -5,12 +5,76 @@ use chrono::DateTime;
 use chrono::Duration as ChronoDuration;
 use chrono::TimeZone;
 use chrono::Utc;
-use http::Response as HttpResponse;
+use codex_http_client::HttpResponse;
+use http::Response as RawHttpResponse;
+use http::StatusCode;
 use pretty_assertions::assert_eq;
-use reqwest::Response;
-use reqwest::ResponseBuilderExt;
-use reqwest::StatusCode;
-use reqwest::Url;
+use std::time::Duration;
+
+#[test]
+fn codex_err_debug_preserves_legacy_shape() {
+    let actual = [
+        CodexErr::Timeout,
+        CodexErr::Stream("disconnected".to_string()),
+        CodexErr::Stream("retry later".to_string()).with_retry_delay(Duration::from_secs(2)),
+        CodexErr::InternalServerError.with_retry_delay(Duration::from_secs(3)),
+    ]
+    .map(|err| format!("{err:?}"));
+
+    assert_eq!(
+        actual,
+        [
+            "Timeout".to_string(),
+            "Stream(\"disconnected\", None)".to_string(),
+            "Stream(\"retry later\", Some(2s))".to_string(),
+            "InternalServerError".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn retryability_preserves_error_details_distinctions() {
+    let errors = [
+        (CodexErr::ServerOverloaded, false),
+        (
+            CodexErr::new(CodexErrorDetails::RateLimitExceeded("retry later".into())),
+            true,
+        ),
+        (
+            CodexErr::RetryLimit(RetryLimitReachedError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                request_id: None,
+            }),
+            false,
+        ),
+        (
+            CodexErr::UnexpectedStatus(UnexpectedResponseError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: String::new(),
+                user_message: None,
+                url: None,
+                cf_ray: None,
+                request_id: None,
+                identity_authorization_error: None,
+                identity_error_code: None,
+            }),
+            true,
+        ),
+        (
+            CodexErrorDetails::ToolCollision("functions.update_plan".to_string()).into(),
+            false,
+        ),
+        (CodexErr::InternalServerError, true),
+    ];
+
+    for (err, expected) in errors {
+        assert_eq!(
+            err.is_retryable(),
+            expected,
+            "unexpected retryability for {err:?}"
+        );
+    }
+}
 
 fn rate_limit_snapshot() -> RateLimitSnapshot {
     let primary_reset_at = Utc
@@ -24,6 +88,7 @@ fn rate_limit_snapshot() -> RateLimitSnapshot {
     RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 50.0,
             window_minutes: Some(60),
@@ -36,6 +101,7 @@ fn rate_limit_snapshot() -> RateLimitSnapshot {
         }),
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }
@@ -165,12 +231,14 @@ fn sandbox_denied_reports_stdout_when_no_stderr() {
 
 #[test]
 fn to_error_event_handles_response_stream_failed() {
-    let response = HttpResponse::builder()
+    let response = RawHttpResponse::builder()
         .status(StatusCode::TOO_MANY_REQUESTS)
-        .url(Url::parse("http://example.com").unwrap())
         .body("")
         .unwrap();
-    let source = Response::from(response).error_for_status_ref().unwrap_err();
+    let source = HttpResponse::from(response)
+        .error_for_status_ref()
+        .unwrap_err()
+        .with_url("http://example.com".parse().unwrap());
     let err = CodexErr::ResponseStreamFailed(ResponseStreamFailed {
         source,
         request_id: Some("req-123".to_string()),
@@ -277,8 +345,29 @@ fn usage_limit_reached_error_formats_team_plan() {
 
 #[test]
 fn usage_limit_reached_error_formats_business_plan_without_reset() {
+    for plan in [
+        KnownPlan::Business,
+        KnownPlan::Ent26,
+        KnownPlan::EnterpriseCbpAutomation,
+    ] {
+        let err = UsageLimitReachedError {
+            plan_type: Some(PlanType::Known(plan)),
+            resets_at: None,
+            rate_limits: Some(Box::new(rate_limit_snapshot())),
+            promo_message: None,
+            rate_limit_reached_type: None,
+        };
+        assert_eq!(
+            err.to_string(),
+            "You've hit your usage limit. To get more access now, send a request to your admin or try again later."
+        );
+    }
+}
+
+#[test]
+fn usage_limit_reached_error_formats_self_serve_business_prolite_plan() {
     let err = UsageLimitReachedError {
-        plan_type: Some(PlanType::Known(KnownPlan::Business)),
+        plan_type: Some(PlanType::Known(KnownPlan::SelfServeBusinessProLite)),
         resets_at: None,
         rate_limits: Some(Box::new(rate_limit_snapshot())),
         promo_message: None,
@@ -322,17 +411,24 @@ fn usage_limit_reached_error_formats_enterprise_cbp_usage_based_plan() {
 
 #[test]
 fn usage_limit_reached_error_formats_default_for_other_plans() {
-    let err = UsageLimitReachedError {
-        plan_type: Some(PlanType::Known(KnownPlan::Enterprise)),
-        resets_at: None,
-        rate_limits: Some(Box::new(rate_limit_snapshot())),
-        promo_message: None,
-        rate_limit_reached_type: None,
-    };
-    assert_eq!(
-        err.to_string(),
-        "You've hit your usage limit. Try again later."
-    );
+    for plan in [
+        KnownPlan::Enterprise,
+        KnownPlan::Edu,
+        KnownPlan::EduPlus,
+        KnownPlan::EduPro,
+    ] {
+        let err = UsageLimitReachedError {
+            plan_type: Some(PlanType::Known(plan)),
+            resets_at: None,
+            rate_limits: Some(Box::new(rate_limit_snapshot())),
+            promo_message: None,
+            rate_limit_reached_type: None,
+        };
+        assert_eq!(
+            err.to_string(),
+            "You've hit your usage limit. Try again later."
+        );
+    }
 }
 
 #[test]

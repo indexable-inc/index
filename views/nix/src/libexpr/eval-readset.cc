@@ -151,11 +151,9 @@ observedHook(SourceAccessor & accessor, const CanonPath & path, SourceReadKind k
         currentTracker->recordObserved(accessor, path, kind, observed);
 }
 
-ReadSetTracker::ReadSetTracker(
-    EvalState & state, std::optional<std::filesystem::path> traceFile, bool hashContents, bool retain)
+ReadSetTracker::ReadSetTracker(EvalState & state, std::optional<std::filesystem::path> traceFile, bool hashContents)
     : state(state)
     , hashContents(hashContents)
-    , retain(retain)
     , fd([&]() {
         if (!traceFile)
             return AutoCloseFD{};
@@ -174,7 +172,6 @@ ReadSetTracker::ReadSetTracker(
     if (hashContents)
         sourceObservedHook.store(observedHook, std::memory_order_relaxed);
 
-    oldIdStack.push_back(0);
     stack.push_back(
         Entry{
             .id = nextEntryId++,
@@ -260,22 +257,6 @@ void ReadSetTracker::push(TrackedEntryKind kind, std::string key, size_t accesso
        new one becomes innermost. */
     if (!stack.empty())
         addEdge(nextEntryId, EdgeKind::demand);
-    /* An import key survives an edit, so its counterpart resolves by key
-       alone. Everything else resolves later, if at all, through the edges of
-       its demanding parent. */
-    int64_t oldId = -1;
-    if (kind == TrackedEntryKind::import && state.retainedPrev) {
-        /* The anchor has to name which tree the key is relative to, or every
-           flake answers for /flake.nix. The tree this accessor most recently
-           answered for is the best name available at push time; an accessor
-           not yet seen leaves the entry unanchored, which forgoes splices
-           under it and nothing else. */
-        if (auto i = accessorTreeId.find(accessor); i != accessorTreeId.end() && i->second < capturedTrees.size()) {
-            auto & t = capturedTrees[i->second];
-            oldId = state.retainedPrev->importIdFor(t.identity, t.view, key);
-        }
-    }
-    oldIdStack.push_back(oldId);
     stack.push_back(
         Entry{
             .id = nextEntryId++,
@@ -301,7 +282,6 @@ void ReadSetTracker::pop()
     assert(!stack.empty());
     auto entry = std::move(stack.back());
     stack.pop_back();
-    oldIdStack.pop_back();
 
     auto wall = wallNs() - entry.wallStartNs;
     auto cpu = cpuNs() - entry.cpuStartNs;
@@ -332,20 +312,6 @@ void ReadSetTracker::emit(const Entry & entry, uint64_t wall, uint64_t cpu, uint
     nrEdges += edges.size();
     if (!edges.empty())
         nrEntriesWithEdges++;
-
-    if (retain) [[unlikely]] {
-        auto entryTree = accessorTreeId.find(entry.accessor);
-        capturedEntries.push_back(
-            RetainedEntry{
-                .id = entry.id,
-                .kind = entry.kind,
-                .key = entry.key,
-                .tree = entryTree == accessorTreeId.end() ? -1 : int32_t(entryTree->second),
-                .inputs = inputs,
-                .edges = edges,
-                .produced = entry.produced,
-            });
-    }
 
     auto j = nlohmann::json{
         {"t", "entry"},
@@ -385,14 +351,11 @@ ReadSetTracker::treeIdFor(SourceAccessor * accessor, std::string_view path, std:
     key += '\0';
     key += root;
 
-    if (auto i = treeIds.find(key); i != treeIds.end()) {
-        accessorTreeId.insert_or_assign(accessor ? accessor->number : 0, i->second);
+    if (auto i = treeIds.find(key); i != treeIds.end())
         return i->second;
-    }
 
     auto id = uint32_t(treeIds.size());
     treeIds.emplace(key, id);
-    accessorTreeId.insert_or_assign(accessor ? accessor->number : 0, id);
 
     /* What names this tree across two runs. The fingerprint without its
        version, if there is one; otherwise the accessor's own display, which is
@@ -409,10 +372,6 @@ ReadSetTracker::treeIdFor(SourceAccessor * accessor, std::string_view path, std:
         identity = display;
     else if (accessor)
         identity = std::string(accessor->identityClass(CanonPath(path)));
-
-    if (retain) [[unlikely]]
-        capturedTrees.push_back(
-            RetainedTree{.identity = identity, .view = viewOfRoot(root), .fp = std::string(fp), .root = root});
 
     auto j = nlohmann::json{
         {"t", "tree"},
@@ -479,15 +438,6 @@ uint32_t ReadSetTracker::internInput(
 
     auto id = uint32_t(inputTable.size());
     inputTable.emplace(key, id);
-
-    if (retain) [[unlikely]]
-        capturedInputs.push_back(
-            RetainedInput{
-                .kind = std::string(kind),
-                .tree = tree ? int32_t(*tree) : -1,
-                .rel = rel,
-                .path = std::string(path),
-            });
 
     auto in = nlohmann::json{
         {"t", "in"},
@@ -851,7 +801,7 @@ void ReadSetTracker::recordTreeAttr(std::string_view treeId, std::string_view at
         observed = "«unprintable»";
 
     /* The attribute's value now flows onward as an ordinary string, read by
-       entries whose own read sets never mention the tree: a `dirtyRev` that
+       entries whose own read sets never mention the tree: a `rev` that
        lands in `nixos-version` crosses into that derivation as a value. The
        payload registration is what lets the consumption hooks attribute
        that flow back to this input. */
@@ -880,56 +830,6 @@ void ReadSetTracker::recordTreeAttr(std::string_view treeId, std::string_view at
             {"changed_during_eval", !inserted},
         }
             .dump());
-}
-
-void ReadSetTracker::setCurrentOldId(int64_t id)
-{
-    if (!oldIdStack.empty())
-        oldIdStack.back() = id;
-}
-
-int64_t ReadSetTracker::parentOldId() const
-{
-    /* Only the immediate demander, never an ancestor. Falling through to
-       the nearest resolved ancestor reached the root, whose edges hold one
-       entry per name that was first demanded under it, including several
-       bootstrap-stage variants of one package name; resolving a child there
-       assembled derivations out of the wrong stages, each input valid on
-       its own and the whole novel. An unresolved parent means the child is
-       computed, which costs time and never correctness. */
-    if (oldIdStack.size() < 2)
-        return -1;
-    return oldIdStack[oldIdStack.size() - 2];
-}
-
-void ReadSetTracker::noteDerivationResult(Value & v)
-{
-    if (!retain || stack.empty())
-        return;
-    auto * copy = state.allocValue();
-    *copy = v;
-    capturedValues[stack.back().id] = copy;
-}
-
-std::shared_ptr<RetainedEval> ReadSetTracker::extractRetained()
-{
-    /* Everything still open has to be emitted first, or the captured
-       entry ids are not dense and the retained graph misindexes. */
-    while (!stack.empty())
-        pop();
-
-    auto out = std::make_shared<RetainedEval>();
-    out->entries = std::move(capturedEntries);
-    out->trees = std::move(capturedTrees);
-    out->inputs = std::move(capturedInputs);
-    for (auto & [id, observed] : observedInputs)
-        if (id < out->inputs.size())
-            out->inputs[id].observed = observed;
-    out->buildIndexes();
-    for (auto & [entryId, value] : capturedValues)
-        out->retainValue(entryId, value);
-    capturedValues.clear();
-    return out;
 }
 
 void ReadSetTracker::recordStoreQuery(std::string_view storePath)

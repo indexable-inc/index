@@ -14,12 +14,10 @@
   # its repo-relative path.
   testSource = fs.toSource {
     inherit (paths) root;
-    fileset = fs.intersection (fs.gitTracked paths.root) (
-      fs.unions [
-        ./tests
-        (paths.root + "/.github/workflows/blast-radius.yml")
-      ]
-    );
+    fileset = fs.unions [
+      ./tests
+      (paths.root + "/.github/workflows/blast-radius.yml")
+    ];
   };
 in {
   # Exercises the trusted half of the blast-radius PR comment: the

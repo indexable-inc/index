@@ -8,18 +8,25 @@ use super::NetworkPolicyAmendment;
 use super::RequestPermissionProfile;
 use super::UserInput;
 use super::shared::v2_enum_from_core;
-use crate::protocol::item_builders::command_actions_for_path_uri;
+use crate::JsonSchema;
+use crate::TS;
+use crate::protocol::item_builders::CommandExecutionPresentation;
 use crate::protocol::item_builders::convert_patch_changes;
 use crate::protocol::item_builders::review_output_text;
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_extension_items::ExtensionItem;
+pub use codex_extension_items::image_generation::ImageGenerationFailure;
 pub use codex_extension_items::image_generation::ImageGenerationItem;
+pub use codex_extension_items::sleep::SleepItem;
 pub use codex_extension_items::web_search::WebSearchAction;
 pub use codex_extension_items::web_search::WebSearchItem;
+use codex_protocol::approvals::ExecApprovalKind as CoreExecApprovalKind;
 use codex_protocol::approvals::GuardianAssessmentAction as CoreGuardianAssessmentAction;
 use codex_protocol::approvals::GuardianAssessmentDecisionSource as CoreGuardianAssessmentDecisionSource;
 use codex_protocol::approvals::GuardianCommandSource as CoreGuardianCommandSource;
 use codex_protocol::items::AgentMessageContent as CoreAgentMessageContent;
+pub use codex_protocol::items::AgentMessageDelivery;
+pub use codex_protocol::items::AsyncUserInputQuestion;
 use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
 use codex_protocol::items::CollabAgentToolCallStatus as CoreCollabAgentToolCallStatus;
 use codex_protocol::items::CommandExecutionStatus as CoreCommandExecutionStatus;
@@ -28,6 +35,7 @@ use codex_protocol::items::McpToolCallStatus as CoreMcpToolCallStatus;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::memory_citation::MemoryCitation as CoreMemoryCitation;
 use codex_protocol::memory_citation::MemoryCitationEntry as CoreMemoryCitationEntry;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -40,10 +48,8 @@ use codex_protocol::protocol::GuardianUserAuthorization as CoreGuardianUserAutho
 use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
 use codex_protocol::protocol::ReviewDecision as CoreReviewDecision;
 use codex_protocol::protocol::SubAgentActivityKind as CoreSubAgentActivityKind;
-use codex_shell_command::parse_command::shlex_join;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -51,7 +57,6 @@ use serde_with::serde_as;
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -81,6 +86,9 @@ impl From<CoreReviewDecision> for CommandExecutionApprovalDecision {
     fn from(value: CoreReviewDecision) -> Self {
         match value {
             CoreReviewDecision::Approved => Self::Accept,
+            // MCP approvals are handled through elicitations, so an MCP policy amendment should
+            // never appear in a command execution approval. To be cautious here, we fail closed.
+            CoreReviewDecision::ApprovedMcpPolicyAmendment => Self::Decline,
             CoreReviewDecision::ApprovedExecpolicyAmendment {
                 proposed_execpolicy_amendment,
             } => Self::AcceptWithExecpolicyAmendment {
@@ -93,7 +101,7 @@ impl From<CoreReviewDecision> for CommandExecutionApprovalDecision {
                 network_policy_amendment: network_policy_amendment.into(),
             },
             CoreReviewDecision::Abort => Self::Cancel,
-            CoreReviewDecision::Denied => Self::Decline,
+            CoreReviewDecision::Denied { .. } => Self::Decline,
             CoreReviewDecision::TimedOut => Self::Decline,
         }
     }
@@ -121,7 +129,7 @@ pub enum CommandAction {
     Read {
         command: String,
         name: String,
-        path: AbsolutePathBuf,
+        path: LegacyAppPathString,
     },
     ListFiles {
         command: String,
@@ -185,7 +193,7 @@ impl CommandAction {
             } => CoreParsedCommand::Read {
                 cmd,
                 name,
-                path: path.into_path_buf(),
+                path: PathBuf::from(path.into_string()),
             },
             CommandAction::ListFiles { command: cmd, path } => {
                 CoreParsedCommand::ListFiles { cmd, path }
@@ -204,7 +212,7 @@ impl CommandAction {
             CoreParsedCommand::Read { cmd, name, path } => CommandAction::Read {
                 command: cmd,
                 name,
-                path: cwd.join(path),
+                path: cwd.join(path).into(),
             },
             CoreParsedCommand::ListFiles { cmd, path } => {
                 CommandAction::ListFiles { command: cmd, path }
@@ -246,6 +254,18 @@ pub enum ThreadItem {
         phase: Option<MessagePhase>,
         #[serde(default)]
         memory_citation: Option<MemoryCitation>,
+        #[serde(default)]
+        delivery: Option<AgentMessageDelivery>,
+        #[serde(default)]
+        questions: Option<Vec<AsyncUserInputQuestion>>,
+    },
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    FunctionCallOutput {
+        id: String,
+        name: String,
+        namespace: Option<String>,
+        output: FunctionCallOutputBody,
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -268,6 +288,12 @@ pub enum ThreadItem {
     #[ts(rename_all = "camelCase")]
     CommandExecution {
         id: String,
+        /// Trusted first-party plugin id when this command resolves to one plugin script.
+        #[serde(default)]
+        plugin_id: Option<String>,
+        /// Safe plugin-relative path when this command resolves to one plugin script.
+        #[serde(default)]
+        script_path: Option<String>,
         /// The command to be executed.
         command: String,
         /// The command's working directory.
@@ -310,6 +336,7 @@ pub enum ThreadItem {
         /// Deprecated: use `appContext.resourceUri` instead.
         mcp_app_resource_uri: Option<String>,
         plugin_id: Option<String>,
+        read_only_hint: Option<bool>,
         result: Option<Box<McpToolCallResult>>,
         error: Option<McpToolCallError>,
         /// The duration of the MCP tool call in milliseconds.
@@ -368,13 +395,7 @@ pub enum ThreadItem {
         id: String,
         path: LegacyAppPathString,
     },
-    #[serde(rename_all = "camelCase")]
-    #[ts(rename_all = "camelCase")]
-    Sleep {
-        id: String,
-        #[ts(type = "number")]
-        duration_ms: u64,
-    },
+    Sleep(SleepItem),
     ImageGeneration(ImageGenerationItem),
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
@@ -403,7 +424,6 @@ pub struct McpToolCallAppContext {
     pub link_id: Option<String>,
     pub resource_uri: Option<String>,
     pub app_name: Option<String>,
-    pub template_id: Option<String>,
     pub action_name: Option<String>,
 }
 
@@ -421,6 +441,7 @@ impl ThreadItem {
             ThreadItem::UserMessage { id, .. }
             | ThreadItem::HookPrompt { id, .. }
             | ThreadItem::AgentMessage { id, .. }
+            | ThreadItem::FunctionCallOutput { id, .. }
             | ThreadItem::Plan { id, .. }
             | ThreadItem::Reasoning { id, .. }
             | ThreadItem::CommandExecution { id, .. }
@@ -430,11 +451,11 @@ impl ThreadItem {
             | ThreadItem::CollabAgentToolCall { id, .. }
             | ThreadItem::SubAgentActivity { id, .. }
             | ThreadItem::ImageView { id, .. }
-            | ThreadItem::Sleep { id, .. }
             | ThreadItem::EnteredReviewMode { id, .. }
             | ThreadItem::ExitedReviewMode { id, .. }
             | ThreadItem::ContextCompaction { id, .. } => id,
             ThreadItem::WebSearch(item) => &item.id,
+            ThreadItem::Sleep(item) => &item.id,
             ThreadItem::ImageGeneration(item) => &item.id,
         }
     }
@@ -628,6 +649,15 @@ pub enum GuardianApprovalReviewAction {
         argv: Vec<String>,
         cwd: AbsolutePathBuf,
     },
+    /// A child approval for input to an existing command execution item.
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    WriteStdin {
+        approval_id: String,
+        process_id: String,
+        stdin: String,
+        cwd: LegacyAppPathString,
+    },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     ApplyPatch {
@@ -681,6 +711,17 @@ impl From<CoreGuardianAssessmentAction> for GuardianApprovalReviewAction {
                 program,
                 argv,
                 cwd,
+            },
+            CoreGuardianAssessmentAction::WriteStdin {
+                approval_id,
+                process_id,
+                stdin,
+                cwd,
+            } => Self::WriteStdin {
+                approval_id,
+                process_id,
+                stdin,
+                cwd: cwd.into(),
             },
             CoreGuardianAssessmentAction::ApplyPatch { cwd, files } => {
                 Self::ApplyPatch { cwd, files }
@@ -744,6 +785,19 @@ impl TryFrom<GuardianApprovalReviewAction> for CoreGuardianAssessmentAction {
                 program,
                 argv,
                 cwd,
+            },
+            GuardianApprovalReviewAction::WriteStdin {
+                approval_id,
+                process_id,
+                stdin,
+                cwd,
+            } => Self::WriteStdin {
+                approval_id,
+                process_id,
+                stdin,
+                cwd: cwd
+                    .try_into()
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
             },
             GuardianApprovalReviewAction::ApplyPatch { cwd, files } => {
                 Self::ApplyPatch { cwd, files }
@@ -829,8 +883,16 @@ impl From<CoreTurnItem> for ThreadItem {
                     text,
                     phase: agent.phase,
                     memory_citation: agent.memory_citation.map(Into::into),
+                    delivery: agent.delivery,
+                    questions: agent.questions,
                 }
             }
+            CoreTurnItem::FunctionCallOutput(output) => ThreadItem::FunctionCallOutput {
+                id: output.id,
+                name: output.name,
+                namespace: output.namespace,
+                output: output.output,
+            },
             CoreTurnItem::Plan(plan) => ThreadItem::Plan {
                 id: plan.id,
                 text: plan.text,
@@ -840,22 +902,31 @@ impl From<CoreTurnItem> for ThreadItem {
                 summary: reasoning.summary_text,
                 content: reasoning.raw_content,
             },
-            CoreTurnItem::CommandExecution(command) => ThreadItem::CommandExecution {
-                id: command.id,
-                command: shlex_join(&command.command),
-                cwd: command.cwd.clone().into(),
-                process_id: command.process_id,
-                source: command.source.into(),
-                status: command.status.into(),
-                command_actions: command_actions_for_path_uri(&command.parsed_cmd, &command.cwd),
-                aggregated_output: command
-                    .aggregated_output
-                    .filter(|output| !output.is_empty()),
-                exit_code: command.exit_code,
-                duration_ms: command
-                    .duration
-                    .and_then(|duration| i64::try_from(duration.as_millis()).ok()),
-            },
+            CoreTurnItem::CommandExecution(command) => {
+                let presentation = CommandExecutionPresentation::from_raw(
+                    &command.command,
+                    &command.parsed_cmd,
+                    &command.cwd,
+                );
+                ThreadItem::CommandExecution {
+                    id: command.id,
+                    plugin_id: command.plugin_id,
+                    script_path: command.script_path,
+                    command: presentation.command,
+                    cwd: command.cwd.clone().into(),
+                    process_id: command.process_id,
+                    source: command.source.into(),
+                    status: command.status.into(),
+                    command_actions: presentation.command_actions,
+                    aggregated_output: command
+                        .aggregated_output
+                        .filter(|output| !output.is_empty()),
+                    exit_code: command.exit_code,
+                    duration_ms: command
+                        .duration
+                        .and_then(|duration| i64::try_from(duration.as_millis()).ok()),
+                }
+            }
             CoreTurnItem::DynamicToolCall(call) => ThreadItem::DynamicToolCall {
                 id: call.id,
                 namespace: call.namespace,
@@ -902,17 +973,15 @@ impl From<CoreTurnItem> for ThreadItem {
                 id: search.id,
                 query: search.query,
                 action: Some(web_search_action_from_core(search.action)),
+                results: search.results,
             }),
             CoreTurnItem::ImageView(image) => ThreadItem::ImageView {
                 id: image.id,
                 path: image.path.into(),
             },
-            CoreTurnItem::Sleep(sleep) => ThreadItem::Sleep {
-                id: sleep.id,
-                duration_ms: sleep.duration_ms,
-            },
             CoreTurnItem::Extension(extension) => match extension {
                 ExtensionItem::ImageGeneration(item) => ThreadItem::ImageGeneration(item),
+                ExtensionItem::Sleep(item) => ThreadItem::Sleep(item),
                 ExtensionItem::WebSearch(item) => ThreadItem::WebSearch(item),
             },
             CoreTurnItem::ImageGeneration(image) => {
@@ -921,7 +990,10 @@ impl From<CoreTurnItem> for ThreadItem {
                     status: image.status,
                     revised_prompt: image.revised_prompt,
                     result: image.result,
+                    transparent_background: None,
+                    failure: None,
                     saved_path: image.saved_path,
+                    imagegen_request_id: None,
                 })
             }
             CoreTurnItem::EnteredReviewMode(review) => ThreadItem::EnteredReviewMode {
@@ -957,11 +1029,11 @@ impl From<CoreTurnItem> for ThreadItem {
                         link_id: mcp.link_id,
                         resource_uri: mcp.mcp_app_resource_uri.clone(),
                         app_name: mcp.app_name,
-                        template_id: mcp.template_id,
                         action_name: mcp.action_name,
                     }),
                     mcp_app_resource_uri: mcp.mcp_app_resource_uri,
                     plugin_id: mcp.plugin_id,
+                    read_only_hint: mcp.read_only_hint,
                     result: mcp.result.map(McpToolCallResult::from).map(Box::new),
                     error: mcp.error.map(McpToolCallError::from),
                     duration_ms,
@@ -1040,6 +1112,10 @@ pub enum CollabAgentTool {
     ResumeAgent,
     Wait,
     CloseAgent,
+    SendMessage,
+    FollowupTask,
+    InterruptAgent,
+    ListAgents,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1132,6 +1208,7 @@ pub enum CollabAgentToolCallStatus {
     InProgress,
     Completed,
     Failed,
+    Interrupted,
 }
 
 impl From<CoreCollabAgentTool> for CollabAgentTool {
@@ -1142,6 +1219,10 @@ impl From<CoreCollabAgentTool> for CollabAgentTool {
             CoreCollabAgentTool::ResumeAgent => Self::ResumeAgent,
             CoreCollabAgentTool::Wait => Self::Wait,
             CoreCollabAgentTool::CloseAgent => Self::CloseAgent,
+            CoreCollabAgentTool::SendMessage => Self::SendMessage,
+            CoreCollabAgentTool::FollowupTask => Self::FollowupTask,
+            CoreCollabAgentTool::InterruptAgent => Self::InterruptAgent,
+            CoreCollabAgentTool::ListAgents => Self::ListAgents,
         }
     }
 }
@@ -1152,6 +1233,7 @@ impl From<CoreCollabAgentToolCallStatus> for CollabAgentToolCallStatus {
             CoreCollabAgentToolCallStatus::InProgress => Self::InProgress,
             CoreCollabAgentToolCallStatus::Completed => Self::Completed,
             CoreCollabAgentToolCallStatus::Failed => Self::Failed,
+            CoreCollabAgentToolCallStatus::Interrupted => Self::Interrupted,
         }
     }
 }
@@ -1163,6 +1245,7 @@ pub enum SubAgentActivityKind {
     Started,
     Interacted,
     Interrupted,
+    Completed,
 }
 
 impl From<CoreSubAgentActivityKind> for SubAgentActivityKind {
@@ -1171,6 +1254,7 @@ impl From<CoreSubAgentActivityKind> for SubAgentActivityKind {
             CoreSubAgentActivityKind::Started => SubAgentActivityKind::Started,
             CoreSubAgentActivityKind::Interacted => SubAgentActivityKind::Interacted,
             CoreSubAgentActivityKind::Interrupted => SubAgentActivityKind::Interrupted,
+            CoreSubAgentActivityKind::Completed => SubAgentActivityKind::Completed,
         }
     }
 }
@@ -1261,6 +1345,8 @@ pub struct ItemGuardianApprovalReviewStartedNotification {
     /// In most cases, one review maps to one target item. The exceptions are
     /// - execve reviews, where a single command may contain multiple execve
     ///   calls to review (only possible when using the shell_zsh_fork feature)
+    /// - stdin reviews, which refer to the existing parent command item and
+    ///   have a separate approval ID in the action payload
     /// - network policy reviews, where there is no target item
     ///
     /// A network call is triggered by a CommandExecution item, so having a
@@ -1293,6 +1379,8 @@ pub struct ItemGuardianApprovalReviewCompletedNotification {
     /// In most cases, one review maps to one target item. The exceptions are
     /// - execve reviews, where a single command may contain multiple execve
     ///   calls to review (only possible when using the shell_zsh_fork feature)
+    /// - stdin reviews, which refer to the existing parent command item and
+    ///   have a separate approval ID in the action payload
     /// - network policy reviews, where there is no target item
     ///
     /// A network call is triggered by a CommandExecution item, so having a
@@ -1428,10 +1516,24 @@ pub struct FileChangePatchUpdatedNotification {
     pub changes: Vec<FileUpdateChange>,
 }
 
+v2_enum_from_core! {
+    /// Distinguishes a command approval from input sent to an existing terminal.
+    #[derive(Default)]
+    #[ts(rename_all = "camelCase")]
+    pub enum CommandExecutionApprovalKind from CoreExecApprovalKind {
+        #[default]
+        Command,
+        WriteStdin,
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct CommandExecutionRequestApprovalParams {
+    /// Kind of action under review. Defaults to `command` for older servers.
+    #[serde(default)]
+    pub kind: CommandExecutionApprovalKind,
     pub thread_id: String,
     pub turn_id: String,
     pub item_id: String,
@@ -1445,6 +1547,7 @@ pub struct CommandExecutionRequestApprovalParams {
     /// For zsh-exec-bridge subcommand approvals, multiple callbacks can belong to
     /// one parent `itemId`, so `approvalId` is a distinct opaque callback id
     /// (a UUID) used to disambiguate routing.
+    /// Stdin approvals also use a distinct callback id; inspect `kind` to distinguish them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub approval_id: Option<String>,
@@ -1561,6 +1664,8 @@ pub enum DynamicToolCallOutputContentItem {
     InputText { text: String },
     #[serde(rename_all = "camelCase")]
     InputImage { image_url: String },
+    #[serde(rename_all = "camelCase")]
+    InputAudio { audio_url: String },
 }
 
 impl From<codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem>
@@ -1574,6 +1679,9 @@ impl From<codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem>
             codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputImage {
                 image_url,
             } => Self::InputImage { image_url },
+            codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputAudio {
+                audio_url,
+            } => Self::InputAudio { audio_url },
         }
     }
 }
@@ -1586,6 +1694,9 @@ impl From<DynamicToolCallOutputContentItem>
             DynamicToolCallOutputContentItem::InputText { text } => Self::InputText { text },
             DynamicToolCallOutputContentItem::InputImage { image_url } => {
                 Self::InputImage { image_url }
+            }
+            DynamicToolCallOutputContentItem::InputAudio { audio_url } => {
+                Self::InputAudio { audio_url }
             }
         }
     }
@@ -1615,7 +1726,7 @@ pub struct ToolRequestUserInputQuestion {
     pub options: Option<Vec<ToolRequestUserInputOption>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 /// EXPERIMENTAL. Params sent with a request_user_input event.
@@ -1624,9 +1735,39 @@ pub struct ToolRequestUserInputParams {
     pub turn_id: String,
     pub item_id: String,
     pub questions: Vec<ToolRequestUserInputQuestion>,
+    pub is_blocking: bool,
+    /// @deprecated Use `isBlocking` to decide whether the request should block.
     #[serde(default)]
     #[ts(type = "number | null")]
     pub auto_resolution_ms: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for ToolRequestUserInputParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WireToolRequestUserInputParams {
+            thread_id: String,
+            turn_id: String,
+            item_id: String,
+            questions: Vec<ToolRequestUserInputQuestion>,
+            is_blocking: Option<bool>,
+            auto_resolution_ms: Option<u64>,
+        }
+
+        let wire = WireToolRequestUserInputParams::deserialize(deserializer)?;
+        Ok(Self {
+            thread_id: wire.thread_id,
+            turn_id: wire.turn_id,
+            item_id: wire.item_id,
+            questions: wire.questions,
+            is_blocking: wire.is_blocking.unwrap_or(true),
+            auto_resolution_ms: wire.auto_resolution_ms,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

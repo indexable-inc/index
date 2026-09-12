@@ -113,7 +113,29 @@ enum struct FileIngestionMethod : uint8_t {
      * manual.
      */
     Git,
+
+    /**
+     * Jujutsu tree id: the BLAKE3 Merkle root that jj's native object
+     * store assigns a directory tree, maintained by the VCS at snapshot
+     * time. The algorithm is fixed by the method (always BLAKE3).
+     *
+     * Nix has no serializer for jj's tree format, so unlike every other
+     * method this hash cannot be computed from the files: `hashPath`
+     * throws `TreeIdNotComputable`. An object with this address enters
+     * the store only through `Store::addToStoreWithKnownCA`, with an id
+     * read from the object store that minted it.
+     *
+     * See `file-system-object/content-address.md#jj-tree` in the manual.
+     */
+    JjTree,
 };
+
+/**
+ * Thrown wherever a `FileIngestionMethod::JjTree` hash would have to be
+ * computed from file contents. Nix cannot: the id is jj's, read from its
+ * object store. Callers that hold the id use `Store::addToStoreWithKnownCA`.
+ */
+MakeError(TreeIdNotComputable, Error);
 
 /**
  * Parse a `FileIngestionMethod` by name. Choice of:
@@ -121,6 +143,7 @@ enum struct FileIngestionMethod : uint8_t {
  *  - `flat`: `FileIngestionMethod::Flat`
  *  - `nar`: `FileIngestionMethod::NixArchive`
  *  - `git`: `FileIngestionMethod::Git`
+ *  - `jj-tree`: `FileIngestionMethod::JjTree`
  *
  * Opposite of `renderFileIngestionMethod`.
  */
@@ -142,6 +165,8 @@ std::string_view renderFileIngestionMethod(FileIngestionMethod method);
  * `FileIngestionMethod` instead of `FileSerialisationMethod`, but
  * may not return the size as this is this is not a both simple and
  * useful defined for a merkle format.
+ *
+ * Throws `TreeIdNotComputable` for `FileIngestionMethod::JjTree`.
  */
 std::pair<Hash, std::optional<uint64_t>> hashPath(
     const SourcePath & path, FileIngestionMethod method, HashAlgorithm ha, PathFilter & filter = defaultPathFilter);

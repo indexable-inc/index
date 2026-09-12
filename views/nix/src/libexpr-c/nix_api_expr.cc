@@ -62,19 +62,6 @@ nix_err nix_libexpr_init(nix_c_context * context)
     NIXC_CATCH_ERRS
 }
 
-nix_err nix_expr_eval_from_string(
-    nix_c_context * context, EvalState * state, const char * expr, const char * path, nix_value * value)
-{
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        nix::Expr * parsedExpr = state->state.parseExprFromString(expr, state->state.rootPath(nix::CanonPath(path)));
-        state->state.eval(parsedExpr, *value->value);
-        state->state.forceValue(*value->value, nix::noPos);
-    }
-    NIXC_CATCH_ERRS
-}
-
 nix_err nix_value_call(nix_c_context * context, EvalState * state, Value * fn, nix_value * arg, nix_value * value)
 {
     if (context)

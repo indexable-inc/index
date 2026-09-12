@@ -115,6 +115,28 @@ Only SHA-1 is supported at this time.
 If [SHA-256-based Git](https://git-scm.com/docs/hash-function-transition)
 becomes more widespread, this restriction will be revisited.
 
+### Jujutsu tree { #method-jj-tree }
+
+This uses the corresponding [Jujutsu tree](../file-system-object/content-address.md#jj-tree) method of file system object content addressing: the hash is the BLAKE3 tree id that jj's native object store assigned the root directory.
+
+References are not supported.
+
+Only BLAKE3 is supported, because that is the algorithm jj's object store uses; the method is not gated on the `blake3-hashes` experimental feature, since the algorithm is the method's and not a choice the user makes.
+
+Nix never computes this hash. A store object with this address is created only by a fetcher that read the tree out of a jj object store and knows its id (`SourceAccessor::knownTreeRoot`), which is what lets the store path of a `jj` flake input be derived without reading a single file. The store still records and verifies the NAR hash of the bytes it wrote.
+
+A filtered or partial view of such a tree is addressed the same way. `builtins.path` and `builtins.filterSource` on a directory served from a jj object store, and a path naming a subdirectory of one, are answered by the id of the tree the filter leaves: a Merkle operation on tree objects that reads no file (`SourceAccessor::getFilteredTree`), after which the object is mounted lazily at its store path exactly as a flake input is and written only when a consumer forces it (a build input, an evaluation result carrying its context, `nix flake archive`). The id depends on the kept content alone, so an edit outside the kept files leaves the store path, and its validity, untouched. Two things keep the NAR road: a `sha256` argument, which names a NAR hash that only a NAR walk can check, and a source string carrying store references. One visible difference between the roads: a directory the filter empties is dropped, since a jj tree has no empty directories, where a NAR copy keeps it.
+
+#### Trust { #method-jj-tree-trust }
+
+A `jj-tree` store object is content-addressed but not *self-certifying*. For every other content-addressing method the address is a function of the bytes, so a store can check any object it is handed against the address it claims and no further trust is needed. A Jujutsu tree id is minted by jj's object store, and Nix has no way to recompute it from the files: the address says which object this should be, not that these bytes are it. The store therefore treats such an object exactly like an [input-addressed](@docroot@/glossary.md#gloss-input-addressed-store-object) one for trust purposes:
+
+- Registering it needs a trusted registrant or a signature. A local store adds it directly (the process reading the jj object store vouches). Through the daemon, the write is an `AddToStoreNar` with signature checking disabled, which the daemon honours only for a user in [`trusted-users`](@docroot@/command-ref/conf-file.md#conf-trusted-users); for anyone else the check is forced back on, the object counts zero signatures, and the write is refused with a trace naming `trusted-users` and signing as the ways out. Evaluation is unaffected: a `jj` input is mounted lazily and only a forced materialization (a build reading the tree, `nix flake archive`) writes to the store.
+- Copying it between stores (`nix copy`, `nix flake archive --to`) needs `--no-check-sigs` at the destination or a signature by a key in [`trusted-public-keys`](@docroot@/command-ref/conf-file.md#conf-trusted-public-keys).
+- `nix store verify` counts its signatures as it does for input-addressed paths, and `builtins.fetchClosure` accepts it only with `inputAddressed = true`.
+
+A registered object is a voucher: a `treeHash`-locked `jj` input whose repository is absent from the host is served from the store when the object is valid there and its recorded content address names the locked id. When the repository exists it is always the source, because a store object is a flattened copy with no subtree objects: a relative `path:./sub` input of a flake served from the store is refused, naming the repository, rather than addressed as a subpath of the parent.
+
 [fso-ca]: ../file-system-object/content-address.md
 [sp-spec]: @docroot@/protocols/store-path.md
 [xp-feature-git-hashing]: @docroot@/development/experimental-features.md#xp-feature-git-hashing

@@ -250,10 +250,6 @@ pub struct NetworkDomainPermissionsToml {
 }
 
 impl NetworkDomainPermissionsToml {
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     pub fn allowed_domains(&self) -> Option<Vec<String>> {
         let allowed_domains: Vec<String> = self
             .entries
@@ -301,10 +297,6 @@ pub struct NetworkUnixSocketPermissionsToml {
 }
 
 impl NetworkUnixSocketPermissionsToml {
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     pub fn allow_unix_sockets(&self) -> Vec<String> {
         self.entries
             .iter()
@@ -447,29 +439,6 @@ impl NetworkMitmToml {
                 return Err(format!(
                     "network.mitm.hooks.{hook_name}.action must not be empty"
                 ));
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn validate_action_references(
-        &self,
-        actions_by_name: &IndexMap<String, NetworkMitmActionToml>,
-    ) -> Result<(), String> {
-        self.validate_action_definitions()?;
-
-        let Some(hooks) = self.hooks.as_ref() else {
-            return Ok(());
-        };
-
-        for (hook_name, hook) in hooks {
-            for action_name in &hook.action {
-                if !actions_by_name.contains_key(action_name) {
-                    return Err(format!(
-                        "network.mitm.hooks.{hook_name}.action references undefined action `{action_name}`"
-                    ));
-                }
             }
         }
 

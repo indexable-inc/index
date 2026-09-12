@@ -273,6 +273,7 @@ config_priv_h = configure_file(
 )
 
 subdir('nix-meson-build-support/common')
+subdir('nix-meson-build-support/rust-runtime')
 
 sources = files(
   'binary-cache-store.cc',
@@ -336,7 +337,7 @@ sources = files(
   'posix-fs-canonicalise.cc',
   'profiles.cc',
   'realisation.cc',
-  'references.cc',
+  'rust-references.cc',
   'remote-fs-accessor.cc',
   'remote-store.cc',
   'restricted-store.cc',
@@ -385,6 +386,8 @@ this_library = library(
   dependencies : deps_public + deps_private + deps_other,
   include_directories : include_dirs,
   link_args : linker_export_flags,
+  build_rpath : rust_runtime_build_rpath,
+  install_rpath : rust_runtime_install_rpath,
   prelink : true, # For C++ static initializers
   install : true,
   cpp_pch : do_pch ? [ 'pch/precompiled-headers.hh' ] : [],
@@ -392,10 +395,12 @@ this_library = library(
 
 install_headers(headers, subdir : 'nix/store', preserve_path : true)
 
-libraries_private = []
+libraries_private = rust_runtime_libraries_private
 
 extra_pkg_config_variables = {
   'storedir' : get_option('store-dir'),
+  'rust_host_runtime_libdir' : rust_runtime_install_rpath,
+  'rust_host_runtime_includedir' : rust_runtime_install_includedir,
 }
 
 # Working around https://github.com/mesonbuild/meson/issues/13584

@@ -252,16 +252,31 @@
     # the wrapper's computed render between the house defaults and the
     # controlled keys; the render is enforced through the managed layer.
     extraSettings = claudeSettings;
-    # Strict kernel-only mode: the index Elixir kernel is the entire tool
-    # surface. The wrapper empties the built-in tool table and bakes only the
-    # `index` MCP server, denying the rest by name so a project `.mcp.json`
-    # cannot merge one back in (claude-code/default.nix,
-    # agent/policy/permissions.nix). It folds AFTER caller `systemTools`, so
-    # an opt-in stated here would be dead config; the old ScheduleWakeup
-    # opt-in went with it.
-    # kernelOnly = true; # 2026-08-07: disabled -- kernel-only default was too
-    # restrictive in practice (Bash/Read/Edit denied everywhere); `claude-kernel`
-    # in home.nix keeps a kernel-only binary for when that posture is wanted.
+    # Strict kernel-only mode (re-enabled 2026-09-03, Andrew: "disable all
+    # system tools"): the Elixir kernel is the entire tool surface, so the
+    # wrapper empties the built-in tool table, bakes only the `index` MCP
+    # server and denies every other server by name. On hydra the kernel
+    # behind `index` is the good-harness one, served over HTTP by a launchd
+    # agent and declared through managed-mcp.json (hosts/hydra in the nix
+    # repo), which also locks the claude.ai connectors out. History: first
+    # enabled 2026-07, reverted 2026-08-07 as too restrictive with the stdio
+    # index kernel (`claude-kernel` in home.nix kept the posture as a second
+    # binary); good-harness is built to be the whole toolset (its own launcher
+    # runs `claude --tools ""`), so the default binary carries it again. The
+    # 2026-09-02 `keepNativeTools = ["Read"]` went with it: kernelOnly
+    # re-denies Read, so stating it would be dead config. Way back: set this
+    # false and switch; there is no per-session escape, because the render
+    # feeds the managed layer, which outranks command-line scope.
+    kernelOnly = true;
+    # The `index` server reaches sessions through hosts/hydra's managed-mcp.json
+    # (the lockdown above), so the wrapper must bake no `--mcp-config`: Claude
+    # Code 2.1.228 refuses to start with both ("You cannot dynamically
+    # configure MCP servers when an enterprise MCP config is present", every
+    # launch after the 2026-09-03 switch). The guard attestation and the
+    # by-name denies still derive from the intended set (see the package).
+    managedMcp = true;
+    # Claude in Chrome off in every session (`--no-chrome`), same request.
+    chrome = false;
     # Personal opt-outs from the fleet posture: run the model's native 1M
     # window (no DISABLE_1M clamp, no AUTO_COMPACT_WINDOW override).
     features = {
@@ -413,6 +428,10 @@ in {
     {
       assertion = cfg.packages.ix != null;
       message = "users.andrewgazelka.packages.ix must be set for the workstation profile.";
+    }
+    {
+      assertion = cfg.packages.jj != null;
+      message = "users.andrewgazelka.packages.jj must be set for the workstation profile.";
     }
     {
       assertion = cfg.packages.mercuryCli != null;
@@ -597,17 +616,14 @@ in {
       gh # GitHub CLI (PRs, issues, gists, auth, runs)
       tea # Forgejo/Gitea CLI (pull requests, issues, releases)
       b4 # `b4`: fetch a kernel patch series or thread from lore.kernel.org by message-id (`b4 mbox <msgid>`, `b4 am`); the CLI path to kernel mailing-list archives, so agents stop driving a browser to read lore. Note it will not create `-o <dir>`: fetch succeeds, then the write dies with FileNotFoundError (ENG-12940)
-      # `jj` from the indexable-inc/jj fork rather than nixpkgs' jujutsu: the
-      # fork carries `jj views fetch` and `jj views push`, which drive the
-      # derived subtrees this config depends on (ix/ is one). nixpkgs' build
-      # has no `views` subcommand at all, so the pin in flake.nix reaches
-      # nothing unless this line names the fork package.
-      indexPkgs.jj # `jj` — Git-compatible VCS with first-class branches/operations
-      # The standalone view tool, packaged apart from `jj` because it is not part
-      # of the VCS anyone installs. `jj views fetch` does the import internally in
-      # the normal case, so this is only reached when a view has diverged and has
-      # to be integrated by hand -- which is exactly when being without it hurts.
-      indexPkgs.jj-views
+      # `jj`: ix's native client, supplied by the consuming flake (see the
+      # `packages.jj` option). Not nixpkgs' jujutsu and not the vendored
+      # fork's own binary -- the client is that CLI plus the ix store
+      # registration this config's repos need, and it is where `jj view`
+      # lives, which `vcs-prompt` above spawns on every prompt. It comes
+      # through an option because it is a package of the ix root flake, which
+      # `indexPackages` does not reach.
+      cfg.packages.jj # `jj` — Git-compatible VCS with first-class branches/operations
       # jj-starship  # slow to build from source (jj-lib); indexPkgs.vcs-prompt renders the same segment
       lazygit # TUI for git (stage, commit, branch, rebase visually)
       delta # syntax-highlighted git diff/blame pager

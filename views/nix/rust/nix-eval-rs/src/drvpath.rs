@@ -256,10 +256,10 @@ impl CaMethod {
 /// Two branches, and picking the wrong one gives a well-formed path that is
 /// not cppnix's:
 ///
-/// * sha256 **and** NAR ingestion is the `source` type, hashing the declared
-///   hash directly -- the same shape `nix store add-path` produces, which is
-///   why a recursive sha256 fetch and an added directory can land on the same
-///   path;
+/// * sha256 or Blake3 **and** NAR ingestion is the `source` type, hashing the
+///   declared hash directly -- the same shape `nix store add-path` produces,
+///   which is why a recursive fetch and an added directory can land on the
+///   same path;
 /// * everything else hashes a `fixed:out:` payload *first* and feeds that
 ///   digest to `output:out`.
 ///
@@ -273,7 +273,7 @@ pub fn make_fixed_output_path(
     method: CaMethod,
     hash: &Hash,
 ) -> String {
-    if method == CaMethod::NixArchive && hash.algo == HashAlgo::Sha256 {
+    if method == CaMethod::NixArchive && matches!(hash.algo, HashAlgo::Blake3 | HashAlgo::Sha256) {
         return make_store_path(store_dir, "source", &hash.to_base16(true), name);
     }
     let payload = format!(
@@ -305,18 +305,25 @@ pub fn make_text_path<'a>(
     contents: &str,
     references: impl IntoIterator<Item = &'a str>,
 ) -> String {
+    make_text_path_from_hash(store_dir, name, &sha256(contents.as_bytes()), references)
+}
+
+/// Construct a text object's path when its SHA-256 is already available.
+/// The store batch uses the same digest in its content-address metadata.
+#[must_use]
+pub(crate) fn make_text_path_from_hash<'a>(
+    store_dir: &str,
+    name: &str,
+    hash: &[u8; 32],
+    references: impl IntoIterator<Item = &'a str>,
+) -> String {
     let sorted: BTreeSet<&str> = references.into_iter().collect();
     let mut ty = String::from("text");
     for reference in &sorted {
         ty.push(':');
         ty.push_str(reference);
     }
-    make_store_path(
-        store_dir,
-        &ty,
-        &format!("sha256:{}", hex(&sha256(contents.as_bytes()))),
-        name,
-    )
+    make_store_path(store_dir, &ty, &format!("sha256:{}", hex(hash)), name)
 }
 
 /// `infoForDerivation` / `computeStorePath` (`derivations.cc:109`): where the
@@ -369,21 +376,11 @@ pub fn text_store_path(
     contents: &str,
     references: &[String],
 ) -> String {
-    // `makeType`: the references are stuffed into the type string, which is
-    // why they have to be in cppnix's order. `StorePathSet` sorts by base
-    // name and every path here shares the store directory, so sorting the
-    // printed form agrees.
-    let sorted: BTreeSet<&str> = references.iter().map(String::as_str).collect();
-    let mut ty = String::from("text");
-    for reference in sorted {
-        ty.push(':');
-        ty.push_str(reference);
-    }
-    make_store_path(
+    make_text_path(
         store_dir,
-        &ty,
-        &format!("sha256:{}", hex(&sha256(contents.as_bytes()))),
         name,
+        contents,
+        references.iter().map(String::as_str),
     )
 }
 
@@ -1737,7 +1734,11 @@ mod fixed_output_tests {
     /// `source` one.
     #[test]
     fn hello_src_lands_on_the_path_cpp_computes() {
-        let hash = parse_any("sha256-DV9gFUOC/uELEUocNOeF2LH0kgc64tOm97FHaHs2aqA=", None);
+        let hash = parse_any(
+            "sha256-DV9gFUOC/uELEUocNOeF2LH0kgc64tOm97FHaHs2aqA=",
+            None,
+            false,
+        );
         // Rendered rather than unwrapped: the workspace denies `panic` and
         // `unwrap`, tests included, so a test says what happened and compares.
         let got = match &hash {

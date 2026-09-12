@@ -3,8 +3,9 @@
 #include "nix/util/thread-pool.hh"
 #include "nix/store/filetransfer.hh"
 #include "nix/util/exit.hh"
-
-#include <nlohmann/json.hpp>
+#include "nix/expr/eval.hh"
+#include "nix/store/store-api.hh"
+#include "nix/util/mounted-source-accessor.hh"
 
 using namespace nix;
 using namespace nix::flake;
@@ -27,42 +28,71 @@ struct CmdFlakePrefetchInputs : FlakeCommand
     {
         auto flake = lockFlake();
 
-        ThreadPool pool{fileTransferSettings.httpConnections};
+        auto state = getEvalState();
 
-        struct State
+        struct MountedInput
         {
-            std::set<const Node *> done;
+            StorePath expected;
+            ref<SourceAccessor> accessor;
         };
 
-        Sync<State> state_;
-
+        // Resolve mounted accessors before starting workers. Relative inputs
+        // have no standalone fetch URL; their mount already fixes their source
+        // and store identity. The root must be materialized before its inputs.
+        const auto mounted = [&] {
+            std::map<NodeId, MountedInput> result;
+            for (auto & [node, source] : flake.nodePaths) {
+                auto expected = store->toStorePath(source.path.abs()).first;
+                auto accessor = state->storeFS->getMount(CanonPath(store->printStorePath(expected)));
+                if (!accessor)
+                    throw Error("prefetch source '%s' has no mounted input", source);
+                result.emplace(node, MountedInput{expected, ref(accessor)});
+            }
+            return result;
+        }();
+        auto schedule = flake.lockFile.prefetchSchedule();
         std::atomic<size_t> nrFailed{0};
-
-        auto visit = [&](this const auto & visit, const Node & node) {
-            if (!state_.lock()->done.insert(&node).second)
-                return;
-
-            if (auto lockedNode = dynamic_cast<const LockedNode *>(&node)) {
-                try {
-                    Activity act(*logger, lvlInfo, actUnknown, fmt("fetching '%s'", lockedNode->lockedRef));
-                    auto accessor = lockedNode->lockedRef.input.getAccessor(fetchSettings, *store).first;
-                    fetchToStore(
-                        fetchSettings, *store, accessor, FetchMode::Copy, lockedNode->lockedRef.input.getName());
-                } catch (Error & e) {
-                    printError("%s", e.what());
-                    nrFailed++;
-                }
+        std::function<void(NodeId)> fetchNode;
+        // Destroy the pool first so no worker outlives the state it captures.
+        ThreadPool pool{fileTransferSettings.httpConnections};
+        fetchNode = [&](NodeId node) {
+            bool succeeded = false;
+            try {
+                auto locked = flake.lockFile.node(node);
+                auto source = mounted.find(node);
+                auto accessor = [&]() -> ref<SourceAccessor> {
+                    if (source != mounted.end())
+                        return source->second.accessor;
+                    if (!locked || locked->lockedRef.input.isRelative())
+                        throw Error("prefetch input %d is missing its mounted source", node.value);
+                    return locked->lockedRef.input.getAccessor(fetchSettings, *store).first;
+                }();
+                auto name = source != mounted.end() ? std::string(source->second.expected.name())
+                                                    : locked->lockedRef.input.getName();
+                auto method =
+                    accessor->knownTreeRoot ? ContentAddressMethod::Raw::JjTree : ContentAddressMethod::Raw::NixArchive;
+                auto copied = fetchToStore(fetchSettings, *store, SourcePath{accessor}, FetchMode::Copy, name, method);
+                if (source != mounted.end() && copied != source->second.expected)
+                    throw Error(
+                        "prefetch source identity changed: expected '%s', copied '%s'",
+                        store->printStorePath(source->second.expected),
+                        store->printStorePath(copied));
+                succeeded = true;
+            } catch (Error & error) {
+                printError("%s", error.what());
+                nrFailed++;
             }
-
-            for (auto & [inputName, input] : node.inputs) {
-                if (auto inputNode = std::get_if<0>(&input))
-                    pool.enqueue(std::bind(visit, **inputNode));
-            }
+            // Rust releases a shared child exactly once, after every direct
+            // parent succeeds. Unrelated branches can continue concurrently.
+            for (auto ready : schedule.complete(node, succeeded))
+                pool.enqueue([&, ready] { fetchNode(ready); });
         };
-
-        pool.enqueue(std::bind(visit, *flake.lockFile.root));
-
+        for (auto ready : schedule.ready())
+            if (!pool.tryEnqueue([&, ready] { fetchNode(ready); }))
+                break;
         pool.process();
+        if (!nrFailed)
+            schedule.checkComplete();
 
         throw Exit(nrFailed ? 1 : 0);
     }

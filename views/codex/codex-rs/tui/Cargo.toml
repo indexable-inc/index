@@ -23,6 +23,7 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+axum = { workspace = true, default-features = false, features = ["http1", "tokio"] }
 base64 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
@@ -35,12 +36,13 @@ codex-cloud-config = { workspace = true }
 codex-config = { workspace = true }
 codex-connectors = { workspace = true }
 codex-core-plugins = { workspace = true }
-codex-core-skills = { workspace = true }
+codex-history = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-features = { workspace = true }
 codex-feedback = { workspace = true }
 codex-file-search = { workspace = true }
 codex-git-utils = { workspace = true }
+codex-http-client = { workspace = true }
 codex-login = { workspace = true }
 codex-message-history = { workspace = true }
 codex-model-provider = { workspace = true }
@@ -55,6 +57,7 @@ codex-shell-command = { workspace = true }
 codex-state = { workspace = true }
 codex-terminal-detection = { workspace = true }
 codex-utils-approval-presets = { workspace = true }
+codex-uds = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-cli = { workspace = true }
 codex-utils-elapsed = { workspace = true }
@@ -87,8 +90,7 @@ ratatui = { workspace = true, features = [
 ] }
 ratatui-macros = { workspace = true }
 regex-lite = { workspace = true }
-reqwest = { workspace = true, features = ["blocking", "json"] }
-rmcp = { workspace = true }
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 sha2 = { workspace = true }
@@ -149,16 +151,18 @@ arboard = { workspace = true }
 
 [dev-dependencies]
 app_test_support = { workspace = true }
-codex-cli = { workspace = true }
 codex-mcp = { workspace = true }
 core_test_support = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 assert_matches = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+futures = { workspace = true }
+http = { workspace = true }
 insta = { workspace = true }
 pretty_assertions = { workspace = true }
 rand = { workspace = true }
 serial_test = { workspace = true }
+tokio-tungstenite = { workspace = true }
 vt100 = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }

@@ -26,34 +26,9 @@ using namespace nix;
    mirrors defined in Nixpkgs. */
 std::string resolveMirrorUrl(EvalState & state, const std::string & url)
 {
-    if (url.substr(0, 9) != "mirror://")
+    if (!url.starts_with("mirror://"))
         return url;
-
-    std::string s(url, 9);
-    auto p = s.find('/');
-    if (p == std::string::npos)
-        throw Error("invalid mirror URL '%s'", url);
-    std::string mirrorName(s, 0, p);
-
-    Value vMirrors;
-    // FIXME: use nixpkgs flake
-    state.eval(
-        state.parseExprFromString(
-            "import <nixpkgs/pkgs/build-support/fetchurl/mirrors.nix>", state.rootPath(CanonPath::root)),
-        vMirrors);
-    state.forceAttrs(vMirrors, noPos, "while evaluating the set of all mirrors");
-
-    auto mirrorList = vMirrors.attrs()->get(state.symbols.create(mirrorName));
-    if (!mirrorList)
-        throw Error("unknown mirror name '%s'", mirrorName);
-    state.forceList(*mirrorList->value, noPos, "while evaluating one mirror configuration");
-
-    if (mirrorList->value->listSize() < 1)
-        throw Error("mirror URL '%s' did not expand to anything", url);
-
-    std::string mirror(
-        state.forceString(*mirrorList->value->listView()[0], noPos, "while evaluating the first available mirror"));
-    return mirror + (hasSuffix(mirror, "/") ? "" : "/") + s.substr(p + 1);
+    state.requireBackendCanServe();
 }
 
 std::tuple<StorePath, Hash> prefetchFile(

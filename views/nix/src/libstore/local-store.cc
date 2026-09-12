@@ -106,6 +106,7 @@ struct LocalStore::State::Stmts
     SQLiteStmt AddDerivationOutput;
     SQLiteStmt RegisterRealisedOutput;
     SQLiteStmt UpdateRealisedOutput;
+    SQLiteStmt RepairRealisedOutput;
     SQLiteStmt QueryValidDerivers;
     SQLiteStmt QueryDerivationOutputs;
     SQLiteStmt QueryRealisedOutput;
@@ -370,6 +371,14 @@ LocalStore::LocalStore(ref<const Config> config)
                     drvPath = ? and
                     outputName = ?
                 ;
+            )");
+        state->stmts->RepairRealisedOutput.create(
+            state->db,
+            R"(
+                update Realisations
+                    set outputPath = (select id from ValidPaths where path = ?), signatures = ?
+                where drvPath = ? and outputName = ?
+                    and outputPath = (select id from ValidPaths where path = ?);
             )");
         state->stmts->QueryRealisedOutput.create(
             state->db,
@@ -640,6 +649,42 @@ void LocalStore::registerDrvOutput(const Realisation & info, CheckSigsFlag check
 void LocalStore::registerDrvOutput(const Realisation & info)
 {
     experimentalFeatureSettings.require(Xp::CaDerivations);
+    std::optional<StorePath> invalidPrevious;
+    PathLocks previousLock;
+    if (auto previous = queryRealisation(info.id); previous && !info.isCompatibleWith(*previous)) {
+        addTempRoot(previous->outPath);
+        addTempRoot(info.outPath);
+        previousLock.lockPaths({toRealPath(previous->outPath)});
+        auto oldInfo = queryPathInfo(previous->outPath);
+        auto newInfo = queryPathInfo(info.outPath);
+        auto hashRecordedContent = [&](const ValidPathInfo & pathInfo) {
+            return hashContentAddress(
+                makeFSSourceAccessor(toRealPath(pathInfo.path)),
+                {.method = pathInfo.ca->method,
+                 .algorithm = pathInfo.ca->hash.algo,
+                 .selfReference = std::string{pathInfo.path.hashPart()}});
+        };
+        auto narMatches = [&](const ValidPathInfo & pathInfo, const ContentAddressHashResult & content) {
+            auto actual = content.narHashAndSize ? content.narHashAndSize->hash
+                                                 : hashPath(
+                                                       makeFSSourceAccessor(toRealPath(pathInfo.path)),
+                                                       FileIngestionMethod::NixArchive,
+                                                       pathInfo.narHash.algo)
+                                                       .first;
+            return actual == pathInfo.narHash;
+        };
+        // Repair only a proven producer-identity error. Preserve both objects;
+        // an intact, valid but different output remains a nondeterminism error.
+        // JjTree identities are authenticated externally, not by filesystem hashing.
+        if (oldInfo->ca && newInfo->ca && oldInfo->ca->method.raw != ContentAddressMethod::Raw::JjTree
+            && newInfo->ca->method.raw != ContentAddressMethod::Raw::JjTree) {
+            auto oldContent = hashRecordedContent(*oldInfo);
+            auto newContent = hashRecordedContent(*newInfo);
+            if (narMatches(*oldInfo, oldContent) && oldContent.hash != oldInfo->ca->hash
+                && narMatches(*newInfo, newContent) && newContent.hash == newInfo->ca->hash)
+                invalidPrevious = previous->outPath;
+        }
+    }
     retrySQLite<void>([&]() {
         auto state(_state->lock());
         if (auto oldR = queryRealisation_(*state, info.id)) {
@@ -650,6 +695,18 @@ void LocalStore::registerDrvOutput(const Realisation & info)
                     .use()(concatStringsSep(" ", Signature::toStrings(combinedSignatures)))(info.id.strHash())(
                         info.id.outputName)
                     .exec();
+            } else if (invalidPrevious && oldR->outPath == *invalidPrevious) {
+                // Compare the exact previously verified mapping under the DB lock.
+                // Old signatures authenticate the old output and must not carry over.
+                state->stmts->RepairRealisedOutput
+                    .use()(printStorePath(info.outPath))(concatStringsSep(" ", Signature::toStrings(info.signatures)))(
+                        info.id.strHash())(info.id.outputName)(printStorePath(*invalidPrevious))
+                    .exec();
+                warn(
+                    "repaired invalid content-address realisation '%s': '%s' -> '%s'; old object retained",
+                    info.id.to_string(),
+                    printStorePath(*invalidPrevious),
+                    printStorePath(info.outPath));
             } else {
                 throw Error(
                     "Trying to register a realisation of '%s', but we already "
@@ -820,7 +877,9 @@ bool LocalStore::isValidPath_(State & state, const StorePath & path)
 
 bool LocalStore::isValidPathUncached(const StorePath & path)
 {
-    return retrySQLite<bool>([&]() { return isValidPath_(*_state->lock(), path); });
+    // Metadata survives lost objects; validity additionally requires the NAR root.
+    // pathExists uses lstat, so a dangling symlink remains a valid object.
+    return retrySQLite<bool>([&]() { return isValidPath_(*_state->lock(), path); }) && pathExists(toRealPath(path));
 }
 
 StorePathSet LocalStore::queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute)
@@ -1024,11 +1083,13 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
 
         addTempRoot(info.path);
 
-        if (repair || !isValidPath(info.path)) {
+        auto realPath = toRealPath(info.path);
+        auto present = [&]() { return isValidPath(info.path) && pathExists(realPath); };
+        // Registration can survive a lost filesystem entry. Re-ingest the
+        // supplied NAR in that case; lstat preserves dangling symlink objects.
+        if (repair || !present()) {
 
             PathLocks outputLock;
-
-            auto realPath = toRealPath(info.path);
 
             /* Lock the output path.  But don't lock if we're being called
             from a build hook (whose parent process already acquired a
@@ -1036,7 +1097,12 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
             if (!locksHeld.count(printStorePath(info.path)))
                 outputLock.lockPaths({realPath});
 
-            if (repair || !isValidPath(info.path)) {
+            if (repair || !present()) {
+                // A refused restoration must not leave new invalid bytes
+                // underneath the surviving registration.
+                std::optional<AutoDelete> missingEntryCleanup;
+                if (!pathExists(realPath))
+                    missingEntryCleanup.emplace(realPath);
 
                 deletePath(realPath);
 
@@ -1065,33 +1131,15 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
                         info.narSize,
                         hashResult.numBytesDigested);
 
-                if (info.ca) {
+                // JjTree identities are authenticated by the object store and
+                // the admitted NAR; they cannot be recomputed from a filesystem.
+                if (info.ca && info.ca->method.raw != ContentAddressMethod::Raw::JjTree) {
                     auto & specified = *info.ca;
-                    auto actualHash = ({
-                        auto accessor = getFSAccessor(false);
-                        CanonPath path{info.path.to_string()};
-                        Hash h{HashAlgorithm::SHA256}; // throwaway def to appease C++
-                        auto fim = specified.method.getFileIngestionMethod();
-                        switch (fim) {
-                        case FileIngestionMethod::Flat:
-                        case FileIngestionMethod::NixArchive: {
-                            HashModuloSink caSink{
-                                specified.hash.algo,
-                                std::string{info.path.hashPart()},
-                            };
-                            dumpPath({accessor, path}, caSink, (FileSerialisationMethod) fim);
-                            h = caSink.finish().hash;
-                            break;
-                        }
-                        case FileIngestionMethod::Git:
-                            h = git::dumpHash(specified.hash.algo, {accessor, path}).hash;
-                            break;
-                        }
-                        ContentAddress{
-                            .method = specified.method,
-                            .hash = std::move(h),
-                        };
-                    });
+                    auto actualHash = hashContentAddress(
+                        {getFSAccessor(false), CanonPath{info.path.to_string()}},
+                        {.method = specified.method,
+                         .algorithm = specified.hash.algo,
+                         .selfReference = std::string{info.path.hashPart()}});
                     if (specified.hash != actualHash.hash) {
                         throw Error(
                             "ca hash mismatch importing path '%s';\n  specified: %s\n  got:       %s",
@@ -1113,6 +1161,8 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
                 }
 
                 registerValidPath(info);
+                if (missingEntryCleanup)
+                    missingEntryCleanup->cancel();
             }
 
             outputLock.setDeletion(true);
@@ -1132,6 +1182,12 @@ StorePath LocalStore::addToStoreFromDump(
     const StorePathSet & references,
     RepairFlag repair)
 {
+    if (hashMethod == ContentAddressMethod::Raw::JjTree)
+        throw TreeIdNotComputable(
+            "cannot add '%s' to the store by its Jujutsu tree id from a dump: Nix does not compute those; "
+            "a caller holding the id uses Store::addToStoreWithKnownCA",
+            name);
+
     /* For computing the store path. */
     auto hashSink = std::make_unique<HashSink>(hashAlgo);
     TeeSource source{source0, *hashSink};
@@ -1246,8 +1302,10 @@ StorePath LocalStore::addToStoreFromDump(
                     restorePath(realPath, dumpSource, (FileSerialisationMethod) fim, localSettings.fsyncStorePaths);
                     break;
                 case FileIngestionMethod::Git:
+                case FileIngestionMethod::JjTree:
                     // doesn't correspond to serialization method, so
-                    // this should be unreachable
+                    // this should be unreachable (JjTree is refused at the
+                    // top of this function)
                     assert(false);
                 }
             } else {

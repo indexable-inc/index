@@ -5,7 +5,12 @@ source ./common.sh
 flake1Dir=$TEST_ROOT/flake1
 flake2Dir=$TEST_ROOT/flake2
 
-mkdir -p "$flake1Dir" "$flake2Dir"
+jjFlakeDir "$flake1Dir"
+
+# flake2 is never used as a flake source: it is only tarred up, and the
+# tarball is what gets fetched. A `.jj` here would ride along inside
+# flake.tar.gz and into the hash taken from the directory below.
+mkdir -p "$flake2Dir"
 
 writeSimpleFlake "$flake2Dir"
 tar cfz "$TEST_ROOT"/flake.tar.gz -C "$TEST_ROOT" flake2

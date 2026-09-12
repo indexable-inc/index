@@ -228,7 +228,7 @@ async fn preserves_large_image_in_original_mode() {
     assert_eq!(processed.bytes.as_ref(), original_bytes);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "current_thread")]
 async fn data_url_processing_preserves_supported_source_bytes() {
     let image = ImageBuffer::from_pixel(64, 32, Rgba([10u8, 20, 30, 255]));
     let original_bytes = image_bytes(&image, ImageFormat::Png);
@@ -236,7 +236,7 @@ async fn data_url_processing_preserves_supported_source_bytes() {
         .replacen("data:", "DATA:", 1)
         .replacen(";base64,", ";BASE64,", 1);
 
-    let processed = load_data_url_for_prompt(&image_url, PromptImageMode::ResizeToFit)
+    let processed = load_data_url_for_prompt_uncached(&image_url, PromptImageMode::ResizeToFit)
         .expect("process data URL image");
 
     assert_eq!(processed.width, 64);
@@ -292,7 +292,15 @@ async fn resize_with_limits_respects_dimension_and_patch_budgets() {
     )
     .expect("process image with explicit limits");
 
-    assert_eq!((processed.width, processed.height), (1600, 1600));
+    assert_eq!(
+        (
+            processed.source_width,
+            processed.source_height,
+            processed.width,
+            processed.height,
+        ),
+        (2048, 2048, 1600, 1600)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -350,6 +358,8 @@ async fn bounds_cache_by_encoded_byte_size() {
     let image = |size| EncodedImage {
         bytes: vec![0; size].into(),
         mime: "image/png".to_string(),
+        source_width: 1,
+        source_height: 1,
         width: 1,
         height: 1,
     };

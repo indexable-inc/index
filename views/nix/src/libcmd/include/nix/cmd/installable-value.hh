@@ -3,6 +3,9 @@
 
 #include "nix/cmd/installables.hh"
 #include "nix/flake/flake.hh"
+#include "nix/expr/value/context.hh"
+#include <optional>
+#include <variant>
 
 namespace nix {
 
@@ -27,6 +30,55 @@ struct UnresolvedApp
     std::vector<BuiltPathWithResult> build(ref<Store> evalStore, ref<Store> store);
     App resolve(ref<Store> evalStore, ref<Store> store);
 };
+
+/**
+ * What an app definition or a derivation yields, gathered by whichever
+ * evaluator walked the value. `unresolvedAppOf` turns them into the app by
+ * the one rule set (expected type by attribute path, `program` context to
+ * derived paths, `meta.mainProgram` over `pname` over the parsed name), so
+ * the C++ walk and the Rust bridge cannot differ on a rule.
+ */
+struct AppFields
+{
+    struct Program
+    {
+        std::string program;
+        NixStringContext context;
+    };
+
+    struct Derivation
+    {
+        StorePath drvPath;
+        std::string outPath;
+        std::string outputName;
+        std::string name;
+        std::optional<std::string> pname;
+        std::optional<std::string> mainProgram;
+    };
+
+    std::variant<Program, Derivation> raw;
+};
+
+/**
+ * The `type` an installable at this attribute path must have: "app" under
+ * `apps` and `defaultApp`, "derivation" everywhere else.
+ */
+std::string_view expectedAppType(std::string_view firstAttr);
+
+/**
+ * The app the fields describe. See `AppFields`.
+ */
+UnresolvedApp unresolvedAppOf(const AppFields & fields);
+
+/**
+ * Materialise every opaque path an app's context names, whichever route
+ * produced the app. An opaque element is a source the evaluator mounted
+ * lazily and only hashed; the program string points into it, so a `nix run`
+ * that skipped this would exec into a store path that does not exist. One
+ * body after every route -- fresh C++, fresh Rust, and served from the memo
+ * -- is what keeps them from disagreeing.
+ */
+UnresolvedApp materialiseApp(EvalState & state, UnresolvedApp app);
 
 /**
  * Extra info about a \ref DerivedPath "derived path" that ultimately

@@ -1,0 +1,6 @@
+# Production failures return typed errors; tests abort on a violated assertion.
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+allow-unwrap-in-tests = true

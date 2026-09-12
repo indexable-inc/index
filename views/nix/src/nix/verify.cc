@@ -4,6 +4,7 @@
 #include "nix/util/thread-pool.hh"
 #include "nix/util/signals.hh"
 #include "nix/store/keys.hh"
+#include "nix/util/source-path.hh"
 
 #include <atomic>
 
@@ -95,11 +96,21 @@ struct CmdVerify : StorePathsCommand
 
                 if (!noContents) {
 
-                    auto hashSink = HashSink(info->narHash.algo);
-
-                    store->narFromPath(info->path, hashSink);
-
-                    auto hash = hashSink.finish();
+                    std::optional<ContentAddressHashResult> contentHash;
+                    if (info->ca && info->ca->method.raw != ContentAddressMethod::Raw::JjTree) {
+                        contentHash = hashContentAddress(
+                            {store->getFSAccessor(), CanonPath{info->path.to_string()}},
+                            {.method = info->ca->method,
+                             .algorithm = info->ca->hash.algo,
+                             .selfReference = std::string{info->path.hashPart()}});
+                    }
+                    auto hash = [&] {
+                        if (contentHash && contentHash->narHashAndSize)
+                            return *contentHash->narHashAndSize;
+                        HashSink hashSink(info->narHash.algo);
+                        store->narFromPath(info->path, hashSink);
+                        return hashSink.finish();
+                    }();
 
                     if (hash.hash != info->narHash) {
                         corrupted++;
@@ -109,6 +120,18 @@ struct CmdVerify : StorePathsCommand
                             store->printStorePath(info->path),
                             info->narHash.to_string(HashFormat::Nix32, true),
                             hash.hash.to_string(HashFormat::Nix32, true));
+                    }
+
+                    if (contentHash) {
+                        if (contentHash->hash != info->ca->hash) {
+                            corrupted++;
+                            act2.result(resCorruptedPath, store->printStorePath(info->path));
+                            printError(
+                                "path '%s' has an invalid content address! expected '%s', got '%s'",
+                                store->printStorePath(info->path),
+                                info->ca->hash.to_string(HashFormat::Nix32, true),
+                                contentHash->hash.to_string(HashFormat::Nix32, true));
+                        }
                     }
                 }
 
@@ -134,7 +157,7 @@ struct CmdVerify : StorePathsCommand
                             }
                         };
 
-                        if (info->isContentAddressed(*store))
+                        if (info->isSelfCertifying(*store))
                             validSigs = ValidPathInfo::maxSigs;
 
                         doSigs(info->sigs);
@@ -144,7 +167,7 @@ struct CmdVerify : StorePathsCommand
                                 break;
                             try {
                                 auto info2 = store2->queryPathInfo(info->path);
-                                if (info2->isContentAddressed(*store))
+                                if (info2->isSelfCertifying(*store))
                                     validSigs = ValidPathInfo::maxSigs;
                                 doSigs(info2->sigs);
                             } catch (InvalidPath &) {

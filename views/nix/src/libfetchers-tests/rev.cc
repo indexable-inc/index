@@ -3,10 +3,15 @@
 #include "nix/fetchers/fetchers.hh"
 #include "nix/util/experimental-features.hh"
 #include "nix/util/hash.hh"
+#include "nix/util/finally.hh"
+#include "nix/util/tests/gmock-matchers.hh"
 
 #include <gtest/gtest.h>
+#include <gmock/gmock.h>
 
+#include <set>
 #include <string>
+#include <utility>
 
 namespace nix {
 
@@ -43,6 +48,8 @@ TEST(parseRev, blake3LengthParsesAsBlake3)
 TEST(parseRev, blake3RevNeedsNoExperimentalFeature)
 {
     auto & features = experimentalFeatureSettings.experimentalFeatures.get();
+    auto savedFeatures = features;
+    Finally restoreFeatures([&]() { features = std::move(savedFeatures); });
     features.erase(Xp::BLAKE3Hashes);
 
     /* Control, decorrelated from the assertion below: with the feature off,
@@ -84,7 +91,14 @@ TEST(parseRev, blake3LengthMustStillBeHex)
 
 class JjInputTest : public ::testing::Test
 {
+    std::set<ExperimentalFeature> savedFeatures = experimentalFeatureSettings.experimentalFeatures.get();
+
 public:
+    ~JjInputTest() override
+    {
+        experimentalFeatureSettings.experimentalFeatures.get() = std::move(savedFeatures);
+    }
+
     void SetUp() override
     {
         experimentalFeatureSettings.experimentalFeatures.get().insert(Xp::Flakes);
@@ -124,20 +138,28 @@ TEST_F(JjInputTest, bareBlake3RevRoundTrips)
     EXPECT_EQ(input.toAttrs(), input2.toAttrs());
 }
 
-/* The same input on jj's Git backend, so the round trip above is shown to be
-   about the length rather than about jj inputs in general. */
-TEST_F(JjInputTest, bareSha1RevRoundTrips)
+TEST_F(JjInputTest, nativeInputRejectsSha1Rev)
 {
     fetchers::Settings fetchSettings;
+    EXPECT_THAT(
+        [&]() {
+            fetchers::Input::fromAttrs(
+                fetchSettings,
+                fetchers::Attrs{
+                    {"type", Attr("jj")},
+                    {"url", Attr("file:///no/such/repo")},
+                    {"rev", Attr(std::string(sha1Rev))},
+                });
+        },
+        ::testing::ThrowsMessage<Error>(testing::HasSubstrIgnoreANSIMatcher("not a Jujutsu native commit id")));
+}
 
-    auto input = fetchers::Input::fromAttrs(
-        fetchSettings,
-        fetchers::Attrs{
-            {"type", Attr("jj")},
-            {"url", Attr("file:///no/such/repo")},
-            {"rev", Attr(std::string(sha1Rev))},
-        });
+TEST_F(JjInputTest, gitFileInputAcceptsSha1Rev)
+{
+    fetchers::Settings fetchSettings;
+    auto input = fetchers::Input::fromURL(fetchSettings, "git+file:///no/such/repo?rev=" + std::string(sha1Rev));
 
+    EXPECT_EQ(fetchers::getStrAttr(input.toAttrs(), "type"), "git");
     auto rev = input.getRev();
     ASSERT_TRUE(rev);
     EXPECT_EQ(rev->algo, HashAlgorithm::SHA1);

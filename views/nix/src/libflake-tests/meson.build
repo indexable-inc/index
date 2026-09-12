@@ -17,7 +17,7 @@ cxx = meson.get_compiler('cpp')
 subdir('nix-meson-build-support/deps-lists')
 
 deps_private_maybe_subproject = [
-  dependency('nix-expr-test-support'),
+  dependency('nix-store-test-support'),
   dependency('nix-flake'),
   dependency('nix-flake-c'),
 ]

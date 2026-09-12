@@ -31,11 +31,6 @@ pub enum Op {
     },
     /// Push the `builtins` attrset.
     BuiltinsSet,
-    /// A cppnix global this evaluator has no implementation for: errors as
-    /// unimplemented when executed (not at compile time, matching laziness).
-    UnimplementedGlobal {
-        sym: u32,
-    },
     /// Push the `derivation` global: a thunk over the wrapper source cppnix
     /// embeds, not a primop. See `Vm`'s `DERIVATION_INTERNAL` and cppnix's
     /// `EvalState::derivationInternal`.
@@ -92,11 +87,21 @@ pub enum Op {
     },
     /// List concatenation (++) of the top two lists.
     ConcatLists,
-    /// Attrset from the top 2*n stack entries: n (name, value) pairs where
-    /// names were pushed as strings (dynamic names compile to the same op).
+    /// Attrset from the top `statics + 2 * dynamics` stack entries: `statics`
+    /// values whose names are the static half of this op's [`AttrSite`]
+    /// (module symbols in the same order, resolved through the link table),
+    /// under `dynamics` (name, value) pairs whose names were pushed as
+    /// strings.
+    ///
+    /// Static names never touch the stack and are never re-interned per
+    /// build (the link table interns each module symbol once per VM, on the
+    /// module's first use). Before this split every attribute of every set
+    /// built pushed its name as a string constant and re-interned it on each
+    /// build: 50.7M interns on one NixOS toplevel (dev-compute-4,
+    /// 2026-09-04), the single largest source.
     MkAttrs {
-        n: u16,
-        rec: bool,
+        statics: u16,
+        dynamics: u16,
     },
     /// Attrset update (//).
     Update,
@@ -185,7 +190,6 @@ pub enum OpKind {
     GetLocalLazy,
     Builtin,
     BuiltinsSet,
-    UnimplementedGlobal,
     DerivationGlobal,
     NixPathGlobal,
     Thunk,
@@ -239,7 +243,6 @@ impl OpKind {
         OpKind::GetLocalLazy,
         OpKind::Builtin,
         OpKind::BuiltinsSet,
-        OpKind::UnimplementedGlobal,
         OpKind::DerivationGlobal,
         OpKind::NixPathGlobal,
         OpKind::Thunk,
@@ -294,7 +297,6 @@ impl OpKind {
             OpKind::GetLocalLazy => "GetLocalLazy",
             OpKind::Builtin => "Builtin",
             OpKind::BuiltinsSet => "BuiltinsSet",
-            OpKind::UnimplementedGlobal => "UnimplementedGlobal",
             OpKind::DerivationGlobal => "DerivationGlobal",
             OpKind::NixPathGlobal => "NixPathGlobal",
             OpKind::Thunk => "Thunk",
@@ -350,7 +352,6 @@ impl Op {
             Op::GetLocalLazy { .. } => OpKind::GetLocalLazy,
             Op::Builtin { .. } => OpKind::Builtin,
             Op::BuiltinsSet => OpKind::BuiltinsSet,
-            Op::UnimplementedGlobal { .. } => OpKind::UnimplementedGlobal,
             Op::DerivationGlobal => OpKind::DerivationGlobal,
             Op::NixPathGlobal => OpKind::NixPathGlobal,
             Op::Thunk { .. } => OpKind::Thunk,
@@ -423,8 +424,10 @@ pub enum Const {
     /// String without context (context arises only at runtime).
     Str(String),
     /// Path literal, already made absolute by the compiler against the
-    /// module's base directory.
-    Path(String),
+    /// module's base directory, with the accessor root selected at parse
+    /// time. Relative literals use [`Module::root`]; absolute and home
+    /// literals use the ambient root, as cppnix's parser does.
+    Path(crate::value2::PathValue),
 }
 
 impl PartialEq for Const {
@@ -434,7 +437,8 @@ impl PartialEq for Const {
             (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
             (Self::Bool(a), Self::Bool(b)) => a == b,
             (Self::Null, Self::Null) => true,
-            (Self::Str(a), Self::Str(b)) | (Self::Path(a), Self::Path(b)) => a == b,
+            (Self::Str(a), Self::Str(b)) => a == b,
+            (Self::Path(a), Self::Path(b)) => a == b,
             _ => false,
         }
     }
@@ -453,7 +457,8 @@ impl std::hash::Hash for Const {
             Self::Float(f) => f.to_bits().hash(state),
             Self::Bool(b) => b.hash(state),
             Self::Null => {}
-            Self::Str(s) | Self::Path(s) => s.hash(state),
+            Self::Str(s) => s.hash(state),
+            Self::Path(p) => p.hash(state),
         }
     }
 }
@@ -487,21 +492,194 @@ pub struct CodeUnit {
     pub attr_sites: Vec<AttrSite>,
 }
 
-/// The statically known attribute names one `MkAttrs` builds, and where each
-/// was written.
+impl CodeUnit {
+    /// The compiler<->VM contract on `attr_sites`, checked structurally.
+    ///
+    /// The VM takes a set's static NAMES from its site, so a site whose static
+    /// half does not match the op it describes names every value wrong,
+    /// silently. The compiler test runs this on every fixture and the module
+    /// decoder runs it on every cached unit, so a stale or damaged cache row
+    /// fails closed instead of evaluating to a wrong set.
+    ///
+    /// Checked: sites strictly increasing by `ip` (the VM binary-searches
+    /// them); each site sits on `MkAttrs`/`MkAttrsOnto`, names as many static
+    /// values as that op pops (the op carries no names, so the table IS their
+    /// identity) with every symbol inside the module's table, and indexes
+    /// exactly its dynamic pairs, in order; each site's `by_name` is its static half permuted into text
+    /// order (`AttrSite::static_offset` binary-searches it); and every
+    /// set-building op that builds anything has a site (`Emit::attr_site`
+    /// files none for `{}`).
+    pub fn check_attr_sites(&self, symbols: &[String]) -> Result<(), String> {
+        let mut prev_ip: Option<u32> = None;
+        for site in &self.attr_sites {
+            if prev_ip.is_some_and(|p| p >= site.ip) {
+                return Err(format!("attr sites out of ip order at ip {}", site.ip));
+            }
+            prev_ip = Some(site.ip);
+            let (statics, dynamics) = match self.ops.get(site.ip as usize) {
+                Some(Op::MkAttrs { statics, dynamics }) => (*statics, *dynamics),
+                Some(Op::MkAttrsOnto { n }) => (0, *n),
+                other => {
+                    return Err(format!(
+                        "attr site at ip {} describes {other:?}, not a set-building op",
+                        site.ip
+                    ));
+                }
+            };
+            if site.static_names().len() != usize::from(statics) {
+                return Err(format!(
+                    "attr site at ip {} names {} static attributes, the op pops {statics}",
+                    site.ip,
+                    site.static_names().len()
+                ));
+            }
+            let indexes_pairs = site.dynamic_names().len() == usize::from(dynamics)
+                && site
+                    .dynamic_names()
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &(pair, _))| usize::try_from(pair) == Ok(i));
+            if !indexes_pairs {
+                return Err(format!(
+                    "attr site at ip {} does not index the op's {dynamics} dynamic pairs in order",
+                    site.ip
+                ));
+            }
+            if let Some(&(sym, _)) = site
+                .static_names()
+                .iter()
+                .find(|&&(sym, _)| usize::try_from(sym).is_ok_and(|s| s >= symbols.len()))
+            {
+                return Err(format!(
+                    "attr site at ip {} names symbol {sym}, the module has {}",
+                    site.ip,
+                    symbols.len()
+                ));
+            }
+            if !site.indexed_by_text(symbols) {
+                return Err(format!(
+                    "attr site at ip {} is not indexed by text: {:?} over {statics} static names",
+                    site.ip, site.by_name
+                ));
+            }
+        }
+        for (ip, op) in self.ops.iter().enumerate() {
+            let builds = match op {
+                Op::MkAttrs { statics, dynamics } => *statics > 0 || *dynamics > 0,
+                Op::MkAttrsOnto { n } => *n > 0,
+                _ => continue,
+            };
+            let has_site = u32::try_from(ip)
+                .is_ok_and(|ip| self.attr_sites.binary_search_by_key(&ip, |s| s.ip).is_ok());
+            if builds != has_site {
+                return Err(format!(
+                    "{op:?} at ip {ip} builds={builds} but has a site={has_site}; a set-building op \
+                     has a site iff it builds something"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Index every site's static names by text, then check the contract: the
+    /// one call the compiler and the module decoder each make once the unit
+    /// and the module's symbols are complete.
+    pub fn link_attr_sites(&mut self, symbols: &[String]) -> Result<(), String> {
+        for site in &mut self.attr_sites {
+            site.index(symbols);
+        }
+        self.check_attr_sites(symbols)
+    }
+}
+
+/// The attribute names one `MkAttrs` builds, and where each was written.
 ///
-/// Dynamic names (`${e} = v;`) are absent: their name is not known until the
-/// op runs, and cppnix's answer for them would have to come from matching the
-/// evaluated string back to a source token. `unsafeGetAttrPos` answers `null`
-/// for those, which is what cppnix answers for an attribute with no recorded
-/// position.
+/// The first `static_count` entries in `names` are static `(module symbol,
+/// byte offset)` pairs in the order the op pops its static values (emission
+/// order: every `inherit` first, then the bindings, each in source order):
+/// the VM zips the two, so this is the op's name table and not only its
+/// position table. The rest are runtime-computed `(index among the op's
+/// dynamic pairs, byte offset)` entries, one per dynamic pair in order. One
+/// vector, a split index and the boxed text index keep `AttrSite` at 48
+/// bytes while letting `MkAttrs` record only the evaluated dynamic names on
+/// each run.
+/// [`CodeUnit::check_attr_sites`] states the contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttrSite {
     /// Index into the unit's `ops` of the `MkAttrs` this describes.
     pub ip: u32,
-    /// `(symbol index into `Module::symbols`, byte offset of the name token)`,
-    /// sorted by the symbol's text so a lookup is a binary search.
+    /// Static entries followed by dynamic entries. See the type-level comment.
     pub names: Vec<(u32, u32)>,
+    /// Where the dynamic suffix of `names` begins.
+    pub static_count: u32,
+    /// Indices into the static half of `names`, ordered by the symbol's text,
+    /// so a position lookup (which arrives with text) is a binary search
+    /// over a table whose own order is the op's. Derived, never encoded:
+    /// [`CodeUnit::link_attr_sites`] builds it from the module's symbols
+    /// after compile and after decode.
+    pub by_name: Box<[u16]>,
+}
+
+impl AttrSite {
+    fn static_len(&self) -> usize {
+        usize::try_from(self.static_count)
+            .unwrap_or(self.names.len())
+            .min(self.names.len())
+    }
+
+    fn text<'a>(&self, i: u16, symbols: &'a [String]) -> &'a str {
+        self.static_names()
+            .get(usize::from(i))
+            .and_then(|&(sym, _)| symbols.get(sym as usize))
+            .map_or("", String::as_str)
+    }
+
+    /// Build `by_name` from `symbols`. `Op::MkAttrs` counts its statics in a
+    /// `u16`, so the indices fit; a wider static half leaves the index empty
+    /// and [`CodeUnit::check_attr_sites`] refuses the unit.
+    fn index(&mut self, symbols: &[String]) {
+        let mut by_name: Vec<u16> = (0..self.static_len())
+            .map(u16::try_from)
+            .collect::<Result<_, _>>()
+            .unwrap_or_default();
+        by_name.sort_by(|&a, &b| self.text(a, symbols).cmp(self.text(b, symbols)));
+        self.by_name = by_name.into_boxed_slice();
+    }
+
+    /// Whether `by_name` is a permutation of the static half ordered by text.
+    fn indexed_by_text(&self, symbols: &[String]) -> bool {
+        let n = self.static_len();
+        let mut seen = vec![false; n];
+        let permutes = self.by_name.len() == n
+            && self.by_name.iter().all(|&i| {
+                let slot = seen.get_mut(usize::from(i));
+                slot.is_some_and(|s| !std::mem::replace(s, true))
+            });
+        permutes && self.by_name.is_sorted_by_key(|&i| self.text(i, symbols))
+    }
+
+    /// The byte offset of static attribute `name`, or `None` when this site
+    /// has no static attribute of that name.
+    #[must_use]
+    pub fn static_offset(&self, name: &str, symbols: &[String]) -> Option<u32> {
+        let i = self
+            .by_name
+            .binary_search_by(|&i| self.text(i, symbols).cmp(name))
+            .ok()?;
+        self.static_names()
+            .get(usize::from(*self.by_name.get(i)?))
+            .map(|&(_, offset)| offset)
+    }
+
+    #[must_use]
+    pub fn static_names(&self) -> &[(u32, u32)] {
+        self.names.split_at(self.static_len()).0
+    }
+
+    #[must_use]
+    pub fn dynamic_names(&self) -> &[(u32, u32)] {
+        self.names.split_at(self.static_len()).1
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -544,6 +722,11 @@ pub struct Module {
     pub units: Vec<CodeUnit>,
     /// Index of the entry unit (the file's top-level expression).
     pub entry: u32,
+    /// The accessor root of the source file this module was compiled from.
+    /// Relative path literals copy it into their constant; keeping it on the
+    /// module also makes imported-source provenance part of the compiled
+    /// module's identity.
+    pub root: crate::value2::Root,
     /// What a position into this module names when it is printed.
     pub origin: SrcOrigin,
     /// Byte offset of the first character of every line of the source, so a
@@ -556,6 +739,13 @@ pub struct Module {
     /// re-reads (`PosTable::operator[]`); here the file cannot be re-read,
     /// because the VM performs no IO.
     pub line_starts: Vec<u32>,
+    /// Runtime-only dynamic, `listToAttrs`, and projected `Update` attribute
+    /// origins. Module encoding omits this slab, and cloning a compiled module
+    /// starts with an empty one.
+    pub(crate) dynamic_attr_origins: crate::value2::DynamicAttrOriginSlab,
+    /// This module's symbols in the running VM's numbering, linked on first
+    /// use. Runtime-only like the slab above; see [`crate::value2::LinkedSymbols`].
+    pub(crate) linked: crate::value2::LinkedSymbols,
 }
 
 /// Where the text a module was compiled from came from.
@@ -585,6 +775,15 @@ pub enum SrcOrigin {
 pub const NO_POS: u32 = u32::MAX;
 
 impl Module {
+    /// Whether module symbol `sym` spells `name`. The formals table is in
+    /// source order, not sorted, and a position lookup arrives with text, so
+    /// its scan compares through this. (Attr sites carry a text index:
+    /// [`AttrSite::static_offset`].)
+    #[must_use]
+    pub(crate) fn symbol_is(&self, sym: u32, name: &str) -> bool {
+        self.symbols.get(sym as usize).is_some_and(|s| s == name)
+    }
+
     /// The 1-based line and column cppnix would print for a byte offset, or
     /// `None` when there is no position.
     ///
@@ -657,7 +856,6 @@ pub(crate) fn one_of_each() -> [Op; OpKind::COUNT] {
         Op::GetLocalLazy { depth: 0, slot: 0 },
         Op::Builtin { idx: 0 },
         Op::BuiltinsSet,
-        Op::UnimplementedGlobal { sym: 0 },
         Op::DerivationGlobal,
         Op::NixPathGlobal,
         Op::Thunk { unit: 0 },
@@ -682,7 +880,10 @@ pub(crate) fn one_of_each() -> [Op; OpKind::COUNT] {
         Op::ConcatStrings { n: 0 },
         Op::MkList { n: 0 },
         Op::ConcatLists,
-        Op::MkAttrs { n: 0, rec: false },
+        Op::MkAttrs {
+            statics: 0,
+            dynamics: 0,
+        },
         Op::Update,
         Op::Select { sym: 0 },
         Op::SelectSoft { sym: 0 },
@@ -776,7 +977,7 @@ mod line_table_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{Op, OpKind, one_of_each};
+    use super::{AttrSite, CodeUnit, NO_POS, Op, OpKind, one_of_each};
     use std::collections::BTreeSet;
 
     /// `OpKind::ALL` is written out by hand, so it can drift from the enum in
@@ -827,6 +1028,70 @@ mod tests {
         assert_eq!(names.len(), OpKind::ALL.len(), "two kinds share a name");
         assert_eq!(OpKind::Const.name(), "Const");
         assert_eq!(OpKind::ConcatPath.name(), "ConcatPath");
-        assert_eq!(Op::MkAttrs { n: 3, rec: true }.kind().name(), "MkAttrs");
+        assert_eq!(
+            Op::MkAttrs {
+                statics: 3,
+                dynamics: 1,
+            }
+            .kind()
+            .name(),
+            "MkAttrs"
+        );
+    }
+
+    /// One `Vec` plus a split index plus one boxed slice: 48 bytes, and a
+    /// unit with no set literal carries none of them.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn attr_site_remains_48_bytes() {
+        assert_eq!(std::mem::size_of::<AttrSite>(), 48);
+    }
+
+    /// `link_attr_sites` derives the text index, and the checker refuses an
+    /// index that is not the text-ordered permutation of the static half:
+    /// a scrambled or duplicated index would make `static_offset` answer
+    /// with the wrong attribute's position.
+    #[test]
+    fn the_text_index_is_derived_and_checked() {
+        let symbols = vec!["b".to_owned(), "a".to_owned(), "c".to_owned()];
+        let mut unit = CodeUnit {
+            ops: vec![
+                Op::MkAttrs {
+                    statics: 3,
+                    dynamics: 0,
+                },
+                Op::Ret,
+            ],
+            param: None,
+            spans: vec![NO_POS; 2],
+            attr_sites: vec![AttrSite {
+                ip: 0,
+                names: vec![(0, 10), (1, 20), (2, 30)],
+                static_count: 3,
+                by_name: Box::default(),
+            }],
+        };
+        unit.link_attr_sites(&symbols)
+            .expect("a well-formed site links");
+        let site = &unit.attr_sites[0];
+        assert_eq!(&*site.by_name, &[1, 0, 2], "a, b, c");
+        assert_eq!(site.static_offset("a", &symbols), Some(20));
+        assert_eq!(site.static_offset("b", &symbols), Some(10));
+        assert_eq!(site.static_offset("c", &symbols), Some(30));
+        assert_eq!(site.static_offset("d", &symbols), None);
+        assert_eq!(site.static_offset("", &symbols), None);
+        for bad in [vec![0u16, 1, 2], vec![1, 1, 2], vec![1, 0], vec![1, 0, 3]] {
+            unit.attr_sites[0].by_name = bad.clone().into_boxed_slice();
+            assert!(
+                unit.check_attr_sites(&symbols).is_err(),
+                "index {bad:?} passed the check"
+            );
+        }
+        // A symbol the module does not have is refused, not read as "".
+        unit.attr_sites[0].names[2].0 = 3;
+        assert!(
+            unit.link_attr_sites(&symbols).is_err(),
+            "a static name with symbol 3 of 3 linked"
+        );
     }
 }

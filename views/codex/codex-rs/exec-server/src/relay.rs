@@ -1,19 +1,18 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use codex_exec_server_protocol::JSONRPCMessage;
+use codex_protocol::protocol::W3cTraceContext;
 use futures::Sink;
 use futures::SinkExt;
 use futures::Stream;
 use futures::StreamExt;
 use prost::Message as ProstMessage;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
 use tracing::info;
@@ -34,13 +33,16 @@ use crate::noise_relay::NOISE_RELAY_RESET_REASON;
 use crate::noise_relay::executor_stream::ClosedNoiseVirtualStream;
 use crate::noise_relay::executor_stream::NoiseVirtualStream;
 use crate::noise_relay::executor_stream::spawn_noise_virtual_stream;
+use crate::noise_relay::stream_handler::NoiseStreamHandler;
 use crate::relay_proto::RelayData;
 use crate::relay_proto::RelayHandshake;
 use crate::relay_proto::RelayMessageFrame;
 use crate::relay_proto::RelayReset;
 use crate::relay_proto::RelayResume;
 use crate::relay_proto::relay_message_frame;
+#[cfg(test)]
 use crate::server::ConnectionProcessor;
+use crate::telemetry::ExecutorRegistration;
 use crate::websocket_pong_watchdog::WEBSOCKET_PONG_TIMEOUT;
 use crate::websocket_pong_watchdog::WEBSOCKET_PONG_TIMEOUT_REASON;
 use crate::websocket_pong_watchdog::WebSocketPongWatchdog;
@@ -84,18 +86,27 @@ pub(crate) enum RelayFrameBodyKind {
 }
 
 impl RelayMessageFrame {
-    pub(crate) fn data(stream_id: String, seq: u32, payload: Vec<u8>) -> Self {
+    pub(crate) fn data(
+        stream_id: String,
+        seq: u32,
+        payload: Vec<u8>,
+        trace: Option<W3cTraceContext>,
+    ) -> Self {
+        let (traceparent, tracestate) = trace
+            .map(|trace| (trace.traceparent, trace.tracestate))
+            .unwrap_or_default();
         Self {
             version: RELAY_MESSAGE_FRAME_VERSION,
             stream_id,
-            ack: 0,
-            ack_bits: 0,
+            traceparent,
+            tracestate,
             body: Some(relay_message_frame::Body::Data(RelayData {
                 seq,
                 segment_index: 0,
                 segment_count: 1,
                 payload,
             })),
+            ..Self::default()
         }
     }
 
@@ -103,11 +114,10 @@ impl RelayMessageFrame {
         Self {
             version: RELAY_MESSAGE_FRAME_VERSION,
             stream_id,
-            ack: 0,
-            ack_bits: 0,
             body: Some(relay_message_frame::Body::Resume(RelayResume {
                 next_seq: 0,
             })),
+            ..Self::default()
         }
     }
 
@@ -115,11 +125,10 @@ impl RelayMessageFrame {
         Self {
             version: RELAY_MESSAGE_FRAME_VERSION,
             stream_id,
-            ack: 0,
-            ack_bits: 0,
             body: Some(relay_message_frame::Body::Handshake(RelayHandshake {
                 payload,
             })),
+            ..Self::default()
         }
     }
 
@@ -127,9 +136,8 @@ impl RelayMessageFrame {
         Self {
             version: RELAY_MESSAGE_FRAME_VERSION,
             stream_id,
-            ack: 0,
-            ack_bits: 0,
             body: Some(relay_message_frame::Body::Reset(RelayReset { reason })),
+            ..Self::default()
         }
     }
 
@@ -316,7 +324,13 @@ where
                             break;
                         }
                     };
-                    let frame = RelayMessageFrame::data(stream_id.clone(), next_seq, payload);
+                    let trace = match message {
+                        JSONRPCMessage::Request(request) => request.trace,
+                        JSONRPCMessage::Notification(_)
+                        | JSONRPCMessage::Response(_)
+                        | JSONRPCMessage::Error(_) => None,
+                    };
+                    let frame = RelayMessageFrame::data(stream_id.clone(), next_seq, payload, trace);
                     next_seq = next_seq.wrapping_add(1);
                     if websocket
                         .send(Message::Binary(encode_relay_message_frame(&frame).into()))
@@ -370,7 +384,7 @@ where
                                             &mut websocket,
                                             &mut keepalive,
                                             &incoming_tx,
-                                            JsonRpcConnectionEvent::Message(message),
+                                            JsonRpcConnectionEvent::message(message),
                                         )
                                         .await
                                         {
@@ -465,22 +479,27 @@ pub(crate) trait HarnessKeyValidator: Send + Sync {
 /// Parsing the first Noise message authenticates the harness key. Only a
 /// successful registry check turns that pending handshake into a virtual stream.
 #[tracing::instrument(level = "debug", skip_all, fields(noise_side = "executor"))]
-pub(crate) async fn run_multiplexed_environment<S, V>(
-    stream: WebSocketStream<S>,
-    processor: ConnectionProcessor,
+pub(crate) async fn run_multiplexed_environment<T, E, V, H>(
+    stream: T,
+    handler: H,
     environment_id: String,
     executor_registration_id: String,
     identity: NoiseChannelIdentity,
     validator: V,
 ) -> RendezvousDisconnectReason
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    T: Sink<Message, Error = E> + Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
     V: HarnessKeyValidator + Clone + 'static,
+    H: NoiseStreamHandler,
 {
     debug!(
         environment_id,
         executor_registration_id, "Noise executor relay details"
     );
+    let executor_registration =
+        ExecutorRegistration::new(environment_id.clone(), executor_registration_id.clone())
+            .map(Arc::new);
     let (mut websocket_sink, mut websocket_stream) = stream.split();
     let (physical_outgoing_tx, mut physical_outgoing_rx) =
         mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
@@ -552,7 +571,7 @@ where
             }
         }
     });
-    let mut streams: HashMap<String, NoiseVirtualStream> = HashMap::new();
+    let mut streams: HashMap<String, NoiseVirtualStream<H>> = HashMap::new();
     let mut pending_handshakes: HashMap<String, PendingHandshake> = HashMap::new();
     let mut validation_tasks: JoinSet<HarnessKeyValidationResult> = JoinSet::new();
     let mut failed_handshakes = 0usize;
@@ -580,6 +599,7 @@ where
                     .is_some_and(|stream| stream.instance_id == closed_stream.instance_id);
                 if is_current {
                     streams.remove(&closed_stream.stream_id);
+                    send_reset(&physical_outgoing_tx, closed_stream.stream_id);
                 }
                 continue;
             }
@@ -667,10 +687,11 @@ where
                             spawn_noise_virtual_stream(
                                 validation_result.stream_id,
                                 validation_result.validation_id,
-                                processor.clone(),
+                                handler.clone(),
                                 physical_outgoing_tx.clone(),
                                 closed_stream_tx.clone(),
                                 transport,
+                                executor_registration.clone(),
                             ),
                         );
                     }
@@ -866,7 +887,7 @@ where
                 pending_handshakes.remove(&stream_id);
                 if let Some(stream) = streams.remove(&stream_id) {
                     // The reset reason is unauthenticated, so do not log it.
-                    stream.disconnect(/*reason*/ None);
+                    stream.disconnect();
                 }
             }
             RelayFrameBodyKind::Ack
@@ -876,7 +897,7 @@ where
     }
 
     for (_stream_id, stream) in streams {
-        stream.disconnect(/*reason*/ None);
+        stream.disconnect();
     }
     // Dropping the JoinSet aborts any registry checks still running.
     if !physical_writer_task.is_finished() {
@@ -963,14 +984,17 @@ mod tests {
                     stream_id,
                     /*seq*/ 0,
                     jsonrpc_payload(&message)?,
+                    /*trace*/ None,
                 ))
                 .into(),
             ))
             .await?;
-        assert!(matches!(
-            timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?,
-            Some(JsonRpcConnectionEvent::Message(actual)) if actual == message
-        ));
+        let Some(JsonRpcConnectionEvent::QueuedRequest { request, .. }) =
+            timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?
+        else {
+            anyhow::bail!("expected a queued JSON-RPC request");
+        };
+        assert_eq!(JSONRPCMessage::Request(request), message);
 
         drop(connection);
         Ok(())

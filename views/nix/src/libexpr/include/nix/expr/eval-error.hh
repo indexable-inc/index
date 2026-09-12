@@ -130,8 +130,6 @@ public:
 
     [[nodiscard, gnu::noinline]] EvalErrorBuilder<T> & withSuggestions(Suggestions & s);
 
-    [[nodiscard, gnu::noinline]] EvalErrorBuilder<T> & withFrame(const Env & e, const Expr & ex);
-
     [[nodiscard, gnu::noinline]] EvalErrorBuilder<T> & addTrace(PosIdx pos, HintFmt hint);
 
     [[nodiscard, gnu::noinline]] EvalErrorBuilder<T> & setIsFromExpr();

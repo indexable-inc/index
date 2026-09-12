@@ -29,6 +29,7 @@
 use ix_kernel::hash;
 use nix_eval_rs::compile::Origin;
 use nix_eval_rs::eval::EvalError;
+use nix_eval_rs::modcache::ModuleCache;
 use nix_eval_rs::session;
 use std::sync::Mutex;
 
@@ -134,6 +135,10 @@ fn class_of(answer: &Result<String, EvalError>) -> &'static str {
         Err(EvalError::Eval(nix_eval_rs::vm::ErrKind::Eval, _, _)) => "eval",
         Err(EvalError::Eval(nix_eval_rs::vm::ErrKind::Thrown, _, _)) => "thrown",
         Err(EvalError::Eval(nix_eval_rs::vm::ErrKind::Assertion, _, _)) => "assertion",
+        Err(EvalError::Eval(nix_eval_rs::vm::ErrKind::ImportFromDerivation, _, _)) => {
+            "import-from-derivation"
+        }
+        Err(EvalError::Eval(nix_eval_rs::vm::ErrKind::MissingArgument, _, _)) => "missing-argument",
     }
 }
 
@@ -159,23 +164,16 @@ fn text_of(answer: &Result<String, EvalError>) -> &str {
 fn verify_selftest() -> std::process::ExitCode {
     use ix_kernel::cas::{Cas, MemoryCas};
     use nix_eval_rs::compile::Origin;
-    use nix_eval_rs::modcache::ModuleCache;
     use nix_eval_rs::readset::{EvalId, EvalResult, ReadSet, ResultCache, Severity};
     use nix_eval_rs::vm::Vm;
 
     let cas = MemoryCas::new();
     let cas: &dyn Cas = &cas;
-    let mut modules = ModuleCache::new(cas);
     let mut results = ResultCache::new(cas);
     let mut vm = Vm::from_process_settings();
     let source = "1 + 2";
 
-    let Ok(compiled) = modules.compile(
-        source,
-        "/selftest",
-        Origin::String,
-        &nix_eval_rs::eval::Settings::current(),
-    ) else {
+    let Ok(compiled) = vm.compile(source, "/selftest", Origin::String) else {
         eprintln!("cache-differential: selftest could not compile `{source}`");
         return std::process::ExitCode::from(2);
     };
@@ -198,6 +196,8 @@ fn verify_selftest() -> std::process::ExitCode {
                 value: "4".to_owned(),
                 ..EvalResult::default()
             },
+            &nix_eval_rs::host::RealFs,
+            &nix_eval_rs::eval::Settings::current(),
         )
         .is_err()
     {
@@ -208,7 +208,6 @@ fn verify_selftest() -> std::process::ExitCode {
     results.set_verify_rate(1);
     let (served, reuse) = session::evaluate(
         &mut vm,
-        &mut modules,
         Some(&mut results),
         &nix_eval_rs::host::RealFs,
         source,
@@ -256,7 +255,7 @@ fn main() -> std::process::ExitCode {
     }
 
     // Configure before evaluating, in the order the C++ bridge does
-    // (`src/nix/rust-eval-session.cc`), so this measures the same
+    // (`src/libcmd/rust-eval-session.cc`), so this measures the same
     // configuration path a user gets.
     if let Some(depth) = args.max_call_depth {
         nix_eval_rs::eval::set_max_call_depth(depth);
@@ -377,17 +376,24 @@ fn main() -> std::process::ExitCode {
         };
         drop(take_warnings());
         let path = file.to_string_lossy().into_owned();
-        let mut vm = nix_eval_rs::vm::Vm::from_process_settings();
-        let (answer, complaints) = session::evaluate_once(
+        // Uncapped: the differential compares answers, and a sweep between
+        // arms would turn a hit into a cold evaluation that agrees for the
+        // wrong reason.
+        let (store, unopened) = session::open_cache(args.cache.as_deref(), 0);
+        let mut vm = nix_eval_rs::vm::Vm::with_modules(
+            nix_eval_rs::eval::Settings::current(),
+            store.map_or_else(ModuleCache::in_memory, ModuleCache::persistent),
+        );
+        let (answer, mut complaints) = session::evaluate_once(
             &mut vm,
             &host,
             &source,
             &base,
             Origin::File(&path),
-            args.cache.as_deref(),
             true,
             args.verify_rate,
         );
+        complaints.extend(unopened);
         let warnings = take_warnings();
 
         // A complaint means the run under test is not the run intended: the

@@ -3,6 +3,7 @@ use codex_api::ModelsClient;
 use codex_api::Provider;
 use codex_api::RetryConfig;
 use codex_client::ReqwestTransport;
+use codex_http_client::HttpClientBuilder;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
@@ -70,7 +71,7 @@ async fn models_client_hits_models_endpoint() {
                     description: ReasoningEffort::High.to_string(),
                 },
             ],
-            shell_type: ConfigShellToolType::ShellCommand,
+            shell_type: ConfigShellToolType::UnifiedExec,
             visibility: ModelVisibility::List,
             supported_in_api: true,
             priority: 1,
@@ -78,10 +79,11 @@ async fn models_client_hits_models_endpoint() {
             service_tiers: Vec::new(),
             default_service_tier: None,
             upgrade: None,
-            base_instructions: "base instructions".to_string(),
             model_messages: None,
             include_skills_usage_instructions: false,
-            supports_reasoning_summaries: false,
+            include_plugin_usage_instructions: false,
+            include_apps_usage_instructions: false,
+            supports_reasoning_summary_parameter: true,
             default_reasoning_summary: ReasoningSummary::Auto,
             support_verbosity: false,
             default_verbosity: None,
@@ -89,7 +91,6 @@ async fn models_client_hits_models_endpoint() {
             apply_patch_tool_type: None,
             web_search_tool_type: Default::default(),
             truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
-            supports_parallel_tool_calls: false,
             supports_image_detail_original: false,
             context_window: Some(272_000),
             max_context_window: None,
@@ -101,9 +102,13 @@ async fn models_client_hits_models_endpoint() {
             used_fallback_model_metadata: false,
             supports_search_tool: false,
             use_responses_lite: false,
+            node_repl_auto_review_required: true,
+            node_repl_disabled: true,
             auto_review_model_override: None,
+            model_specialty: None,
             tool_mode: None,
             multi_agent_version: None,
+            multi_agent_reasoning_effort: None,
         }],
     };
 
@@ -117,7 +122,11 @@ async fn models_client_hits_models_endpoint() {
         .mount(&server)
         .await;
 
-    let transport = ReqwestTransport::new(reqwest::Client::new());
+    let transport = ReqwestTransport::from_http_client(
+        HttpClientBuilder::new()
+            .build_direct()
+            .expect("test HTTP client should build"),
+    );
     let provider = provider(&base_url);
     let request_url = ModelsClient::<ReqwestTransport>::request_url(&provider, "0.1.0");
     let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
@@ -129,6 +138,8 @@ async fn models_client_hits_models_endpoint() {
 
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].slug, "gpt-test");
+    assert!(models[0].node_repl_auto_review_required);
+    assert!(models[0].node_repl_disabled);
 
     let received = server
         .received_requests()

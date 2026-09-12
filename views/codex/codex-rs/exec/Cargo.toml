@@ -32,10 +32,12 @@ codex-config = { workspace = true }
 codex-core = { workspace = true }
 codex-feedback = { workspace = true }
 codex-git-utils = { workspace = true }
+codex-history = { workspace = true }
 codex-login = { workspace = true }
 codex-model-provider-info = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
+codex-rollout = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-cli = { workspace = true }
 codex-utils-oss = { workspace = true }
@@ -76,3 +78,4 @@ tracing-opentelemetry = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
 wiremock = { workspace = true }
+zstd = { workspace = true }

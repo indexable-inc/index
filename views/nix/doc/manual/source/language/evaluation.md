@@ -12,7 +12,7 @@ This happens by a number of rules, such as:
 - Applying user-defined functions
   For example the expression `(x: x + 1) 10` can[*](#laziness) be thought of rewriting `x` in the function body to the argument, `10 + 1`, which is then evaluated to `11`.
 
-These rules are applied as needed, driven by the specific use of the expression. For example, this can occur in the Nix command line interface or interactively with the [repl (read-eval-print loop)](@docroot@/command-ref/new-cli/nix3-repl.md), which is a useful tool when learning about evaluation.
+These rules are applied as needed, driven by the specific use of the expression. Use [`nix eval`](@docroot@/command-ref/new-cli/nix3-eval.md) to evaluate expressions from the command line.
 
 # Details
 
@@ -33,7 +33,7 @@ Furthermore, the result of evaluation is preserved, in values, in `let` bindings
 
 When discussing the process of evaluation in lower level terms, we may define values not as a subset of expressions, but separately, where each "value" is either a data constructor, a function or a _thunk_. A thunk is a delayed computation, represented by an expression reference and a "closure" &ndash; the values for the lexical scope around the delayed expression.
 
-As a user of the language, you generally don't have to think about thunks, as they are not part of the language semantics, but you may encounter them in the repl, in the [C API] or in discussions.
+As a user of the language, you generally don't have to think about thunks, as they are not part of the language semantics, but you may encounter them in the [C API] or in discussions.
 
 ## Strictness
 

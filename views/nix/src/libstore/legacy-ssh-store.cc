@@ -272,8 +272,10 @@ void LegacySSHStore::computeFSClosure(
 
 StorePathSet LegacySSHStore::queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute)
 {
-    auto conn(connections->get());
-    return conn->queryValidPaths(*this, false, paths, maybeSubstitute);
+    // copyPaths skips outputs already present at the destination. Retain those
+    // paths before reporting validity, just as importing a missing path does,
+    // so a concurrent collector cannot remove inputs before buildDerivation.
+    return queryValidPaths(paths, true, maybeSubstitute);
 }
 
 StorePathSet LegacySSHStore::queryValidPaths(const StorePathSet & paths, bool lock, SubstituteFlag maybeSubstitute)

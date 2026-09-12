@@ -72,6 +72,21 @@ are not obviously coarse and are the reason this was measured rather than
 assumed: 8.7 million interns and 793 thousand constant-pool insertions on the
 run above.
 
+Since 2026-09-04 the default-on set also carries the allocation census
+(`alloc.*`: every slot cell, attribute set and entry, list and element,
+frame and frame slot; cppnix's `nrValues` family). That one is not coarse.
+On the hil-compute-1 NixOS toplevel it counts 160.7M slot cells (52.7M
+values, 91.4M thunks, 16.6M pending applies), 12.4M attribute sets holding
+279.6M entries, 16.1M lists holding 31.5M elements and 39.5M frames holding
+60.3M slots: about 340M thread-local increments per run, predicted ~0.34 s
+at ~1 ns each, 0.5% of a 66 s evaluation. The bed pair on dev-compute-4
+(same tree with and without the census, plain env, one run per arm, output
+identical): with 65.76 s cpuTime, without 66.40 s and 66.33 s. The predicted
+cost sits below what one run per arm resolves: two runs of one binary were
+0.07 s apart, two binaries 0.6 s apart the other way, so the honest figure
+is "under 1%, sign not resolved", and the +0.43% bound at the end of this
+file, measured before the census existed, does not cover it.
+
 `perf-ops`, the per-IR-op counter, is a **separate feature and off by
 default**, because that one really is in the innermost loop. The fourth
 attempt below prices it at +0.36%; a run with it on reports `ops_counted=true`
@@ -247,7 +262,8 @@ perf-ops - off: median +0.0450s  sign test p=0.0118  95% CI [+0.02%, +0.72%]
 perf-ops - on:  median +0.0735s  sign test p=0.0118
 ```
 
-**The shipping counters are free at any resolution that matters.** The
+**The shipping counters of that build are free at any resolution that
+matters.** (The allocation census postdates this run; it is priced above.) The
 prediction, derived from the source before the timings were read, was ~23.1M
 thread-local `Cell<u64>` increments per run (13.44M yields, 8.74M interns,
 0.79M konsts, the rest smaller) at ~1ns each: +0.023s, or 0.19% -- which is

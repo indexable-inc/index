@@ -427,11 +427,8 @@ TEST_F(ValuePrintingTests, ansiColorsDerivation)
 
 TEST_F(ValuePrintingTests, ansiColorsError)
 {
-    Value throw_ = state.getBuiltin("throw");
-    Value message;
-    message.mkStringNoCopy("uh oh!"_sds);
     Value vError;
-    vError.mkApp(&throw_, &message);
+    vError.mkFailed(std::make_exception_ptr(Error("uh oh!")), nullptr);
 
     test(
         vError,
@@ -444,11 +441,8 @@ TEST_F(ValuePrintingTests, ansiColorsError)
 
 TEST_F(ValuePrintingTests, ansiColorsDerivationError)
 {
-    Value throw_ = state.getBuiltin("throw");
-    Value message;
-    message.mkStringNoCopy("uh oh!"_sds);
     Value vError;
-    vError.mkApp(&throw_, &message);
+    vError.mkFailed(std::make_exception_ptr(Error("uh oh!")), nullptr);
 
     Value vDerivation;
     vDerivation.mkStringNoCopy("derivation"_sds);
@@ -478,14 +472,8 @@ TEST_F(ValuePrintingTests, ansiColorsDerivationError)
 
 TEST_F(ValuePrintingTests, ansiColorsAssert)
 {
-    ExprVar eFalse(state.symbols.create("false"));
-    eFalse.bindVars(state, state.staticBaseEnv);
-    ExprInt eInt(1);
-
-    ExprAssert expr(noPos, &eFalse, &eInt);
-
     Value v;
-    state.mkThunk_(v, &expr);
+    v.mkFailed(std::make_exception_ptr(AssertionError(state, "assertion 'false' failed")), nullptr);
 
     test(v, ANSI_RED "«error: assertion 'false' failed»" ANSI_NORMAL, PrintOptions{.ansiColors = true, .force = true});
 }

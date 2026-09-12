@@ -64,31 +64,27 @@
   dashboardSiteHtml = "${dashboardSite}/share/dashboard-site/index.html";
   src = let
     rustPackageFiles = packagePath:
-      lib.fileset.intersection (lib.fileset.gitTracked packagePath) (
-        lib.fileset.unions [
-          (packagePath + "/Cargo.toml")
-          (packagePath + "/src")
-          (lib.fileset.maybeMissing (packagePath + "/benches"))
-          (lib.fileset.maybeMissing (packagePath + "/build.rs"))
-          (lib.fileset.maybeMissing (packagePath + "/tests"))
-          (lib.fileset.maybeMissing (packagePath + "/templates"))
-        ]
-      );
+      lib.fileset.unions [
+        (packagePath + "/Cargo.toml")
+        (packagePath + "/src")
+        (lib.fileset.maybeMissing (packagePath + "/benches"))
+        (lib.fileset.maybeMissing (packagePath + "/build.rs"))
+        (lib.fileset.maybeMissing (packagePath + "/tests"))
+        (lib.fileset.maybeMissing (packagePath + "/templates"))
+      ];
   in
     lib.fileset.toSource {
       inherit root;
-      fileset = lib.fileset.intersection (lib.fileset.gitTracked root) (
-        lib.fileset.unions (
-          [
-            (root + "/Cargo.toml")
-            (root + "/Cargo.lock")
-            (rustPackageFiles (paths.modules + "/services/resource-monitor/stats-writer"))
-            (rustPackageFiles (paths.modules + "/services/sandboxed-agent/egress-check"))
-            (rustPackageFiles (paths.modules + "/services/sandboxed-agent/launch"))
-            (rustPackageFiles (paths.modules + "/services/sandboxed-agent/proxy"))
-          ]
-          ++ map (entry: rustPackageFiles entry.path) packageRegistry.rustWorkspaceEntries
-        )
+      fileset = lib.fileset.unions (
+        [
+          (root + "/Cargo.toml")
+          (root + "/Cargo.lock")
+          (rustPackageFiles (paths.modules + "/services/resource-monitor/stats-writer"))
+          (rustPackageFiles (paths.modules + "/services/sandboxed-agent/egress-check"))
+          (rustPackageFiles (paths.modules + "/services/sandboxed-agent/launch"))
+          (rustPackageFiles (paths.modules + "/services/sandboxed-agent/proxy"))
+        ]
+        ++ map (entry: rustPackageFiles entry.path) packageRegistry.rustWorkspaceEntries
       );
     };
   cargoLock = root + "/Cargo.lock";

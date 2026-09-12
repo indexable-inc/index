@@ -8,10 +8,12 @@ fn snapshot(
     RateLimitSnapshot {
         limit_id: Some(crate::guard_limits::CODEX_LIMIT_ID.to_string()),
         limit_name: None,
+        normal_model_slug: None,
         primary: primary_used_percent.map(window),
         secondary: secondary_used_percent.map(window),
         credits: None,
         individual_limit: None,
+        spend_control_reached: None,
         plan_type: None,
         rate_limit_reached_type: None,
     }

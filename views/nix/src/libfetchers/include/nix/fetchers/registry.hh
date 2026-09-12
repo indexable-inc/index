@@ -11,6 +11,8 @@ class Store;
 
 namespace nix::fetchers {
 
+enum class UseRegistries : int;
+
 struct Registry
 {
     enum RegistryType {
@@ -30,12 +32,11 @@ struct Registry
         bool exact = false;
     };
 
-    std::vector<Entry> entries;
+    Registry(RegistryType type);
+    ~Registry();
 
-    Registry(RegistryType type)
-        : type{type}
-    {
-    }
+    /** An independently owned snapshot; Rust owns the live entry table. */
+    std::vector<Entry> entries() const;
 
     static std::shared_ptr<Registry> read(const Settings & settings, const SourcePath & path, RegistryType type);
 
@@ -44,6 +45,12 @@ struct Registry
     void add(const Input & from, const Input & to, const Attrs & extraAttrs);
 
     void remove(const Input & input);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+
+    friend std::pair<Input, Attrs> lookupInRegistries(const Settings &, Store &, const Input &, UseRegistries);
 };
 
 typedef std::vector<std::shared_ptr<Registry>> Registries;

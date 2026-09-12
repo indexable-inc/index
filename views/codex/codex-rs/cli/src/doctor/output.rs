@@ -26,13 +26,17 @@ const GROUPS: &[OutputGroup] = &[
     OutputGroup {
         title: "Environment",
         keys: &[
-            "system", "runtime", "install", "search", "git", "terminal", "title", "state",
-            "threads",
+            "system", "disk", "security", "runtime", "install", "search", "git", "terminal",
+            "title", "state", "threads",
         ],
     },
     OutputGroup {
         title: "Configuration",
         keys: &["config", "auth", "mcp", "sandbox"],
+    },
+    OutputGroup {
+        title: "Desktop App",
+        keys: &["desktop"],
     },
     OutputGroup {
         title: "Updates",
@@ -495,6 +499,9 @@ fn notes_for_report(report: &DoctorReport) -> Vec<DoctorNote> {
         update_note(check, report)
             .into_iter()
             .for_each(|note| notes.push(note));
+        desktop_update_note(check)
+            .into_iter()
+            .for_each(|note| notes.push(note));
     }
     if let Some(check) = find_check(report, "state") {
         rollout_note(check)
@@ -541,6 +548,21 @@ fn update_note(check: &DoctorCheck, report: &DoctorReport) -> Option<DoctorNote>
         status: DisplayStatus::Update,
         name: "updates".to_string(),
         summary: format!("{latest} available ({parenthetical})"),
+    })
+}
+
+fn desktop_update_note(check: &DoctorCheck) -> Option<DoctorNote> {
+    let status = detail::detail_value(check, "desktop update status")?;
+    let build = detail::detail_value(check, "desktop latest build")?;
+    let summary = match status.as_str() {
+        "ready to install" => format!("build {build} available (ready to install)"),
+        "available" => format!("build {build} available"),
+        _ => return None,
+    };
+    Some(DoctorNote {
+        status: DisplayStatus::Update,
+        name: "desktop".to_string(),
+        summary,
     })
 }
 
@@ -620,7 +642,6 @@ fn display_summary(check: &DoctorCheck, options: HumanOutputOptions) -> String {
         "runtime" => runtime_summary(check),
         "install" if check.status == CheckStatus::Ok => "consistent".to_string(),
         "search" => search_summary(check),
-        "git" => git_summary(check),
         "terminal" => terminal_summary(check),
         "title" => title_summary(check, options),
         "state" => state_summary(check),
@@ -657,12 +678,6 @@ fn search_summary(check: &DoctorCheck) -> String {
         }
         _ => check.summary.clone(),
     }
-}
-
-fn git_summary(check: &DoctorCheck) -> String {
-    detail::detail_value(check, "git version")
-        .or_else(|| detail::detail_value(check, "selected git"))
-        .unwrap_or_else(|| check.summary.clone())
 }
 
 fn terminal_summary(check: &DoctorCheck) -> String {
@@ -1260,7 +1275,7 @@ Environment
       LESS                     -FRX
   ✓ runtime      running local build on darwin-arm64
   ✓ install      consistent
-      managed by               npm: no · bun: no · pnpm: no · package root —
+      managed by               npm: no · bun: no · pnpm: no · Vite+: no · package root —
   ✓ search       search is OK (bundled)
   ✓ git          git version 2.54.0
       selected git             /usr/bin/git
@@ -1301,9 +1316,69 @@ Background Server
 
     #[test]
     fn render_human_report_snapshot_covers_environment_rows() {
+        let mut report = sample_report();
+        report.checks.push(DoctorCheck::new(
+            "system.disk",
+            "disk",
+            CheckStatus::Ok,
+            "sufficient free disk space (42.0 GiB)",
+        ));
+        report.checks.push(
+            DoctorCheck::new(
+                "git.worktree.dev_drive",
+                "git",
+                CheckStatus::Warning,
+                "this worktree is not on a Windows Dev Drive",
+            )
+            .remediation(
+                "create a trusted Windows Dev Drive: https://learn.microsoft.com/en-us/windows/dev-drive/",
+            ),
+        );
+        let mut security = super::super::security::endpoint_check(
+            super::super::security::EndpointInspection::Complete(vec!["Microsoft Defender"]),
+        );
+        let targets = security
+            .details
+            .iter_mut()
+            .find(|detail| detail.starts_with("exclusion targets: "))
+            .expect("endpoint security check should include exclusion targets");
+        *targets = "exclusion targets: verified Codex app and required helpers".into();
+        report.checks.push(security);
+        report.checks.extend([
+            DoctorCheck::new(
+                "desktop.app.version",
+                "desktop",
+                CheckStatus::Ok,
+                "the desktop application is installed",
+            )
+            .detail("version: 1.2.3")
+            .detail("running: true")
+            .detail("log directory: $HOME/Library/Logs/com.openai.codex"),
+            DoctorCheck::new(
+                "desktop.app_server.handshake",
+                "desktop",
+                CheckStatus::Ok,
+                "the desktop app-server initialized successfully",
+            ),
+        ]);
+        let update = report
+            .checks
+            .iter_mut()
+            .find(|check| check.category == "updates")
+            .unwrap();
+        for (status, expected) in [
+            ("available", "build 123 available"),
+            ("ready to install", "build 123 available (ready to install)"),
+        ] {
+            update.details = vec![
+                format!("desktop update status: {status}"),
+                "desktop latest build: 123".to_string(),
+            ];
+            assert_eq!(desktop_update_note(update).unwrap().summary, expected);
+        }
         insta::assert_snapshot!(
             "doctor_human_report_environment_rows",
-            render_human_report(&sample_report(), detailed_no_color_unicode_options())
+            render_human_report(&report, detailed_no_color_unicode_options())
         );
     }
 

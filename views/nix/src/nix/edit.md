@@ -23,6 +23,11 @@ its `meta.position` attribute. Nixpkgs' `stdenv.mkDerivation` sets
 this attribute to the location of the definition of the
 `meta.description`, `version` or `name` derivation attributes.
 
+For an unpinned local flake, locations inside its root input open the corresponding
+file in the current checkout, including files under a flake subdirectory. Explicit
+revision or branch references and dependency inputs retain their immutable source
+paths.
+
 The editor to invoke is specified by the `EDITOR` environment
 variable. It defaults to `cat`. If the editor is `emacs`, `nano`,
 `vim` or `kak`, it is passed the line number of the derivation using

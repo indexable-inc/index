@@ -6,6 +6,17 @@ members = ["nix-eval-rs", "ix-kernel", "nix-eval-driver"]
 edition = "2024"
 license = "LGPL-2.1-or-later"
 
+[workspace.dependencies]
+# The dialect's lexer: the rnix-parser view (`index/views/rnix-0-12`, the
+# 0.12.0 tag plus the underscore-digit-separator patch, the same tree that
+# lib/util/rnix-digit-separators overlays onto alejandra/statix/deadnix).
+# Reached as a sibling under `index/views/`; the nix build of this workspace
+# (index/packages/nix/default.nix, `nixEvalRs`) lays the two trees out the
+# same way. A path and not a git rev: the view is the copy of that tree the
+# monorepo already holds, and a git URL to the private fork made every build
+# a network fetch no sandbox can make.
+rnix = { path = "../../rnix-0-12" }
+
 # Mirrored from the index monorepo workspace lints so the same bar applies
 # here before the ciCheck derivations arrive. Stock clippy aborts (E0602) on
 # the two llm-clippy-only lints, so those two are added when the forked

@@ -41,6 +41,7 @@
     "path"
     "pyExtension"
     "updateScript"
+    "workspaceIfdRoots"
   ];
 
   assertKnownKeys = label: allowedKeys: value: let
@@ -217,6 +218,14 @@
       # upstream "latest" pointer). The generated `update` app runs every
       # flagged package's updater; see lib/per-system.nix.
       updateScript = raw.updateScript or false;
+      # Only declared workspace providers are inspected for IFD roots. Probing
+      # every package's passthru forces unrelated system closures during job
+      # name discovery. The actual roots remain owned by the package producer.
+      workspaceIfdRoots = let
+        declared = raw.workspaceIfdRoots or false;
+      in
+        assert lib.assertMsg (builtins.isBool declared)
+        "${label}: workspaceIfdRoots must be a boolean"; declared;
     };
 
   entries = map importMetadata packageDirs;

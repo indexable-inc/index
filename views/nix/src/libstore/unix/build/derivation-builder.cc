@@ -2126,31 +2126,11 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs()
                ingestion method serialises something other than a NAR, and is
                reset if self-references force the contents to be rewritten. */
             std::optional<HashResult> narHashAndSize;
-            auto got = [&] {
-                SourcePath path{getFSSourceAccessor(), CanonPath(actualPath.native())};
-                auto fim = outputHash.method.getFileIngestionMethod();
-                switch (fim) {
-                case FileIngestionMethod::Flat:
-                case FileIngestionMethod::NixArchive: {
-                    HashModuloSink caSink{outputHash.hashAlgo, oldHashPart};
-                    if (fim == FileIngestionMethod::NixArchive) {
-                        /* The content address is taken over the NAR itself, so
-                           one serialisation can feed both hashes. */
-                        HashSink narSink{HashAlgorithm::SHA256};
-                        TeeSink teeSink{caSink, narSink};
-                        dumpPath(path, teeSink, FileSerialisationMethod::NixArchive);
-                        narHashAndSize = narSink.finish();
-                    } else {
-                        dumpPath(path, caSink, (FileSerialisationMethod) fim);
-                    }
-                    return caSink.finish().hash;
-                }
-                case FileIngestionMethod::Git: {
-                    return git::dumpHash(outputHash.hashAlgo, path).hash;
-                }
-                }
-                assert(false);
-            }();
+            auto contentHash = hashContentAddress(
+                {getFSSourceAccessor(), CanonPath(actualPath.native())},
+                {.method = outputHash.method, .algorithm = outputHash.hashAlgo, .selfReference = oldHashPart});
+            narHashAndSize = contentHash.narHashAndSize;
+            auto got = std::move(contentHash.hash);
 
             auto newInfo0 = ValidPathInfo::makeFromCA(
                 store,

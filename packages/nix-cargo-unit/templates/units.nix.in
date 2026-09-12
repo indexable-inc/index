@@ -197,6 +197,28 @@ let
 
   scopedWorkspaceClosureSource = name: includes: scopedClosureSource workspaceRoot name includes;
 
+  workspaceSourceAllows =
+    excluded: path:
+    let relative = sourceRelativePath workspaceRoot path;
+    in !(builtins.any (other: relative == other || pkgs.lib.hasPrefix (other + "/") relative) excluded);
+
+  scopedWorkspaceSourceExcluding =
+    name: relative: excluded:
+    builtins.path {
+      inherit name;
+      path = sourceRootPath workspaceRoot + pkgs.lib.optionalString (relative != "") "/${relative}";
+      filter = path: _type: workspaceSourceAllows excluded path;
+    };
+
+  scopedWorkspaceClosureSourceExcluding =
+    name: includes: excluded:
+    builtins.path {
+      inherit name;
+      path = sourceRootPath workspaceRoot;
+      filter = path: type: sourceClosureFilter workspaceRoot includes path type && workspaceSourceAllows excluded path;
+    };
+
+
   scopedVendorClosureSource =
     name: includes:
     assert pkgs.lib.assertMsg (vendorDir != null) ''

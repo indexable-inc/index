@@ -88,32 +88,20 @@ public:
     auto operator<=>(const NonEmptyInputAttrPath & other) const = default;
 };
 
-struct LockedNode;
-
-/**
- * A node in the lock file. It has outgoing edges to other nodes (its
- * inputs). Only the root node has this type; all other nodes have
- * type LockedNode.
- */
-struct Node : std::enable_shared_from_this<Node>
+/** Stable identity within one Rust-owned graph. */
+struct NodeId
 {
-    typedef std::variant<ref<LockedNode>, InputAttrPath> Edge;
-
-    std::map<FlakeId, Edge> inputs;
-
-    virtual ~Node() {}
+    uint64_t value;
+    auto operator<=>(const NodeId &) const = default;
 };
 
-/**
- * A non-root node in the lock file.
- */
-struct LockedNode : Node
+using Edge = std::variant<NodeId, InputAttrPath>;
+
+/** Host fetch objects for a graph node. Adjacency is owned only by Rust. */
+struct LockedNode
 {
     FlakeRef lockedRef, originalRef;
     bool isFlake = true;
-
-    /* The node relative to which relative source paths
-       (e.g. 'path:../foo') are interpreted. */
     std::optional<InputAttrPath> parentInputAttrPath;
 
     LockedNode(
@@ -121,48 +109,68 @@ struct LockedNode : Node
         const FlakeRef & originalRef,
         bool isFlake = true,
         std::optional<InputAttrPath> parentInputAttrPath = {})
-        : lockedRef(std::move(lockedRef))
-        , originalRef(std::move(originalRef))
+        : lockedRef(lockedRef)
+        , originalRef(originalRef)
         , isFlake(isFlake)
         , parentInputAttrPath(std::move(parentInputAttrPath))
     {
     }
 
     LockedNode(const fetchers::Settings & fetchSettings, const nlohmann::json & json);
-
     StorePath computeStorePath(Store & store) const;
 };
 
-struct LockFile
-{
-    ref<Node> root = make_ref<Node>();
+struct LockPrefetchImpl;
 
-    LockFile() {};
+/** A Rust-owned dependency schedule shared by concurrent fetch workers. */
+class LockPrefetchSchedule
+{
+    std::shared_ptr<LockPrefetchImpl> impl;
+
+    explicit LockPrefetchSchedule(std::shared_ptr<LockPrefetchImpl> impl)
+        : impl(std::move(impl))
+    {
+    }
+    friend class LockFile;
+
+public:
+    std::vector<NodeId> ready() const;
+    std::vector<NodeId> complete(NodeId node, bool succeeded) const;
+    void checkComplete() const;
+};
+
+struct LockFileImpl;
+
+class LockFile
+{
+    std::shared_ptr<LockFileImpl> impl;
+
+public:
+    static constexpr NodeId root{0};
+    LockFile();
     LockFile(const fetchers::Settings & fetchSettings, std::string_view contents, std::string_view path);
 
-    typedef std::map<ref<const Node>, std::string> KeyMap;
+    using KeyMap = std::map<NodeId, std::string>;
+
+    NodeId addNode(
+        const FlakeRef & lockedRef,
+        const FlakeRef & originalRef,
+        bool isFlake = true,
+        std::optional<InputAttrPath> parentInputAttrPath = {});
+    void setInput(NodeId node, const FlakeId & name, const Edge & edge);
+    std::map<FlakeId, Edge> inputs(NodeId node) const;
+    const LockedNode * node(NodeId node) const;
+    /** Each directly reachable node once, in Rust graph traversal order. */
+    std::vector<NodeId> reachableNodes() const;
+    LockPrefetchSchedule prefetchSchedule() const;
 
     std::pair<nlohmann::json, KeyMap> toJSON() const;
-
     std::pair<std::string, KeyMap> to_string() const;
-
-    /**
-     * Check whether this lock file has any unlocked or non-final
-     * inputs. If so, return one.
-     */
     std::optional<FlakeRef> isUnlocked(const fetchers::Settings & fetchSettings) const;
-
     bool operator==(const LockFile & other) const;
-
-    std::shared_ptr<Node> findInput(const InputAttrPath & path);
-
-    std::map<InputAttrPath, Node::Edge> getAllInputs() const;
-
+    std::optional<NodeId> findInput(const InputAttrPath & path) const;
+    std::map<InputAttrPath, Edge> getAllInputs() const;
     static std::string diff(const LockFile & oldLocks, const LockFile & newLocks);
-
-    /**
-     * Check that every 'follows' input target exists.
-     */
     void check();
 };
 

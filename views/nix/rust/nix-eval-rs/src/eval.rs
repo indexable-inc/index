@@ -104,6 +104,23 @@ pub fn nix_version() -> Option<&'static str> {
     NIX_VERSION.get().map(String::as_str)
 }
 
+/// The immutable artifact implementing callbacks and command-side answer policy.
+/// Kept separate from the user-visible language version: two host builds can
+/// expose the same version while computing different answers for the same question.
+static HOST_BUILD_IDENTITY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_host_build_identity(identity: &str) -> Result<(), SettingConflict> {
+    #[cfg(test)]
+    assert_globals_exclusive("host-build-identity");
+    set_once(&HOST_BUILD_IDENTITY, "host build identity", identity)
+}
+
+pub fn host_build_identity() -> Option<&'static str> {
+    #[cfg(test)]
+    assert_globals_guarded("host-build-identity");
+    HOST_BUILD_IDENTITY.get().map(String::as_str)
+}
+
 /// The platform string `builtins.currentSystem` reports.
 ///
 /// Handed over rather than detected, for the same reason the version string
@@ -508,6 +525,22 @@ impl From<CompileError> for EvalError {
     }
 }
 
+/// A compile through the machine's cache ([`Vm::compile`]) fails either
+/// because the source is bad, which keeps the class the source-level mapping
+/// above gives it, or because the cache's store is (an I/O refusal, a row
+/// naming an object that is gone): not the expression's fault, and reported
+/// as an evaluation error naming the cache rather than blamed on the syntax.
+/// `session::compile_failure` is this same split for the embedder's status
+/// strings.
+impl From<crate::modcache::CacheError> for EvalError {
+    fn from(e: crate::modcache::CacheError) -> Self {
+        match e {
+            crate::modcache::CacheError::Compile(compile) => EvalError::from(compile),
+            other => EvalError::eval(ErrKind::Eval, format!("compile cache: {other}")),
+        }
+    }
+}
+
 pub fn eval_str_on(
     src: &str,
     base_dir: &str,
@@ -515,9 +548,10 @@ pub fn eval_str_on(
     vm: &mut Vm,
     host: &dyn Host,
 ) -> Result<String, EvalError> {
-    let module =
-        compile::compile_source(src, base_dir, origin, vm.settings()).map_err(EvalError::from)?;
-    let module = Rc::new(module);
+    let module = vm
+        .compile(src, base_dir, origin)
+        .map_err(EvalError::from)?
+        .module;
     vm.start_module(&module);
     let value = drive(vm, host).map_err(map_vm_error)?;
     vm.start_print(value);
@@ -552,26 +586,60 @@ struct InFlight {
     /// having the answer, which for an asynchronous one is not the time the
     /// collect took.
     began: std::time::Instant,
+    /// The context a `Realise` question was about, kept so the answer can
+    /// be remembered in [`JobMemo::realised`] when it arrives; `None` for
+    /// every other shape.
+    realised: Option<Vec<crate::value2::ContextElem>>,
 }
 
 /// Which value-building half a collected [`crate::host::SlowAnswer`] needs.
-enum SlowShape {
+///
+/// The one owner of "which questions can go to a worker thread": `begin_slow`
+/// classifies by producing one of these, and `perf` reports under
+/// [`SlowShape::ALL`]'s names, so the scheduler and the census cannot list
+/// different sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlowShape {
     Fetch,
     FetchTree,
     Flake,
     Realise,
 }
 
+impl SlowShape {
+    /// Every shape, in reporting order.
+    pub const ALL: [SlowShape; 4] = [
+        SlowShape::Fetch,
+        SlowShape::FetchTree,
+        SlowShape::Flake,
+        SlowShape::Realise,
+    ];
+
+    /// The question kind's name, as `purity::question_kind` spells it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            SlowShape::Fetch => "Fetch",
+            SlowShape::FetchTree => "FetchTree",
+            SlowShape::Flake => "Flake",
+            SlowShape::Realise => "Realise",
+        }
+    }
+}
+
 /// One evaluation the scheduler is running.
 struct Job<'a> {
     vm: &'a mut Vm,
     host: &'a dyn Host,
-    /// Per-evaluation, never shared. Sharing one across jobs would let the
-    /// job that missed record the `ReadDir` and the job that hit record
-    /// nothing, so the second one's read set would omit a directory its
-    /// value depends on -- a wrong answer from a memo, not a slow one. See
-    /// the type's own doc.
-    dirs: DirCache,
+    /// Lent by whoever owns the recording this job answers into, for exactly
+    /// as long as that recording: [`drive`] makes one per call, and the
+    /// handle API keeps one per question (`capi::MemoScope`), so every force
+    /// a question performs shares it. Never shared across two recordings:
+    /// that would let the job that missed record the `ReadDir` and the job
+    /// that hit record nothing, so the second one's read set would omit a
+    /// directory its value depends on -- a wrong answer from a memo, not a
+    /// slow one. See the type's own doc.
+    memo: &'a mut JobMemo,
     /// The slow questions this job has in flight, oldest resume token first.
     ///
     /// A map and not a slot, since ENG-13150: one job can have several
@@ -582,6 +650,9 @@ struct Job<'a> {
     inflight: std::collections::BTreeMap<crate::vm::ResumeToken, InFlight>,
     /// Set once, when the job stops having anything more to do.
     outcome: Option<Result<Value, VmError>>,
+    /// Whether [`settle_job`] has run for this job; it runs once, on the
+    /// scheduler turn after `outcome` is set.
+    settled: bool,
 }
 
 /// The scheduler side of the poll loop: the only place in the crate that
@@ -595,7 +666,27 @@ struct Job<'a> {
 /// [`drive_concurrent`] for the case that has something else to be getting
 /// on with.
 pub fn drive(vm: &mut Vm, host: &dyn Host) -> Result<Value, VmError> {
-    let mut outcomes = drive_concurrent(vec![(vm, host)]);
+    let mut memo = JobMemo::default();
+    drive_with(vm, host, &mut memo)
+}
+
+/// [`drive`] with the evaluation's memo lent by the caller.
+///
+/// The caller owns the memo's lifetime, and with it the soundness argument
+/// on [`Job::memo`]: the memo must live exactly as long as the recording it
+/// answers into. Two callers lend one across several drives, and both hold
+/// one recording across them -- the handle API for every force of one
+/// question (`capi::MemoScope`), and `session::run` for the evaluation and
+/// the render that prints it. Measured before this existed: one `nix eval`
+/// of a host's `toplevel.drvPath` asked the host for 126,094 directory
+/// listings over 8,084 directories, 15.6 per directory, one per force the
+/// embedder made (`goals/rust-eval.md`, 2026-09-04).
+pub(crate) fn drive_with(
+    vm: &mut Vm,
+    host: &dyn Host,
+    memo: &mut JobMemo,
+) -> Result<Value, VmError> {
+    let mut outcomes = drive_concurrent_with(vec![(vm, host, memo)]);
     outcomes.pop().unwrap_or_else(|| {
         Err(VmError::eval(
             "internal: the scheduler dropped its only job",
@@ -653,14 +744,31 @@ pub fn drive(vm: &mut Vm, host: &dyn Host) -> Result<Value, VmError> {
 pub fn drive_concurrent<'a>(
     jobs: impl IntoIterator<Item = (&'a mut Vm, &'a dyn Host)>,
 ) -> Vec<Result<Value, VmError>> {
+    // One memo per job, living for this call: the recording each job answers
+    // into is its host's, and nothing outlives the call.
+    let jobs: Vec<(&'a mut Vm, &'a dyn Host)> = jobs.into_iter().collect();
+    let mut memos: Vec<JobMemo> = jobs.iter().map(|_| JobMemo::default()).collect();
+    drive_concurrent_with(
+        jobs.into_iter()
+            .zip(memos.iter_mut())
+            .map(|((vm, host), memo)| (vm, host, memo)),
+    )
+}
+
+/// [`drive_concurrent`] with each job's memo lent by the caller; see
+/// [`drive_with`] for who lends one and why.
+fn drive_concurrent_with<'a>(
+    jobs: impl IntoIterator<Item = (&'a mut Vm, &'a dyn Host, &'a mut JobMemo)>,
+) -> Vec<Result<Value, VmError>> {
     let mut jobs: Vec<Job<'a>> = jobs
         .into_iter()
-        .map(|(vm, host)| Job {
+        .map(|(vm, host, memo)| Job {
             vm,
             host,
-            dirs: DirCache::default(),
+            memo,
             inflight: std::collections::BTreeMap::new(),
             outcome: None,
+            settled: false,
         })
         .collect();
     loop {
@@ -682,8 +790,13 @@ pub fn drive_concurrent<'a>(
             // not be *collected*: the fiber a collect would resume was
             // cleared with the machine, and blocking on an answer nobody
             // wants is the stall this scheduler exists to remove.
-            if job.outcome.is_some() {
+            if job.outcome.is_some() && !job.settled {
+                for question in job.inflight.values() {
+                    crate::perf::note_question_abandoned(question.kind);
+                }
                 job.inflight.clear();
+                job.settled = true;
+                settle_job(job);
             }
         }
         // Nothing can move until an answer arrives. Wait for the oldest
@@ -715,6 +828,34 @@ pub fn drive_concurrent<'a>(
                 .collect();
         };
         collect_one(job);
+    }
+}
+
+/// A finished job settles: the host gets its one chance to make every effect
+/// the evaluation deferred visible ([`Host::settle`]) before the value leaves
+/// the scheduler. This is the only place it happens, so every route into an
+/// evaluation -- a forced handle, a render, a memo verification, a
+/// derivation-set walk -- is covered by construction rather than by a flush
+/// at each entry point (a flush at `force_slot` and friends missed
+/// `ixe_render`, whose deep force is where `nix-instantiate --eval --strict`
+/// builds its derivations; the functional test rust-eval-host-questions.sh
+/// counted `flushes: 0`). A settled failure turns a finished value into an
+/// error; a failed evaluation keeps its own error, the settle still running so
+/// nothing stays deferred across the boundary.
+fn settle_job(job: &mut Job<'_>) {
+    match (job.host.settle(), &job.outcome) {
+        (Ok(()), _) => {}
+        (Err(error), Some(Ok(_))) => {
+            job.outcome = Some(Err(VmError::eval(format!(
+                "settling the evaluation's deferred store effects: {error}"
+            ))));
+        }
+        // The evaluation's own error stays the error. The store's refusal is
+        // still said: a queued derivation the store would not take is a fact
+        // about the store, and the next evaluation meets the same poison.
+        (Err(error), _) => job.host.warn(&format!(
+            "settling the failed evaluation's deferred store effects: {error}"
+        )),
     }
 }
 
@@ -764,25 +905,15 @@ fn step_job(job: &mut Job<'_>) {
                 // Counted here and nowhere else: this is the one place a
                 // question crosses out of the VM, which is what makes the
                 // count complete in the same way the read set is.
-                let name = crate::purity::question_kind(&need);
-                let kind = crate::purity::QUESTION_KINDS
-                    .iter()
-                    .position(|k| *k == name)
-                    .unwrap_or(usize::MAX);
-                // Cannot miss since ENG-13065: the name and the list come out
-                // of one `question_kinds!` invocation. It could before, and
-                // did -- `Flake` was in the match and not the list, so every
-                // `getFlake` landed in the `usize::MAX` bucket `note_question`
-                // drops. Asserted rather than removed because the fallback is
-                // what makes the miss silent, and a lookup that cannot fail is
-                // cheap to say so.
-                debug_assert_ne!(
-                    kind,
-                    usize::MAX,
-                    "question kind {name:?} is not in purity::QUESTION_KINDS, so it \
-                     is counted in the total and in no per-kind bucket"
-                );
-                match begin_slow(job.vm, job.host, &need, resume, kind) {
+                // The dense index comes from the same `question_kinds!` list
+                // as the name, so it cannot miss the way a name lookup with
+                // a fallback once did (ENG-13065: `Flake` was in the match
+                // and not the list, and every `getFlake` landed in a bucket
+                // the per-kind counters dropped).
+                let kind = crate::purity::question_kind_index(&need);
+                crate::perf::note_question_asked(kind);
+                job.vm.note_question_argument(&need);
+                match begin_slow(job.vm, job.host, &need, resume, kind, &*job.memo) {
                     Err(error) => {
                         job.outcome = Some(Err(error));
                         return;
@@ -806,8 +937,8 @@ fn step_job(job: &mut Job<'_>) {
                 // than returning it from here, so it unwinds through the
                 // frames and `tryEval` can catch it. See `Vm::resume_error`.
                 let (answered, nanos) =
-                    crate::perf::timed(|| answer_path(job.vm, job.host, &need, &mut job.dirs));
-                crate::perf::note_question(kind, nanos);
+                    crate::perf::timed(|| answer_path(job.vm, job.host, &need, &mut *job.memo));
+                crate::perf::note_question_answered(kind, nanos);
                 let resumed = match answered {
                     Ok(answer) => job.vm.resume(resume, answer),
                     Err(error) => job.vm.resume_error(resume, error),
@@ -832,7 +963,9 @@ fn begin_slow(
     need: &NeedPath,
     resume: crate::vm::ResumeToken,
     kind: usize,
+    memo: &JobMemo,
 ) -> Result<Option<InFlight>, VmError> {
+    let mut realised = None;
     let (question, shape, who) = match need {
         NeedPath::Fetch(request) => (
             crate::host::Slow::Fetch(request),
@@ -849,11 +982,18 @@ fn begin_slow(
             SlowShape::Flake,
             "getFlake".to_owned(),
         ),
-        NeedPath::Realise(context) => (
-            crate::host::Slow::Realise(context),
-            SlowShape::Realise,
-            realise_who(context),
-        ),
+        // A context this evaluation has already had built is answered by
+        // `answer_path` from the memo; beginning it would spend a validity
+        // check, a thread and a `buildPaths` on an answer already in hand.
+        NeedPath::Realise(context) if memo.realised.contains_key(context) => return Ok(None),
+        NeedPath::Realise(context) => {
+            realised = Some(context.clone());
+            (
+                crate::host::Slow::Realise(context),
+                SlowShape::Realise,
+                realise_who(context),
+            )
+        }
         _ => return Ok(None),
     };
     // The same gate `answer_path` puts in front of the blocking call, and for
@@ -864,13 +1004,18 @@ fn begin_slow(
     if access_check(vm, need)?.is_some() {
         return Ok(None);
     }
-    Ok(host.begin(&question).map(|ticket| InFlight {
-        resume,
-        ticket,
-        shape,
-        who,
-        kind,
-        began: std::time::Instant::now(),
+    let began = std::time::Instant::now();
+    Ok(host.begin(&question).map(|ticket| {
+        crate::perf::note_slow_question_started(kind);
+        InFlight {
+            resume,
+            ticket,
+            shape,
+            who,
+            kind,
+            began,
+            realised,
+        }
     }))
 }
 
@@ -885,17 +1030,19 @@ fn collect_one(job: &mut Job<'_>) {
         )));
         return;
     };
-    crate::perf::note_question(
-        done.kind,
-        u64::try_from(done.began.elapsed().as_nanos()).unwrap_or(u64::MAX),
-    );
-    let Some(answer) = job.host.collect(done.ticket, true) else {
+    let (answer, collect_call_ns) = crate::perf::timed(|| job.host.collect(done.ticket, true));
+    crate::perf::note_collect_call(collect_call_ns);
+    let latency_ns = u64::try_from(done.began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let Some(answer) = answer else {
+        crate::perf::note_question_abandoned(done.kind);
         job.outcome = Some(Err(VmError::eval(format!(
             "internal: the host abandoned the '{}' question it agreed to answer",
             done.who
         ))));
         return;
     };
+    crate::perf::note_question_answered(done.kind, latency_ns);
+    crate::perf::note_slow_question_answered(done.kind, latency_ns);
     // The value is built here, on the thread that owns the VM. Only plain
     // owned data crossed from the worker: nothing `Rc` and nothing interned
     // was ever touched off this thread.
@@ -906,13 +1053,11 @@ fn collect_one(job: &mut Job<'_>) {
         (SlowShape::FetchTree, crate::host::SlowAnswer::Store(answer)) => {
             tree_answer(job.vm, answer, &done.who)
         }
-        (SlowShape::Flake, crate::host::SlowAnswer::Flake(answer)) => match answer {
-            Ok(call) => Ok(flake_attrs(job.vm, call)),
-            Err(error) => store_answer(Err(error), &done.who, |_| {
-                Err(VmError::eval("internal: unreachable store answer"))
-            }),
-        },
+        (SlowShape::Flake, crate::host::SlowAnswer::Flake(answer)) => flake_answer(job.vm, answer),
         (SlowShape::Realise, crate::host::SlowAnswer::Realise(answer)) => {
+            if let Some(context) = done.realised {
+                remember_realised(&mut *job.memo, context, &answer);
+            }
             realise_answer(answer, &done.who)
         }
         // The host answered a different shape from the one it was asked. Not
@@ -950,9 +1095,11 @@ fn collect_one(job: &mut Job<'_>) {
 /// behind the path has not changed -- true within one evaluation, false for
 /// anything that outlives one. `Vm::modules` is content-keyed for exactly
 /// that reason, and the `Vm` does outlive an evaluation on the warm-start
-/// path. Owning the cache in [`drive`] makes the lifetime structural: it is
-/// created when an evaluation starts and dropped when it finishes, so no
-/// clearing discipline exists to get wrong.
+/// path. The cache lives in a [`JobMemo`] owned by whoever owns the recording
+/// it answers into ([`drive`] for one call, `capi::MemoScope` for one
+/// question), which makes the lifetime structural: it is created when a
+/// recording starts and dropped when the recording is filed, so no clearing
+/// discipline exists to get wrong.
 ///
 /// # What it does to the read set
 ///
@@ -966,7 +1113,66 @@ fn collect_one(job: &mut Job<'_>) {
 /// Sharing the answer is sound because these attrsets are immutable and
 /// already forced: every slot is a `Slot::value`, never a thunk that a
 /// second consumer could force differently.
-type DirCache = std::collections::HashMap<String, Rc<Attrs>>;
+type DirCache = std::collections::HashMap<Rc<crate::value2::PathValue>, Rc<Attrs>>;
+
+/// What one evaluation remembers of the host's answers, beside the read set:
+/// directory listings, imported sources, and the store copy of each path.
+///
+/// One per recording, never shared across two, for the reason `Job::memo`
+/// gives: a memo outliving its recording would let the job that missed
+/// record the question and the job that hit record nothing. And one per
+/// machine: the listings hold `Sym`s of the VM that interned them, and a
+/// `Sym` is an index into that VM's interner alone.
+///
+/// Every root is memoised, the ambient filesystem included. One evaluation
+/// is one snapshot of the world: the read set records a question once, with
+/// one answer, and a world that changed under a running evaluation would make
+/// its key unreproducible (a miss, never a wrong answer) whether or not the
+/// second ask reached the host. cppnix makes the same assumption with its
+/// parse cache and its per-evaluation `srcToStore`. What repeating the ask
+/// cost was measured, not supposed: one home-manager evaluation coerced
+/// 170k paths, 780 of them distinct, and every repeat crossed the ABI and
+/// reached the store (`maintainers/ix/host-questions.md`).
+#[derive(Default)]
+pub(crate) struct JobMemo {
+    dirs: DirCache,
+    /// The store path each coerced path copied to.
+    copies: std::collections::HashMap<Rc<crate::value2::PathValue>, String>,
+    /// The `import` answer for each path: resolved path, root and text, as
+    /// the attrset the VM compiles from. cppnix's `fileParseCache`.
+    imports: std::collections::HashMap<Rc<crate::value2::PathValue>, Rc<Attrs>>,
+    /// The rewrites each realised context answered with. A `Realise` that
+    /// has already succeeded in this evaluation is not asked again: every
+    /// ask, built or not, costs the embedder a validity check per element, a
+    /// worker thread and a `buildPaths` round trip (about 2 ms each; one
+    /// home-manager evaluation asked 2,269 times for 48 distinct contexts,
+    /// 4.4 s). Sound for the reason `copies` is: within one evaluation the
+    /// store either still has the outputs or the evaluation's key is
+    /// unreproducible anyway. A `BTreeMap` because [`ContextElem`] orders
+    /// but does not hash. Only answered contexts are here: two strands that
+    /// begin the same context before either collects both build it, as they
+    /// did before the memo, and the store answers both alike; joining the
+    /// second onto the first's ticket would be a scheduler feature, not a
+    /// memo.
+    realised: std::collections::BTreeMap<
+        Vec<crate::value2::ContextElem>,
+        std::collections::BTreeMap<String, String>,
+    >,
+}
+
+/// Remember a successful `Realise` answer for `context` in this evaluation's
+/// memo, whichever route (synchronous or begun) it came by. A failure is not
+/// remembered: `realise_answer` makes it uncatchable, so no later asker
+/// exists in this evaluation and a remembered failure would be dead state.
+fn remember_realised(
+    memo: &mut JobMemo,
+    context: Vec<crate::value2::ContextElem>,
+    answer: &Result<std::collections::BTreeMap<String, String>, StoreError>,
+) {
+    if let Ok(rewrites) = answer {
+        memo.realised.insert(context, rewrites.clone());
+    }
+}
 
 /// `pure-eval`, as the embedder set it.
 ///
@@ -1080,6 +1286,90 @@ pub fn ca_derivations() -> bool {
     #[cfg(test)]
     assert_globals_guarded("ca-derivations");
     CA_DERIVATIONS.load(Ordering::Relaxed)
+}
+
+/// Policy the memo must not serve across. None of the three changes what an
+/// expression evaluates to; each changes whether the host lets it: a
+/// realisation served by validity never reaches `realiseContextCheck`
+/// (`allow-import-from-derivation`), a fetch served by validity never reaches
+/// `checkURI` (`allowed-uris`), and under `--repair` a served derivation
+/// write skips the rewrite repair exists for. So the first two are in the
+/// key and the third turns the memo off.
+static ALLOW_IMPORT_FROM_DERIVATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+static ALLOWED_URIS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static REPAIR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tell the evaluator whether `allow-import-from-derivation` is on.
+pub fn set_allow_import_from_derivation(on: bool) {
+    #[cfg(test)]
+    assert_globals_exclusive("allow-import-from-derivation");
+    ALLOW_IMPORT_FROM_DERIVATION.store(on, Ordering::Relaxed);
+}
+
+/// Whether `allow-import-from-derivation` is on.
+#[must_use]
+pub fn allow_import_from_derivation() -> bool {
+    #[cfg(test)]
+    assert_globals_guarded("allow-import-from-derivation");
+    ALLOW_IMPORT_FROM_DERIVATION.load(Ordering::Relaxed)
+}
+
+/// Tell the evaluator the `allowed-uris` list, newline-terminated entries.
+pub fn set_allowed_uris(uris: String) {
+    #[cfg(test)]
+    assert_globals_exclusive("allowed-uris");
+    *ALLOWED_URIS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(uris);
+}
+
+/// The `allowed-uris` list as the embedder sent it, if it did.
+#[must_use]
+pub fn allowed_uris() -> Option<String> {
+    #[cfg(test)]
+    assert_globals_guarded("allowed-uris");
+    ALLOWED_URIS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Tell the evaluator whether the evaluation runs under `--repair`.
+pub fn set_repair(on: bool) {
+    #[cfg(test)]
+    assert_globals_exclusive("repair");
+    REPAIR.store(on, Ordering::Relaxed);
+}
+
+/// Whether the evaluation runs under `--repair`.
+#[must_use]
+pub fn repair() -> bool {
+    #[cfg(test)]
+    assert_globals_guarded("repair");
+    REPAIR.load(Ordering::Relaxed)
+}
+
+/// cppnix's `blake3-hashes` experimental feature.
+///
+/// Value-deciding wherever a hash algorithm is parsed: with it off cppnix
+/// raises `MissingExperimentalFeature`, while with it on the same expression
+/// computes a 32-byte Blake3 digest (`libutil/hash.cc:25-29,468-473`).
+static BLAKE3_HASHES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tell the evaluator whether cppnix's `blake3-hashes` feature is enabled.
+pub fn set_blake3_hashes(on: bool) {
+    #[cfg(test)]
+    assert_globals_exclusive("blake3-hashes");
+    BLAKE3_HASHES.store(on, Ordering::Relaxed);
+}
+
+/// Whether the `blake3-hashes` feature is enabled.
+#[must_use]
+pub fn blake3_hashes() -> bool {
+    #[cfg(test)]
+    assert_globals_guarded("blake3-hashes");
+    BLAKE3_HASHES.load(Ordering::Relaxed)
 }
 
 /// cppnix's `parse-toml-timestamps` experimental feature.
@@ -1243,111 +1533,25 @@ pub fn pipe_operators() -> bool {
     PIPE_OPERATORS.load(Ordering::Relaxed)
 }
 
-/// The names cppnix's own `builtins` attrset has, space separated.
-///
-/// **Which primops exist is not something this crate can work out.** cppnix
-/// skips a primop whose experimental feature is off (`primops.cc:5606`),
-/// registers `__exec` and `__importNative` only under
-/// `allow-unsafe-native-code-during-evaluation` (`primops.cc:5537`), files an
-/// `.internal` one in `internalPrimOps` instead of in `builtins`
-/// (`eval.cc:608`) -- and on top of all three, `wasm.cc` is only compiled at
-/// all when the `libexpr:wasm` meson option finds wasmtime
-/// (`src/libexpr/primops/meson.build:14`). The last one is a build fact, not a
-/// setting, so a table here that re-derived cppnix's rules would be a mirror
-/// that cannot see it, and measuring found exactly that: a local build without
-/// wasmtime advertised `wasm` under `experimental-features = wasm-builtin`
-/// where cppnix did not.
-///
-/// So the embedder hands over the answer rather than the inputs, taken
-/// straight from `EvalState::getBuiltins()`. One source of truth, and nothing
-/// to keep in step.
-///
-/// Unset means no embedder said, which is the standalone case (the probe, the
-/// corpus runner, this crate's own tests). Then a gated name is advertised iff
-/// this crate implements it -- there is no cppnix in the process to disagree
-/// with, and hiding a working builtin would be its own wrong answer. What
-/// that default cannot do is advertise a gated name this crate does *not*
-/// implement, which is the whole of ENG-12717.
-static CPP_BUILTIN_NAMES: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+pub use crate::builtin_catalogue::BuiltinFeatures;
 
-/// Tell the evaluator which names cppnix's `builtins` has.
-///
-/// # Errors
-/// When the process has already been told a *different* set. Same rule as the
-/// store directory: the two sets disagree about which names exist, so a
-/// result memoised under the first would be served under the second.
-pub fn set_cpp_builtin_names(names: &str) -> Result<(), SettingConflict> {
+// Standalone evaluation enables implemented features; embedding hosts set their explicit policy.
+static BUILTIN_FEATURES: AtomicU32 = AtomicU32::new(BuiltinFeatures::ALL.bits());
+
+pub fn set_builtin_features(features: BuiltinFeatures) {
     #[cfg(test)]
-    assert_globals_exclusive("cpp-builtin-names");
-    set_once(
-        &CPP_BUILTIN_NAMES,
-        "the cppnix builtins name set",
-        &canonical_names(names),
-    )
+    assert_globals_exclusive("builtin-features");
+    BUILTIN_FEATURES.store(features.bits(), Ordering::Relaxed);
 }
 
-/// One spelling per set: split on whitespace, deduplicate, sort, rejoin, so
-/// the bridge repeating itself in a different order is not a conflict.
-fn canonical_names(names: &str) -> String {
-    let mut names: Vec<&str> = names.split_whitespace().collect();
-    names.sort_unstable();
-    names.dedup();
-    names.join(" ")
-}
-
-/// The names cppnix's `builtins` has, if the embedder supplied them.
-#[must_use]
-pub fn cpp_builtin_names() -> Option<&'static str> {
+pub fn builtin_features() -> BuiltinFeatures {
     #[cfg(test)]
-    assert_globals_guarded("cpp-builtin-names");
-    CPP_BUILTIN_NAMES.get().map(String::as_str)
-}
-
-/// Whether cppnix registers `name` under the current settings, where `name`
-/// is the registered spelling (`__` and all).
-///
-/// One rule for the `builtins` set and for the global scope, because
-/// `addPrimOp` puts a registered primop in both and a skipped one in neither.
-#[must_use]
-pub fn primop_registered(settings: &Settings, name: &str) -> bool {
-    // cppnix's `impureOnly`, which is not a primop gate at all but reaches
-    // the same conclusion for the same two questions -- is the name in
-    // `builtins`, is it in scope -- so it is answered by the same function.
-    // Answered here rather than asked of the embedder because `pure-eval` is
-    // a setting this evaluator already carries, and the standalone
-    // configuration has to reach the same answer as the embedded one.
-    if settings.pure_eval && crate::builtins_gen::CPP_IMPURE_ONLY_CONSTANTS.contains(&name) {
-        return false;
-    }
-    match crate::builtins_gen::gate_of(name) {
-        None => {
-            // Unconditional in cppnix. Not looked up in the embedder's list on
-            // purpose: this crate's own coverage of the ungated names is its
-            // business, and an embedder list that happened to lack one would
-            // otherwise silently delete it here.
-            return true;
-        }
-        // `.internal = true`: cppnix files it in `internalPrimOps` and it
-        // reaches neither the set nor the scope, under any setting. Answered
-        // here rather than by falling through to the embedder, because the
-        // fallthrough's standalone branch says "advertised iff this crate
-        // implements it" -- which is right for a feature gate and exactly
-        // wrong for this one. It went unnoticed while no `Gate::Never` name
-        // was implemented; `fetchFinalTree` is, so the standalone probe would
-        // have grown a `builtins.fetchFinalTree` cppnix has never had.
-        Some(crate::builtins_gen::Gate::Never) => return false,
-        Some(_) => {}
-    }
-    // Gated: cppnix decides, and it already has. The `builtins` spelling is
-    // what the attrset holds, so the `__` comes off before the lookup.
-    let member = name.strip_prefix("__").unwrap_or(name);
-    match settings.cpp_builtin_names.as_deref() {
-        Some(names) => names.split(' ').any(|advertised| advertised == member),
-        // Standalone: no cppnix in the process, so what this crate has is the
-        // only honest answer. `fetchTree` is implemented here and is gated in
-        // cppnix, so this is the branch that keeps it usable from the probe
-        // and from this crate's own tests.
-        None => crate::builtins::global_index(member).is_some(),
+    assert_globals_guarded("builtin-features");
+    let bits = BUILTIN_FEATURES.load(Ordering::Relaxed);
+    BuiltinFeatures {
+        flakes: bits & 1 != 0,
+        fetch_tree: bits & 2 != 0,
+        wasm: bits & 4 != 0,
     }
 }
 
@@ -1378,6 +1582,8 @@ pub struct Settings {
     pub store_dir: Option<String>,
     /// `ixe_set_nix_version`.
     pub nix_version: Option<String>,
+    /// Immutable host artifact identity, independent of `nix_version`.
+    pub host_build_identity: Option<String>,
     /// `ixe_set_current_system`, what `builtins.currentSystem` reports. The
     /// comment on `CURRENT_SYSTEM` calls this hole ENG-12541's, which it is,
     /// and this is where it closes.
@@ -1394,10 +1600,10 @@ pub struct Settings {
     /// configurations that differ only in which one is on are two different
     /// evaluations.
     pub restrict_eval: bool,
-    /// `ixe_set_cpp_builtin_names`. It decides which gated names `builtins`
+    /// `ixe_set_builtin_features`. It decides which gated names `builtins`
     /// has and which bare globals resolve, so the same text under two of
     /// these is two different evaluations.
-    pub cpp_builtin_names: Option<String>,
+    pub builtin_features: BuiltinFeatures,
     /// Whether `readFile`, `pathExists`, `readDir`, `readFileType` and
     /// `import` reach the world through the embedder's accessor or through
     /// this crate's `std::fs`.
@@ -1436,6 +1642,23 @@ pub struct Settings {
     /// evaluates to a floating-CA `.drv` under one setting and to the
     /// feature-is-disabled error under the other.
     pub ca_derivations: bool,
+    /// `ixe_set_allow_import_from_derivation`. In the key because a
+    /// realisation the verifier serves by validity never reaches the host's
+    /// `realiseContextCheck`, which is where the refusal lives.
+    pub allow_import_from_derivation: bool,
+    /// `ixe_set_allowed_uris`, newline-terminated entries, `None` when the
+    /// embedder never said. In the key because a fetch served by validity
+    /// never reaches `checkURI`.
+    pub allowed_uris: Option<String>,
+    /// `ixe_set_repair`: whether the evaluation runs under `--repair`. Not in
+    /// the key: it turns the memo off (`ReadSet`'s lookup serves nothing),
+    /// since a served derivation write would skip the rewrite repair is for.
+    pub repair: bool,
+    /// `ixe_set_blake3_hashes`: whether cppnix's `blake3-hashes`
+    /// experimental feature is enabled. In the key because the same hash or
+    /// derivation refuses under one setting and computes a value under the
+    /// other.
+    pub blake3_hashes: bool,
     /// `ixe_set_lint_url_literals`. Compile-time like `home_dir`: at `fatal`
     /// a URL literal is a compile error, so the level decides what a module
     /// compiles to. Only fatal-ness enters the fingerprint -- `warn` and
@@ -1476,16 +1699,21 @@ impl Default for Settings {
         Self {
             store_dir: None,
             nix_version: None,
+            host_build_identity: None,
             current_system: None,
             max_call_depth: crate::vm::DEFAULT_MAX_CALL_DEPTH,
             pure_eval: false,
             restrict_eval: false,
-            cpp_builtin_names: None,
+            builtin_features: BuiltinFeatures::default(),
             path_reads: crate::purity::PathReads::Direct,
             trace_verbose: false,
             abort_on_warn: false,
             home_dir: None,
             ca_derivations: false,
+            allow_import_from_derivation: true,
+            allowed_uris: None,
+            repair: false,
+            blake3_hashes: false,
             lint_url_literals: Diagnose::Ignore,
             lint_short_path_literals: Diagnose::Ignore,
             lint_absolute_path_literals: Diagnose::Ignore,
@@ -1516,7 +1744,7 @@ pub(crate) fn settings_with_store() -> Settings {
 }
 
 /// Domain separation for the settings fingerprint.
-const SETTINGS_TAG: &str = "ixe-eval-settings-v1";
+const SETTINGS_TAG: &str = "ixe-eval-settings-v2";
 
 impl Settings {
     /// What the process is configured to do right now.
@@ -1525,11 +1753,12 @@ impl Settings {
         Self {
             store_dir: store_dir().map(str::to_owned),
             nix_version: nix_version().map(str::to_owned),
+            host_build_identity: host_build_identity().map(str::to_owned),
             current_system: current_system().map(str::to_owned),
             max_call_depth: max_call_depth(),
             pure_eval: pure_eval(),
             restrict_eval: restrict_eval(),
-            cpp_builtin_names: cpp_builtin_names().map(str::to_owned),
+            builtin_features: builtin_features(),
             // Direct, always: whether reads go through an embedder is a
             // property of the host a session was handed, not of the process,
             // so the session overwrites this field from its own vtable. A
@@ -1539,6 +1768,10 @@ impl Settings {
             trace_verbose: trace_verbose(),
             abort_on_warn: abort_on_warn(),
             ca_derivations: ca_derivations(),
+            allow_import_from_derivation: allow_import_from_derivation(),
+            allowed_uris: allowed_uris(),
+            repair: repair(),
+            blake3_hashes: blake3_hashes(),
             lint_url_literals: lint_url_literals(),
             lint_short_path_literals: lint_short_path_literals(),
             lint_absolute_path_literals: lint_absolute_path_literals(),
@@ -1579,16 +1812,24 @@ impl Settings {
         let Self {
             store_dir,
             nix_version,
+            host_build_identity,
             current_system,
             max_call_depth,
             pure_eval,
             restrict_eval,
-            cpp_builtin_names,
+            builtin_features,
             path_reads,
             trace_verbose,
             abort_on_warn,
             home_dir,
             ca_derivations,
+            allow_import_from_derivation,
+            allowed_uris,
+            // Not a key part on purpose: repair disables the memo instead
+            // (see the field). Two evaluations differing only in it share
+            // their witness, and neither is served while it is on.
+            repair: _,
+            blake3_hashes,
             lint_url_literals,
             lint_short_path_literals,
             lint_absolute_path_literals,
@@ -1603,17 +1844,19 @@ impl Settings {
         let mut parts: Vec<&[u8]> = Vec::new();
         let (store_tag, store_bytes) = tagged_option(store_dir);
         let (version_tag, version_bytes) = tagged_option(nix_version);
+        let (host_tag, host_bytes) = tagged_option(host_build_identity);
         let (system_tag, system_bytes) = tagged_option(current_system);
-        let (names_tag, names_bytes) = tagged_option(cpp_builtin_names);
+        let feature_bytes = builtin_features.bits().to_be_bytes();
         let (home_tag, home_bytes) = tagged_option(home_dir);
         parts.push(store_tag);
         parts.push(store_bytes);
         parts.push(version_tag);
         parts.push(version_bytes);
+        parts.push(host_tag);
+        parts.push(host_bytes);
         parts.push(system_tag);
         parts.push(system_bytes);
-        parts.push(names_tag);
-        parts.push(names_bytes);
+        parts.push(&feature_bytes);
         parts.push(home_tag);
         parts.push(home_bytes);
         parts.push(&depth);
@@ -1645,6 +1888,22 @@ impl Settings {
         // In the key for the reason on the field: the feature decides what
         // `__contentAddressed = true` evaluates to.
         parts.push(if *ca_derivations { b"ca-yes" } else { b"ca-no" });
+        // Host policy the verifier would otherwise serve across (see the
+        // fields): the IFD gate and the URI allow list.
+        parts.push(if *allow_import_from_derivation {
+            b"ifd-yes"
+        } else {
+            b"ifd-no"
+        });
+        let (uris_tag, uris_bytes) = tagged_option(allowed_uris);
+        parts.push(uris_tag);
+        parts.push(uris_bytes);
+        // The feature decides whether a recognised hash algorithm is usable.
+        parts.push(if *blake3_hashes {
+            b"blake3-yes"
+        } else {
+            b"blake3-no"
+        });
         // Fatal-ness only, on purpose: `warn` and `ignore` compile the same
         // module (the lint's warning is a stderr line, not a value), so
         // folding the full level would split cache rows between two
@@ -1872,8 +2131,9 @@ pub(crate) fn assert_globals_exclusive(what: &str) {
 /// makes the careless call site look careful, so nobody re-reads it. If you
 /// need to exclude other readers, that is [`globals_moving`]. If the state
 /// you are protecting is not the settings statics at all, it needs a guard of
-/// its own -- see `crate::host::registry_exclusive` for the worked example --
-/// because this one has never covered anything but [`SETTINGS_LOCK`].
+/// its own, because this one has never covered anything but
+/// [`SETTINGS_LOCK`]. (The virtual-file registry once needed one; it is a
+/// per-host value now and needs none.)
 #[cfg(test)]
 pub(crate) fn globals_shared() -> GlobalsGuard {
     let inner = SETTINGS_LOCK
@@ -1933,6 +2193,15 @@ pub(crate) fn store_path_string(store_path: String) -> Value {
     Value::Str(crate::value2::NixStr::with_context(path, context))
 }
 
+fn store_path_reference_string(answer: crate::host::StorePathResult) -> Value {
+    let mut context = std::collections::BTreeSet::new();
+    context.insert(crate::value2::ContextElem::Opaque(answer.store_path.into()));
+    Value::Str(crate::value2::NixStr::with_context(
+        answer.path.into_bytes(),
+        context,
+    ))
+}
+
 /// The `FetchTree` answer: cppnix's `emitTreeAttrs` set, decoded.
 ///
 /// JSON carries every attribute except the one that matters most. `outPath`
@@ -1942,7 +2211,7 @@ pub(crate) fn store_path_string(store_path: String) -> Value {
 /// lose that silently -- the value prints identically and the derivation ends
 /// up with one fewer input -- so it is rebuilt here rather than trusted from
 /// the wire.
-/// Turn a store answer into a value, mapping the three [`StoreError`] cases
+/// Turn a store answer into a value, mapping every [`StoreError`] class
 /// the way every store-backed question maps them.
 ///
 /// One function rather than the arm each question used to spell out, because
@@ -1950,14 +2219,17 @@ pub(crate) fn store_path_string(store_path: String) -> Value {
 /// host and blocked, and the scheduler's collect, which asked the host to
 /// begin and came back later. Two copies of a `NoStore` message that has to
 /// name the right builtin is exactly the kind of thing that drifts.
-fn store_answer(
-    answer: Result<String, StoreError>,
-    who: &str,
-    ok: impl FnOnce(String) -> Result<Value, VmError>,
+fn store_answer<T>(
+    answer: Result<T, StoreError>,
+    no_store: &str,
+    ok: impl FnOnce(T) -> Result<Value, VmError>,
 ) -> Result<Value, VmError> {
     match answer {
         Ok(payload) => ok(payload),
         Err(StoreError::Failed(message)) => Err(VmError::eval(message)),
+        Err(StoreError::ImportFromDerivation(message)) => {
+            Err(VmError::import_from_derivation(message))
+        }
         // A gap in this backend, not a fault in the program, so it is
         // unimplemented rather than an evaluation error -- reported as a Nix
         // error it would score a mismatch against a cpp arm that answers
@@ -1968,14 +2240,39 @@ fn store_answer(
         ))),
         Err(StoreError::NoStore) => Err(VmError::Unimplemented(Refusal::new(
             RefusalToken::StoreUnavailable,
-            format!("builtins.{who} (no store behind this evaluator)"),
+            no_store.to_owned(),
         ))),
     }
 }
 
+/// The refusal a store-less evaluator gives `builtins.<who>`. The questions
+/// that are not a builtin, or that miss something other than a store, spell
+/// their own sentence at the call.
+fn no_store(who: &str) -> String {
+    format!("builtins.{who} (no store behind this evaluator)")
+}
+
+/// [`NeedPath::Flake`]'s answer as a value, whichever route asked.
+///
+/// Standalone: no embedder, so no `lockFlake`. Locking is not something this
+/// crate can stand in for -- it would be inventing lock-file data, exactly as
+/// it would for a fetch -- so the refusal names the locker, not a store.
+fn flake_answer(
+    vm: &mut Vm,
+    answer: Result<crate::host::FlakeCall, StoreError>,
+) -> Result<Value, VmError> {
+    store_answer(
+        answer,
+        "builtins.getFlake (no flake locking behind this evaluator)",
+        |call| Ok(flake_attrs(vm, call)),
+    )
+}
+
 /// [`NeedPath::Fetch`]'s answer as a value.
 fn fetch_answer(answer: Result<String, StoreError>, who: &str) -> Result<Value, VmError> {
-    store_answer(answer, who, |store_path| Ok(store_path_string(store_path)))
+    store_answer(answer, &no_store(who), |store_path| {
+        Ok(store_path_string(store_path))
+    })
 }
 
 /// [`NeedPath::FetchTree`]'s answer as a value.
@@ -1986,7 +2283,7 @@ fn tree_answer(
 ) -> Result<Value, VmError> {
     match answer {
         Ok(json) => tree_attrs(vm, &json),
-        other => store_answer(other, who, |_| {
+        other => store_answer(other, &no_store(who), |_| {
             Err(VmError::eval("internal: unreachable store answer"))
         }),
     }
@@ -2072,30 +2369,19 @@ fn realise_answer(
     answer: Result<std::collections::BTreeMap<String, String>, StoreError>,
     who: &str,
 ) -> Result<Value, VmError> {
-    match answer {
-        Ok(rewrites) => {
-            let mut items: Vec<Slot> = Vec::with_capacity(rewrites.len() * 2);
-            for (from, to) in rewrites {
-                items.push(Slot::value(Value::Str(from.as_str().into())));
-                items.push(Slot::value(Value::Str(to.as_str().into())));
-            }
-            Ok(Value::List(Rc::new(items)))
+    // Nothing to build with, so the path the read is about was never going to
+    // exist. Refusing by name is the honest answer; reading anyway would
+    // report "no such file" for a program cppnix runs.
+    let no_store =
+        format!("import from derivation ({who}: no store behind this evaluator to build it with)");
+    store_answer(answer, &no_store, |rewrites| {
+        let mut items: Vec<Slot> = Vec::with_capacity(rewrites.len() * 2);
+        for (from, to) in rewrites {
+            items.push(Slot::value(Value::Str(from.as_str().into())));
+            items.push(Slot::value(Value::Str(to.as_str().into())));
         }
-        Err(StoreError::Failed(message)) => Err(VmError::eval(message)),
-        Err(StoreError::Unsupported(message)) => Err(VmError::Unimplemented(Refusal::new(
-            RefusalToken::UnimplementedBuiltin,
-            message,
-        ))),
-        // Nothing to build with, so the path the read is about was never
-        // going to exist. Refusing by name is the honest answer; reading
-        // anyway would report "no such file" for a program cppnix runs.
-        Err(StoreError::NoStore) => Err(VmError::Unimplemented(Refusal::new(
-            RefusalToken::StoreUnavailable,
-            format!(
-                "import from derivation ({who}: no store behind this evaluator to build it with)"
-            ),
-        ))),
-    }
+        Ok(Value::list(items))
+    })
 }
 
 fn tree_attrs(vm: &mut Vm, json: &str) -> Result<Value, VmError> {
@@ -2196,7 +2482,7 @@ fn answer_path(
     vm: &mut Vm,
     host: &dyn Host,
     need: &NeedPath,
-    dirs: &mut DirCache,
+    memo: &mut JobMemo,
 ) -> Result<Value, VmError> {
     if let Some(answered) = access_check(vm, need)? {
         return Ok(answered);
@@ -2215,19 +2501,41 @@ fn answer_path(
     }
     match need {
         NeedPath::Import(p) => {
-            let resolved = host.resolve_import(p).map_err(VmError::eval)?;
-            let text = host.read_file(&resolved).map_err(VmError::eval)?;
+            if let Some(hit) = memo.imports.get(p) {
+                crate::perf::note_import_hit();
+                return Ok(Value::Attrs(Rc::clone(hit)));
+            }
+            let imported = host.import_source(p).map_err(VmError::eval)?;
+            let (resolved, text) = match imported {
+                crate::host::ImportedSource::Nix { path, text } => (path, text),
+                crate::host::ImportedSource::Derivation(drv) => {
+                    let argument = crate::imported_drv::argument(vm, &drv);
+                    let key = vm.intern("derivation");
+                    let attrs = Rc::new(Attrs::new(BTreeMap::from([(key, Slot::value(argument))])));
+                    memo.imports.insert(Rc::clone(p), Rc::clone(&attrs));
+                    return Ok(Value::Attrs(attrs));
+                }
+            };
             // Both halves in one answer: the VM needs the resolved path to
             // give the imported file its own base directory for relative
             // paths, and asking twice would let the two disagree.
             let mut m = BTreeMap::new();
             let k = vm.intern("path");
-            m.insert(k, Slot::value(Value::Str(resolved.into())));
+            m.insert(k, Slot::value(Value::Str(resolved.to_string().into())));
+            let k = vm.intern("root");
+            m.insert(k, Slot::value(Value::Str(resolved.root.wire_name().into())));
             let k = vm.intern("text");
             m.insert(k, Slot::value(Value::Str(text.into())));
-            Ok(Value::Attrs(Rc::new(Attrs::new(m))))
+            let attrs = Rc::new(Attrs::new(m));
+            memo.imports.insert(Rc::clone(p), Rc::clone(&attrs));
+            Ok(Value::Attrs(attrs))
         }
-        NeedPath::Contents(p) => Ok(Value::Str(host.read_file(p).map_err(VmError::eval)?.into())),
+        // Raw bytes, as cppnix's `readFile` answers: a Nix string is a byte
+        // string, and `builtins.wasm` reads its module through this question.
+        // `Host::read_file` (text) is now the import's reader alone.
+        NeedPath::Contents(p) => Ok(Value::Str(crate::value2::NixStr::from(
+            host.read_file_bytes(p).map_err(VmError::eval)?.as_slice(),
+        ))),
         // The digest is computed here, from the raw bytes, so no string ever
         // carries the contents; see the variant's own comment (ENG-13146).
         NeedPath::HashFile { path, algo } => {
@@ -2240,53 +2548,25 @@ fn answer_path(
         // the machine needs all of them together and asking three times would
         // let a re-lock in between hand it a lock file and an overrides
         // document from two different locks.
-        NeedPath::Flake(flake_ref) => match host.lock_flake(flake_ref) {
-            Ok(call) => Ok(flake_attrs(vm, call)),
-            Err(StoreError::Failed(message)) => Err(VmError::eval(message)),
-            Err(StoreError::Unsupported(message)) => Err(VmError::Unimplemented(Refusal::new(
-                RefusalToken::UnimplementedBuiltin,
-                message,
-            ))),
-            // Standalone: no embedder, so no `lockFlake`. Locking is not
-            // something this crate can stand in for -- it would be inventing
-            // lock-file data, exactly as it would for a fetch.
-            Err(StoreError::NoStore) => Err(VmError::Unimplemented(Refusal::new(
-                RefusalToken::StoreUnavailable,
-                "builtins.getFlake (no flake locking behind this evaluator)".to_owned(),
-            ))),
-        },
+        NeedPath::Flake(flake_ref) => flake_answer(vm, host.lock_flake(flake_ref)),
         // The exploded form comes back as JSON -- string, integer and
         // Boolean fields, the three shapes `fetchers::Attr` holds -- and
         // becomes the attribute set `prim_parseFlakeRef` builds from
         // `toAttrs`. Standalone hosts refuse for the reason `Flake`'s do:
         // the grammar is the embedder's, and this crate parsing flake
         // references itself would be a second parser to drift.
-        NeedPath::ParseFlakeRef(flake_ref) => match host.parse_flake_ref(flake_ref) {
-            Ok(json) => flake_ref_attrs(vm, &json),
-            Err(StoreError::Failed(message)) => Err(VmError::eval(message)),
-            Err(StoreError::Unsupported(message)) => Err(VmError::Unimplemented(Refusal::new(
-                RefusalToken::UnimplementedBuiltin,
-                message,
-            ))),
-            Err(StoreError::NoStore) => Err(VmError::Unimplemented(Refusal::new(
-                RefusalToken::StoreUnavailable,
-                "builtins.parseFlakeRef (no flake-ref grammar behind this evaluator)".to_owned(),
-            ))),
-        },
+        NeedPath::ParseFlakeRef(flake_ref) => store_answer(
+            host.parse_flake_ref(flake_ref),
+            "builtins.parseFlakeRef (no flake-ref grammar behind this evaluator)",
+            |json| flake_ref_attrs(vm, &json),
+        ),
         // The answer is the reference string, carrying nothing: a flake ref
         // names a source, it does not depend on one, so no context.
-        NeedPath::FlakeRefToString(attrs) => match host.flake_ref_to_string(attrs) {
-            Ok(text) => Ok(Value::Str(text.as_str().into())),
-            Err(StoreError::Failed(message)) => Err(VmError::eval(message)),
-            Err(StoreError::Unsupported(message)) => Err(VmError::Unimplemented(Refusal::new(
-                RefusalToken::UnimplementedBuiltin,
-                message,
-            ))),
-            Err(StoreError::NoStore) => Err(VmError::Unimplemented(Refusal::new(
-                RefusalToken::StoreUnavailable,
-                "builtins.flakeRefToString (no flake-ref grammar behind this evaluator)".to_owned(),
-            ))),
-        },
+        NeedPath::FlakeRefToString(attrs) => store_answer(
+            host.flake_ref_to_string(attrs),
+            "builtins.flakeRefToString (no flake-ref grammar behind this evaluator)",
+            |text| Ok(Value::Str(text.as_str().into())),
+        ),
         // cppnix renders an unset variable as the empty string rather than
         // failing, and the corpus compares the rendering.
         NeedPath::Env(name) => Ok(Value::Str(
@@ -2295,25 +2575,31 @@ fn answer_path(
         // A path inside a string is the store path cppnix would copy it to,
         // not the source path (ENG-12447). A host with no store behind it
         // says so rather than answering with something wrong.
-        NeedPath::StorePath(p) => match host.copy_to_store(p) {
-            // The store path IS the dependency, so the string carries it:
-            // cppnix's copyPathToStore inserts an Opaque element for exactly
-            // the path it returns (eval.cc:2660).
-            Ok(store_path) => Ok(store_path_string(store_path)),
-            Err(StoreError::Failed(message)) => Err(VmError::eval(message)),
-            // A gap in this backend, not a fault in the program, so it is
-            // unimplemented rather than an evaluation error -- reported as a
-            // Nix error it would score a mismatch against a cpp arm that
-            // answers fine.
-            Err(StoreError::Unsupported(message)) => Err(VmError::Unimplemented(Refusal::new(
-                RefusalToken::UnimplementedBuiltin,
-                message,
-            ))),
-            Err(StoreError::NoStore) => Err(VmError::Unimplemented(Refusal::new(
-                RefusalToken::StoreUnavailable,
+        // The store path IS the dependency, so the string carries it: cppnix's
+        // copyPathToStore inserts an Opaque element for exactly the path it
+        // returns (eval.cc:2660).
+        NeedPath::StorePath(p) => {
+            if let Some(copied) = memo.copies.get(p) {
+                crate::perf::note_copy_hit();
+                return Ok(store_path_string(copied.clone()));
+            }
+            let answer = host.copy_to_store(p);
+            // A failure is deliberately not memoised, as a directory read's
+            // is not: the next asker should get the error afresh.
+            if let Ok(store_path) = &answer {
+                memo.copies.insert(Rc::clone(p), store_path.clone());
+            }
+            store_answer(
+                answer,
                 "interpolating a path into a string (no store behind this evaluator)",
-            ))),
-        },
+                |store_path| Ok(store_path_string(store_path)),
+            )
+        }
+        NeedPath::UseStorePath(p) => store_answer(
+            host.store_path(p),
+            "builtins.storePath (no store behind this evaluator)",
+            |answer| Ok(store_path_reference_string(answer)),
+        ),
         // `builtins.toFile`. The result carries the new path and *only* that:
         // cppnix says so in its own comment ("we don't need to add `context`
         // to the context of the result, since `storePath` itself has
@@ -2324,22 +2610,11 @@ fn answer_path(
             name,
             contents,
             references,
-        } => match host.store_text(name, contents, references) {
-            Ok(store_path) => Ok(store_path_string(store_path)),
-            Err(StoreError::Failed(message)) => Err(VmError::eval(message)),
-            // A gap in this backend, not a fault in the program, so it is
-            // unimplemented rather than an evaluation error -- reported as a
-            // Nix error it would score a mismatch against a cpp arm that
-            // answers fine.
-            Err(StoreError::Unsupported(message)) => Err(VmError::Unimplemented(Refusal::new(
-                RefusalToken::UnimplementedBuiltin,
-                message,
-            ))),
-            Err(StoreError::NoStore) => Err(VmError::Unimplemented(Refusal::new(
-                RefusalToken::StoreUnavailable,
-                "builtins.toFile (no store behind this evaluator)",
-            ))),
-        },
+        } => store_answer(
+            host.store_text(name, contents, references),
+            "builtins.toFile (no store behind this evaluator)",
+            |store_path| Ok(store_path_string(store_path)),
+        ),
         // `builtins.derivationStrict`. The answer is checked against the path
         // the evaluator computed and then discarded, so it carries no
         // context: the `drvPath` the expression sees is built by the task out
@@ -2348,11 +2623,13 @@ fn answer_path(
         NeedPath::WriteDrv {
             name,
             aterm,
-            references,
             expected,
-        } => match host.write_derivation(name, aterm, references) {
+        } => match host.write_derivation(name, aterm) {
             Ok(written) => Ok(Value::Str(crate::value2::NixStr::from(written.as_str()))),
             Err(StoreError::Failed(message)) => Err(VmError::eval(message)),
+            Err(StoreError::ImportFromDerivation(message)) => {
+                Err(VmError::import_from_derivation(message))
+            }
             Err(StoreError::Unsupported(message)) => Err(VmError::Unimplemented(Refusal::new(
                 RefusalToken::UnimplementedBuiltin,
                 message,
@@ -2371,28 +2648,17 @@ fn answer_path(
         // `builtins.path`. The context is the copied path and only that, as
         // for `StorePath`: the result is a fresh store object, and whatever
         // the source path's own coercion carried is not a dependency of it.
-        NeedPath::StoreFiltered(request) => match host.store_filtered(request) {
-            Ok(store_path) => Ok(store_path_string(store_path)),
-            Err(StoreError::Failed(message)) => Err(VmError::eval(message)),
-            // A gap in this backend, not a fault in the program, so it is
-            // unimplemented rather than an evaluation error -- reported as a
-            // Nix error it would score a mismatch against a cpp arm that
-            // answers fine.
-            Err(StoreError::Unsupported(message)) => Err(VmError::Unimplemented(Refusal::new(
-                RefusalToken::UnimplementedBuiltin,
-                message,
-            ))),
+        NeedPath::StoreFiltered(request) => store_answer(
+            host.store_filtered(request),
             // Named for the question and not for a builtin: `builtins.path`
             // and `builtins.filterSource` both reach this one, and a message
             // naming either sends half the callers to the wrong line. The
             // alternative -- carrying the caller's name in `FilteredCopy` --
             // would put it in the read-set key, so the same copy would key
             // differently depending on which spelling asked for it.
-            Err(StoreError::NoStore) => Err(VmError::Unimplemented(Refusal::new(
-                RefusalToken::StoreUnavailable,
-                "a filtered copy into the store (no store behind this evaluator)",
-            ))),
-        },
+            "a filtered copy into the store (no store behind this evaluator)",
+            |store_path| Ok(store_path_string(store_path)),
+        ),
         // The fixed-output fetchers. The context is the fetched path and only
         // that: cppnix's `allowAndSetStorePathString` puts exactly the path it
         // returns in, and a fetch has no other dependency -- the URL is not
@@ -2408,22 +2674,11 @@ fn answer_path(
         // Nothing to hand back: the builtin wanted the path present, not a
         // value. `Null` rather than a bool, so a caller cannot read a
         // meaningful answer out of something that has none.
-        NeedPath::EnsurePath(p) => match host.ensure_path(p) {
-            Ok(()) => Ok(Value::Null),
-            Err(StoreError::Failed(message)) => Err(VmError::eval(message)),
-            // A gap in this backend, not a fault in the program, so it is
-            // unimplemented rather than an evaluation error -- reported as a
-            // Nix error it would score a mismatch against a cpp arm that
-            // answers fine.
-            Err(StoreError::Unsupported(message)) => Err(VmError::Unimplemented(Refusal::new(
-                RefusalToken::UnimplementedBuiltin,
-                message,
-            ))),
-            Err(StoreError::NoStore) => Err(VmError::Unimplemented(Refusal::new(
-                RefusalToken::StoreUnavailable,
-                "builtins.appendContext (no store behind this evaluator)",
-            ))),
-        },
+        NeedPath::EnsurePath(p) => store_answer(
+            host.ensure_path(p),
+            "builtins.appendContext (no store behind this evaluator)",
+            |()| Ok(Value::Null),
+        ),
         // Import from derivation. The answer is the rewrite map
         // `realiseContext` returns, flattened to `[from, to, from, to, ...]`.
         // A list of strings and not an attribute set, so that a placeholder --
@@ -2442,14 +2697,22 @@ fn answer_path(
         // `BuildError` from `buildPaths`. Measured on nix
         // 2.34.7+ix.h24085346: `(builtins.tryEval (import failing.drv)).success`
         // does not return false, it aborts.
-        NeedPath::Realise(context) => realise_answer(host.realise(context), &realise_who(context)),
+        NeedPath::Realise(context) => {
+            if let Some(rewrites) = memo.realised.get(context) {
+                crate::perf::note_realise_hit();
+                return realise_answer(Ok(rewrites.clone()), &realise_who(context));
+            }
+            let answer = host.realise(context);
+            remember_realised(memo, context.clone(), &answer);
+            realise_answer(answer, &realise_who(context))
+        }
         // Answered above, before the access check.
         NeedPath::Warn(_) | NeedPath::Trace(_) => Ok(Value::Null),
         // cppnix's `prim_findFile` returns a path value (`primops.cc:2293`),
         // not a string, and the difference is visible: `builtins.typeOf
         // <nixpkgs>` is "path", and interpolating one copies it to the store.
         NeedPath::FindFile { entries, name } => match host.find_file(entries, name) {
-            Ok(path) => Ok(Value::Path(path.into())),
+            Ok(path) => Ok(Value::Path(Rc::new(path))),
             Err(LookupError::NotFound(message)) => Err(VmError::thrown(message)),
             Err(LookupError::Failed(message)) => Err(VmError::eval(message)),
             Err(LookupError::Unsupported(message)) => Err(VmError::Unimplemented(Refusal::new(
@@ -2478,7 +2741,7 @@ fn answer_path(
                         Slot::value(Value::Attrs(Rc::new(Attrs::new(m))))
                     })
                     .collect();
-                Ok(Value::List(Rc::new(items)))
+                Ok(Value::list(items))
             }
             Err(LookupError::NotFound(message) | LookupError::Failed(message)) => {
                 Err(VmError::eval(message))
@@ -2492,23 +2755,16 @@ fn answer_path(
                 "builtins.nixPath (no search path behind this evaluator)",
             ))),
         },
-        NeedPath::Exists(p) => Ok(Value::Bool(host.path_exists(p))),
-        // The trailing-slash half of `pathExists`: full resolution, then the
-        // type. Every `Err` collapses to `false`, which is WIDER than
-        // cppnix's catch: `prim_pathExists` catches `RestrictedPathError`
-        // only (primops.cc:2116), and a missing path is `false` via
-        // `maybeLstat`'s nullopt -- but a symlink LOOP or an EACCES throws
-        // there and answers `false` here. Deliberate, and shared with the
-        // plain branch: `rustPathExists` (rust-eval-session.cc) already does
-        // `catch (...) { return 0; }`, the hook's `Result<FileType, String>`
-        // cannot tell a loop from a miss without matching message text, and
-        // no corpus fixture can spell a loop. Narrowing it honestly means
-        // widening the hook answer to found/absent/error, the shape
-        // `rustFileType` already uses.
-        NeedPath::DirExists(p) => Ok(Value::Bool(matches!(
-            host.file_type_resolved(p),
-            Ok(crate::host::FileType::Directory)
-        ))),
+        NeedPath::Exists(p) => Ok(Value::Bool(
+            host.path_exists_checked(p).map_err(VmError::eval)?,
+        )),
+        // The trailing-slash half of `pathExists`: full resolution, then a
+        // directory test. Its dedicated existence question keeps a vanished
+        // mount or I/O failure as an error while cppnix's narrow
+        // `RestrictedPathError` catch remains `false`.
+        NeedPath::DirExists(p) => Ok(Value::Bool(
+            host.dir_exists_checked(p).map_err(VmError::eval)?,
+        )),
         // cppnix's `SourceAccessor::lstat`, spelled out: `maybeLstat` and
         // then `throw FileNotFound("path '%s' does not exist")` on nullopt
         // (`source-accessor.cc:73`). The throw is here rather than in the
@@ -2523,7 +2779,7 @@ fn answer_path(
             None => Value::Null,
         }),
         NeedPath::Entries(p) => {
-            if let Some(hit) = dirs.get(p) {
+            if let Some(hit) = memo.dirs.get(p) {
                 crate::perf::note_dir_hit();
                 return Ok(Value::Attrs(Rc::clone(hit)));
             }
@@ -2536,7 +2792,7 @@ fn answer_path(
             // A failure is deliberately not cached: the next asker should get
             // the error the filesystem gives it then, not the one it gave now.
             let attrs = Rc::new(Attrs::new(m));
-            dirs.insert(p.clone(), Rc::clone(&attrs));
+            memo.dirs.insert(p.clone(), Rc::clone(&attrs));
             Ok(Value::Attrs(attrs))
         }
     }
@@ -2591,8 +2847,9 @@ mod tests {
         }
 
         impl Host for Built {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -2619,6 +2876,7 @@ mod tests {
             fn ensure_path(&self, _p: &str) -> std::result::Result<(), StoreError> {
                 Ok(())
             }
+
             fn realise(
                 &self,
                 context: &[crate::value2::ContextElem],
@@ -2637,19 +2895,45 @@ mod tests {
                     )),
                 }
             }
-            fn read_file(&self, path: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
+                if path.path.as_ref() == "/abc" {
+                    return Ok("abc".to_owned());
+                }
                 if path.ends_with("-out") || path.ends_with("-rewritten") {
                     return Ok("42".to_owned());
                 }
                 Err(format!("path '{path}' does not exist"))
             }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, path: &str) -> bool {
-                path.ends_with("-out") || path.ends_with("-rewritten")
+            fn path_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok({
+                    path.path.as_ref() == "/abc"
+                        || path.ends_with("-out")
+                        || path.ends_with("-rewritten")
+                })
             }
-            fn file_type(&self, _p: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 Ok(Some(FileType::Regular))
             }
         }
@@ -2686,6 +2970,23 @@ mod tests {
             );
         }
 
+        /// The enabled half of `hashFile` reaches the raw-byte host question
+        /// and hashes its answer, rather than merely accepting the algorithm
+        /// name. The disabled half is pinned beside the other builtin gates in
+        /// `primops_host`.
+        #[test]
+        fn blake3_hash_file_matches_cppnixs_known_answer_when_enabled() {
+            let host = Built::default();
+            let settings = crate::eval::Settings {
+                blake3_hashes: true,
+                ..crate::eval::settings_with_store()
+            };
+            assert_eq!(
+                render_with(&settings, &host, r#"builtins.hashFile "blake3" /abc"#),
+                "\"6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85\""
+            );
+        }
+
         /// The digest is of the file's raw bytes. Before ENG-13146 the
         /// contents travelled back as a string, invalid UTF-8 was repaired
         /// to U+FFFD on the way, and a binary hashed to a digest no other
@@ -2697,6 +2998,7 @@ mod tests {
             const RAW: &[u8] = &[0xFF, 0xFE, 0x00, b'h', b'e', b'l', b'l', b'o'];
             struct Binary;
             impl Host for Binary {
+                crate::host::host_stubs!(settle);
                 crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
                 crate::host::host_stubs!(
                     realise,
@@ -2718,22 +3020,41 @@ mod tests {
                     nix_path,
                     trace
                 );
-                fn read_file(&self, _p: &str) -> std::result::Result<String, String> {
+                fn read_file(
+                    &self,
+                    _p: &crate::value2::PathValue,
+                ) -> std::result::Result<String, String> {
                     Ok(String::from_utf8_lossy(RAW).into_owned())
                 }
-                fn read_file_bytes(&self, _p: &str) -> std::result::Result<Vec<u8>, String> {
+                fn read_file_bytes(
+                    &self,
+                    _p: &crate::value2::PathValue,
+                ) -> std::result::Result<Vec<u8>, String> {
                     Ok(RAW.to_vec())
                 }
                 fn read_dir(
                     &self,
-                    _p: &str,
+                    _p: &crate::value2::PathValue,
                 ) -> std::result::Result<Vec<(String, FileType)>, String> {
                     Ok(Vec::new())
                 }
-                fn path_exists(&self, _p: &str) -> bool {
-                    true
+                fn path_exists_checked(
+                    &self,
+                    _p: &crate::value2::PathValue,
+                ) -> std::result::Result<bool, String> {
+                    Ok(true)
                 }
-                fn file_type(&self, _p: &str) -> std::result::Result<Option<FileType>, String> {
+                fn dir_exists_checked(
+                    &self,
+                    path: &crate::value2::PathValue,
+                ) -> std::result::Result<bool, String> {
+                    self.file_type_resolved(path)
+                        .map(|kind| kind == crate::host::FileType::Directory)
+                }
+                fn file_type(
+                    &self,
+                    _p: &crate::value2::PathValue,
+                ) -> std::result::Result<Option<FileType>, String> {
                     Ok(Some(FileType::Regular))
                 }
             }
@@ -2871,6 +3192,57 @@ mod tests {
             );
         }
 
+        /// One evaluation asks for a build once. Every later ask for the
+        /// same context is answered from `JobMemo::realised`: at the
+        /// embedder each ask costs a validity check per element, a thread
+        /// and a `buildPaths` round trip whether or not the outputs exist
+        /// (one home-manager evaluation: 2,269 asks, 48 distinct contexts,
+        /// 4.4 s). Two reads of the same built path, one build; the second
+        /// read still gets the built contents, so the memo answered with
+        /// the same rewrites the build did.
+        #[test]
+        fn a_context_is_realised_once_per_evaluation() {
+            let once = Built::default();
+            let single = run(&once, &format!("builtins.readFile ({WITH_CONTEXT})"));
+            assert_eq!(once.asked.borrow().len(), 1);
+            let inner = single.trim_matches('"');
+            assert!(!inner.is_empty(), "the fixture read nothing: {single}");
+
+            let twice = Built::default();
+            let doubled = run(
+                &twice,
+                &format!("let p = {WITH_CONTEXT}; in builtins.readFile p + builtins.readFile p"),
+            );
+            assert_eq!(
+                doubled,
+                format!("\"{inner}{inner}\""),
+                "both reads see the built file"
+            );
+            assert_eq!(
+                twice.asked.borrow().len(),
+                1,
+                "the second read of the same context was answered from the memo: {:?}",
+                twice.asked.borrow()
+            );
+
+            // The key is the whole context: another derivation's output is
+            // another build, however alike the two look.
+            let other = WITH_CONTEXT.replace(
+                "11111111111111111111111111111111-x.drv",
+                "22222222222222222222222222222222-y.drv",
+            );
+            let distinct = Built::default();
+            let _ = run(
+                &distinct,
+                &format!(
+                    "let p = {WITH_CONTEXT}; q = {other}; in builtins.readFile p + builtins.readFile q"
+                ),
+            );
+            let asked = distinct.asked.borrow();
+            assert_eq!(asked.len(), 2, "two contexts, two builds: {asked:?}");
+            assert_ne!(asked[0], asked[1], "and they were different builds");
+        }
+
         /// The question reaches the read set, so a warm start that replays
         /// this evaluation re-asks the build rather than assuming the output
         /// is still there. A store can be garbage collected between two runs;
@@ -2890,8 +3262,10 @@ mod tests {
                 asked.contains("Realise("),
                 "the build is missing from {asked}"
             );
+            // `readFile` asks for the bytes, as cppnix's does (`Contents`
+            // answers `read_file_bytes`); the text reader is `import`'s.
             assert!(
-                asked.contains("ReadFile("),
+                asked.contains("ReadFileBytes("),
                 "the read is missing from {asked}"
             );
         }
@@ -2904,8 +3278,12 @@ mod tests {
         fn without_a_store_it_refuses_by_name() {
             struct NoStore;
             impl Host for NoStore {
+                crate::host::host_stubs!(settle);
                 crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-                fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+                fn read_file_bytes(
+                    &self,
+                    path: &crate::value2::PathValue,
+                ) -> Result<Vec<u8>, String> {
                     self.read_file(path).map(String::into_bytes)
                 }
                 crate::host::host_stubs!(
@@ -2933,19 +3311,36 @@ mod tests {
                 fn ensure_path(&self, _p: &str) -> std::result::Result<(), StoreError> {
                     Ok(())
                 }
-                fn read_file(&self, _p: &str) -> std::result::Result<String, String> {
+
+                fn read_file(
+                    &self,
+                    _p: &crate::value2::PathValue,
+                ) -> std::result::Result<String, String> {
                     Ok("unreachable".to_owned())
                 }
                 fn read_dir(
                     &self,
-                    _p: &str,
+                    _p: &crate::value2::PathValue,
                 ) -> std::result::Result<Vec<(String, FileType)>, String> {
                     Ok(Vec::new())
                 }
-                fn path_exists(&self, _p: &str) -> bool {
-                    true
+                fn path_exists_checked(
+                    &self,
+                    _p: &crate::value2::PathValue,
+                ) -> std::result::Result<bool, String> {
+                    Ok(true)
                 }
-                fn file_type(&self, _p: &str) -> std::result::Result<Option<FileType>, String> {
+                fn dir_exists_checked(
+                    &self,
+                    path: &crate::value2::PathValue,
+                ) -> std::result::Result<bool, String> {
+                    self.file_type_resolved(path)
+                        .map(|kind| kind == crate::host::FileType::Directory)
+                }
+                fn file_type(
+                    &self,
+                    _p: &crate::value2::PathValue,
+                ) -> std::result::Result<Option<FileType>, String> {
                     Ok(Some(FileType::Regular))
                 }
             }
@@ -3009,8 +3404,9 @@ mod tests {
 
         struct NoStore;
         impl Host for NoStore {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -3033,16 +3429,35 @@ mod tests {
                 nix_path,
                 trace
             );
-            fn read_file(&self, path: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 Err(format!("path \'{path}\' does not exist"))
             }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                true
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(true)
             }
-            fn file_type(&self, _p: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 Ok(Some(FileType::Regular))
             }
         }
@@ -3208,16 +3623,21 @@ mod tests {
         let base = Settings {
             store_dir: Some("/nix/store".to_owned()),
             nix_version: Some("2.34.7".to_owned()),
+            host_build_identity: Some("/test/host-a".to_owned()),
             current_system: Some("x86_64-linux".to_owned()),
             max_call_depth: 10_000,
             pure_eval: false,
             restrict_eval: false,
-            cpp_builtin_names: Some("abort baseNameOf fetchTree".to_owned()),
+            builtin_features: BuiltinFeatures::ALL,
             path_reads: crate::purity::PathReads::Direct,
             trace_verbose: false,
             abort_on_warn: false,
             home_dir: Some("/home/nixer".to_owned()),
             ca_derivations: false,
+            allow_import_from_derivation: true,
+            allowed_uris: None,
+            repair: false,
+            blake3_hashes: false,
             lint_url_literals: Diagnose::Ignore,
             lint_short_path_literals: Diagnose::Ignore,
             lint_absolute_path_literals: Diagnose::Ignore,
@@ -3229,16 +3649,21 @@ mod tests {
         let Settings {
             store_dir: _,
             nix_version: _,
+            host_build_identity: _,
             current_system: _,
             max_call_depth: _,
             pure_eval: _,
             restrict_eval: _,
-            cpp_builtin_names: _,
+            builtin_features: _,
             path_reads: _,
             trace_verbose: _,
             abort_on_warn: _,
             home_dir: _,
             ca_derivations: _,
+            allow_import_from_derivation: _,
+            allowed_uris: _,
+            repair: _,
+            blake3_hashes: _,
             lint_url_literals: _,
             lint_short_path_literals: _,
             lint_absolute_path_literals: _,
@@ -3247,6 +3672,20 @@ mod tests {
         } = base.clone();
 
         let perturbed = [
+            (
+                "host_build_identity",
+                Settings {
+                    host_build_identity: Some("/test/host-b".to_owned()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "host_build_identity unset",
+                Settings {
+                    host_build_identity: None,
+                    ..base.clone()
+                },
+            ),
             (
                 "store_dir",
                 Settings {
@@ -3318,16 +3757,19 @@ mod tests {
                 },
             ),
             (
-                "cpp_builtin_names",
+                "builtin_features",
                 Settings {
-                    cpp_builtin_names: Some("abort baseNameOf fetchClosure fetchTree".to_owned()),
+                    builtin_features: BuiltinFeatures {
+                        flakes: false,
+                        ..BuiltinFeatures::ALL
+                    },
                     ..base.clone()
                 },
             ),
             (
-                "cpp_builtin_names unset",
+                "builtin_features unset",
                 Settings {
-                    cpp_builtin_names: None,
+                    builtin_features: BuiltinFeatures::NONE,
                     ..base.clone()
                 },
             ),
@@ -3349,6 +3791,27 @@ mod tests {
                 "ca_derivations",
                 Settings {
                     ca_derivations: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "blake3_hashes",
+                Settings {
+                    blake3_hashes: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "allow_import_from_derivation",
+                Settings {
+                    allow_import_from_derivation: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "allowed_uris",
+                Settings {
+                    allowed_uris: Some("https://example.org/\n".to_owned()),
                     ..base.clone()
                 },
             ),
@@ -3434,16 +3897,21 @@ mod tests {
         let base = Settings {
             store_dir: Some("/nix/store".to_owned()),
             nix_version: Some("2.34.7".to_owned()),
+            host_build_identity: Some("/test/host-a".to_owned()),
             current_system: Some("x86_64-linux".to_owned()),
             max_call_depth: 10_000,
             pure_eval: false,
             restrict_eval: false,
-            cpp_builtin_names: Some("abort baseNameOf".to_owned()),
+            builtin_features: BuiltinFeatures::ALL,
             path_reads: crate::purity::PathReads::Direct,
             trace_verbose: false,
             abort_on_warn: false,
             home_dir: Some("/home/nixer".to_owned()),
             ca_derivations: false,
+            allow_import_from_derivation: true,
+            allowed_uris: None,
+            repair: false,
+            blake3_hashes: false,
             lint_url_literals: Diagnose::Ignore,
             lint_short_path_literals: Diagnose::Ignore,
             lint_absolute_path_literals: Diagnose::Ignore,
@@ -3583,16 +4051,21 @@ mod tests {
         let base = Settings {
             store_dir: Some("/nix/store".to_owned()),
             nix_version: Some("2.34.7".to_owned()),
+            host_build_identity: Some("/test/host-a".to_owned()),
             current_system: Some("x86_64-linux".to_owned()),
             max_call_depth: 10_000,
             pure_eval: false,
             restrict_eval: false,
-            cpp_builtin_names: Some("abort baseNameOf".to_owned()),
+            builtin_features: BuiltinFeatures::ALL,
             path_reads: crate::purity::PathReads::Direct,
             trace_verbose: false,
             abort_on_warn: false,
             home_dir: Some("/home/nixer".to_owned()),
             ca_derivations: false,
+            allow_import_from_derivation: true,
+            allowed_uris: None,
+            repair: false,
+            blake3_hashes: false,
             lint_url_literals: Diagnose::Ignore,
             lint_short_path_literals: Diagnose::Ignore,
             lint_absolute_path_literals: Diagnose::Ignore,
@@ -3630,16 +4103,21 @@ mod tests {
         let unset = Settings {
             store_dir: None,
             nix_version: None,
+            host_build_identity: None,
             current_system: None,
             max_call_depth: 10_000,
             pure_eval: false,
             restrict_eval: false,
-            cpp_builtin_names: None,
+            builtin_features: BuiltinFeatures::NONE,
             path_reads: crate::purity::PathReads::Direct,
             trace_verbose: false,
             abort_on_warn: false,
             home_dir: Some("/home/nixer".to_owned()),
             ca_derivations: false,
+            allow_import_from_derivation: true,
+            allowed_uris: None,
+            repair: false,
+            blake3_hashes: false,
             lint_url_literals: Diagnose::Ignore,
             lint_short_path_literals: Diagnose::Ignore,
             lint_absolute_path_literals: Diagnose::Ignore,
@@ -3649,8 +4127,9 @@ mod tests {
         let empty = Settings {
             store_dir: Some(String::new()),
             nix_version: Some(String::new()),
+            host_build_identity: Some(String::new()),
             current_system: Some(String::new()),
-            cpp_builtin_names: Some(String::new()),
+            builtin_features: BuiltinFeatures::ALL,
             ..unset.clone()
         };
         assert_ne!(unset.fingerprint(), empty.fingerprint());
@@ -3664,16 +4143,21 @@ mod tests {
         let left = Settings {
             store_dir: Some("ab".to_owned()),
             nix_version: Some(String::new()),
+            host_build_identity: Some(String::new()),
             current_system: Some(String::new()),
             max_call_depth: 1,
             pure_eval: false,
             restrict_eval: false,
-            cpp_builtin_names: Some(String::new()),
+            builtin_features: BuiltinFeatures::ALL,
             path_reads: crate::purity::PathReads::Direct,
             trace_verbose: false,
             abort_on_warn: false,
             home_dir: Some("/home/nixer".to_owned()),
             ca_derivations: false,
+            allow_import_from_derivation: true,
+            allowed_uris: None,
+            repair: false,
+            blake3_hashes: false,
             lint_url_literals: Diagnose::Ignore,
             lint_short_path_literals: Diagnose::Ignore,
             lint_absolute_path_literals: Diagnose::Ignore,
@@ -3888,10 +4372,9 @@ mod tests {
             "{}",
             render("builtins.nope")
         );
-        // A member cppnix has and this evaluator does not: unimplemented, not
-        // missing, because the differ counts the two differently.
+        // An unsupported builtin is absent, so capability checks can choose another path.
         assert!(
-            render("builtins.fetchMercurial").contains("Unimplemented"),
+            render("builtins.fetchMercurial").contains("missing"),
             "{}",
             render("builtins.fetchMercurial")
         );
@@ -4562,8 +5045,9 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
         /// out, and a refusal for anything absent.
         struct Store;
         impl Host for Store {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -4585,27 +5069,51 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
                 nix_path,
                 trace
             );
-            fn read_file(&self, path: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 match path {
-                    "/m/f" => Ok("hi".to_owned()),
+                    p if p.path.as_ref() == "/m/f" => Ok("hi".to_owned()),
                     _ => Err(format!("path '{path}' does not exist")),
                 }
             }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, path: &str) -> bool {
-                self.read_file(path).is_ok()
+            fn path_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(self.read_file(path).is_ok())
             }
-            fn file_type(&self, path: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 match path {
-                    p if self.path_exists(p) => Ok(Some(FileType::Regular)),
+                    p if self.path_exists_checked(p)? => Ok(Some(FileType::Regular)),
                     p => Err(format!("path '{p}' does not exist")),
                 }
             }
-            fn copy_to_store(&self, path: &str) -> std::result::Result<String, StoreError> {
+            fn copy_to_store(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<String, StoreError> {
                 match path {
-                    "/m/f" => Ok("/nix/store/00000000000000000000000000000000-f".to_owned()),
+                    p if p.path.as_ref() == "/m/f" => {
+                        Ok("/nix/store/00000000000000000000000000000000-f".to_owned())
+                    }
                     p => Err(StoreError::Failed(format!("path '{p}' does not exist"))),
                 }
             }
@@ -4670,8 +5178,9 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
 
         struct Store;
         impl Host for Store {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -4693,19 +5202,41 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
                 nix_path,
                 trace
             );
-            fn read_file(&self, _p: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 Ok(String::new())
             }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                true
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(true)
             }
-            fn file_type(&self, _p: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 Ok(Some(FileType::Regular))
             }
-            fn copy_to_store(&self, path: &str) -> std::result::Result<String, StoreError> {
+            fn copy_to_store(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<String, StoreError> {
                 Ok(format!("/nix/store/hash{}", path.replace('/', "-")))
             }
         }
@@ -4817,8 +5348,9 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
 
         struct Store;
         impl Host for Store {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -4840,19 +5372,41 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
                 nix_path,
                 trace
             );
-            fn read_file(&self, _p: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 Ok(String::new())
             }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                true
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(true)
             }
-            fn file_type(&self, _p: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 Ok(Some(FileType::Regular))
             }
-            fn copy_to_store(&self, path: &str) -> std::result::Result<String, StoreError> {
+            fn copy_to_store(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<String, StoreError> {
                 Ok(format!("/nix/store/h{}", path.replace('/', "-")))
             }
         }
@@ -4981,8 +5535,9 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
 
         struct Store;
         impl Host for Store {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -5004,19 +5559,41 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
                 nix_path,
                 trace
             );
-            fn read_file(&self, _p: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 Ok(String::new())
             }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                true
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(true)
             }
-            fn file_type(&self, _p: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 Ok(Some(FileType::Regular))
             }
-            fn copy_to_store(&self, path: &str) -> std::result::Result<String, StoreError> {
+            fn copy_to_store(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<String, StoreError> {
                 Ok(format!("/nix/store/h{}", path.replace('/', "-")))
             }
         }
@@ -5175,8 +5752,9 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
 
         struct NoStore;
         impl Host for NoStore {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -5199,16 +5777,35 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
                 nix_path,
                 trace
             );
-            fn read_file(&self, path: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 Err(format!("path \'{path}\' does not exist"))
             }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                true
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(true)
             }
-            fn file_type(&self, _p: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 Ok(Some(FileType::Regular))
             }
         }
@@ -5248,8 +5845,9 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
 
         struct Fake;
         impl Host for Fake {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -5272,23 +5870,44 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
                 nix_path,
                 trace
             );
-            fn read_file(&self, path: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 match path {
-                    "/m/lib.nix" => Ok("{ id = x: x; n = 7; }".to_owned()),
-                    "/m/dir/default.nix" => Ok("import /m/lib.nix".to_owned()),
+                    p if p.path.as_ref() == "/m/lib.nix" => Ok("{ id = x: x; n = 7; }".to_owned()),
+                    p if p.path.as_ref() == "/m/dir/default.nix" => {
+                        Ok("import /m/lib.nix".to_owned())
+                    }
                     _ => Err(format!("path '{path}' does not exist")),
                 }
             }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Ok(vec![("a".to_owned(), FileType::Regular)])
             }
-            fn path_exists(&self, path: &str) -> bool {
-                self.read_file(path).is_ok()
+            fn path_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(self.read_file(path).is_ok())
             }
-            fn file_type(&self, path: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 match path {
-                    "/m/dir" => Ok(Some(FileType::Directory)),
-                    p if self.path_exists(p) => Ok(Some(FileType::Regular)),
+                    p if p.path.as_ref() == "/m/dir" => Ok(Some(FileType::Directory)),
+                    p if self.path_exists_checked(p)? => Ok(Some(FileType::Regular)),
                     p => Err(format!("path '{p}' does not exist")),
                 }
             }
@@ -5363,13 +5982,10 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
         assert_eq!(render("toString (/a/b + \"/c\")"), "\"/a/b/c\"");
     }
 
-    /// A `Vm` outlives one evaluation in the persistent evaluator, and its
-    /// import cache outlives it too. Keyed by path that cache would serve the
-    /// pre-edit module to a post-edit request, which is the failure the C++
-    /// retained evaluator shipped and had to be caught by comparing against a
-    /// fresh process. Keyed by content it cannot: the edited text hashes
-    /// differently, so the lookup misses and the file is recompiled. There is
-    /// no invalidation pass here to get wrong.
+    /// A `Vm` and its import cache may outlive one evaluation. A path-keyed
+    /// cache would serve pre-edit module text after the host changes it. The
+    /// content key makes edited text miss and recompile, with no invalidation
+    /// pass to maintain.
     #[test]
     fn a_reused_vm_does_not_serve_a_stale_import() {
         use crate::host::{FileType, Host};
@@ -5379,8 +5995,9 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
             lib: RefCell<String>,
         }
         impl Host for Mutable {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -5403,21 +6020,40 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
                 nix_path,
                 trace
             );
-            fn read_file(&self, path: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 match path {
-                    "/m/lib.nix" => Ok(self.lib.borrow().clone()),
-                    "/m/main.nix" => Ok("(import /m/lib.nix).n".to_owned()),
+                    p if p.path.as_ref() == "/m/lib.nix" => Ok(self.lib.borrow().clone()),
+                    p if p.path.as_ref() == "/m/main.nix" => Ok("(import /m/lib.nix).n".to_owned()),
                     _ => Err(format!("path '{path}' does not exist")),
                 }
             }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, path: &str) -> bool {
-                self.read_file(path).is_ok()
+            fn path_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(self.read_file(path).is_ok())
             }
-            fn file_type(&self, path: &str) -> std::result::Result<Option<FileType>, String> {
-                if self.path_exists(path) {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
+                if self.path_exists_checked(path)? {
                     Ok(Some(FileType::Regular))
                 } else {
                     Err(format!("path '{path}' does not exist"))
@@ -5466,6 +6102,72 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
         assert_eq!(run(&mut vm, &host), "2");
     }
 
+    /// A host that counts how often it is asked to list a directory: the
+    /// only place a memo hit and a miss look different, because `q.Entries`
+    /// counts what the VM asked, not what was read.
+    struct Counting {
+        reads: std::cell::Cell<u64>,
+    }
+    impl crate::host::Host for Counting {
+        crate::host::host_stubs!(settle);
+        crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
+            self.read_file(path).map(String::into_bytes)
+        }
+        crate::host::host_stubs!(
+            realise,
+            store_text,
+            write_derivation,
+            store_filtered,
+            fetch,
+            lock_flake,
+            fetch_tree,
+            not_async,
+        );
+        crate::host::host_stubs!(
+            file_type_resolved,
+            get_env,
+            copy_to_store,
+            ensure_path,
+            warn,
+            find_file,
+            nix_path,
+            trace
+        );
+        fn read_file(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<String, String> {
+            Err(format!("path '{path}' does not exist"))
+        }
+        fn read_dir(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<Vec<(String, crate::host::FileType)>, String> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(vec![("a".to_owned(), crate::host::FileType::Regular)])
+        }
+        fn path_exists_checked(
+            &self,
+            _path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(true)
+        }
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
+        }
+        fn file_type(
+            &self,
+            _path: &crate::value2::PathValue,
+        ) -> std::result::Result<Option<crate::host::FileType>, String> {
+            Ok(Some(crate::host::FileType::Directory))
+        }
+    }
+
     /// The directory cache exists to stop this: two `builtins.readDir` calls
     /// on one path inside one evaluation must reach the filesystem once.
     ///
@@ -5474,51 +6176,7 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
     /// counts what the VM asked, not what was read.
     #[test]
     fn one_evaluation_reads_a_directory_once() {
-        use crate::host::{FileType, Host};
         use std::cell::Cell;
-
-        struct Counting {
-            reads: Cell<u64>,
-        }
-        impl Host for Counting {
-            crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
-                self.read_file(path).map(String::into_bytes)
-            }
-            crate::host::host_stubs!(
-                realise,
-                store_text,
-                write_derivation,
-                store_filtered,
-                fetch,
-                lock_flake,
-                fetch_tree,
-                not_async,
-            );
-            crate::host::host_stubs!(
-                file_type_resolved,
-                get_env,
-                copy_to_store,
-                ensure_path,
-                warn,
-                find_file,
-                nix_path,
-                trace
-            );
-            fn read_file(&self, path: &str) -> std::result::Result<String, String> {
-                Err(format!("path '{path}' does not exist"))
-            }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
-                self.reads.set(self.reads.get() + 1);
-                Ok(vec![("a".to_owned(), FileType::Regular)])
-            }
-            fn path_exists(&self, _path: &str) -> bool {
-                true
-            }
-            fn file_type(&self, _path: &str) -> std::result::Result<Option<FileType>, String> {
-                Ok(Some(FileType::Directory))
-            }
-        }
 
         let host = Counting {
             reads: Cell::new(0),
@@ -5544,6 +6202,55 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
         );
     }
 
+    /// Two drives lending one memo -- the shape of every force a question
+    /// performs through the handle API -- read a directory once between them.
+    /// The control is two drives with their own memos, which read it twice:
+    /// without it, a host that never counted would pass the first assertion.
+    #[test]
+    fn drives_lending_one_memo_read_a_directory_once() {
+        use std::cell::Cell;
+
+        let Ok(module) = compile::compile_source(
+            "builtins.length (builtins.attrNames (builtins.readDir /d))",
+            "/",
+            crate::compile::Origin::String,
+            &crate::eval::Settings::default(),
+        ) else {
+            unreachable!("the source above must compile")
+        };
+        let module = Rc::new(module);
+        let mut vm = Vm::with_settings(crate::eval::Settings::default());
+
+        let host = Counting {
+            reads: Cell::new(0),
+        };
+        let mut memo = JobMemo::default();
+        for _ in 0..2 {
+            vm.start_module(&module);
+            let got = drive_with(&mut vm, &host, &mut memo);
+            assert!(matches!(got, Ok(Value::Int(1))), "{got:?}");
+        }
+        assert_eq!(
+            host.reads.get(),
+            1,
+            "two drives lending one memo asked the host for one directory twice"
+        );
+
+        let host = Counting {
+            reads: Cell::new(0),
+        };
+        for _ in 0..2 {
+            vm.start_module(&module);
+            let got = drive(&mut vm, &host);
+            assert!(matches!(got, Ok(Value::Int(1))), "{got:?}");
+        }
+        assert_eq!(
+            host.reads.get(),
+            2,
+            "the control did not read twice, so the assertion above proved nothing"
+        );
+    }
+
     /// ...and it must not survive the evaluation that filled it.
     ///
     /// The cache is keyed by path, so an entry is valid only while the
@@ -5551,7 +6258,8 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
     /// evaluation on the warm-start path, so a cache living there would serve
     /// a pre-edit listing to a post-edit request -- the same defect the
     /// import cache avoids by being content-keyed. This one avoids it by
-    /// being owned by `drive`, and this is the test that says so.
+    /// living in a `JobMemo` owned by whoever holds the recording (`drive`
+    /// here, one per call), and this is the test that says so.
     #[test]
     fn a_reused_vm_does_not_serve_a_stale_directory() {
         use crate::host::{FileType, Host};
@@ -5561,8 +6269,9 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
             names: RefCell<Vec<String>>,
         }
         impl Host for Mutable {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -5585,10 +6294,16 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
                 nix_path,
                 trace
             );
-            fn read_file(&self, path: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 Err(format!("path '{path}' does not exist"))
             }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Ok(self
                     .names
                     .borrow()
@@ -5596,10 +6311,23 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
                     .map(|n| (n.clone(), FileType::Regular))
                     .collect())
             }
-            fn path_exists(&self, _path: &str) -> bool {
-                true
+            fn path_exists_checked(
+                &self,
+                _path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(true)
             }
-            fn file_type(&self, _path: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                _path: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 Ok(Some(FileType::Directory))
             }
         }
@@ -5645,8 +6373,9 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
 
         struct Env;
         impl Host for Env {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -5674,16 +6403,35 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
                     _ => None,
                 }
             }
-            fn read_file(&self, _p: &str) -> std::result::Result<String, String> {
+            fn read_file(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
                 Err("no files".to_owned())
             }
-            fn read_dir(&self, _p: &str) -> std::result::Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                false
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(false)
             }
-            fn file_type(&self, _p: &str) -> std::result::Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<FileType>, String> {
                 Err("no files".to_owned())
             }
         }
@@ -5735,8 +6483,9 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
     struct CoerceFs;
 
     impl crate::host::Host for CoerceFs {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -5758,42 +6507,55 @@ set3 = { a = 1; b = 2; }; set4 = { a = 1; b = 2; }; }"
             nix_path,
             trace
         );
-        fn read_file(&self, path: &str) -> std::result::Result<String, String> {
+        fn read_file(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<String, String> {
             match path {
-                "/m/f" => Ok("source".to_owned()),
-                "/nix/store/h-m-f" => Ok("copied".to_owned()),
-                "/m/d/default.nix" => Ok("42".to_owned()),
+                p if p.path.as_ref() == "/m/f" => Ok("source".to_owned()),
+                p if p.path.as_ref() == "/nix/store/h-m-f" => Ok("copied".to_owned()),
+                p if p.path.as_ref() == "/m/d/default.nix" => Ok("42".to_owned()),
                 _ => Err(format!("path '{path}' does not exist")),
             }
         }
         fn read_dir(
             &self,
-            path: &str,
+            path: &crate::value2::PathValue,
         ) -> std::result::Result<Vec<(String, crate::host::FileType)>, String> {
             match path {
-                "/m/d" => Ok(vec![(
+                p if p.path.as_ref() == "/m/d" => Ok(vec![(
                     "default.nix".to_owned(),
                     crate::host::FileType::Regular,
                 )]),
                 p => Err(format!("path '{p}' does not exist")),
             }
         }
-        fn path_exists(&self, path: &str) -> bool {
-            path == "/m/d" || self.read_file(path).is_ok()
+        fn path_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(path.path.as_ref() == "/m/d" || self.read_file(path).is_ok())
+        }
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
         }
         fn file_type(
             &self,
-            path: &str,
+            path: &crate::value2::PathValue,
         ) -> std::result::Result<Option<crate::host::FileType>, String> {
             match path {
-                "/m/d" => Ok(Some(crate::host::FileType::Directory)),
+                p if p.path.as_ref() == "/m/d" => Ok(Some(crate::host::FileType::Directory)),
                 p if self.read_file(p).is_ok() => Ok(Some(crate::host::FileType::Regular)),
                 p => Err(format!("path '{p}' does not exist")),
             }
         }
         fn copy_to_store(
             &self,
-            path: &str,
+            path: &crate::value2::PathValue,
         ) -> std::result::Result<String, crate::host::StoreError> {
             Ok(format!("/nix/store/h{}", path.replace('/', "-")))
         }
@@ -6228,8 +6990,9 @@ mod scheduler {
     }
 
     impl Host for SlowFetch {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -6251,16 +7014,29 @@ mod scheduler {
             warn,
             file_type_resolved
         );
-        fn read_file(&self, p: &str) -> Result<String, String> {
+        fn read_file(&self, p: &crate::value2::PathValue) -> Result<String, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn read_dir(&self, p: &str) -> Result<Vec<(String, FileType)>, String> {
+        fn read_dir(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> Result<Vec<(String, FileType)>, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn path_exists(&self, _p: &str) -> bool {
-            false
+        fn path_exists_checked(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(false)
         }
-        fn file_type(&self, p: &str) -> Result<Option<FileType>, String> {
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
+        }
+        fn file_type(&self, p: &crate::value2::PathValue) -> Result<Option<FileType>, String> {
             Err(format!("path '{p}' does not exist"))
         }
         fn fetch(&self, request: &crate::task::FetchRequest) -> Result<String, StoreError> {
@@ -6350,15 +7126,17 @@ mod scheduler {
              (peak in flight {peak_together}), apart {queued:?} (peak in flight {peak_apart})"
         );
 
-        // The wall clock, stated as a fraction of one stall so the numbers
-        // travel to a slower machine.
-        if overlapped >= STALL * 3 / 2 {
-            return Err(format!(
-                "two overlapping evaluations took {overlapped:?}, which is more than 1.5 stalls \
-                 ({:?}); they did not overlap",
-                STALL * 3 / 2
-            ));
-        }
+        // The timings are printed, not judged: overlap is decided by the
+        // peak counts below. A ratio bound on
+        // the two arms was tried and failed a run that overlapped perfectly
+        // (peak 2, 350ms together against 457ms apart): the machine was
+        // loaded (the nix sandbox runs this beside a C++ build, under a
+        // darwin switch), and load stretches the fixed cost of building and
+        // driving two machines, which the together arm pays concurrently and
+        // the sequential arm pays twice, so no fixed ratio separates "did
+        // not overlap" from "overlapped on a busy machine". The one clock
+        // check kept is a control on the sequential arm, which load can only
+        // lengthen.
         if queued <= STALL * 9 / 5 {
             return Err(format!(
                 "two sequential evaluations took only {queued:?}, under 1.8 stalls ({:?}); the \
@@ -6395,11 +7173,14 @@ mod scheduler {
     struct SlowBuild {
         concurrent: AtomicUsize,
         peak: AtomicUsize,
+        /// Every `realise` that reached this store.
+        calls: AtomicUsize,
     }
 
     impl Host for SlowBuild {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -6425,16 +7206,30 @@ mod scheduler {
         fn ensure_path(&self, _p: &str) -> Result<(), StoreError> {
             Ok(())
         }
-        fn read_file(&self, _p: &str) -> Result<String, String> {
+
+        fn read_file(&self, _p: &crate::value2::PathValue) -> Result<String, String> {
             Ok("built".to_owned())
         }
-        fn read_dir(&self, p: &str) -> Result<Vec<(String, FileType)>, String> {
+        fn read_dir(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> Result<Vec<(String, FileType)>, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn path_exists(&self, _p: &str) -> bool {
-            true
+        fn path_exists_checked(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(true)
         }
-        fn file_type(&self, _p: &str) -> Result<Option<FileType>, String> {
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
+        }
+        fn file_type(&self, _p: &crate::value2::PathValue) -> Result<Option<FileType>, String> {
             Ok(Some(FileType::Regular))
         }
         fn realise(
@@ -6460,6 +7255,7 @@ mod scheduler {
                     "the worker rebuilt the context as {shape:?}"
                 )));
             }
+            self.calls.fetch_add(1, Ordering::SeqCst);
             let now = self.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
             std::thread::sleep(STALL);
@@ -6510,10 +7306,47 @@ mod scheduler {
                 "the peak number of builds in flight was {peak}, not 2 (took {overlapped:?})"
             ));
         }
-        if overlapped >= STALL * 3 / 2 {
+        // Two builds that did not overlap take two full stalls whatever the
+        // load; anything under that is proof of overlap on any machine.
+        if overlapped >= STALL * 2 {
             return Err(format!(
-                "two overlapping builds took {overlapped:?}, more than 1.5 stalls ({:?})",
-                STALL * 3 / 2
+                "two overlapping builds took {overlapped:?}, not less than two stalls ({:?})",
+                STALL * 2
+            ));
+        }
+        Ok(())
+    }
+
+    /// The realise memo covers the begun route too: the second ask for a
+    /// context this evaluation has built is not begun (no thread, no stall),
+    /// and its answer is the first build's: two reads, and the store saw one
+    /// build.
+    #[test]
+    fn a_context_built_on_a_worker_is_not_begun_again() -> std::result::Result<(), String> {
+        let settings = crate::eval::settings_with_store();
+        let host = ThreadedHost::new(SlowBuild::default());
+        let src = format!("let p = {WITH_CONTEXT}; in builtins.readFile p + builtins.readFile p");
+        let mut vm = machine(&settings, &src)?;
+        let began = Instant::now();
+        let answer = rendered(drive(&mut vm, &host));
+        let took = began.elapsed();
+        // `rendered` prints the value's debug form, as the neighbouring
+        // tests read it.
+        if !answer.contains("builtbuilt") {
+            return Err(format!(
+                "expected both reads of the built path, got {answer}"
+            ));
+        }
+        // The count is the proof; the time is a note. A second begun build
+        // would be a second call whatever the machine's load, while a bound
+        // on `took` would fail on a loaded CI machine with the memo working.
+        let calls = host.inner().calls.load(Ordering::SeqCst);
+        println!(
+            "realise memo on the begun route: two reads, {calls} build(s), {took:?} (one stall {STALL:?})"
+        );
+        if calls != 1 {
+            return Err(format!(
+                "the store was asked to build {calls} times, not once"
             ));
         }
         Ok(())
@@ -6574,8 +7407,9 @@ mod scheduler {
         /// Mints tickets, answers none.
         struct Abandons;
         impl Host for Abandons {
+            crate::host::host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -6597,16 +7431,29 @@ mod scheduler {
                 warn,
                 file_type_resolved
             );
-            fn read_file(&self, p: &str) -> Result<String, String> {
+            fn read_file(&self, p: &crate::value2::PathValue) -> Result<String, String> {
                 Err(format!("path '{p}' does not exist"))
             }
-            fn read_dir(&self, p: &str) -> Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                p: &crate::value2::PathValue,
+            ) -> Result<Vec<(String, FileType)>, String> {
                 Err(format!("path '{p}' does not exist"))
             }
-            fn path_exists(&self, _p: &str) -> bool {
-                false
+            fn path_exists_checked(
+                &self,
+                _p: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(false)
             }
-            fn file_type(&self, p: &str) -> Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(&self, p: &crate::value2::PathValue) -> Result<Option<FileType>, String> {
                 Err(format!("path '{p}' does not exist"))
             }
             fn begin(&self, _question: &crate::host::Slow<'_>) -> Option<crate::host::Ticket> {
@@ -6624,11 +7471,29 @@ mod scheduler {
         let settings = Settings::default();
         let host = Abandons;
         let mut vm = machine(&settings, &fetching("a"))?;
+        crate::perf::reset();
         let abandoned = rendered(drive(&mut vm, &host));
         if !abandoned.contains("abandoned the 'fetchurl' question") {
             return Err(format!(
                 "expected an abandoned-question failure, got {abandoned:?}"
             ));
+        }
+        if cfg!(feature = "perf") {
+            let kind = crate::purity::QUESTION_KINDS
+                .iter()
+                .position(|name| *name == "Fetch")
+                .ok_or_else(|| "Fetch is missing from QUESTION_KINDS".to_owned())?;
+            if crate::perf::by_kind()[kind] != 1
+                || crate::perf::slow_by_kind()[kind] != 1
+                || crate::perf::abandoned_by_kind()[kind] != 1
+                || crate::perf::by_kind_ns()[kind] != 0
+                || crate::perf::slow_by_kind_ns()[kind] != 0
+            {
+                return Err(
+                    "an abandoned ticket was not counted as one begun ask, one abandonment, and no completed latency"
+                        .to_owned(),
+                );
+            }
         }
 
         // The machine is still parked on that suspension, and a driver handed
@@ -6807,8 +7672,9 @@ mod fanout {
     }
 
     impl Host for FanHost {
+        crate::host::host_stubs!(settle);
         crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-        fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
             self.read_file(path).map(String::into_bytes)
         }
         crate::host::host_stubs!(
@@ -6827,16 +7693,29 @@ mod fanout {
             nix_path,
             file_type_resolved
         );
-        fn read_file(&self, p: &str) -> Result<String, String> {
+        fn read_file(&self, p: &crate::value2::PathValue) -> Result<String, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn read_dir(&self, p: &str) -> Result<Vec<(String, FileType)>, String> {
+        fn read_dir(
+            &self,
+            p: &crate::value2::PathValue,
+        ) -> Result<Vec<(String, FileType)>, String> {
             Err(format!("path '{p}' does not exist"))
         }
-        fn path_exists(&self, _p: &str) -> bool {
-            false
+        fn path_exists_checked(
+            &self,
+            _p: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            Ok(false)
         }
-        fn file_type(&self, p: &str) -> Result<Option<FileType>, String> {
+        fn dir_exists_checked(
+            &self,
+            path: &crate::value2::PathValue,
+        ) -> std::result::Result<bool, String> {
+            self.file_type_resolved(path)
+                .map(|kind| kind == crate::host::FileType::Directory)
+        }
+        fn file_type(&self, p: &crate::value2::PathValue) -> Result<Option<FileType>, String> {
             Err(format!("path '{p}' does not exist"))
         }
         fn trace(&self, message: &str) {
@@ -6930,10 +7809,194 @@ mod fanout {
         }
     }
 
+    /// The scheduler settles every finished job exactly once, value or error,
+    /// and a settle failure is an error only where there was a value to lose:
+    /// a failed evaluation keeps its own error and the settle's is a warning,
+    /// never silence. Every deferred host effect (the queued derivation
+    /// writes of the bridge host) rests on this; the C API used to flush per
+    /// entry point and missed one.
+    #[test]
+    fn a_finished_job_settles_once() {
+        use crate::host::Host;
+        use std::cell::{Cell, RefCell};
+
+        struct Settling {
+            settles: Cell<u32>,
+            refuse: bool,
+            warnings: RefCell<Vec<String>>,
+        }
+        impl Settling {
+            fn new(refuse: bool) -> Self {
+                Self {
+                    settles: Cell::new(0),
+                    refuse,
+                    warnings: RefCell::new(Vec::new()),
+                }
+            }
+        }
+        impl Host for Settling {
+            crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
+                self.read_file(path).map(String::into_bytes)
+            }
+            crate::host::host_stubs!(
+                realise,
+                store_text,
+                write_derivation,
+                store_filtered,
+                fetch,
+                lock_flake,
+                fetch_tree,
+                not_async,
+            );
+            crate::host::host_stubs!(
+                file_type_resolved,
+                get_env,
+                copy_to_store,
+                ensure_path,
+                find_file,
+                nix_path,
+                trace
+            );
+            fn read_file(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<String, String> {
+                Err(format!("path '{path}' does not exist"))
+            }
+            fn read_dir(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<Vec<(String, crate::host::FileType)>, String> {
+                Err(format!("path '{path}' does not exist"))
+            }
+            fn path_exists_checked(
+                &self,
+                _path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(false)
+            }
+            fn dir_exists_checked(
+                &self,
+                _path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(false)
+            }
+            fn file_type(
+                &self,
+                _path: &crate::value2::PathValue,
+            ) -> std::result::Result<Option<crate::host::FileType>, String> {
+                Ok(None)
+            }
+            fn settle(&self) -> Result<(), crate::host::StoreError> {
+                self.settles.set(self.settles.get() + 1);
+                if self.refuse {
+                    Err(crate::host::StoreError::Failed(
+                        "the store refused the batch".to_owned(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            fn warn(&self, message: &str) {
+                self.warnings.borrow_mut().push(message.to_owned());
+            }
+        }
+
+        let host = Settling::new(false);
+        assert_eq!(run(&host, r#""a" + "b""#).as_deref(), Ok("ab"));
+        assert_eq!(
+            host.settles.get(),
+            1,
+            "one settle for one finished evaluation"
+        );
+        assert!(host.warnings.borrow().is_empty());
+
+        let refusing = Settling::new(true);
+        let text = run(&refusing, r#""a" + "b""#).unwrap();
+        assert!(
+            text.contains(
+                "settling the evaluation's deferred store effects: the store refused the batch"
+            ),
+            "a value whose deferred effects the store refused is not an answer: {text}"
+        );
+        assert_eq!(refusing.settles.get(), 1);
+        assert!(
+            refusing.warnings.borrow().is_empty(),
+            "the refusal IS the error, not a warning"
+        );
+
+        let failing = Settling::new(true);
+        let text = run(&failing, r#"throw "boom""#).unwrap();
+        assert!(
+            text.contains("boom"),
+            "the evaluation's own error is the one reported: {text}"
+        );
+        assert!(!text.contains("deferred store effects"), "{text}");
+        assert_eq!(
+            failing.settles.get(),
+            1,
+            "a failed evaluation still settles"
+        );
+        let warnings = failing.warnings.borrow();
+        assert_eq!(warnings.len(), 1, "and the refusal is heard: {warnings:?}");
+        assert!(
+            warnings[0].contains("settling the failed evaluation's deferred store effects: the store refused the batch"),
+            "{warnings:?}"
+        );
+    }
+
     /// Evaluate `src` against `host`: the string value itself on success, the
     /// position-scrubbed debug form of the error otherwise.
     fn run(host: &dyn Host, src: &str) -> Result<String, String> {
         run_debugged(host, src, vm_debug_without_pos)
+    }
+
+    /// A trailing slash selects cppnix's full-resolution directory check.
+    /// Its error outcome must survive the evaluator: the old implementation
+    /// folded every `file_type_resolved` failure into `false`, so a vanished
+    /// mounted root could satisfy this test only after becoming observable.
+    #[test]
+    fn trailing_slash_path_exists_propagates_host_errors() -> Result<(), String> {
+        use crate::host::{FileType, FnHost, PathReadHooks};
+
+        fn read_file(_path: &crate::value2::PathValue) -> Result<String, String> {
+            Err("not asked".to_owned())
+        }
+        fn exists(_path: &crate::value2::PathValue) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn dir_exists(_path: &crate::value2::PathValue) -> Result<bool, String> {
+            Err("mounted root disappeared".to_owned())
+        }
+        fn read_dir(_path: &crate::value2::PathValue) -> Result<Vec<(String, FileType)>, String> {
+            Err("not asked".to_owned())
+        }
+        fn file_type(_path: &crate::value2::PathValue) -> Result<Option<FileType>, String> {
+            Ok(None)
+        }
+        fn file_type_resolved(_path: &crate::value2::PathValue) -> Result<FileType, String> {
+            Err("mounted root disappeared through the old route".to_owned())
+        }
+
+        let host = FnHost {
+            path_reads: Some(PathReadHooks {
+                read_file,
+                path_exists: exists,
+                dir_exists,
+                read_dir,
+                file_type,
+                file_type_resolved,
+            }),
+            ..FnHost::default()
+        };
+        let answer = run(&host, "builtins.pathExists \"/gone/\"")?;
+        if !answer.contains("mounted root disappeared") {
+            return Err(format!(
+                "trailing-slash existence swallowed its host error: {answer}"
+            ));
+        }
+        Ok(())
     }
 
     /// Like [`run`], but an error keeps its position: for the tests whose

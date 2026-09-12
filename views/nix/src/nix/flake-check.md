@@ -2,82 +2,45 @@ R""(
 
 # Examples
 
-* Evaluate the flake in the current directory, and build its checks:
+* Validate current-system outputs and build every local check:
 
   ```console
   # nix flake check
   ```
 
-* Verify that the `patchelf` flake evaluates, but don't build its
-  checks:
+* Validate without running builders or import from derivation:
 
   ```console
-  # nix flake check --no-build github:NixOS/patchelf
+  # nix flake check --no-build
+  ```
+
+* Validate foreign-system outputs and collect independent failures:
+
+  ```console
+  # nix flake check --all-systems --keep-going
   ```
 
 # Description
 
-This command verifies that the flake specified by flake reference
-*flake-url* can be evaluated successfully (as detailed below), and
-that the derivations specified by the flake's `checks` output can be
-built successfully.
+Rust validates each supported flake output and reports invalid values with
+its attribute path. `checks.<system>`, `packages.<system>`, and
+`devShells.<system>` must contain named derivations. `formatter.<system>`
+must be a derivation. Apps, overlays, bundlers, NixOS modules and
+configurations, templates, and nested `hydraJobs` jobsets receive their
+corresponding shape checks. Function bodies are not invoked.
 
-If the `keep-going` option is set to `true`, Nix will keep evaluating as much
-as it can and report the errors as it encounters them. Otherwise it will stop
-at the first error.
+By default, foreign-system outputs are omitted and named in a warning.
+`--all-systems` validates them but still builds only local-system checks.
+Each check builds all of its outputs. A warm evaluation cache reuses validated
+metadata; the store still checks the build targets on every invocation.
 
-# Evaluation checks
+Hydra jobsets always use a separate evaluation session with import from
+derivation disabled. Regular outputs use the configured IFD policy when
+building; `--no-build` disables IFD for them too.
 
-The following flake output attributes must be derivations:
-
-* `checks.`*system*`.`*name*
-* `devShells.`*system*`.default`
-* `devShells.`*system*`.`*name*
-* `nixosConfigurations.`*name*`.config.system.build.toplevel`
-* `packages.`*system*`.default`
-* `packages.`*system*`.`*name*
-
-The following flake output attributes must be [app
-definitions](./nix3-run.md):
-
-* `apps.`*system*`.default`
-* `apps.`*system*`.`*name*
-
-The following flake output attributes must be [template
-definitions](./nix3-flake-init.md):
-
-* `templates.default`
-* `templates.`*name*
-
-The following flake output attributes must be *Nixpkgs overlays*:
-
-* `overlays.default`
-* `overlays.`*name*
-
-The following flake output attributes must be *NixOS modules*:
-
-* `nixosModules.default`
-* `nixosModules.`*name*
-
-The following flake output attributes must be
-[bundlers](./nix3-bundle.md):
-
-* `bundlers.default`
-* `bundlers.`*name*
-
-Old default attributes are renamed, they will work but will emit a warning:
-
-* `defaultPackage.<system>` → `packages.`*system*`.default`
-* `defaultApps.<system>` → `apps.`*system*`.default`
-* `defaultTemplate` → `templates.default`
-* `defaultBundler.<system>` → `bundlers.`*system*`.default`
-* `overlay` → `overlays.default`
-* `devShell.<system>` → `devShells.`*system*`.default`
-* `nixosModule` → `nixosModules.default`
-
-In addition, the `hydraJobs` output is evaluated in the same way as
-Hydra's `hydra-eval-jobs` (i.e. as a arbitrarily deeply nested
-attribute set of derivations). Similarly, the
-`legacyPackages`.*system* output is evaluated like `nix-env --query --available `.
+Unknown output namespaces and deprecated aliases such as `overlay`,
+`defaultPackage`, and `devShell` are rejected explicitly. `legacyPackages`
+and community namespaces without a validator are also rejected; they do not
+silently count as checked.
 
 )""

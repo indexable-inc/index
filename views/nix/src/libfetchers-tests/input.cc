@@ -1,10 +1,14 @@
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/fetchers/attrs.hh"
 #include "nix/fetchers/fetchers.hh"
+#include "nix/util/tests/gmock-matchers.hh"
 
 #include <gtest/gtest.h>
+#include <gmock/gmock.h>
 
+#include <set>
 #include <string>
+#include <utility>
 
 namespace nix {
 
@@ -18,9 +22,16 @@ struct InputFromAttrsTestCase
     fetchers::Attrs expectedAttrs = attrs;
 };
 
-class InputFromAttrsTest : public ::testing::WithParamInterface<InputFromAttrsTestCase>, public ::testing::Test
+class FlakesTest : public ::testing::Test
 {
+    std::set<ExperimentalFeature> savedFeatures = experimentalFeatureSettings.experimentalFeatures.get();
+
 public:
+    ~FlakesTest() override
+    {
+        experimentalFeatureSettings.experimentalFeatures.get() = std::move(savedFeatures);
+    }
+
     void SetUp() override
     {
         // The forge archive schemes (github/gitlab/sourcehut) are gated
@@ -28,6 +39,66 @@ public:
         experimentalFeatureSettings.experimentalFeatures.get().insert(Xp::Flakes);
     }
 };
+
+class InputFromAttrsTest : public ::testing::WithParamInterface<InputFromAttrsTestCase>, public FlakesTest
+{};
+
+using InputTreeHash = FlakesTest;
+
+/* `treeHash` is the lock identity of a jj input: a BLAKE3 SRI id, read
+   without the `blake3-hashes` feature (the algorithm is jj's, not a user
+   choice), and refused for any other algorithm, the mirror of `narHash`
+   having to be SHA-256. */
+TEST_F(InputTreeHash, parsesBlake3SRI)
+{
+    fetchers::Settings fetchSettings;
+    auto input = fetchers::Input::fromAttrs(
+        fetchSettings,
+        {
+            {"type", Attr("jj")},
+            {"url", Attr("file:///nonexistent")},
+            {"treeHash", Attr("blake3-TAPbLczl0EP0I9SGuLfWmVPhgmOEd9ABjIzodWGd+aA=")},
+        });
+    auto treeHash = input.getTreeHash();
+    ASSERT_TRUE(treeHash);
+    EXPECT_EQ(treeHash->algo, HashAlgorithm::BLAKE3);
+    EXPECT_EQ(treeHash->to_string(HashFormat::SRI, true), "blake3-TAPbLczl0EP0I9SGuLfWmVPhgmOEd9ABjIzodWGd+aA=");
+    EXPECT_FALSE(input.getNarHash());
+}
+
+TEST_F(InputTreeHash, refusesNonBlake3)
+{
+    fetchers::Settings fetchSettings;
+    EXPECT_THAT(
+        [&]() {
+            fetchers::Input::fromAttrs(
+                fetchSettings,
+                {
+                    {"type", Attr("jj")},
+                    {"url", Attr("file:///nonexistent")},
+                    {"treeHash", Attr("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=")},
+                });
+        },
+        ::testing::ThrowsMessage<UsageError>(testing::HasSubstrIgnoreANSIMatcher("must be a BLAKE3")));
+}
+
+/* A jj input has one identity. The scheme's attribute list is what refuses
+   the other one, so a hand-edited lock cannot smuggle a NAR promise in. */
+TEST_F(InputTreeHash, jjInputRefusesNarHash)
+{
+    fetchers::Settings fetchSettings;
+    EXPECT_THAT(
+        [&]() {
+            fetchers::Input::fromAttrs(
+                fetchSettings,
+                {
+                    {"type", Attr("jj")},
+                    {"url", Attr("file:///nonexistent")},
+                    {"narHash", Attr("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=")},
+                });
+        },
+        ::testing::ThrowsMessage<Error>(testing::HasSubstrIgnoreANSIMatcher("'narHash' not supported by scheme 'jj'")));
+}
 
 TEST_P(InputFromAttrsTest, attrsAreCorrectAndRoundTrips)
 {
@@ -211,14 +282,7 @@ INSTANTIATE_TEST_SUITE_P(
         }),
     [](const ::testing::TestParamInfo<InputFromAttrsTestCase> & info) { return info.param.description; });
 
-class InputFromURLTest : public ::testing::Test
-{
-public:
-    void SetUp() override
-    {
-        experimentalFeatureSettings.experimentalFeatures.get().insert(Xp::Flakes);
-    }
-};
+using InputFromURLTest = FlakesTest;
 
 /* Previously `github:...?submodules=1` silently dropped the query
    parameter and fetched a tarball with empty submodule directories

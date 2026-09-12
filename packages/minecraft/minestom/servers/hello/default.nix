@@ -7,7 +7,7 @@
   minestomRoot = ix.paths.packagesRoot + "/minecraft/minestom";
   src = fs.toSource {
     root = minestomRoot;
-    fileset = fs.intersection (fs.gitTracked minestomRoot) minestomRoot;
+    fileset = minestomRoot;
   };
 in
   ix.buildGradleFatJar pkgs {

@@ -43,6 +43,52 @@ INSTANTIATE_TEST_CASE_P(
         RewriteParams{"foooo", "bazoo", {{"fou", "bar"}, {"foo", "baz"}}},
         RewriteParams{"foooo", "foooo", {}}));
 
+TEST(references, rewriteDoesNotReprocessTransformedCarry)
+{
+    for (size_t split = 0; split <= 4; ++split) {
+        StringSink output;
+        RewritingSink sink(StringMap{{"abc", "xyz"}, {"xyz", "123"}}, output);
+        std::string_view input = "abc!";
+        sink(input.substr(0, split));
+        sink(input.substr(split));
+        sink.flush();
+        EXPECT_EQ(output.s, "xyz!");
+    }
+}
+
+TEST(references, moduloHashBindsSelfReferenceOffsets)
+{
+    auto digest = [](std::string_view input) {
+        HashModuloSink sink(HashAlgorithm::SHA256, "abc");
+        for (auto byte : input)
+            sink(std::string_view(&byte, 1));
+        return sink.finish();
+    };
+    auto actual = digest("xabc!");
+    EXPECT_EQ(actual.hash, hashString(HashAlgorithm::SHA256, std::string("x\0\0\0!|1", 7)));
+    EXPECT_EQ(actual.numBytesDigested, 5);
+    EXPECT_NE(digest("abc").hash, digest(std::string(3, '\0')).hash);
+}
+
+TEST(references, downstreamExceptionDoesNotCrossRustAndPoisonsStream)
+{
+    struct RejectingSink : Sink
+    {
+        int calls = 0;
+
+        void operator()(std::string_view) override
+        {
+            ++calls;
+            throw Error("downstream failure");
+        }
+    } output;
+
+    RewritingSink sink(StringMap{}, output);
+    EXPECT_THROW(sink("first"), Error);
+    EXPECT_THROW(sink("second"), Error);
+    EXPECT_EQ(output.calls, 1);
+}
+
 TEST(references, scan)
 {
     std::string hash1 = "dc04vv14dak1c1r48qa0m23vr9jy8sm0";

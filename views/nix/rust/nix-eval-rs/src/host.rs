@@ -9,7 +9,9 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{PoisonError, RwLock};
+use std::sync::PoisonError;
+
+use crate::value2::PathValue;
 
 /// What a path turned out to be. Mirrors cppnix's `readFileType`, whose
 /// spellings ("regular", "directory", "symlink", "unknown") are corpus-visible
@@ -44,6 +46,10 @@ pub enum StoreError {
     /// The copy was attempted and failed; the text is what the evaluator
     /// reports, phrased the way cppnix phrases it.
     Failed(String),
+    /// cppnix refused import from derivation. Kept apart from [`Failed`]
+    /// because flake-show catches this exception class and prints an omitted
+    /// node; flattening it into an evaluation error changes the document.
+    ImportFromDerivation(String),
     /// The embedder could have answered and will not, because this backend
     /// cannot carry something the answer needs. Kept apart from `Failed` for
     /// the reason [`LookupError::Unsupported`] is kept apart from
@@ -57,12 +63,32 @@ pub enum StoreError {
     Unsupported(String),
 }
 
+impl std::fmt::Display for StoreError {
+    /// `Failed` carries the text cppnix would print and shows bare; the other
+    /// variants name themselves, each being a classification a caller matches
+    /// on rather than a message written for a reader.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(why) => f.write_str(why),
+            other => write!(f, "{other:?}"),
+        }
+    }
+}
+
 /// How [`FnHost`] reaches a store. The store belongs to the embedder, so the
 /// embedder supplies the answer; a plain `fn` pointer because a Rust embedder
 /// has nothing to capture. An embedder that does -- anything crossing the C
 /// ABI -- carries its state on the context pointer of its own vtable instead
 /// (`capi::IxeHostVtable`) rather than in a global.
-pub type StoreCopyHook = fn(&str) -> Result<String, String>;
+pub type StoreCopyHook = fn(&PathValue) -> Result<String, String>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorePathResult {
+    pub path: String,
+    pub store_path: String,
+}
+
+pub type StorePathHook = fn(&PathValue) -> Result<StorePathResult, String>;
 
 /// How [`FnHost`] stores a text blob. Same shape and same reasoning as
 /// [`StoreCopyHook`], with one extra: the embedder also owns the decision of
@@ -75,7 +101,7 @@ pub type StoreTextHook = fn(&str, &str, &[String]) -> Result<String, String>;
 /// because cppnix's `writeDerivation` is that call. It is a hook of its own
 /// only because a missing one means something different -- see
 /// [`Host::write_derivation`].
-pub type WriteDrvHook = fn(&str, &str, &[String]) -> Result<String, String>;
+pub type WriteDrvHook = fn(&str, &str) -> Result<String, String>;
 
 /// How [`FnHost`] performs a filtered copy into the store, for
 /// `builtins.path`. Same shape and same reasoning as [`StoreTextHook`]: the
@@ -119,6 +145,40 @@ pub struct FlakeCall {
     /// without its own context is a derivation input that has silently
     /// vanished.
     pub overrides: String,
+}
+
+/// One symlink under a store object, as [`Host::sealed_paths`] reports it:
+/// its path relative to the object and its target text, verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Symlink {
+    pub path: String,
+    pub target: String,
+}
+
+/// [`Host::sealed_paths`]'s answer: each sealed object (`<hash>-<name>`)
+/// with every symlink under it. Which of them leave the object is the
+/// verifier's reading (`readset::leaving_links`), not the host's.
+pub type Links = std::collections::BTreeMap<String, Vec<Symlink>>;
+
+/// The verifier's reading of [`Links`]: each sealed object with the symlinks
+/// that LEAVE it, as paths relative to the object, so a read that stays
+/// inside the object's bytes can be told from one that follows a link out
+/// of them.
+pub type Sealed = std::collections::BTreeMap<String, Vec<String>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportedSource {
+    Nix { path: PathValue, text: String },
+    /// Only the store host may classify an import as a valid derivation.
+    /// Output strings are the store's static paths or downstream placeholders.
+    Derivation(ImportedDerivation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedDerivation {
+    pub path: String,
+    pub name: String,
+    pub outputs: BTreeMap<String, String>,
 }
 
 /// [`crate::value2::ContextElem`] with its `Rc<str>`s widened to `String`.
@@ -247,38 +307,66 @@ impl<H: Host + Send + Sync + 'static> ThreadedHost<H> {
 }
 
 impl<H: Host + Send + Sync + 'static> Host for ThreadedHost<H> {
-    fn read_file(&self, path: &str) -> Result<String, String> {
+    fn import_source(&self, path: &PathValue) -> Result<ImportedSource, String> {
+        self.inner.import_source(path)
+    }
+    fn read_file(&self, path: &PathValue) -> Result<String, String> {
         self.inner.read_file(path)
     }
-    fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+    fn read_file_bytes(&self, path: &PathValue) -> Result<Vec<u8>, String> {
         self.inner.read_file_bytes(path)
     }
     fn get_env(&self, name: &str) -> Option<String> {
         self.inner.get_env(name)
     }
-    fn read_dir(&self, path: &str) -> Result<Vec<(String, FileType)>, String> {
+    fn settle(&self) -> Result<(), StoreError> {
+        self.inner.settle()
+    }
+    fn read_dir(&self, path: &PathValue) -> Result<Vec<(String, FileType)>, String> {
         self.inner.read_dir(path)
     }
-    fn path_exists(&self, path: &str) -> bool {
-        self.inner.path_exists(path)
+    fn path_exists_checked(&self, path: &PathValue) -> Result<bool, String> {
+        self.inner.path_exists_checked(path)
     }
-    fn file_type(&self, path: &str) -> Result<Option<FileType>, String> {
+    fn dir_exists_checked(&self, path: &PathValue) -> Result<bool, String> {
+        self.inner.dir_exists_checked(path)
+    }
+    fn file_type(&self, path: &PathValue) -> Result<Option<FileType>, String> {
         self.inner.file_type(path)
     }
-    fn file_type_resolved(&self, path: &str) -> Result<FileType, String> {
+    fn file_type_resolved(&self, path: &PathValue) -> Result<FileType, String> {
         self.inner.file_type_resolved(path)
     }
-    fn copy_to_store(&self, path: &str) -> Result<String, StoreError> {
+    fn copy_to_store(&self, path: &PathValue) -> Result<String, StoreError> {
         self.inner.copy_to_store(path)
+    }
+    fn store_path(&self, path: &PathValue) -> Result<StorePathResult, StoreError> {
+        self.inner.store_path(path)
     }
     fn ensure_path(&self, path: &str) -> Result<(), StoreError> {
         self.inner.ensure_path(path)
+    }
+
+    fn valid_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        self.inner.valid_paths(paths)
+    }
+    fn sealed_paths(&self, objects: &[String]) -> Result<Links, StoreError> {
+        self.inner.sealed_paths(objects)
+    }
+    fn allow_paths(&self, paths: &[String]) -> Result<(), StoreError> {
+        self.inner.allow_paths(paths)
+    }
+    fn allow_closures(&self, outputs: &[String]) -> Result<(), StoreError> {
+        self.inner.allow_closures(outputs)
     }
     fn find_file(
         &self,
         entries: &[crate::task::SearchPathEntry],
         name: &str,
-    ) -> Result<String, LookupError> {
+    ) -> Result<PathValue, LookupError> {
         self.inner.find_file(entries, name)
     }
     fn store_text(
@@ -289,13 +377,8 @@ impl<H: Host + Send + Sync + 'static> Host for ThreadedHost<H> {
     ) -> Result<String, StoreError> {
         self.inner.store_text(name, contents, references)
     }
-    fn write_derivation(
-        &self,
-        name: &str,
-        aterm: &str,
-        references: &[String],
-    ) -> Result<String, StoreError> {
-        self.inner.write_derivation(name, aterm, references)
+    fn write_derivation(&self, name: &str, aterm: &str) -> Result<String, StoreError> {
+        self.inner.write_derivation(name, aterm)
     }
     fn store_filtered(&self, request: &crate::task::FilteredCopy) -> Result<String, StoreError> {
         self.inner.store_filtered(request)
@@ -446,210 +529,169 @@ pub enum LookupError {
 /// How [`FnHost`] resolves a search path. Same shape and same reasoning as
 /// [`StoreCopyHook`]: cppnix's `findFile` reaches fetchers, the `corepkgs`
 /// accessor and its own access control, none of which live here.
-pub type FindFileHook = fn(&[crate::task::SearchPathEntry], &str) -> Result<String, LookupError>;
+pub type FindFileHook = fn(&[crate::task::SearchPathEntry], &str) -> Result<PathValue, LookupError>;
 
 /// How [`FnHost`] learns the default search path, cppnix's
 /// `builtins.nixPath`.
 pub type NixPathHook = fn() -> Result<Vec<crate::task::SearchPathEntry>, LookupError>;
 
-/// Files the embedder has handed over by content rather than by path.
+/// Files an embedder hands the evaluator by content, for paths it cannot
+/// read off the filesystem.
 ///
-/// cppnix can resolve a search path into an accessor that is not the real
-/// filesystem: `corepkgs` holds `<nix/fetchurl.nix>` in memory, and a
-/// downloaded lookup-path entry lives behind whatever accessor its fetcher
-/// returned. This evaluator reads the real filesystem directly, so it cannot
-/// follow one -- and handing back a plausible absolute path for something that
-/// is not there would be a path that looks fine and does not exist (ENG-12443).
+/// cppnix resolves `<nix/fetchurl.nix>` into an in-memory accessor and
+/// reports its path as `/fetchurl.nix`; there is no such file on disk. The
+/// embedder's `findFile` answer carries the bytes beside that path, and the
+/// host that received the answer serves every later question about the path
+/// -- existence, kind, contents, and the atomic import -- from here, so
+/// `builtins.toString <nix/fetchurl.nix>` is `/fetchurl.nix` on both arms
+/// rather than a store path on one of them. ENG-12607.
 ///
-/// The way out is not to invent a path but to keep cppnix's and carry the
-/// bytes: the embedder registers `(path, contents)` and answers the lookup with
-/// the path cppnix itself would report, so `builtins.toString
-/// <nix/fetchurl.nix>` is `/fetchurl.nix` on both arms rather than a store path
-/// on one of them. ENG-12607.
+/// Owned by the host that received the answer and dropped with it: two
+/// sessions in one process cannot see each other's files, and a later
+/// session cannot read bytes an earlier one was handed. The overlay used to
+/// be a process-global and the atomic import did not consult it, which is how
+/// `import <nix/fetchurl.nix>` refused under pure evaluation while every
+/// other read of the same path answered.
 ///
-/// Process-global, and the last thing here that still is. Unlike the effect
-/// hooks -- which are now a per-host value, so two evaluations in one process
-/// cannot share one -- registered content is compiled into the embedder and is
-/// the same bytes for every evaluation in the process, so there is nothing for
-/// two hosts to disagree about. ENG-13040 covers moving it anyway.
+/// Registered content wins over the filesystem, which is also cppnix's
+/// order: its `findFile` short-circuits `nix/...` to `corepkgs` before it
+/// consults the search path at all (`eval.cc:3445`). Only an ambient path
+/// can be one; a mounted root is a real accessor.
 ///
-/// A read set does not record these, which is right: the bytes are compiled
-/// into the embedder, so there is no file whose change should invalidate
-/// anything.
-static VIRTUAL_FILES: RwLock<Option<BTreeMap<String, String>>> = RwLock::new(None);
-
-/// Register a file the evaluator should read from memory instead of from disk.
-///
-/// Overrides a real file at the same path, which is also cppnix's order: its
-/// `findFile` short-circuits `nix/...` to `corepkgs` before it consults the
-/// search path at all (`eval.cc:3445`), so a real `/fetchurl.nix` would not be
-/// consulted there either.
-pub fn add_virtual_file(path: &str, contents: &str) {
-    let mut slot = VIRTUAL_FILES
-        .write()
-        .unwrap_or_else(PoisonError::into_inner);
-    slot.get_or_insert_with(BTreeMap::new)
-        .insert(path.to_owned(), contents.to_owned());
-}
-
-/// The contents registered for `path`, if any.
-///
-/// `None` before any registration, which is the common case, so the ordinary
-/// read path pays one uncontended read lock and no allocation.
-fn virtual_file(path: &str) -> Option<String> {
-    let slot = VIRTUAL_FILES.read().unwrap_or_else(PoisonError::into_inner);
-    slot.as_ref()?.get(path).cloned()
-}
-
-/// Answer a file read out of the registered files when one matches.
-///
-/// The three `*_or_virtual` helpers exist so that consulting the registration
-/// is one decision rather than one per `Host`. It used to be open-coded in
-/// each, and the copy that was missing is exactly the bug that shape invites:
-/// [`crate::capi::EmbedderHost`] answered every read straight from the
-/// embedder, so `import <nix/fetchurl.nix>` reported "path '/fetchurl.nix'
-/// does not exist" under the C++ bridge while `RealFs` and [`FnHost`] both
-/// resolved it. That is `eval-okay-search-path` in the lang corpus, and it
-/// was a `match` on every host in the crate's own tests.
-///
-/// Registered content wins over the filesystem, which is also cppnix's order:
-/// its `findFile` short-circuits `nix/...` to `corepkgs` before it consults
-/// the search path at all (`eval.cc:3445`).
+/// A read set does not record these on their own: the bytes are compiled
+/// into the embedder, and the `findFile` question that carried them is what
+/// a replay re-asks, in order, so the registration precedes the reads that
+/// depend on it exactly as it did when recorded.
 ///
 /// `read_dir` has no counterpart on purpose: a registered file is a file, and
 /// a directory listing has never been answerable from one.
-pub(crate) fn read_file_or_virtual(
-    path: &str,
-    ask: impl FnOnce() -> Result<String, String>,
-) -> Result<String, String> {
-    match virtual_file(path) {
-        Some(contents) => Ok(contents),
-        None => ask(),
+#[derive(Clone, Default, Debug)]
+pub struct VirtualFiles(std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>);
+
+impl VirtualFiles {
+    /// Register `contents` for the ambient `path`. Last writer wins, which
+    /// is what makes registration idempotent for an embedder that resolves
+    /// the same lookup twice.
+    pub fn insert(&self, path: &str, contents: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_owned(), contents.to_owned());
     }
-}
 
-/// As [`read_file_or_virtual`], for the raw-bytes read. Registered content
-/// is a `String`, so its bytes are its UTF-8 encoding; a virtual file cannot
-/// hold the bytes this exists for, and that is fine, because every caller
-/// registers Nix source text.
-pub(crate) fn read_file_bytes_or_virtual(
-    path: &str,
-    ask: impl FnOnce() -> Result<Vec<u8>, String>,
-) -> Result<Vec<u8>, String> {
-    match virtual_file(path) {
-        Some(contents) => Ok(contents.into_bytes()),
-        None => ask(),
+    /// The contents registered for `path`, if it is an ambient path with one.
+    fn get(&self, path: &PathValue) -> Option<String> {
+        if !matches!(&path.root, crate::value2::Root::Ambient) {
+            return None;
+        }
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(path.as_ref())
+            .cloned()
     }
-}
 
-/// As [`read_file_or_virtual`]: a registered file exists, whatever the
-/// filesystem or the embedder says. `import` asks this before it reads.
-pub(crate) fn path_exists_or_virtual(path: &str, ask: impl FnOnce() -> bool) -> bool {
-    virtual_file(path).is_some() || ask()
-}
-
-/// As [`read_file_or_virtual`]: registered content is a regular file, which
-/// is what decides whether `import` appends `/default.nix`
-/// ([`Host::resolve_import`]).
-///
-/// Two functions and not one for the two kind queries, which used to share
-/// this: [`Host::file_type`] is `maybeLstat` and can answer "not there",
-/// [`Host::file_type_resolved`] is still `lstat` and cannot. Resolution has
-/// nothing to do with it -- neither changes the answer for content held in
-/// memory -- so what the split records is the difference in contract.
-pub(crate) fn file_type_or_virtual(
-    path: &str,
-    ask: impl FnOnce() -> Result<Option<FileType>, String>,
-) -> Result<Option<FileType>, String> {
-    match virtual_file(path) {
-        Some(_) => Ok(Some(FileType::Regular)),
-        None => ask(),
+    /// Answer a file read out of the registered files when one matches.
+    pub(crate) fn read_file_or(
+        &self,
+        path: &PathValue,
+        ask: impl FnOnce() -> Result<String, String>,
+    ) -> Result<String, String> {
+        match self.get(path) {
+            Some(contents) => Ok(contents),
+            None => ask(),
+        }
     }
-}
 
-/// [`file_type_or_virtual`] for the resolving query, which reports a missing
-/// path as a failure because its caller is cppnix's `lstat`.
-pub(crate) fn file_type_resolved_or_virtual(
-    path: &str,
-    ask: impl FnOnce() -> Result<FileType, String>,
-) -> Result<FileType, String> {
-    match virtual_file(path) {
-        Some(_) => Ok(FileType::Regular),
-        None => ask(),
+    /// As [`VirtualFiles::read_file_or`], for the raw-bytes read. Registered
+    /// content is a `String`, so its bytes are its UTF-8 encoding; every
+    /// caller registers Nix source text.
+    pub(crate) fn read_file_bytes_or(
+        &self,
+        path: &PathValue,
+        ask: impl FnOnce() -> Result<Vec<u8>, String>,
+    ) -> Result<Vec<u8>, String> {
+        match self.get(path) {
+            Some(contents) => Ok(contents.into_bytes()),
+            None => ask(),
+        }
     }
-}
 
-/// Serialises the tests that write to [`VIRTUAL_FILES`].
-///
-/// `crate::eval::globals_shared` does not cover this, and its old name --
-/// `globals_held` -- is why somebody thought it did: it is a *read* lock on
-/// the settings, so any number of tests hold it at once, and two of them
-/// registering and clearing one process-global registry interleave. That is
-/// how the second registry test written here failed only when run beside the
-/// first, and passed alone, with a `left: None` that looks exactly like the
-/// bug it was written to catch (ENG-13094). Take this in any test that calls
-/// [`add_virtual_file`] or [`clear_virtual_files`].
-#[cfg(test)]
-static REGISTRY_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The atomic import of a registered file is the file itself: a regular
+    /// file resolves to its own path, with these bytes.
+    pub(crate) fn import_source_or(
+        &self,
+        path: &PathValue,
+        ask: impl FnOnce() -> Result<ImportedSource, String>,
+    ) -> Result<ImportedSource, String> {
+        match self.get(path) {
+            Some(text) => Ok(ImportedSource::Nix {
+                path: path.clone(),
+                text,
+            }),
+            None => ask(),
+        }
+    }
 
-/// Exclusive use of the virtual-file registry. See [`REGISTRY_TESTS`].
-///
-/// Named for what it grants and not for the act of holding it, which is the
-/// distinction `globals_held` lost. Every process-global in this crate should
-/// have a guard of its own, spelled this way; there are two today.
-///
-/// Not taken by [`assert_answers_from_registered_files`] itself, because a
-/// caller that also registers files of its own needs to hold it across both.
-#[cfg(test)]
-pub(crate) fn registry_exclusive() -> std::sync::MutexGuard<'static, ()> {
-    REGISTRY_TESTS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-}
+    /// A registered file exists, whatever the filesystem or the embedder
+    /// says. `import` asks this before it reads.
+    pub(crate) fn path_exists_checked_or(
+        &self,
+        path: &PathValue,
+        ask: impl FnOnce() -> Result<bool, String>,
+    ) -> Result<bool, String> {
+        match self.get(path) {
+            Some(_) => Ok(true),
+            None => ask(),
+        }
+    }
 
-/// Assert that `host` answers the four path questions out of the registered
-/// files rather than out of whatever it reads through.
-///
-/// Every `Host` that can answer a path read is held to this, from that impl's
-/// own module, because the property is not one an impl can be trusted to
-/// remember: [`crate::capi::EmbedderHost`] forgot it and shipped an evaluator
-/// that could not `import <nix/fetchurl.nix>`. The caller registers nothing
-/// and holds [`registry_exclusive`]; `path` must be one the host would otherwise
-/// report missing, so that answering correctly can only mean it consulted the
-/// registry.
-#[cfg(test)]
-pub(crate) fn assert_answers_from_registered_files(host: &dyn Host, path: &str) {
-    clear_virtual_files();
-    assert!(
-        !host.path_exists(path),
-        "{path} must be absent before registration or this proves nothing"
-    );
+    /// The trailing-slash directory predicate: registered content is a
+    /// regular file, so it exists but is not a directory. Answering `true`
+    /// here would make `pathExists "<virtual>/"` disagree with the kind
+    /// query import uses.
+    pub(crate) fn dir_exists_checked_or(
+        &self,
+        path: &PathValue,
+        ask: impl FnOnce() -> Result<bool, String>,
+    ) -> Result<bool, String> {
+        match self.get(path) {
+            Some(_) => Ok(false),
+            None => ask(),
+        }
+    }
 
-    add_virtual_file(path, "{ registered = true; }");
-    assert_eq!(
-        host.read_file(path).ok().as_deref(),
-        Some("{ registered = true; }")
-    );
-    assert!(host.path_exists(path));
-    // Regular and not a directory, or `resolve_import` appends `/default.nix`
-    // and turns this into a second missing path.
-    assert!(matches!(host.file_type(path), Ok(Some(FileType::Regular))));
-    assert!(matches!(
-        host.file_type_resolved(path),
-        Ok(FileType::Regular)
-    ));
-    assert_eq!(host.resolve_import(path).ok().as_deref(), Some(path));
+    /// Registered content is a regular file, which is what decides whether
+    /// `import` appends `/default.nix` ([`Host::resolve_import`]).
+    ///
+    /// Two functions and not one for the two kind queries: [`Host::file_type`]
+    /// is `maybeLstat` and can answer "not there", [`Host::file_type_resolved`]
+    /// is still `lstat` and cannot. Resolution has nothing to do with it --
+    /// neither changes the answer for content held in memory -- so what the
+    /// split records is the difference in contract.
+    pub(crate) fn file_type_or(
+        &self,
+        path: &PathValue,
+        ask: impl FnOnce() -> Result<Option<FileType>, String>,
+    ) -> Result<Option<FileType>, String> {
+        match self.get(path) {
+            Some(_) => Ok(Some(FileType::Regular)),
+            None => ask(),
+        }
+    }
 
-    clear_virtual_files();
-    assert!(!host.path_exists(path));
-}
-
-/// Forget every registered file. For tests, which share one process.
-pub fn clear_virtual_files() {
-    let mut slot = VIRTUAL_FILES
-        .write()
-        .unwrap_or_else(PoisonError::into_inner);
-    *slot = None;
+    /// [`VirtualFiles::file_type_or`] for the resolving query, which reports
+    /// a missing path as a failure because its caller is cppnix's `lstat`.
+    pub(crate) fn file_type_resolved_or(
+        &self,
+        path: &PathValue,
+        ask: impl FnOnce() -> Result<FileType, String>,
+    ) -> Result<FileType, String> {
+        match self.get(path) {
+            Some(_) => Ok(FileType::Regular),
+            None => ask(),
+        }
+    }
 }
 
 /// How [`FnHost`] prints a trace line. Same shape and same reasoning as
@@ -660,7 +702,7 @@ pub type TraceHook = fn(&str);
 ///
 /// A named alias because the hook's type is otherwise nested three deep and
 /// reads as noise at every site that mentions it.
-pub type ReadDirFn = fn(&str) -> Result<Vec<(String, FileType)>, String>;
+pub type ReadDirFn = fn(&PathValue) -> Result<Vec<(String, FileType)>, String>;
 
 /// The plain filesystem reads, answered by the embedder instead of by
 /// `std::fs`.
@@ -692,27 +734,33 @@ pub type ReadDirFn = fn(&str) -> Result<Vec<(String, FileType)>, String>;
 #[derive(Debug, Clone, Copy)]
 pub struct PathReadHooks {
     /// `builtins.readFile`, and the second half of an `import`.
-    pub read_file: fn(&str) -> Result<String, String>,
-    /// `builtins.pathExists`. Total, like [`Host::path_exists`]: cppnix's
-    /// `prim_pathExists` turns a forbidden path into `false` rather than a
-    /// failure (`primops.cc:2097`), so there is no error to report.
-    pub path_exists: fn(&str) -> bool,
+    pub read_file: fn(&PathValue) -> Result<String, String>,
+    /// `builtins.pathExists`. Missing paths and cppnix's
+    /// `RestrictedPathError` are `Ok(false)`; a vanished mounted root and
+    /// every other accessor or I/O failure stay `Err`. Keeping that third
+    /// outcome is required by read-set replay: disappearance must not look
+    /// like the same negative observation as an absent child.
+    pub path_exists: fn(&PathValue) -> Result<bool, String>,
+    /// The string-with-trailing-slash form of `builtins.pathExists`: full
+    /// symlink resolution followed by a directory test. Missing paths and
+    /// `RestrictedPathError` are `Ok(false)`; other failures stay `Err`.
+    pub dir_exists: fn(&PathValue) -> Result<bool, String>,
     /// `builtins.readDir`.
     pub read_dir: ReadDirFn,
     /// `builtins.readFileType`: `lstat`, resolving nothing, not even
     /// ancestors. `Ok(None)` is cppnix's `maybeLstat` answering nullopt; see
     /// [`Host::file_type`].
-    pub file_type: fn(&str) -> Result<Option<FileType>, String>,
+    pub file_type: fn(&PathValue) -> Result<Option<FileType>, String>,
     /// The first half of an `import`: `stat`, ie the type of the path with
     /// every symlink in it resolved.
-    pub file_type_resolved: fn(&str) -> Result<FileType, String>,
+    pub file_type_resolved: fn(&PathValue) -> Result<FileType, String>,
 }
 
 /// Every question the evaluator can ask of the world outside it. Errors are
 /// the message text the evaluator reports, so implementations phrase them the
 /// way cppnix does rather than leaking an OS string.
 ///
-/// # Exactly one method here has a body, and that is load-bearing
+/// # Exactly two methods here have bodies, and both are load-bearing
 ///
 /// A defaulted method is a method a wrapper can forget to forward while still
 /// compiling, and a wrapper that forgets one answers a question the host
@@ -825,7 +873,12 @@ pub enum SlowAnswer {
 }
 
 pub trait Host {
-    fn read_file(&self, path: &str) -> Result<String, String>;
+    fn import_source(&self, path: &PathValue) -> Result<ImportedSource, String> {
+        let path = self.resolve_import(path)?;
+        let text = self.read_file(&path)?;
+        Ok(ImportedSource::Nix { path, text })
+    }
+    fn read_file(&self, path: &PathValue) -> Result<String, String>;
 
     /// The raw bytes of `path`: what [`Host::read_file`] answers, before any
     /// text decoding. `builtins.hashFile` digests these, and a digest of
@@ -833,15 +886,25 @@ pub trait Host {
     /// (ENG-13146). A second method beside `read_file` rather than a change
     /// to it because the string answer is what `Value::Str` can carry today;
     /// collapsing the two is the byte-string redesign (ENG-13147).
-    fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String>;
+    fn read_file_bytes(&self, path: &PathValue) -> Result<Vec<u8>, String>;
 
     /// An environment variable, or `None` when it is unset. cppnix renders an
     /// unset variable as the empty string, and the caller does that; keeping
     /// unset distinguishable here is what lets a read set record "was unset"
     /// rather than "was empty", which are different facts to re-check.
     fn get_env(&self, name: &str) -> Option<String>;
-    fn read_dir(&self, path: &str) -> Result<Vec<(String, FileType)>, String>;
-    fn path_exists(&self, path: &str) -> bool;
+    fn read_dir(&self, path: &PathValue) -> Result<Vec<(String, FileType)>, String>;
+    /// The three-outcome existence question. `Ok(false)` means the accessor
+    /// answered absent (or cppnix deliberately hid a restricted path); `Err`
+    /// means the question itself failed and must remain distinct in replay.
+    /// There is deliberately no Boolean form: one that collapsed `Err` to
+    /// `false` let a vanished mount replay as "still absent", and test builds
+    /// derived this contract from that lossy spelling.
+    fn path_exists_checked(&self, path: &PathValue) -> Result<bool, String>;
+    /// The trailing-slash form of `builtins.pathExists`. This is distinct from
+    /// [`Host::file_type_resolved`] because a restricted path is `false` here,
+    /// while every other resolver failure remains an error.
+    fn dir_exists_checked(&self, path: &PathValue) -> Result<bool, String>;
 
     /// The type of `path` itself, resolving no symlink, not even one in an
     /// ancestor -- cppnix's `SourceAccessor::maybeLstat`.
@@ -871,7 +934,7 @@ pub trait Host {
     /// `RestrictedPathError`, a `SymlinkNotAllowed`, an unreadable directory.
     /// Do not fold one of those into `Ok(None)`; a refused read that reads as
     /// "not there" is a silently wrong answer.
-    fn file_type(&self, path: &str) -> Result<Option<FileType>, String>;
+    fn file_type(&self, path: &PathValue) -> Result<Option<FileType>, String>;
 
     /// The type of `path` with every symlink resolved: `stat` where
     /// [`Host::file_type`] is `lstat`.
@@ -879,7 +942,7 @@ pub trait Host {
     /// Asked only by [`Host::resolve_import`], and separate from `file_type`
     /// because cppnix's `import` resolves where its `readFileType` does not.
     /// See [`PathReadHooks`] for which cppnix line says which.
-    fn file_type_resolved(&self, path: &str) -> Result<FileType, String>;
+    fn file_type_resolved(&self, path: &PathValue) -> Result<FileType, String>;
 
     /// The store path a path coerces to when it appears inside a string.
     ///
@@ -896,7 +959,13 @@ pub trait Host {
     ///
     /// A host with no store behind it answers [`StoreError::NoStore`] rather
     /// than inventing a path.
-    fn copy_to_store(&self, path: &str) -> Result<String, StoreError>;
+    fn copy_to_store(&self, path: &PathValue) -> Result<String, StoreError>;
+    #[cfg(not(test))]
+    fn store_path(&self, path: &PathValue) -> Result<StorePathResult, StoreError>;
+    #[cfg(test)]
+    fn store_path(&self, _path: &PathValue) -> Result<StorePathResult, StoreError> {
+        Err(StoreError::NoStore)
+    }
 
     /// Make a store path present, substituting or building it if it is not.
     ///
@@ -910,6 +979,97 @@ pub trait Host {
     /// same reason [`Host::copy_to_store`] does: better to say so than to let
     /// a key nobody validated into a string's context.
     fn ensure_path(&self, path: &str) -> Result<(), StoreError>;
+
+    /// Which of these store paths the store holds now: cppnix's
+    /// `Store::queryValidPaths` over the list, plus every path at which the
+    /// evaluator has a tree mounted (`rustValidPaths`).
+    ///
+    /// Asked by the witness verifier, not by an evaluation: once as a batch
+    /// for the paths the rows name, then of one path at each row that needs
+    /// a path the batch did not hold (`readset::Validity::holds`: a
+    /// derivation is held only from the row that writes it). Presence is
+    /// asked of what a served result hands out (derivations, copies,
+    /// realisations), never of a tree a row read under: a sealed tree's
+    /// record stands whether or not the store still holds it. A `WriteDrv`
+    /// row replays as "still there" for a held path and rewrites only the
+    /// rest, where re-asking the write for each of a witness's 23k
+    /// derivations was 23k parses and 23k round trips on a hit. A host that
+    /// cannot say (no store) answers [`StoreError::NoStore`]: the batch
+    /// fails closed and no late question is asked, so every row asks as
+    /// before.
+    ///
+    /// Bodiless in production, as every effect here is, so a forwarding
+    /// wrapper that skips it does not compile; the `cfg(test)` default is
+    /// for the fake hosts, as `store_path`'s is.
+    #[cfg(not(test))]
+    fn valid_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, StoreError>;
+    #[cfg(test)]
+    fn valid_paths(
+        &self,
+        _paths: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        Err(StoreError::NoStore)
+    }
+
+    /// Which of these store objects (`<hash>-<name>`) are sealed -- held by
+    /// the store and content-addressed, so the name pins the bytes, link
+    /// text included -- and for each, the symlinks that leave it (a target
+    /// resolving outside the object), as object-relative paths.
+    ///
+    /// Asked by the witness verifier, once per object it has not recorded
+    /// as sealed (`readset::DirSealed`); a sealed object is a permanent fact
+    /// about immutable bytes and is never asked again. Under it, every read
+    /// row replays from the record as one under a mounted root does
+    /// (`Question::replays_from_record`), except a read at or below a
+    /// leaving link, the one read that can reach bytes the name does not
+    /// pin. An object the store does not hold is simply absent from the
+    /// answer. A host that cannot say (no store) answers
+    /// [`StoreError::NoStore`], and every row asks as before.
+    ///
+    /// Bodiless in production for the reason `valid_paths` is.
+    #[cfg(not(test))]
+    fn sealed_paths(&self, objects: &[String]) -> Result<Links, StoreError>;
+    #[cfg(test)]
+    fn sealed_paths(&self, _objects: &[String]) -> Result<Links, StoreError> {
+        Err(StoreError::NoStore)
+    }
+
+    /// Allow reads through these store paths (cppnix's `allowPath`), for a
+    /// copy, a pinned fetch or a locked tree the witness verifier served by
+    /// validity instead of re-running. Every live hook for those ends by
+    /// allowing the path it produced -- the path alone, not what it
+    /// references -- and under pure or restricted evaluation the root
+    /// accessor is an allow list, so the rows recorded after the effect read
+    /// through its object; without this they are refused on replay and every
+    /// hit is a miss. A host with no store answers [`StoreError::NoStore`],
+    /// and the verifier asks the effect again instead.
+    ///
+    /// Bodiless in production for the reason `valid_paths` is.
+    #[cfg(not(test))]
+    fn allow_paths(&self, paths: &[String]) -> Result<(), StoreError>;
+    #[cfg(test)]
+    fn allow_paths(&self, _paths: &[String]) -> Result<(), StoreError> {
+        Err(StoreError::NoStore)
+    }
+
+    /// Allow reads through these realised output paths and their closures
+    /// (cppnix's `allowClosure`, primops.cc:185; the third phase of
+    /// [`Host::realise`] on its own), for a realisation the verifier served
+    /// by validity. The closure form is what `realiseContext` grants, and
+    /// only for outputs: a copy served by validity goes through
+    /// [`Host::allow_paths`], since the live copy never allowed its
+    /// references. Failure means the row asks.
+    ///
+    /// Bodiless in production for the reason `valid_paths` is.
+    #[cfg(not(test))]
+    fn allow_closures(&self, outputs: &[String]) -> Result<(), StoreError>;
+    #[cfg(test)]
+    fn allow_closures(&self, _outputs: &[String]) -> Result<(), StoreError> {
+        Err(StoreError::NoStore)
+    }
 
     /// Realise a string's context and answer with the rewrites it produced:
     /// cppnix's `EvalState::realiseContext` (`primops.cc:72`), and so this
@@ -952,7 +1112,7 @@ pub trait Host {
         &self,
         entries: &[crate::task::SearchPathEntry],
         name: &str,
-    ) -> Result<String, LookupError>;
+    ) -> Result<PathValue, LookupError>;
 
     /// Store `contents` under a name ending in `name`, with `references`, and
     /// answer with the store path. `builtins.toFile`.
@@ -972,11 +1132,18 @@ pub trait Host {
     /// Write a finished `.drv` and answer with the store path it landed on.
     /// `builtins.derivationStrict`.
     ///
-    /// The embedder should perform cppnix's `writeDerivation`, which is
-    /// [`Host::store_text`] of the ATerm under `{name}.drv`; the answer must
-    /// be the path that call produced and never one recomputed some other
-    /// way, since agreeing with the evaluator is the whole point of returning
-    /// it.
+    /// The answer is cppnix's `writeDerivation`, which is [`Host::store_text`]
+    /// of the ATerm under `{name}.drv`, and it must be a path a store would
+    /// compute for these bytes rather than one taken from the request, since
+    /// agreeing with the evaluator is the whole point of returning it. A host
+    /// need not have performed the write when it answers: the path is a
+    /// function of the bytes, and the bridge host computes it here and hands
+    /// the derivations to the store in batches before anything could observe
+    /// one missing (`capi::EmbedderHost::flush_derivations`). A write that
+    /// then fails fails the evaluation, not silently the store.
+    ///
+    /// Asked once per derivation per evaluation: the VM answers a repeat of
+    /// the same bytes itself (`Vm::note_drv_written`).
     ///
     /// A leaf host with no store answers [`StoreError::NoStore`], and here
     /// that refusal costs less than it does for [`Host::store_text`]: the
@@ -985,12 +1152,7 @@ pub trait Host {
     /// with no store leaves them unwritten, which is precisely what cppnix
     /// does under `readOnlyMode`, and the derivation's value is unchanged
     /// either way. See [`crate::task::NeedPath::WriteDrv`].
-    fn write_derivation(
-        &self,
-        name: &str,
-        aterm: &str,
-        references: &[String],
-    ) -> Result<String, StoreError>;
+    fn write_derivation(&self, name: &str, aterm: &str) -> Result<String, StoreError>;
 
     /// Copy a filtered tree into the store and answer with its store path.
     /// `builtins.path`, and every `lib.cleanSource` spelled through it.
@@ -1059,6 +1221,19 @@ pub trait Host {
     /// and `NIX_PATH` the embedder was started with, in order.
     fn nix_path(&self) -> Result<Vec<crate::task::SearchPathEntry>, LookupError>;
 
+    /// The evaluation is finished (value or error): make every effect the
+    /// host deferred on its behalf visible before the value leaves the
+    /// evaluator. The scheduler calls it once per finished job
+    /// (`eval::drive_concurrent`), and that is the only crossing there is, so
+    /// a host that answers a store write from the bytes and queues the write
+    /// (`capi::EmbedderHost::write_derivation`) has one place to flush and
+    /// every route into an evaluation is covered by construction. No default
+    /// body, like every other effect here: a leaf that defers nothing says
+    /// `Ok(())` (`host_stubs!(settle)` in tests), and a wrapper forwards,
+    /// because a wrapper that inherited a no-op would swallow the deferred
+    /// writes of the host behind it and compile.
+    fn settle(&self) -> Result<(), StoreError>;
+
     /// Print a trace line, as `builtins.trace` does.
     ///
     /// An output rather than a question, exactly like [`Host::warn`], and
@@ -1090,15 +1265,17 @@ pub trait Host {
     /// `default.nix`, as cppnix does, so the importing file's own directory
     /// (which relative paths inside it resolve against) is the resolved
     /// file's parent, not the argument's.
-    fn resolve_import(&self, path: &str) -> Result<String, String> {
+    fn resolve_import(&self, path: &PathValue) -> Result<PathValue, String> {
         // `file_type_resolved` and not `file_type`, because cppnix's
         // `resolveExprPath` tests `path.resolveSymlinks().lstat().type ==
         // tDirectory` (`eval.cc:3440`). Asking the unresolved question here
         // refused `import a/symlinked-dir/f.nix`, which cppnix imports
         // (ENG-12871).
         match self.file_type_resolved(path) {
-            Ok(FileType::Directory) => Ok(format!("{}/default.nix", path.trim_end_matches('/'))),
-            Ok(_) => Ok(path.to_owned()),
+            Ok(FileType::Directory) => {
+                Ok(path.with_path(format!("{}/default.nix", path.trim_end_matches('/'))))
+            }
+            Ok(_) => Ok(path.clone()),
             Err(e) => Err(e),
         }
     }
@@ -1162,11 +1339,14 @@ pub trait Host {
 /// on a recorder forwarding would run the lookup on the inner host and record
 /// nothing. See the note on the trait.
 impl<T: Host + ?Sized> Host for &T {
-    fn read_file(&self, path: &str) -> Result<String, String> {
+    fn import_source(&self, path: &PathValue) -> Result<ImportedSource, String> {
+        (**self).import_source(path)
+    }
+    fn read_file(&self, path: &PathValue) -> Result<String, String> {
         (**self).read_file(path)
     }
 
-    fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+    fn read_file_bytes(&self, path: &PathValue) -> Result<Vec<u8>, String> {
         (**self).read_file_bytes(path)
     }
 
@@ -1174,28 +1354,59 @@ impl<T: Host + ?Sized> Host for &T {
         (**self).get_env(name)
     }
 
-    fn read_dir(&self, path: &str) -> Result<Vec<(String, FileType)>, String> {
+    fn settle(&self) -> Result<(), StoreError> {
+        (**self).settle()
+    }
+
+    fn read_dir(&self, path: &PathValue) -> Result<Vec<(String, FileType)>, String> {
         (**self).read_dir(path)
     }
 
-    fn path_exists(&self, path: &str) -> bool {
-        (**self).path_exists(path)
+    fn path_exists_checked(&self, path: &PathValue) -> Result<bool, String> {
+        (**self).path_exists_checked(path)
     }
 
-    fn file_type(&self, path: &str) -> Result<Option<FileType>, String> {
+    fn dir_exists_checked(&self, path: &PathValue) -> Result<bool, String> {
+        (**self).dir_exists_checked(path)
+    }
+
+    fn file_type(&self, path: &PathValue) -> Result<Option<FileType>, String> {
         (**self).file_type(path)
     }
 
-    fn file_type_resolved(&self, path: &str) -> Result<FileType, String> {
+    fn file_type_resolved(&self, path: &PathValue) -> Result<FileType, String> {
         (**self).file_type_resolved(path)
     }
 
-    fn copy_to_store(&self, path: &str) -> Result<String, StoreError> {
+    fn copy_to_store(&self, path: &PathValue) -> Result<String, StoreError> {
         (**self).copy_to_store(path)
+    }
+
+    fn store_path(&self, path: &PathValue) -> Result<StorePathResult, StoreError> {
+        (**self).store_path(path)
     }
 
     fn ensure_path(&self, path: &str) -> Result<(), StoreError> {
         (**self).ensure_path(path)
+    }
+
+    fn valid_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        (**self).valid_paths(paths)
+    }
+
+    fn sealed_paths(&self, objects: &[String]) -> Result<Links, StoreError> {
+        (**self).sealed_paths(objects)
+    }
+
+    fn allow_paths(&self, paths: &[String]) -> Result<(), StoreError> {
+        (**self).allow_paths(paths)
+    }
+
+    fn allow_closures(&self, outputs: &[String]) -> Result<(), StoreError> {
+        (**self).allow_closures(outputs)
     }
 
     fn realise(
@@ -1209,7 +1420,7 @@ impl<T: Host + ?Sized> Host for &T {
         &self,
         entries: &[crate::task::SearchPathEntry],
         name: &str,
-    ) -> Result<String, LookupError> {
+    ) -> Result<PathValue, LookupError> {
         (**self).find_file(entries, name)
     }
 
@@ -1222,13 +1433,8 @@ impl<T: Host + ?Sized> Host for &T {
         (**self).store_text(name, contents, references)
     }
 
-    fn write_derivation(
-        &self,
-        name: &str,
-        aterm: &str,
-        references: &[String],
-    ) -> Result<String, StoreError> {
-        (**self).write_derivation(name, aterm, references)
+    fn write_derivation(&self, name: &str, aterm: &str) -> Result<String, StoreError> {
+        (**self).write_derivation(name, aterm)
     }
 
     fn store_filtered(&self, request: &crate::task::FilteredCopy) -> Result<String, StoreError> {
@@ -1268,7 +1474,7 @@ impl<T: Host + ?Sized> Host for &T {
         (**self).warn(message);
     }
 
-    fn resolve_import(&self, path: &str) -> Result<String, String> {
+    fn resolve_import(&self, path: &PathValue) -> Result<PathValue, String> {
         (**self).resolve_import(path)
     }
 
@@ -1314,8 +1520,13 @@ impl<T: Host + ?Sized> Host for &T {
 /// because every refusal it writes is a lie about the host behind it.
 #[cfg(test)]
 macro_rules! host_stubs {
+    (@one settle) => {
+        fn settle(&self) -> Result<(), $crate::host::StoreError> {
+            Ok(())
+        }
+    };
     (@one read_file_bytes) => {
-        fn read_file_bytes(&self, _path: &str) -> Result<Vec<u8>, String> {
+        fn read_file_bytes(&self, _path: &$crate::value2::PathValue) -> Result<Vec<u8>, String> {
             Err("no file bytes behind this test host".to_owned())
         }
     };
@@ -1325,12 +1536,46 @@ macro_rules! host_stubs {
         }
     };
     (@one copy_to_store) => {
-        fn copy_to_store(&self, _path: &str) -> Result<String, $crate::host::StoreError> {
+        fn copy_to_store(&self, _path: &$crate::value2::PathValue) -> Result<String, $crate::host::StoreError> {
+            Err($crate::host::StoreError::NoStore)
+        }
+    };
+    (@one store_path) => {
+        fn store_path(
+            &self,
+            _path: &$crate::value2::PathValue,
+        ) -> Result<$crate::host::StorePathResult, $crate::host::StoreError> {
             Err($crate::host::StoreError::NoStore)
         }
     };
     (@one ensure_path) => {
         fn ensure_path(&self, _path: &str) -> Result<(), $crate::host::StoreError> {
+            Err($crate::host::StoreError::NoStore)
+        }
+    };
+    (@one valid_paths) => {
+        fn valid_paths(
+            &self,
+            _paths: &[String],
+        ) -> Result<std::collections::BTreeSet<String>, $crate::host::StoreError> {
+            Err($crate::host::StoreError::NoStore)
+        }
+    };
+    (@one sealed_paths) => {
+        fn sealed_paths(
+            &self,
+            _objects: &[String],
+        ) -> Result<$crate::host::Links, $crate::host::StoreError> {
+            Err($crate::host::StoreError::NoStore)
+        }
+    };
+    (@one allow_paths) => {
+        fn allow_paths(&self, _paths: &[String]) -> Result<(), $crate::host::StoreError> {
+            Err($crate::host::StoreError::NoStore)
+        }
+    };
+    (@one allow_closures) => {
+        fn allow_closures(&self, _outputs: &[String]) -> Result<(), $crate::host::StoreError> {
             Err($crate::host::StoreError::NoStore)
         }
     };
@@ -1360,7 +1605,6 @@ macro_rules! host_stubs {
             &self,
             _name: &str,
             _aterm: &str,
-            _references: &[String],
         ) -> Result<String, $crate::host::StoreError> {
             Err($crate::host::StoreError::NoStore)
         }
@@ -1443,14 +1687,14 @@ macro_rules! host_stubs {
             &self,
             _entries: &[$crate::task::SearchPathEntry],
             _name: &str,
-        ) -> Result<String, $crate::host::LookupError> {
+        ) -> Result<$crate::value2::PathValue, $crate::host::LookupError> {
             Err($crate::host::LookupError::NoResolver)
         }
     };
     (@one file_type_resolved) => {
         fn file_type_resolved(
             &self,
-            path: &str,
+            path: &$crate::value2::PathValue,
         ) -> Result<$crate::host::FileType, String> {
             // Delegating and not refusing, unlike the effects above, because
             // this one has a right answer here: no test host in this crate
@@ -1503,12 +1747,35 @@ pub(crate) use host_stubs;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RealFs;
 
+fn ambient_path(path: &PathValue) -> Result<&str, String> {
+    match &path.root {
+        crate::value2::Root::Ambient => Ok(path.as_ref()),
+        crate::value2::Root::Mounted(mount) => Err(format!(
+            "mounted path '{path}' requires accessor rooted at '{mount}'"
+        )),
+    }
+}
+
 impl Host for RealFs {
+    /// Nothing is deferred: every effect of this host happens when asked.
+    fn settle(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn import_source(&self, path: &PathValue) -> Result<ImportedSource, String> {
+        let path = self.resolve_import(path)?;
+        let text = self.read_file(&path)?;
+        Ok(ImportedSource::Nix { path, text })
+    }
     fn get_env(&self, name: &str) -> Option<String> {
         std::env::var(name).ok()
     }
 
-    fn copy_to_store(&self, _path: &str) -> Result<String, StoreError> {
+    fn copy_to_store(&self, _path: &PathValue) -> Result<String, StoreError> {
+        Err(StoreError::NoStore)
+    }
+
+    fn store_path(&self, _path: &PathValue) -> Result<StorePathResult, StoreError> {
         Err(StoreError::NoStore)
     }
 
@@ -1525,6 +1792,25 @@ impl Host for RealFs {
         Err(StoreError::NoStore)
     }
 
+    fn valid_paths(
+        &self,
+        _paths: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        Err(StoreError::NoStore)
+    }
+
+    fn sealed_paths(&self, _objects: &[String]) -> Result<Links, StoreError> {
+        Err(StoreError::NoStore)
+    }
+
+    fn allow_paths(&self, _paths: &[String]) -> Result<(), StoreError> {
+        Err(StoreError::NoStore)
+    }
+
+    fn allow_closures(&self, _outputs: &[String]) -> Result<(), StoreError> {
+        Err(StoreError::NoStore)
+    }
+
     fn realise(
         &self,
         _context: &[crate::value2::ContextElem],
@@ -1532,12 +1818,7 @@ impl Host for RealFs {
         Err(StoreError::NoStore)
     }
 
-    fn write_derivation(
-        &self,
-        _name: &str,
-        _aterm: &str,
-        _references: &[String],
-    ) -> Result<String, StoreError> {
+    fn write_derivation(&self, _name: &str, _aterm: &str) -> Result<String, StoreError> {
         Err(StoreError::NoStore)
     }
 
@@ -1572,7 +1853,7 @@ impl Host for RealFs {
         &self,
         _entries: &[crate::task::SearchPathEntry],
         _name: &str,
-    ) -> Result<String, LookupError> {
+    ) -> Result<PathValue, LookupError> {
         Err(LookupError::NoResolver)
     }
 
@@ -1595,42 +1876,41 @@ impl Host for RealFs {
         None
     }
 
-    fn read_file(&self, path: &str) -> Result<String, String> {
-        read_file_or_virtual(path, || {
-            // cppnix reports a missing path before it reports anything about
-            // the contents, and with this wording; the corpus compares the
-            // class.
-            if !self.path_exists(path) {
-                return Err(format!("path '{path}' does not exist"));
-            }
-            std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))
-        })
+    fn read_file(&self, path: &PathValue) -> Result<String, String> {
+        let fs_path = ambient_path(path)?;
+        // cppnix reports a missing path before it reports anything about
+        // the contents, and with this wording; the corpus compares the
+        // class.
+        if !self.path_exists_checked(path)? {
+            return Err(format!("path '{path}' does not exist"));
+        }
+        std::fs::read_to_string(fs_path).map_err(|e| format!("cannot read '{path}': {e}"))
     }
 
-    fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
-        read_file_bytes_or_virtual(path, || {
-            // The same wording and order as `read_file`, because the two are
-            // one read with two answer types.
-            if !self.path_exists(path) {
-                return Err(format!("path '{path}' does not exist"));
-            }
-            std::fs::read(path).map_err(|e| format!("cannot read '{path}': {e}"))
-        })
+    fn read_file_bytes(&self, path: &PathValue) -> Result<Vec<u8>, String> {
+        let fs_path = ambient_path(path)?;
+        // The same wording and order as `read_file`, because the two are
+        // one read with two answer types.
+        if !self.path_exists_checked(path)? {
+            return Err(format!("path '{path}' does not exist"));
+        }
+        std::fs::read(fs_path).map_err(|e| format!("cannot read '{path}': {e}"))
     }
 
-    fn read_dir(&self, path: &str) -> Result<Vec<(String, FileType)>, String> {
+    fn read_dir(&self, path: &PathValue) -> Result<Vec<(String, FileType)>, String> {
+        let fs_path = ambient_path(path)?;
         // cppnix's two spellings, verbatim: a missing path is reported as
         // missing before anything about directories, and a non-directory is
         // reported with double quotes and no errno tail.
-        if !self.path_exists(path) {
+        if !self.path_exists_checked(path)? {
             return Err(format!("path '{path}' does not exist"));
         }
         // cppnix names the path it actually opened, so a symlink to a
         // non-directory is reported as its target rather than as the link.
-        let shown = std::fs::canonicalize(path)
+        let shown = std::fs::canonicalize(fs_path)
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| path.to_owned());
-        let entries = std::fs::read_dir(path)
+            .unwrap_or_else(|_| path.to_string());
+        let entries = std::fs::read_dir(fs_path)
             .map_err(|e| format!("cannot read directory \"{shown}\": {}", errno_text(&e)))?;
         let mut out = Vec::new();
         for e in entries {
@@ -1653,57 +1933,62 @@ impl Host for RealFs {
         Ok(out)
     }
 
-    fn path_exists(&self, path: &str) -> bool {
-        path_exists_or_virtual(path, || {
-            // Still a plain `bool`, because cppnix's `prim_pathExists` has no
-            // failure either: it turns a forbidden path into `false`
-            // (`primops.cc:2097`) and a missing one into `false` via
-            // `maybeLstat`.
-            Path::new(path).symlink_metadata().is_ok() && Path::new(path).metadata().is_ok()
-        })
+    fn path_exists_checked(&self, path: &PathValue) -> Result<bool, String> {
+        let fs_path = ambient_path(path)?;
+        match Path::new(fs_path).symlink_metadata() {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!("cannot access '{path}': {error}")),
+        }
     }
 
-    fn file_type(&self, path: &str) -> Result<Option<FileType>, String> {
-        file_type_or_virtual(path, || {
-            // Every error `symlink_metadata` can give is folded into "not
-            // there", which is what it meant here before absence had a value
-            // of its own: the message this used to build was
-            // `path '...' does not exist` whatever the errno said. A host
-            // reading with `std::fs` is refused under either purity setting
-            // (`purity.rs`), so there is no allow list here to report a
-            // refusal from -- the distinction `Err` now carries has no
-            // producer on this path.
-            let Ok(md) = std::fs::symlink_metadata(path) else {
-                return Ok(None);
-            };
-            Ok(Some(if md.file_type().is_symlink() {
-                FileType::Symlink
-            } else if md.is_dir() {
-                FileType::Directory
-            } else if md.is_file() {
-                FileType::Regular
-            } else {
-                FileType::Unknown
-            }))
-        })
+    fn dir_exists_checked(&self, path: &PathValue) -> Result<bool, String> {
+        let fs_path = ambient_path(path)?;
+        match Path::new(fs_path).metadata() {
+            Ok(metadata) => Ok(metadata.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!("cannot access '{path}': {error}")),
+        }
     }
 
-    fn file_type_resolved(&self, path: &str) -> Result<FileType, String> {
-        file_type_resolved_or_virtual(path, || {
-            // `metadata` and not `symlink_metadata`: this is the `stat`
-            // question. A dangling symlink therefore reports the missing
-            // target, which is what cppnix's `resolveExprPath` does too --
-            // `path.resolveSymlinks()` rewrites the path to the target before
-            // `lstat` looks at it.
-            let md =
-                std::fs::metadata(path).map_err(|_| format!("path '{path}' does not exist"))?;
-            Ok(if md.is_dir() {
-                FileType::Directory
-            } else if md.is_file() {
-                FileType::Regular
-            } else {
-                FileType::Unknown
-            })
+    fn file_type(&self, path: &PathValue) -> Result<Option<FileType>, String> {
+        let fs_path = ambient_path(path)?;
+        // Every error `symlink_metadata` can give is folded into "not
+        // there", which is what it meant here before absence had a value
+        // of its own: the message this used to build was
+        // `path '...' does not exist` whatever the errno said. A host
+        // reading with `std::fs` is refused under either purity setting
+        // (`purity.rs`), so there is no allow list here to report a
+        // refusal from -- the distinction `Err` now carries has no
+        // producer on this path.
+        let Ok(md) = std::fs::symlink_metadata(fs_path) else {
+            return Ok(None);
+        };
+        Ok(Some(if md.file_type().is_symlink() {
+            FileType::Symlink
+        } else if md.is_dir() {
+            FileType::Directory
+        } else if md.is_file() {
+            FileType::Regular
+        } else {
+            FileType::Unknown
+        }))
+    }
+
+    fn file_type_resolved(&self, path: &PathValue) -> Result<FileType, String> {
+        let fs_path = ambient_path(path)?;
+        // `metadata` and not `symlink_metadata`: this is the `stat`
+        // question. A dangling symlink therefore reports the missing
+        // target, which is what cppnix's `resolveExprPath` does too --
+        // `path.resolveSymlinks()` rewrites the path to the target before
+        // `lstat` looks at it.
+        let md = std::fs::metadata(fs_path).map_err(|_| format!("path '{path}' does not exist"))?;
+        Ok(if md.is_dir() {
+            FileType::Directory
+        } else if md.is_file() {
+            FileType::Regular
+        } else {
+            FileType::Unknown
         })
     }
 }
@@ -1724,9 +2009,14 @@ impl Host for RealFs {
 /// [`StoreError::NoStore`] or [`LookupError::NoResolver`] -- never a guess.
 /// [`FnHost::path_reads`] is the one that is all-or-nothing; see
 /// [`PathReadHooks`] for why.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct FnHost {
+    /// Files the embedding hands over by content, known up front -- the
+    /// C++ bridge hands them over lazily, in `findFile` answers, and its host
+    /// holds the same value. Consulted before every path read.
+    pub virtual_files: VirtualFiles,
     pub store_copy: Option<StoreCopyHook>,
+    pub store_path: Option<StorePathHook>,
     pub store_text: Option<StoreTextHook>,
     pub write_drv: Option<WriteDrvHook>,
     pub store_filtered: Option<StoreFilteredHook>,
@@ -1759,12 +2049,27 @@ impl FnHost {
 }
 
 impl Host for FnHost {
+    /// Nothing is deferred: the store functions act when called.
+    fn settle(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn import_source(&self, path: &PathValue) -> Result<ImportedSource, String> {
+        let path = self.resolve_import(path)?;
+        let text = self.read_file(&path)?;
+        Ok(ImportedSource::Nix { path, text })
+    }
     fn get_env(&self, name: &str) -> Option<String> {
         RealFs.get_env(name)
     }
 
-    fn copy_to_store(&self, path: &str) -> Result<String, StoreError> {
+    fn copy_to_store(&self, path: &PathValue) -> Result<String, StoreError> {
         let hook = self.store_copy.ok_or(StoreError::NoStore)?;
+        hook(path).map_err(StoreError::Failed)
+    }
+
+    fn store_path(&self, path: &PathValue) -> Result<StorePathResult, StoreError> {
+        let hook = self.store_path.ok_or(StoreError::NoStore)?;
         hook(path).map_err(StoreError::Failed)
     }
 
@@ -1783,6 +2088,29 @@ impl Host for FnHost {
         hook(path).map_err(StoreError::Failed)
     }
 
+    /// No hook for it: the fn-table host is the test and example embedder,
+    /// whose replays may rewrite.
+    fn valid_paths(
+        &self,
+        _paths: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        Err(StoreError::NoStore)
+    }
+
+    /// No hook for it either, for the same reason: its replays ask.
+    fn sealed_paths(&self, _objects: &[String]) -> Result<Links, StoreError> {
+        Err(StoreError::NoStore)
+    }
+
+    /// Nor for this: a realisation this host served is re-run, not allowed.
+    fn allow_paths(&self, _paths: &[String]) -> Result<(), StoreError> {
+        Err(StoreError::NoStore)
+    }
+
+    fn allow_closures(&self, _outputs: &[String]) -> Result<(), StoreError> {
+        Err(StoreError::NoStore)
+    }
+
     fn realise(
         &self,
         context: &[crate::value2::ContextElem],
@@ -1791,14 +2119,9 @@ impl Host for FnHost {
         hook(context)
     }
 
-    fn write_derivation(
-        &self,
-        name: &str,
-        aterm: &str,
-        references: &[String],
-    ) -> Result<String, StoreError> {
+    fn write_derivation(&self, name: &str, aterm: &str) -> Result<String, StoreError> {
         let hook = self.write_drv.ok_or(StoreError::NoStore)?;
-        hook(name, aterm, references).map_err(StoreError::Failed)
+        hook(name, aterm).map_err(StoreError::Failed)
     }
 
     fn store_filtered(&self, request: &crate::task::FilteredCopy) -> Result<String, StoreError> {
@@ -1836,7 +2159,7 @@ impl Host for FnHost {
         &self,
         entries: &[crate::task::SearchPathEntry],
         name: &str,
-    ) -> Result<String, LookupError> {
+    ) -> Result<PathValue, LookupError> {
         let hook = self.find_file.ok_or(LookupError::NoResolver)?;
         hook(entries, name)
     }
@@ -1871,58 +2194,69 @@ impl Host for FnHost {
         None
     }
 
-    fn read_file(&self, path: &str) -> Result<String, String> {
-        read_file_or_virtual(path, || {
-            // With hooks the read goes through the embedder's accessor, which
-            // for cppnix is `rootFS` -- so `pure-eval` and `restrict-eval`
-            // are enforced there and their `RestrictedPathError` text comes
-            // back as the error. `RealFs` below is the standalone embedding
-            // and cannot do either (ENG-12792).
-            match self.path_reads {
+    fn read_file(&self, path: &PathValue) -> Result<String, String> {
+        // With hooks the read goes through the embedder's accessor, which
+        // for cppnix is `rootFS` -- so `pure-eval` and `restrict-eval`
+        // are enforced there and their `RestrictedPathError` text comes
+        // back as the error. `RealFs` below is the standalone embedding
+        // and cannot do either (ENG-12792).
+        self.virtual_files
+            .read_file_or(path, || match self.path_reads {
                 Some(hooks) => (hooks.read_file)(path),
                 None => RealFs.read_file(path),
-            }
-        })
+            })
     }
 
-    fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
-        read_file_bytes_or_virtual(path, || match self.path_reads {
-            // The hook table answers `String`, so a hooked read has already
-            // decoded: this arm inherits the corruption ENG-13147 names, and
-            // the byte-clean hook belongs to that redesign. No caller reaches
-            // it today -- the bridge embeds through `capi`, whose host reads
-            // the FFI bytes raw.
-            Some(hooks) => (hooks.read_file)(path).map(String::into_bytes),
-            None => RealFs.read_file_bytes(path),
-        })
+    fn read_file_bytes(&self, path: &PathValue) -> Result<Vec<u8>, String> {
+        self.virtual_files
+            .read_file_bytes_or(path, || match self.path_reads {
+                // The hook table answers `String`, so a hooked read has already
+                // decoded: this arm inherits the corruption ENG-13147 names, and
+                // the byte-clean hook belongs to that redesign. No caller reaches
+                // it today -- the bridge embeds through `capi`, whose host reads
+                // the FFI bytes raw.
+                Some(hooks) => (hooks.read_file)(path).map(String::into_bytes),
+                None => RealFs.read_file_bytes(path),
+            })
     }
 
-    fn read_dir(&self, path: &str) -> Result<Vec<(String, FileType)>, String> {
+    fn read_dir(&self, path: &PathValue) -> Result<Vec<(String, FileType)>, String> {
         match self.path_reads {
             Some(hooks) => (hooks.read_dir)(path),
             None => RealFs.read_dir(path),
         }
     }
 
-    fn path_exists(&self, path: &str) -> bool {
-        path_exists_or_virtual(path, || match self.path_reads {
-            Some(hooks) => (hooks.path_exists)(path),
-            None => RealFs.path_exists(path),
-        })
+    fn path_exists_checked(&self, path: &PathValue) -> Result<bool, String> {
+        self.virtual_files
+            .path_exists_checked_or(path, || match self.path_reads {
+                Some(hooks) => (hooks.path_exists)(path),
+                None => RealFs.path_exists_checked(path),
+            })
     }
 
-    fn file_type(&self, path: &str) -> Result<Option<FileType>, String> {
-        file_type_or_virtual(path, || match self.path_reads {
-            Some(hooks) => (hooks.file_type)(path),
-            None => RealFs.file_type(path),
-        })
+    fn dir_exists_checked(&self, path: &PathValue) -> Result<bool, String> {
+        self.virtual_files
+            .dir_exists_checked_or(path, || match self.path_reads {
+                Some(hooks) => (hooks.dir_exists)(path),
+                None => RealFs.dir_exists_checked(path),
+            })
     }
 
-    fn file_type_resolved(&self, path: &str) -> Result<FileType, String> {
-        file_type_resolved_or_virtual(path, || match self.path_reads {
-            Some(hooks) => (hooks.file_type_resolved)(path),
-            None => RealFs.file_type_resolved(path),
-        })
+    fn file_type(&self, path: &PathValue) -> Result<Option<FileType>, String> {
+        self.virtual_files
+            .file_type_or(path, || match self.path_reads {
+                Some(hooks) => (hooks.file_type)(path),
+                None => RealFs.file_type(path),
+            })
+    }
+
+    fn file_type_resolved(&self, path: &PathValue) -> Result<FileType, String> {
+        self.virtual_files
+            .file_type_resolved_or(path, || match self.path_reads {
+                Some(hooks) => (hooks.file_type_resolved)(path),
+                None => RealFs.file_type_resolved(path),
+            })
     }
 }
 
@@ -1936,109 +2270,12 @@ fn errno_text(e: &std::io::Error) -> String {
     }
 }
 
-#[cfg(test)]
-mod virtual_file_tests {
-    use super::{Host, RealFs, add_virtual_file, clear_virtual_files};
-
-    /// ENG-12607. cppnix resolves `<nix/fetchurl.nix>` into an in-memory
-    /// accessor and reports its path as `/fetchurl.nix`; there is no such file
-    /// on disk. The embedder hands the bytes over and answers with that path,
-    /// so the evaluator has to read it from memory rather than from the
-    /// filesystem -- and `import` asks `path_exists` and `file_type` before it
-    /// reads, so all three have to agree that it is there.
-    ///
-    /// The language corpus has one case for this (`eval-okay-search-path.nix`,
-    /// `assert isFunction (import <nix/fetchurl.nix>)`) and it does not observe
-    /// the path or the bytes, so this is the coverage.
-    ///
-    /// One test, because the registry is process-global and these would race.
-    #[test]
-    fn a_registered_file_is_read_from_memory_and_looks_like_a_file() {
-        // The read hooks are process-global and this test reads through
-        // `RealFs`, so a test that installs them must not run alongside it.
-        // Before ENG-12792 nothing this test touches was global and the lock
-        // was unnecessary; it is not any more.
-        let _held = crate::eval::globals_shared();
-        let _registry = super::registry_exclusive();
-        clear_virtual_files();
-        let fs = RealFs;
-        let absent = "/nixpkgs-probe-no-such-file.nix";
-
-        // Before registration it is missing, and says so in cppnix's words.
-        assert!(!fs.path_exists(absent));
-        assert_eq!(
-            fs.read_file(absent).err().as_deref(),
-            Some("path '/nixpkgs-probe-no-such-file.nix' does not exist")
-        );
-
-        add_virtual_file(absent, "{ a = 1; }");
-        assert!(fs.path_exists(absent));
-        assert_eq!(fs.read_file(absent).ok().as_deref(), Some("{ a = 1; }"));
-        // Regular, not a directory: `resolve_import` appends `/default.nix` to
-        // a directory, which would turn this into a second missing path.
-        assert!(matches!(
-            fs.file_type(absent),
-            Ok(Some(super::FileType::Regular))
-        ));
-        // So an `import` of it resolves to itself.
-        assert_eq!(fs.resolve_import(absent).ok().as_deref(), Some(absent));
-
-        // Last writer wins, which is what makes registration idempotent for an
-        // embedder that resolves the same lookup twice.
-        add_virtual_file(absent, "{ a = 2; }");
-        assert_eq!(fs.read_file(absent).ok().as_deref(), Some("{ a = 2; }"));
-
-        clear_virtual_files();
-        assert!(!fs.path_exists(absent));
-
-        // The same property the other two hosts are held to, so that the
-        // shared helpers have one statement of what they are for.
-        super::assert_answers_from_registered_files(&fs, absent);
-    }
-
-    /// [`FnHost`] with read hooks installed answers from the registry too.
-    ///
-    /// Its hooks deny everything, so an answer can only have come from the
-    /// registry. Same module as the impl, and same reason as the
-    /// `EmbedderHost` case in `capi`.
-    #[test]
-    fn a_host_with_read_hooks_still_answers_from_registered_files() {
-        let _held = crate::eval::globals_shared();
-        let _registry = super::registry_exclusive();
-        fn missing(path: &str) -> Result<String, String> {
-            Err(format!("path '{path}' does not exist"))
-        }
-        fn missing_dir(path: &str) -> Result<Vec<(String, super::FileType)>, String> {
-            Err(format!("path '{path}' does not exist"))
-        }
-        // Two functions, because the two hooks no longer share a return
-        // type: the non-resolving one may say "absent". Both deny, which is
-        // what makes an answer provably the registry's.
-        fn missing_maybe_type(path: &str) -> Result<Option<super::FileType>, String> {
-            Err(format!("path '{path}' does not exist"))
-        }
-        fn missing_type(path: &str) -> Result<super::FileType, String> {
-            Err(format!("path '{path}' does not exist"))
-        }
-        let host = super::FnHost {
-            path_reads: Some(super::PathReadHooks {
-                read_file: missing,
-                path_exists: |_| false,
-                read_dir: missing_dir,
-                file_type: missing_maybe_type,
-                file_type_resolved: missing_type,
-            }),
-            ..super::FnHost::default()
-        };
-        super::assert_answers_from_registered_files(&host, "/no-such-file-for-fnhost.nix");
-    }
-}
-
 /// The one thing the compiler cannot catch about [`Host`]: a default body
 /// nobody has written yet.
 #[cfg(test)]
 mod trait_shape_tests {
-    /// Refuse a default body on [`super::Host`], except on `resolve_import`.
+    /// Refuse a default body on [`super::Host`], except on helpers derived
+    /// entirely from other host methods and test-only compatibility defaults.
     ///
     /// # Why a source parse and not a normal test
     ///
@@ -2056,12 +2293,23 @@ mod trait_shape_tests {
     /// `host_stubs!`, which a leaf asks for by name. This test is what says
     /// so at the moment somebody reaches for the other one.
     ///
-    /// `resolve_import` is the sole exemption, named here rather than
-    /// inferred, because it is derived from [`super::Host::file_type_resolved`]
-    /// rather than being an effect of its own.
+    /// `resolve_import` and `import_source` are derived from primitive path
+    /// reads. The other exemptions have bodies only under `cfg(test)`, so the
+    /// many focused fake hosts can keep implementing the older primitive
+    /// surface; production wrappers still have to forward them explicitly.
     #[test]
     fn the_trait_has_no_default_bodies_to_inherit() {
-        const EXEMPT: &[&str] = &["resolve_import"];
+        const EXEMPT: &[&str] = &[
+            "import_source",
+            "resolve_import",
+            "store_path",
+            "valid_paths",
+            // The same shape as `valid_paths`: bodiless in production, a
+            // `cfg(test)` default for the fake hosts.
+            "sealed_paths",
+            "allow_paths",
+            "allow_closures",
+        ];
 
         let source = include_str!("host.rs");
         let lines: Vec<&str> = source.lines().collect();
@@ -2157,7 +2405,14 @@ mod trait_shape_tests {
              not the trait",
             bodiless.len() + bodied.len()
         );
-        for known in ["read_file", "fetch", "begin", "collect", "resolve_import"] {
+        for known in [
+            "import_source",
+            "read_file",
+            "fetch",
+            "begin",
+            "collect",
+            "resolve_import",
+        ] {
             assert!(
                 bodiless.contains(&known) || bodied.contains(&known),
                 "`{known}` was not among the parsed methods; the parse is wrong"
@@ -2190,7 +2445,7 @@ mod trait_shape_tests {
              the reason."
         );
 
-        // A stale exemption is its own failure: the day `resolve_import` stops
+        // A stale exemption is its own failure: the day an import helper stops
         // having a body, this list must shrink rather than sit there widening
         // the check for a method that no longer needs it.
         for exempt in EXEMPT {
@@ -2226,8 +2481,9 @@ mod threaded_host_tests {
             asked: Mutex<Vec<String>>,
         }
         impl Host for Inner {
+            host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -2247,16 +2503,32 @@ mod threaded_host_tests {
             // Not the subject here, and not refusals either: the four path
             // reads have to answer something for the host to be usable at
             // all.
-            fn read_file(&self, _path: &str) -> Result<String, String> {
+            fn read_file(&self, _path: &crate::value2::PathValue) -> Result<String, String> {
                 Ok(String::new())
             }
-            fn read_dir(&self, _path: &str) -> Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _path: &crate::value2::PathValue,
+            ) -> Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, _path: &str) -> bool {
-                false
+            fn path_exists_checked(
+                &self,
+                _path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(false)
             }
-            fn file_type(&self, _path: &str) -> Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                _path: &crate::value2::PathValue,
+            ) -> Result<Option<FileType>, String> {
                 Ok(Some(FileType::Regular))
             }
             fn fetch(&self, request: &crate::task::FetchRequest) -> Result<String, StoreError> {
@@ -2352,8 +2624,9 @@ mod threaded_host_tests {
     fn an_unknown_ticket_collects_as_nothing_rather_than_blocking() {
         struct Nothing;
         impl Host for Nothing {
+            host_stubs!(settle);
             crate::host::host_stubs!(parse_flake_ref, flake_ref_to_string);
-            fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+            fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
                 self.read_file(path).map(String::into_bytes)
             }
             crate::host::host_stubs!(
@@ -2376,16 +2649,32 @@ mod threaded_host_tests {
                 warn,
                 trace
             );
-            fn read_file(&self, _path: &str) -> Result<String, String> {
+            fn read_file(&self, _path: &crate::value2::PathValue) -> Result<String, String> {
                 Err("no".to_owned())
             }
-            fn read_dir(&self, _path: &str) -> Result<Vec<(String, FileType)>, String> {
+            fn read_dir(
+                &self,
+                _path: &crate::value2::PathValue,
+            ) -> Result<Vec<(String, FileType)>, String> {
                 Ok(Vec::new())
             }
-            fn path_exists(&self, _path: &str) -> bool {
-                false
+            fn path_exists_checked(
+                &self,
+                _path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                Ok(false)
             }
-            fn file_type(&self, _path: &str) -> Result<Option<FileType>, String> {
+            fn dir_exists_checked(
+                &self,
+                path: &crate::value2::PathValue,
+            ) -> std::result::Result<bool, String> {
+                self.file_type_resolved(path)
+                    .map(|kind| kind == crate::host::FileType::Directory)
+            }
+            fn file_type(
+                &self,
+                _path: &crate::value2::PathValue,
+            ) -> Result<Option<FileType>, String> {
                 Err("no".to_owned())
             }
         }

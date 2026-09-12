@@ -83,6 +83,19 @@ up. Filed as ix#9086.
 
 ## Evaluate before you build
 
+When a planner predicts a build but execution returns a cached output, compare
+the exact derivations and serialized inputs before changing cache or hook rules.
+In the September 2026 mechanical-owner integration, the planner encoded candidate
+JSON without a final newline while the adapter included one. `builtins.toFile`
+produced different inputs and derivations. Sharing the adapter's encoder made the
+forecast resolve the existing output with no missing build dependencies; native
+output metadata and content verification passed. This proved an input encoding
+defect, not a cache-engine defect or complete CI success.
+
+Use one encoder for planning and execution. Query the exact `drv^out` target and
+bind its returned output to the adapter's result. Preserve cold-build hook checks;
+do not delete cached outputs or loosen checks to conceal a derivation mismatch.
+
 An attribute costs minutes; its closure costs hours. `nix eval --raw
 .#<attr>.drvPath` proves the expression is sound without building anything.
 
@@ -173,3 +186,20 @@ commit, so 29 of those 34 deploys paid the timer's whole reason for nothing.
 The two findings take different fixes. A semantic change earns its restart. A
 pure path bump means the unit is carrying a store path it does not need to
 carry, and `nix-dag` on the same closure will name the edge that puts it there.
+
+## NAR integrity and content-address identity are separate checks
+
+A matching NAR hash proves the transferred bytes match their metadata. It does
+not alone prove a self-referential content address. In the September 2026 ix
+cache incident, an older producer zeroed self references without recording their
+positions; NAR verification passed, but the canonical importer rejected the CA.
+The native verifier reproduced that rejection on the preserved cache entry and
+accepted a newly built output. The canonical hash includes the reference-offset
+trailer; accepting either hash would weaken the identity contract.
+
+For this failure, retain the rejected bytes for diagnosis, require the native
+consumer's CA check, and rebuild affected outputs with the canonical producer.
+Reuse unaffected outputs that pass admission. Do not disable signature or CA
+checks, delete shared store paths, or infer that every historical output is bad.
+Older `nix store verify` implementations may check only NAR integrity: verify the
+actual implementation or use normal native import before claiming CA validity.

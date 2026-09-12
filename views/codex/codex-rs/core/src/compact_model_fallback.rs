@@ -2,7 +2,22 @@ use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionReason;
 use codex_otel::SessionTelemetry;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use tracing::warn;
+
+/// Retries failures that may be model-specific and succeed with a different model.
+pub(crate) fn should_retry_with_current_model(error: &CodexErr) -> bool {
+    matches!(
+        error.details(),
+        CodexErrorDetails::InvalidRequest(_)
+            | CodexErrorDetails::UnexpectedStatus(_)
+            | CodexErrorDetails::ContextWindowExceeded
+            | CodexErrorDetails::UsageLimitReached(_)
+            | CodexErrorDetails::ServerOverloaded
+            | CodexErrorDetails::InternalServerError
+            | CodexErrorDetails::RetryLimit(_)
+    )
+}
 
 pub(crate) fn record_model_fallback(
     session_telemetry: &SessionTelemetry,

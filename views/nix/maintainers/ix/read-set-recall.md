@@ -105,7 +105,8 @@ and about 210s traced, not the 25s quoted in
 
 `contrib/readset-analyze.py --compare before.jsonl after.jsonl` reports recall
 and invalidation, keyed four ways; the `tree` keying is the model. Trace with
-`--option read-set-trace-file` and `--option lazy-trees false`.
+`--option read-set-trace-file`. (Inputs are always lazily mounted now; the
+`lazy-trees` setting the original runs disabled no longer exists.)
 
 Harnesses used for the numbers above are on dev-compute-6 under `~/measure5`
 through `~/measure8` (trace pairs and analyses; 7 and 8 are the like-for-like

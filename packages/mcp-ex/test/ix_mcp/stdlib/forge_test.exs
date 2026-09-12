@@ -400,7 +400,15 @@ defmodule IxMcp.Stdlib.ForgeTest do
 
       # A fresh clone, then identity, then the change, then the description --
       # and no submit.
-      assert Enum.any?(calls, &(&1 =~ "ix clone --server https://fixture.invalid/rpc"))
+      clone_call = Enum.find(calls, &(&1 =~ "clone https://fixture.invalid/rpc"))
+      assert clone_call
+      # `--repo ix`: the server URL carries no fragment, so the flag is the
+      # only place the repo is named. The trailing "." is load-bearing too:
+      # `jj clone` defaults DEST to a NEW directory named after the repo, so
+      # without it the checkout lands in <workspace>/ix while every later
+      # step runs with cd: <workspace>.
+      assert clone_call =~ "--repo ix"
+      assert String.ends_with?(clone_call, " .")
       assert Enum.any?(calls, &(&1 =~ "config set --repo user.email somebody@example.com"))
       assert Enum.any?(calls, &(&1 =~ "describe --stdin"))
       refute Enum.any?(calls, &(&1 =~ "submit"))
@@ -906,7 +914,7 @@ defmodule IxMcp.Stdlib.ForgeTest do
                adopting(["\n", "index/packages/mcp-ex/lib/ix_mcp/stdlib/forge.ex\n"], "\n")
 
       assert report.workspace == "/fixture/lands/land-earlier"
-      refute Enum.any?(calls, &(&1 =~ "ix clone"))
+      refute Enum.any?(calls, &(&1 =~ "clone https://"))
 
       # Adoption replaces the clone, not the discipline: the same `jj new main`
       # and the same tier check still run.

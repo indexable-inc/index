@@ -3,6 +3,7 @@
 include_dirs = [ include_directories('../..') ]
 
 headers = files(
+  'flake-document.hh',
   'flake.hh',
   'flakeref.hh',
   'lockfile.hh',

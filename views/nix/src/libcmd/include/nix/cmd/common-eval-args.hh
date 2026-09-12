@@ -58,7 +58,9 @@ struct MixEvalArgs : virtual Args, virtual MixRepair
 
     std::optional<StoreReference> evalStoreUrl;
 
-private:
+    /* Public rather than private: the Rust evaluator's bridge reads them to
+       carry --arg/--argstr across the C ABI as the bytes they are, which is
+       what puts them in the memo key (`rustAutoArgsOf`). */
     struct AutoArgExpr
     {
         std::string expr;

@@ -15,7 +15,11 @@ use std::slice;
 /// 0 value produced; 1 evaluation error (cppnix should throw EvalError);
 /// 2 unimplemented construct (cppnix should throw with the marker the
 /// harnesses grep, "rust-eval unimplemented"); 3 parse error; 4 bad call;
-/// 5 `builtins.throw` (ThrownError); 6 failed assert (AssertionError).
+/// 5 `builtins.throw` (ThrownError); 6 failed assert (AssertionError);
+/// 8 import from derivation disabled (IFDError); 9 a top-level auto-call
+/// met a formal with neither a default nor an argument
+/// (MissingArgumentError); 10 candidate attribute selection failed
+/// (AttrPathNotFound).
 ///
 /// 5 and 6 exist because the exception class is not recoverable from the
 /// message: cppnix reports a throw as ThrownError under "while calling the
@@ -28,6 +32,12 @@ const IXE_ERR_PARSE: i32 = 3;
 const IXE_ERR_BADCALL: i32 = 4;
 const IXE_ERR_THROWN: i32 = 5;
 const IXE_ERR_ASSERT: i32 = 6;
+const IXE_ERR_IFD: i32 = 8;
+/// A top-level auto-call met a formal with neither a default nor an
+/// argument: cppnix's `MissingArgumentError`.
+const IXE_ERR_MISSING_ARGUMENT: i32 = 9;
+/// A complete candidate selection failed; distinct from an optional field miss.
+const IXE_ERR_ATTR_PATH_NOT_FOUND: i32 = 10;
 
 /// Every string this ABI hands out is NUL-terminated, so a NUL inside the
 /// payload would truncate it. Substituting is not a caller error and must not
@@ -250,11 +260,33 @@ pub unsafe extern "C" fn ixe_eval_expr(
             return if rc == IXE_OK { IXE_ERR_BADCALL } else { rc };
         }
     };
-    let mut vm = crate::vm::Vm::with_settings(settings_for(&host));
+    if let Err(why) =
+        require_host_cache_identity(&host, &settings_for(&host), eval_cache_dir().is_some())
+    {
+        let status = out_string(why.to_owned(), out);
+        return if status == IXE_OK {
+            IXE_ERR_BADCALL
+        } else {
+            status
+        };
+    }
+    // The on-disk cache, when configured and openable, goes behind the
+    // machine: its imports compile through it, and `evaluate_once` finds the
+    // store for the result memo there too.
+    let (store, unopened) =
+        crate::session::open_cache(eval_cache_dir().as_deref(), cache_max_bytes());
+    let mut vm = crate::vm::Vm::with_modules(
+        settings_for(&host),
+        store.map_or_else(
+            crate::modcache::ModuleCache::in_memory,
+            crate::modcache::ModuleCache::persistent,
+        ),
+    );
     if let Some(interrupt) = host.interrupt() {
         vm.set_interrupt(interrupt);
     }
-    let (answer, warnings) = crate::session::evaluate_once(
+    let mut warnings: Vec<crate::readset::Complaint> = unopened.into_iter().collect();
+    let (answer, more) = crate::session::evaluate_once(
         &mut vm,
         &host,
         text,
@@ -263,10 +295,10 @@ pub unsafe extern "C" fn ixe_eval_expr(
             Some(path) => crate::compile::Origin::File(path),
             None => crate::compile::Origin::String,
         },
-        eval_cache_dir().as_deref(),
         true,
         verify_rate(),
     );
+    warnings.extend(more);
     // Damaged store entries are a miss with a reason, and the reason has to
     // reach somebody. stderr rather than the returned string: the string is
     // the expression's value, and a cache complaint is not part of it.
@@ -274,11 +306,7 @@ pub unsafe extern "C" fn ixe_eval_expr(
     // grepping for failures, and anything filtering a journal on priority,
     // both key on the label rather than the prose.
     for complaint in warnings {
-        let label = match complaint.severity {
-            crate::readset::Severity::Warning => "warning",
-            crate::readset::Severity::Error => "error",
-        };
-        eprintln!("rust-eval: {label}: {}", complaint.message);
+        eprintln!("rust-eval: {complaint}");
     }
     let (status, msg) = match answer {
         Ok(v) => (IXE_OK, v.to_string()),
@@ -293,14 +321,7 @@ pub unsafe extern "C" fn ixe_eval_expr(
         Err(EvalError::Eval(kind, msg, pos)) => {
             // SAFETY: caller contract; out_pos is null or a writable slot.
             unsafe { write_pos(out_pos, pos.as_ref()) };
-            (
-                match kind {
-                    ErrKind::Eval => IXE_ERR_EVAL,
-                    ErrKind::Thrown => IXE_ERR_THROWN,
-                    ErrKind::Assertion => IXE_ERR_ASSERT,
-                },
-                msg,
-            )
+            (status_of_kind(kind), msg)
         }
         Err(EvalError::Parse(msg)) => (IXE_ERR_PARSE, msg),
     };
@@ -379,6 +400,34 @@ pub unsafe extern "C" fn ixe_set_current_system(v: *const u8, v_len: usize) -> i
     }
 }
 
+/// Supply the immutable build identity of external host callbacks and answer policy.
+/// Nonempty UTF-8; identical repeated calls succeed, conflicting calls report through
+/// `ixe_take_setting_conflict` and leave the first identity intact.
+///
+/// # Safety
+/// `identity` must point to `identity_len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ixe_set_host_build_identity(
+    identity: *const u8,
+    identity_len: usize,
+) -> i32 {
+    if identity.is_null() || identity_len == 0 {
+        return IXE_ERR_BADCALL;
+    }
+    // SAFETY: caller contract guarantees a readable nonempty byte slice.
+    let bytes = unsafe { slice::from_raw_parts(identity, identity_len) };
+    let Ok(identity) = std::str::from_utf8(bytes) else {
+        return IXE_ERR_BADCALL;
+    };
+    match crate::eval::set_host_build_identity(identity) {
+        Ok(()) => IXE_OK,
+        Err(conflict) => {
+            set_last_setting_conflict(conflict.to_string());
+            IXE_ERR_BADCALL
+        }
+    }
+}
+
 /// Tell the evaluator what `~/...` expands to. From cppnix's `getHome()`,
 /// which is `$HOME` checked against the `passwd` entry and the directory's
 /// owner, so it cannot be worked out from the environment here.
@@ -406,44 +455,6 @@ pub unsafe extern "C" fn ixe_set_home_dir(v: *const u8, v_len: usize) -> i32 {
             IXE_ERR_BADCALL
         }
     }
-}
-
-/// Register a file by content, for a path the evaluator cannot read off the
-/// filesystem.
-///
-/// cppnix resolves `<nix/fetchurl.nix>` into an in-memory accessor, and can
-/// resolve a downloaded lookup-path entry into a fetcher's. This evaluator
-/// reads real paths, so the embedder hands the bytes over and answers the
-/// lookup with the path cppnix itself reports -- which is how
-/// `builtins.toString <nix/fetchurl.nix>` stays `/fetchurl.nix` on both arms
-/// instead of becoming a store path on one. ENG-12607.
-///
-/// Idempotent, and last writer wins for a repeated path.
-///
-/// # Safety
-/// `path` must point to `path_len` readable bytes and `contents` to
-/// `contents_len` readable bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ixe_add_virtual_file(
-    path: *const u8,
-    path_len: usize,
-    contents: *const u8,
-    contents_len: usize,
-) -> i32 {
-    if path.is_null() || contents.is_null() {
-        return IXE_ERR_BADCALL;
-    }
-    // SAFETY: caller contract; both pointers cover the stated lengths.
-    let path_bytes = unsafe { slice::from_raw_parts(path, path_len) };
-    let contents_bytes = unsafe { slice::from_raw_parts(contents, contents_len) };
-    let (Ok(path), Ok(contents)) = (
-        std::str::from_utf8(path_bytes),
-        std::str::from_utf8(contents_bytes),
-    ) else {
-        return IXE_ERR_BADCALL;
-    };
-    crate::host::add_virtual_file(path, contents);
-    IXE_OK
 }
 
 /// Tell the evaluator which store directory derivations are built under.
@@ -538,6 +549,50 @@ pub extern "C" fn ixe_set_ca_derivations(on: i32) {
     crate::eval::set_ca_derivations(on != 0);
 }
 
+/// Tell the evaluator whether `allow-import-from-derivation` is on.
+///
+/// In the memo key: a witness recorded with it on holds realisations the
+/// verifier serves by validity without reaching the host's
+/// `realiseContextCheck`, which refuses them with it off.
+#[unsafe(no_mangle)]
+pub extern "C" fn ixe_set_allow_import_from_derivation(on: i32) {
+    crate::eval::set_allow_import_from_derivation(on != 0);
+}
+
+/// Tell the evaluator the `allowed-uris` list, one entry per
+/// newline-terminated line.
+///
+/// In the memo key: a fetch served by validity never reaches `checkURI`, so a
+/// witness recorded under a wider list must not hit under a narrower one.
+///
+/// # Safety
+/// `uris` must point to `uris_len` readable bytes of UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ixe_set_allowed_uris(uris: *const u8, uris_len: usize) {
+    // SAFETY: the caller promises `uris_len` readable bytes at `uris`.
+    let bytes = unsafe { std::slice::from_raw_parts(uris, uris_len) };
+    crate::eval::set_allowed_uris(String::from_utf8_lossy(bytes).into_owned());
+}
+
+/// Tell the evaluator whether the evaluation runs under `--repair`. Nothing
+/// is served from the memo under repair: repair means redo.
+#[unsafe(no_mangle)]
+pub extern "C" fn ixe_set_repair(on: i32) {
+    crate::eval::set_repair(on != 0);
+}
+
+/// Tell the evaluator whether cppnix's `blake3-hashes` experimental feature
+/// is enabled.
+///
+/// Value-deciding for every hash parser: with it off cppnix raises
+/// `MissingExperimentalFeature`, and with it on the same expression computes
+/// a Blake3 hash (`libutil/hash.cc:25-29,468-473`). `eval::Settings` carries
+/// it into the memo key.
+#[unsafe(no_mangle)]
+pub extern "C" fn ixe_set_blake3_hashes(on: i32) {
+    crate::eval::set_blake3_hashes(on != 0);
+}
+
 /// Tell the evaluator cppnix's `lint-url-literals` level: 0 ignore, 1 warn,
 /// 2 fatal.
 ///
@@ -590,50 +645,35 @@ pub extern "C" fn ixe_set_parse_toml_timestamps(on: i32) {
     crate::eval::set_parse_toml_timestamps(on != 0);
 }
 
-/// Tell the evaluator which names cppnix's own `builtins` attrset has, space
-/// separated, taken from `EvalState::getBuiltins()`.
-///
-/// The answer rather than the inputs. cppnix decides which primops to
-/// register from an experimental feature, a plain setting, an `.internal`
-/// flag *and* a meson option that decides whether the source file is compiled
-/// at all, and a table on the Rust side that re-derived those rules would be
-/// a mirror that cannot see the last one. Without this the Rust backend
-/// advertised eight names cppnix hides, so `builtins ? fetchClosure` -- the
-/// standard capability test -- answered true and steered the evaluation into
-/// the one branch that cannot work (ENG-12717).
-///
-/// Only the names cppnix gates are read from this list; the rest of the
-/// `builtins` set is this crate's own business, so an embedder that sent a
-/// short list cannot delete `stringLength`.
-///
-/// Set-once per process, like the store directory: returns IXE_ERR_BADCALL
-/// and fills `ixe_take_setting_conflict` when given a different set. Order
-/// and repeats do not make a different set.
+/// Set the language capabilities. Unknown bits are rejected without changing settings.
+#[unsafe(no_mangle)]
+pub extern "C" fn ixe_set_builtin_features(flags: u32) -> i32 {
+    let Some(features) = crate::eval::BuiltinFeatures::from_bits(flags) else {
+        return IXE_ERR_BADCALL;
+    };
+    crate::eval::set_builtin_features(features);
+    IXE_OK
+}
+
+/// Export the owned language documentation without creating a store or evaluation session.
+/// Both returned strings use `ixe_string_free`.
 ///
 /// # Safety
-/// `v` must point to `v_len` readable bytes, or be null with `v_len` zero.
+/// `out` and `error` must be distinct writable pointer slots.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ixe_set_cpp_builtin_names(v: *const u8, v_len: usize) -> i32 {
-    // A null pointer with zero length is the empty set, which is a real
-    // answer and not a bad call.
-    let s = if v.is_null() {
-        if v_len == 0 {
-            ""
-        } else {
-            return IXE_ERR_BADCALL;
-        }
-    } else {
-        // SAFETY: caller contract; v points to v_len bytes.
-        let bytes = unsafe { slice::from_raw_parts(v, v_len) };
-        match std::str::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(_) => return IXE_ERR_BADCALL,
-        }
-    };
-    match crate::eval::set_cpp_builtin_names(s) {
-        Ok(()) => IXE_OK,
-        Err(conflict) => {
-            set_last_setting_conflict(conflict.to_string());
+pub unsafe extern "C" fn ixe_language_docs(out: *mut *mut c_char, error: *mut *mut c_char) -> i32 {
+    if out.is_null() || error.is_null() || out == error {
+        return IXE_ERR_BADCALL;
+    }
+    // SAFETY: writable distinct output slots required by the caller contract.
+    unsafe {
+        *out = std::ptr::null_mut();
+        *error = std::ptr::null_mut();
+    }
+    match crate::builtin_catalogue::language_docs() {
+        Ok(docs) => out_string(docs, out),
+        Err(why) => {
+            let _ = out_string(why.to_string(), error);
             IXE_ERR_BADCALL
         }
     }
@@ -691,6 +731,23 @@ pub extern "C" fn ixe_set_cache_verify_rate(rate: u32) {
     VERIFY_RATE.store(rate, std::sync::atomic::Ordering::Relaxed);
 }
 
+static EVAL_CACHE_MAX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn cache_max_bytes() -> u64 {
+    EVAL_CACHE_MAX_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Cap the on-disk evaluation cache at `bytes`. After each result is
+/// published the store is swept, least recently used entries first, until it
+/// fits (`Store::sweep_to_cap`). 0 turns the sweep off and the cache grows
+/// without bound. Eviction can only cause a later miss, never a different
+/// answer, so this is not part of the memo key. Meaningless without
+/// [`ixe_set_eval_cache_dir`].
+#[unsafe(no_mangle)]
+pub extern "C" fn ixe_set_eval_cache_max_bytes(bytes: u64) {
+    EVAL_CACHE_MAX_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Where the on-disk evaluation cache lives, or `None` for no cache.
 ///
 /// Process-global, like the call-depth ceiling and the version string, because
@@ -742,11 +799,17 @@ pub unsafe extern "C" fn ixe_set_eval_cache_dir(path: *const u8, path_len: usize
 /// the other's allocation.
 pub type CopyToStoreFn = unsafe extern "C" fn(
     ctx: *mut c_void,
+    root: *const u8,
+    root_len: usize,
     path: *const u8,
     path_len: usize,
     out: *mut *const u8,
     out_len: *mut usize,
 ) -> i32;
+
+/// `builtins.storePath`: the same rooted input and buffer contract as a copy,
+/// under its own name, as `ixe_store_path_fn` is in `ixe.h`.
+pub type StorePathFn = CopyToStoreFn;
 
 /// How the embedder stores a text blob, for `builtins.toFile`.
 ///
@@ -771,23 +834,37 @@ pub type StoreTextFn = unsafe extern "C" fn(
     out_len: *mut usize,
 ) -> i32;
 
-/// How the embedder writes a `.drv`, for `builtins.derivationStrict`.
+/// How the embedder writes `.drv`s, for `builtins.derivationStrict`: a batch
+/// of them, not one.
 ///
-/// The same three arguments and the same encoding as [`StoreTextFn`], because
-/// cppnix's `writeDerivation` is `addTextToStore` of the ATerm and an
-/// embedder should answer both with one function. It is a hook of its own
-/// because leaving it uninstalled means something different: `toFile` then
-/// refuses, while a derivation still evaluates and simply goes unwritten,
-/// which is cppnix's `readOnlyMode`. `name` arrives **without** the `.drv`
-/// suffix, exactly as `writeDerivation` takes it.
-pub type WriteDrvFn = unsafe extern "C" fn(
+/// The request is prepared by [`crate::store_batch`]: an accounting count,
+/// a set of lazy input sources, then one AddMultipleToStore stream. Rust
+/// validates each derivation, owns its references and content address, and
+/// encodes its metadata and NAR. The embedder materialises the lazy sources
+/// and forwards the store stream. Zero means every derivation is a store
+/// object with its temporary root; anything else is the failure text, and
+/// nothing is promised about which entries were written.
+///
+/// A batch because the evaluator answers the question itself. The path is a
+/// function of the bytes, so the store is not consulted per derivation but
+/// told, once, before anything could observe the object: the derivations an
+/// evaluation writes are queued on the host and handed over here at the
+/// first build, validity check, read or `toFile` reference that names one,
+/// and when the scheduler settles the finished evaluation
+/// ([`EmbedderHost::flush_derivations`], `Host::settle`). cppnix asks its
+/// store one round
+/// trip per `derivationStrict` (a NixOS closure is 23k of them, at 600 us
+/// each over the daemon socket); this is one round trip per batch.
+///
+/// Leaving this NULL is not an error and is cppnix's `readOnlyMode`: a
+/// derivation still evaluates and reports the path it would have been
+/// written to, only the file is missing. `nix build` needs the hook;
+/// `nix eval` does not. It is a hook of its own rather than `store_text`
+/// with a loop because leaving `store_text` NULL means `toFile` refuses.
+pub type WriteDrvsFn = unsafe extern "C" fn(
     ctx: *mut c_void,
-    name: *const u8,
-    name_len: usize,
-    aterm: *const u8,
-    aterm_len: usize,
-    references: *const u8,
-    references_len: usize,
+    batch: *const u8,
+    batch_len: usize,
     out: *mut *const u8,
     out_len: *mut usize,
 ) -> i32;
@@ -800,15 +877,17 @@ pub type WriteDrvFn = unsafe extern "C" fn(
 /// unambiguous for the reason `references` is: a filesystem path cannot
 /// contain a NUL.
 ///
-/// 1. the root path;
-/// 2. the store object's name;
-/// 3. `"nar"` or `"flat"`;
-/// 4. the expected SHA-256 as SRI, or empty for "no `sha256` attribute" -- a
+/// 1. the accessor root (empty for ambient, otherwise its mount point);
+/// 2. the path relative to that accessor;
+/// 3. the store object's name;
+/// 4. `"nar"` or `"flat"`;
+/// 5. the expected SHA-256 as SRI, or empty for "no `sha256` attribute" -- a
 ///    present one is rendered from a parsed hash and is never empty;
-/// 5. `"unfiltered"` (copy everything, cppnix's `defaultPathFilter`) or
+/// 6. `"inherit-references"` or `"own-references"`;
+/// 7. `"unfiltered"` (copy everything, cppnix's `defaultPathFilter`) or
 ///    `"filtered"`;
-/// 6. then, when filtered, a path and a type (`regular`, `directory`,
-///    `symlink`, `unknown`) per accepted entry.
+/// 8. then, when filtered, an accessor-relative path and a type (`regular`,
+///    `directory`, `symlink`, `unknown`) per accepted entry.
 ///
 /// Same buffer discipline as [`CopyToStoreFn`], and the same division of
 /// labour: the embedder owns the store and the read-only decision. What it
@@ -831,7 +910,8 @@ pub fn encode_filtered_copy(request: &crate::task::FilteredCopy) -> Vec<u8> {
         out.extend_from_slice(s.as_bytes());
         out.push(0);
     };
-    field(&request.root);
+    field(request.root.root.wire_name());
+    field(request.root.accessor_path());
     field(&request.name);
     field(request.method.as_str());
     field(request.expected_sha256.as_deref().unwrap_or(""));
@@ -849,7 +929,7 @@ pub fn encode_filtered_copy(request: &crate::task::FilteredCopy) -> Vec<u8> {
         Some(list) => {
             field("filtered");
             for e in list {
-                field(&e.path);
+                field(request.root.with_path(e.path.clone()).accessor_path());
                 field(e.file_type.as_str());
             }
         }
@@ -1111,6 +1191,42 @@ pub type EnsurePathFn = unsafe extern "C" fn(
     out_len: *mut usize,
 ) -> i32;
 
+/// How the embedder says which of a list of store paths it holds now:
+/// `Store::queryValidPaths`, one round trip for the whole list. Paths in and
+/// out are newline-separated; see `ixe_valid_paths_fn` in `ixe.h`.
+pub type ValidPathsFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    paths: *const u8,
+    paths_len: usize,
+    out: *mut *const u8,
+    out_len: *mut usize,
+) -> i32;
+
+/// How the embedder says which of a list of store objects are sealed
+/// (content-addressed) and every symlink under each; see
+/// `ixe_sealed_paths_fn` in `ixe.h`. Objects in are newline-separated
+/// `<hash>-<name>` lines; each line out is a sealed object followed by
+/// (object-relative path, target) pairs, all tab-separated.
+pub type SealedPathsFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    paths: *const u8,
+    paths_len: usize,
+    out: *mut *const u8,
+    out_len: *mut usize,
+) -> i32;
+
+/// How the embedder allows reads through store paths the verifier served by
+/// validity (`ixe_allow_paths_fn`): `allowPath` per NUL-terminated path, the
+/// form the live copy, fetch and tree hooks use. The closure form for
+/// realised outputs is the realise protocol's own third phase.
+pub type AllowPathsFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    paths: *const u8,
+    paths_len: usize,
+    out: *mut *const u8,
+    out_len: *mut usize,
+) -> i32;
+
 /// How the embedder realises a string context, for import from derivation.
 ///
 /// This is cppnix's `EvalState::realiseContext` (`primops.cc:72`) behind one
@@ -1133,25 +1249,78 @@ pub type EnsurePathFn = unsafe extern "C" fn(
 /// for a store the evaluator is not talking to directly. The evaluator asks
 /// only "make these valid"; it does not know whether it is allowed to.
 ///
-/// Same buffer discipline as [`CopyToStoreFn`].
-pub type RealiseFn = unsafe extern "C" fn(
-    ctx: *mut c_void,
-    request: *const u8,
-    request_len: usize,
-    out: *mut *const u8,
-    out_len: *mut usize,
-) -> i32;
+/// Same buffer discipline as [`CopyToStoreFn`]. On failure, `error_class`
+/// distinguishes a disabled import from derivation from an ordinary store
+/// error so the embedder can reconstruct cppnix's exception class.
+///
+/// The callback writes a plain `i32`, never this enum: C may store any
+/// integer in an enum-typed cell, and a Rust enum holding a discriminant it
+/// does not define is undefined behaviour before anything reads it. The
+/// values are decoded through [`IxeRealiseErrorClass::decode`], which
+/// refuses what the header does not name.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IxeRealiseErrorClass {
+    Other = 0,
+    ImportFromDerivation = 1,
+}
 
-/// The three phases of a non-blocking realise (ENG-13150). The full protocol
-/// -- who runs on which thread, the answer encoding, and why supplying
-/// `realise_build` is the embedder's consent to a worker-thread call -- is
-/// written once, beside `ixe_realise_check_fn` in `ixe.h`. One signature
-/// shape three times rather than one alias three ways, so a vtable field
-/// cannot be filled with a phase it does not name.
+impl IxeRealiseErrorClass {
+    /// The class an embedder answered, or the integer it answered that the
+    /// header does not define. The wire value is the discriminant.
+    pub fn decode(raw: i32) -> Result<Self, i32> {
+        match raw {
+            x if x == Self::Other as i32 => Ok(Self::Other),
+            x if x == Self::ImportFromDerivation as i32 => Ok(Self::ImportFromDerivation),
+            other => Err(other),
+        }
+    }
+}
+
+/// What the check phase of a realise answered, as `ixe.h` names it. Decoded
+/// from the hook's status the way [`IxeRealiseErrorClass`] is, refusing what
+/// the header does not name.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IxeRealiseCheck {
+    /// The context needs a build: phase 2 follows.
+    Build = 0,
+    /// The checks refused, with a message and an [`IxeRealiseErrorClass`].
+    Failed = 1,
+    /// Every element is already valid: the answer is the empty rewrite map.
+    Nothing = 2,
+}
+
+impl IxeRealiseCheck {
+    /// The status an embedder answered, or the integer it answered that the
+    /// header does not define. The wire value is the discriminant.
+    pub fn decode(raw: i32) -> Result<Self, i32> {
+        match raw {
+            x if x == Self::Build as i32 => Ok(Self::Build),
+            x if x == Self::Failed as i32 => Ok(Self::Failed),
+            x if x == Self::Nothing as i32 => Ok(Self::Nothing),
+            other => Err(other),
+        }
+    }
+}
+
+/// The three phases of a realise (ENG-13150). Both routes queue the build on
+/// the session's dispatcher; the blocking route waits for its answer.
+/// The full protocol -- who runs on which thread, the answer
+/// encoding, and why supplying `realise_build` is the embedder's consent to
+/// a worker-thread call -- is written once, beside `ixe_realise_check_fn` in
+/// `ixe.h`. One signature shape per phase rather than one alias three ways,
+/// so a vtable field cannot be filled with a phase it does not name.
+///
+/// Phase 1 answers an [`IxeRealiseCheck`] status; on `Failed` it also writes
+/// the error class, as a plain int the evaluator decodes and refuses when
+/// the header does not name it, rather than an enum cell C may have filled
+/// with anything.
 pub type RealiseCheckFn = unsafe extern "C" fn(
     ctx: *mut c_void,
     request: *const u8,
     request_len: usize,
+    error_class: *mut i32,
     out: *mut *const u8,
     out_len: *mut usize,
 ) -> i32;
@@ -1159,11 +1328,25 @@ pub type RealiseCheckFn = unsafe extern "C" fn(
 /// Phase 2: the build, on a worker thread. See [`RealiseCheckFn`].
 pub type RealiseBuildFn = unsafe extern "C" fn(
     ctx: *mut c_void,
-    request: *const u8,
-    request_len: usize,
-    out: *mut *const u8,
-    out_len: *mut usize,
+    requests: *const IxeRealiseRequest,
+    count: usize,
+    results: *mut IxeRealiseResult,
 ) -> i32;
+
+/// One checked context borrowed for a batch build call.
+#[repr(C)]
+pub struct IxeRealiseRequest {
+    pub data: *const u8,
+    pub len: usize,
+}
+
+/// One batch result. The host owns its bytes until the next build call.
+#[repr(C)]
+pub struct IxeRealiseResult {
+    pub status: i32,
+    pub data: *const u8,
+    pub len: usize,
+}
 
 /// Phase 3: allow-list registration at delivery. See [`RealiseCheckFn`].
 pub type RealiseAllowFn = unsafe extern "C" fn(
@@ -1174,51 +1357,14 @@ pub type RealiseAllowFn = unsafe extern "C" fn(
     out_len: *mut usize,
 ) -> i32;
 
-/// Ask the embedder to realise a string context. `None` for the hook is a
-/// host with no store behind it, which refuses by name rather than reading a
-/// path nothing built.
-fn realise_through_embedder(
-    f: Option<RealiseFn>,
-    ctx: *mut c_void,
-    context: &[crate::value2::ContextElem],
-) -> Result<std::collections::BTreeMap<String, String>, crate::host::StoreError> {
-    let Some(f) = f else {
-        return Err(crate::host::StoreError::NoStore);
-    };
-    let encoded = encode_realise_request(context);
-    let mut out: *const u8 = std::ptr::null();
-    let mut out_len: usize = 0;
-    // SAFETY: as `copy_through_embedder`. `encoded` is live for the call and
-    // the callee's buffer is read before this returns.
-    let rc = unsafe {
-        f(
-            ctx,
-            encoded.as_ptr(),
-            encoded.len(),
-            &raw mut out,
-            &raw mut out_len,
-        )
-    };
-    let answer = if out.is_null() {
-        Vec::new()
-    } else {
-        // SAFETY: the callee promised `out_len` readable bytes at `out`.
-        unsafe { slice::from_raw_parts(out, out_len) }.to_vec()
-    };
-    if rc != 0 {
-        return Err(crate::host::StoreError::Failed(
-            String::from_utf8_lossy(&answer).into_owned(),
-        ));
-    }
-    parse_rewrite_fields(&answer)
-}
-
 /// The realise request bytes: the context, one NUL-terminated field per
 /// element. One spelling for the blocking hook and all three phases of the
 /// threaded one, because the check phase and the build phase parsing two
 /// different renderings of one context is exactly the drift the split must
 /// not introduce.
-fn encode_realise_request(context: &[crate::value2::ContextElem]) -> Vec<u8> {
+fn encode_realise_request<'a>(
+    context: impl IntoIterator<Item = &'a crate::value2::ContextElem>,
+) -> Vec<u8> {
     let mut encoded = Vec::new();
     for e in context {
         // `display_base_name` and NOT `display`, and the difference is the
@@ -1278,21 +1424,25 @@ pub type WarnFn = unsafe extern "C" fn(ctx: *mut c_void, message: *const u8, mes
 /// How the embedder reads a file. See `ixe.h` for the encoding.
 pub type ReadFileFn = unsafe extern "C" fn(
     ctx: *mut c_void,
+    root: *const u8,
+    root_len: usize,
     path: *const u8,
     path_len: usize,
     out: *mut *const u8,
     out_len: *mut usize,
 ) -> i32;
 
-/// How the embedder answers `builtins.pathExists`. Total: 1 for yes, anything
-/// else for no, and no error channel, because cppnix's own `prim_pathExists`
-/// has none either (`primops.cc:2097`).
-pub type PathExistsFn =
-    unsafe extern "C" fn(ctx: *mut c_void, path: *const u8, path_len: usize) -> i32;
+pub type ImportFn = ReadFileFn;
+
+/// How the embedder answers `builtins.pathExists`: the same status and buffer
+/// contract as a file read, with `1` or `0` as the successful answer.
+pub type PathExistsFn = ReadFileFn;
 
 /// How the embedder lists a directory. See `ixe.h` for the encoding.
 pub type ReadDirFn = unsafe extern "C" fn(
     ctx: *mut c_void,
+    root: *const u8,
+    root_len: usize,
     path: *const u8,
     path_len: usize,
     out: *mut *const u8,
@@ -1302,6 +1452,8 @@ pub type ReadDirFn = unsafe extern "C" fn(
 /// How the embedder says what a path is. See `ixe.h` for the encoding.
 pub type FileTypeFn = unsafe extern "C" fn(
     ctx: *mut c_void,
+    root: *const u8,
+    root_len: usize,
     path: *const u8,
     path_len: usize,
     out: *mut *const u8,
@@ -1347,10 +1499,10 @@ pub type FileTypeFn = unsafe extern "C" fn(
 /// no store supplies none of the store hooks and evaluates everything that
 /// does not need one.
 ///
-/// The five read hooks are the exception: they are all-or-nothing, because
+/// The seven read hooks are the exception: they are all-or-nothing, because
 /// [`crate::purity`] can only honour `pure-eval` and `restrict-eval` when
-/// *every* read goes through an accessor that applies the allow list. Four of
-/// five is a state the evaluator would have to describe as both honoured and
+/// *every* read goes through an accessor that applies the allow list. Five of
+/// six is a state the evaluator would have to describe as both honoured and
 /// not, so a session refuses to be created with one. See
 /// [`IxeHostVtable::path_reads`].
 ///
@@ -1365,8 +1517,9 @@ pub struct IxeHostVtable {
     /// Passed back to every function below and otherwise untouched.
     pub ctx: *mut c_void,
     pub copy_to_store: Option<CopyToStoreFn>,
+    pub store_path: Option<StorePathFn>,
     pub store_text: Option<StoreTextFn>,
-    pub write_derivation: Option<WriteDrvFn>,
+    pub write_derivations: Option<WriteDrvsFn>,
     pub store_filtered: Option<StoreFilteredFn>,
     pub fetch: Option<FetchFn>,
     pub fetch_tree: Option<FetchTreeFn>,
@@ -1374,9 +1527,11 @@ pub struct IxeHostVtable {
     pub parse_flake_ref: Option<ParseFlakeRefFn>,
     pub flake_ref_to_string: Option<FlakeRefToStringFn>,
     pub ensure_path: Option<EnsurePathFn>,
-    pub realise: Option<RealiseFn>,
-    /// All three or none, and only beside a non-null `realise`; enforced by
-    /// [`IxeHostVtable::async_realise`] at session creation.
+    pub valid_paths: Option<ValidPathsFn>,
+    pub sealed_paths: Option<SealedPathsFn>,
+    pub allow_paths: Option<AllowPathsFn>,
+    /// All three or none; enforced by [`IxeHostVtable::async_realise`] at
+    /// session creation. None is a host with no store behind it.
     pub realise_check: Option<RealiseCheckFn>,
     pub realise_build: Option<RealiseBuildFn>,
     pub realise_allow: Option<RealiseAllowFn>,
@@ -1385,18 +1540,22 @@ pub struct IxeHostVtable {
     pub warn: Option<WarnFn>,
     pub trace: Option<TraceFn>,
     pub interrupted: Option<InterruptedFn>,
+    pub import_source: Option<ImportFn>,
     pub read_file: Option<ReadFileFn>,
     pub path_exists: Option<PathExistsFn>,
+    pub dir_exists: Option<PathExistsFn>,
     pub read_dir: Option<ReadDirFn>,
     pub file_type: Option<FileTypeFn>,
     pub file_type_resolved: Option<FileTypeFn>,
 }
 
-/// The five filesystem reads, present together or not at all.
+/// The seven filesystem reads, present together or not at all.
 #[derive(Clone, Copy)]
 struct PathReadFns {
+    import_source: ImportFn,
     read_file: ReadFileFn,
     path_exists: PathExistsFn,
+    dir_exists: PathExistsFn,
     read_dir: ReadDirFn,
     file_type: FileTypeFn,
     file_type_resolved: FileTypeFn,
@@ -1415,8 +1574,9 @@ impl IxeHostVtable {
         IxeHostVtable {
             ctx: std::ptr::null_mut(),
             copy_to_store: None,
+            store_path: None,
             store_text: None,
-            write_derivation: None,
+            write_derivations: None,
             store_filtered: None,
             fetch: None,
             fetch_tree: None,
@@ -1424,7 +1584,9 @@ impl IxeHostVtable {
             parse_flake_ref: None,
             flake_ref_to_string: None,
             ensure_path: None,
-            realise: None,
+            valid_paths: None,
+            sealed_paths: None,
+            allow_paths: None,
             realise_check: None,
             realise_build: None,
             realise_allow: None,
@@ -1433,37 +1595,110 @@ impl IxeHostVtable {
             warn: None,
             trace: None,
             interrupted: None,
+            import_source: None,
             read_file: None,
             path_exists: None,
+            dir_exists: None,
             read_dir: None,
             file_type: None,
             file_type_resolved: None,
         }
     }
 
-    /// The five read hooks as a group, or the reason the group is malformed.
+    /// Any host callback can affect answers or their replay policy.
+    fn has_callbacks(&self) -> bool {
+        let Self {
+            ctx: _,
+            copy_to_store,
+            store_path,
+            store_text,
+            write_derivations,
+            store_filtered,
+            fetch,
+            fetch_tree,
+            lock_flake,
+            parse_flake_ref,
+            flake_ref_to_string,
+            ensure_path,
+            valid_paths,
+            sealed_paths,
+            allow_paths,
+            realise_check,
+            realise_build,
+            realise_allow,
+            find_file,
+            nix_path,
+            warn,
+            trace,
+            interrupted,
+            import_source,
+            read_file,
+            path_exists,
+            dir_exists,
+            read_dir,
+            file_type,
+            file_type_resolved,
+        } = self;
+        copy_to_store.is_some()
+            || store_path.is_some()
+            || store_text.is_some()
+            || write_derivations.is_some()
+            || store_filtered.is_some()
+            || fetch.is_some()
+            || fetch_tree.is_some()
+            || lock_flake.is_some()
+            || parse_flake_ref.is_some()
+            || flake_ref_to_string.is_some()
+            || ensure_path.is_some()
+            || valid_paths.is_some()
+            || sealed_paths.is_some()
+            || allow_paths.is_some()
+            || realise_check.is_some()
+            || realise_build.is_some()
+            || realise_allow.is_some()
+            || find_file.is_some()
+            || nix_path.is_some()
+            || warn.is_some()
+            || trace.is_some()
+            || interrupted.is_some()
+            || import_source.is_some()
+            || read_file.is_some()
+            || path_exists.is_some()
+            || dir_exists.is_some()
+            || read_dir.is_some()
+            || file_type.is_some()
+            || file_type_resolved.is_some()
+    }
+
+    /// The seven read hooks as a group, or the reason the group is malformed.
     ///
     /// `Ok(None)` is a legitimate answer -- an embedder with no accessor,
     /// which reads with `std::fs` and cannot honour either purity setting.
     /// `Err` is the partial set, which is a caller bug: see the type's docs
-    /// for why there is no honest way to run with four of five.
+    /// for why there is no honest way to run with six of seven.
     fn path_reads(&self) -> Result<Option<PathReadFns>, &'static str> {
         let supplied = [
+            self.import_source.is_some(),
             self.read_file.is_some(),
             self.path_exists.is_some(),
+            self.dir_exists.is_some(),
             self.read_dir.is_some(),
             self.file_type.is_some(),
             self.file_type_resolved.is_some(),
         ];
         let (
+            Some(import_source),
             Some(read_file),
             Some(path_exists),
+            Some(dir_exists),
             Some(read_dir),
             Some(file_type),
             Some(file_type_resolved),
         ) = (
+            self.import_source,
             self.read_file,
             self.path_exists,
+            self.dir_exists,
             self.read_dir,
             self.file_type,
             self.file_type_resolved,
@@ -1471,7 +1706,7 @@ impl IxeHostVtable {
         else {
             return if supplied.iter().any(|p| *p) {
                 Err(
-                    "rust-eval: the host vtable supplies some of the five filesystem \
+                    "rust-eval: the host vtable supplies some of the seven filesystem \
                      read hooks and not all of them, which would leave one question \
                      reading outside this process's access control while the purity \
                      table said the setting was being honoured",
@@ -1481,8 +1716,10 @@ impl IxeHostVtable {
             };
         };
         Ok(Some(PathReadFns {
+            import_source,
             read_file,
             path_exists,
+            dir_exists,
             read_dir,
             file_type,
             file_type_resolved,
@@ -1495,10 +1732,7 @@ impl IxeHostVtable {
     /// refuses a partial set: the phases are a protocol, and a vtable with
     /// two of three would either skip the checks the evaluation thread owes
     /// or build outputs no one ever registers in the allow list -- both
-    /// silent. The synchronous `realise` must be present beside them, because
-    /// it is the fallback a declined check falls to; without it a refusal
-    /// that should say "allow-import-from-derivation is disabled" would say
-    /// "no store behind this evaluator" instead.
+    /// silent.
     fn async_realise(&self) -> Result<Option<AsyncRealiseFns>, &'static str> {
         let supplied = [
             self.realise_check.is_some(),
@@ -1519,12 +1753,6 @@ impl IxeHostVtable {
                 Ok(None)
             };
         };
-        if self.realise.is_none() {
-            return Err(
-                "rust-eval: the async realise hooks need the synchronous realise \
-                 hook beside them; it is the fallback a declined check falls to",
-            );
-        }
         Ok(Some(AsyncRealiseFns {
             check,
             build,
@@ -1567,18 +1795,164 @@ pub struct EmbedderHost {
     /// `begin` or `collect` -- the workers talk back through their channels,
     /// never through this map.
     ifd: std::sync::Arc<IfdInflight>,
+    /// Files the embedder handed over by content through `findFile`
+    /// answers; see [`crate::host::VirtualFiles`]. Shared by the clones of
+    /// this host, which are one session's.
+    virtual_files: crate::host::VirtualFiles,
+    /// Derivations answered and not yet handed to the embedder's store.
+    /// Shared by the clones for the reason `ifd` is: the recording host in a
+    /// memo scope is a clone, and a derivation it queues is flushed by
+    /// whichever clone crosses the boundary next. See
+    /// [`EmbedderHost::flush_derivations`].
+    drv_writes: std::sync::Arc<std::sync::Mutex<DrvWrites>>,
 }
 
-/// What a build worker sends back: the hook's status and its answer bytes,
-/// copied out of the thread-local buffer before the worker exits.
-type BuildOutcome = (i32, Vec<u8>);
+use crate::store_batch::PendingDerivation as PendingDrv;
 
-/// What [`EmbedderHost::begin`] files a spawned build under.
+/// The write-behind state of one host: what is queued, and whether a flush
+/// has failed.
+///
+/// `paths` is the set of `expected` paths in `pending`, kept beside the
+/// vector so a read can ask "does this name a pending derivation" in one
+/// lookup rather than a scan (a NixOS evaluation lists 139k directories).
+/// `failed` is sticky: a batch the store refused is not retried, because the
+/// derivations in it were already answered as written to the evaluation
+/// that asked, and the only honest continuation is to fail every later
+/// store question and the settle of every later evaluation, so no result
+/// that depends on them can be returned or memoised.
+#[derive(Default)]
+struct DrvWrites {
+    pending: Vec<PendingDrv>,
+    paths: std::collections::BTreeSet<String>,
+    failed: Option<String>,
+}
+
+/// Queue length that forces a flush on its own, so an evaluation that never
+/// crosses the boundary (one `nix build` of a whole NixOS closure is a single
+/// force) holds a bounded number of ATerms: 4096 of them is ~16 MB.
+const DRV_WRITE_BATCH: usize = 4096;
+
+/// What arrives at [`EmbedderHost::collect`] for one realise question: the
+/// worker's answer bytes, or the outcome the check phase settled on the
+/// evaluation thread without a build. Both are filed under the ticket at
+/// `begin`, so a question is checked exactly once whichever way it goes.
+enum Realised {
+    Nothing,
+    Built(Vec<u8>),
+    Failed(crate::host::StoreError),
+}
+
+/// What the check phase settled, short of a refusal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Checked {
+    Build,
+    Nothing,
+}
+
+/// A build hook's status and answer bytes, as the outcome they mean.
+fn built(rc: i32, answer: Vec<u8>) -> Realised {
+    if rc == 0 {
+        Realised::Built(answer)
+    } else {
+        Realised::Failed(crate::host::StoreError::Failed(
+            String::from_utf8_lossy(&answer).into_owned(),
+        ))
+    }
+}
+
+/// Tickets and the build dispatcher shared by this session's host clones.
 #[derive(Default)]
 struct IfdInflight {
     next: std::sync::atomic::AtomicU64,
-    inflight:
-        std::sync::Mutex<std::collections::HashMap<u64, std::sync::mpsc::Receiver<BuildOutcome>>>,
+    inflight: std::sync::Mutex<std::collections::HashMap<u64, std::sync::mpsc::Receiver<Realised>>>,
+    dispatcher: std::sync::Mutex<Option<IfdDispatcher>>,
+}
+
+struct IfdRequest {
+    encoded: Vec<u8>,
+    answer: std::sync::mpsc::Sender<Realised>,
+}
+
+/// One build dispatcher per session. The store owns concurrency within a
+/// batch, so max-jobs and max-substitution-jobs govern all its IFD roots.
+struct IfdDispatcher {
+    queue: std::sync::Arc<(std::sync::Mutex<IfdQueue>, std::sync::Condvar)>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct IfdQueue {
+    pending: std::collections::VecDeque<IfdRequest>,
+    ready: bool,
+    closed: bool,
+}
+
+impl Drop for IfdDispatcher {
+    fn drop(&mut self) {
+        {
+            let mut queue = self.queue.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            queue.closed = true;
+            queue.pending.clear();
+        }
+        self.queue.1.notify_one();
+        // The callback borrows the embedder's ctx. Join before session_free
+        // returns and lets the embedder release that object. Queued requests
+        // are discarded; an active callback observes normal store interrupts.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+const IFD_BATCH_SIZE: usize = 256;
+
+fn run_ifd_batches(
+    ctx: SendCtx,
+    build: RealiseBuildFn,
+    shared: std::sync::Arc<(std::sync::Mutex<IfdQueue>, std::sync::Condvar)>,
+) {
+    loop {
+        let batch: Vec<_> = {
+            let queue = shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut queue = shared.1.wait_while(queue, |q| !q.closed && (!q.ready || q.pending.is_empty()))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if queue.closed {
+                break;
+            }
+            let count = queue.pending.len().min(IFD_BATCH_SIZE);
+            let batch = queue.pending.drain(..count).collect();
+            queue.ready = !queue.pending.is_empty();
+            batch
+        };
+        let requests: Vec<_> = batch.iter().map(|request| IxeRealiseRequest {
+            data: request.encoded.as_ptr(),
+            len: request.encoded.len(),
+        }).collect();
+        const MISSING: &[u8] = b"realise build hook did not fill a result slot";
+        let mut results: Vec<_> = batch.iter().map(|_| IxeRealiseResult {
+            status: 1,
+            data: MISSING.as_ptr(),
+            len: MISSING.len(),
+        }).collect();
+        let started = std::time::Instant::now();
+        // SAFETY: requests borrow this batch; results has exactly the same
+        // length. The ctx contract and returned-buffer lifetime are in ixe.h.
+        let rc = unsafe { build(ctx.0, requests.as_ptr(), requests.len(), results.as_mut_ptr()) };
+        if crate::perf::replay_trace() {
+            eprintln!("ixe slow: Realise batch={} work_ns={} rc={rc}", batch.len(), started.elapsed().as_nanos());
+        }
+        for (request, result) in batch.into_iter().zip(results) {
+            let realised = if rc == 0 {
+                built(result.status, read_answer_bytes(result.data, result.len))
+            } else {
+                Realised::Failed(crate::host::StoreError::Failed(format!(
+                    "realise build batch failed with status {rc}"
+                )))
+            };
+            // A dropped receiver means this evaluation no longer needs it.
+            let _ = request.answer.send(realised);
+        }
+    }
 }
 
 /// One `(ctx, bytes...) -> (status, answer)` crossing.
@@ -1601,6 +1975,61 @@ macro_rules! ask_embedder {
 }
 
 impl EmbedderHost {
+    fn enqueue_ifd(
+        &self,
+        build: RealiseBuildFn,
+        encoded: Vec<u8>,
+        answer: std::sync::mpsc::Sender<Realised>,
+    ) -> Result<(), crate::host::StoreError> {
+        let mut dispatcher = self.ifd.dispatcher.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if dispatcher.is_none() {
+            let queue = std::sync::Arc::new((
+                std::sync::Mutex::new(IfdQueue::default()), std::sync::Condvar::new(),
+            ));
+            let worker_queue = queue.clone();
+            let ctx = SendCtx(self.vtable.ctx);
+            let worker = std::thread::Builder::new()
+                .name("nix-eval-ifd".into())
+                .spawn(move || run_ifd_batches(ctx, build, worker_queue))
+                .map_err(|why| crate::host::StoreError::Failed(format!(
+                    "could not start the build dispatcher: {why}"
+                )))?;
+            *dispatcher = Some(IfdDispatcher {
+                queue, worker: Some(worker),
+            });
+        }
+        let dispatcher = dispatcher.as_ref()
+            .ok_or_else(|| crate::host::StoreError::Failed("build dispatcher is closed".into()))?;
+        if dispatcher.worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+            return Err(crate::host::StoreError::Failed("build dispatcher stopped before answering".into()));
+        }
+        dispatcher.queue.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending.push_back(IfdRequest { encoded, answer });
+        Ok(())
+    }
+
+    fn dispatch_ifd(&self) {
+        let dispatcher = self.ifd.dispatcher.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(dispatcher) = dispatcher.as_ref() {
+            let mut queue = dispatcher.queue.0.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if dispatcher.worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+                for request in queue.pending.drain(..) {
+                    let _ = request.answer.send(Realised::Failed(crate::host::StoreError::Failed(
+                        "build dispatcher stopped before answering".into()
+                    )));
+                }
+                return;
+            }
+            if !queue.pending.is_empty() {
+                queue.ready = true;
+                dispatcher.queue.1.notify_one();
+            }
+        }
+    }
+
     /// Build a host from the embedder's vtable, or say why the vtable is
     /// malformed.
     fn new(vtable: IxeHostVtable) -> Result<Self, &'static str> {
@@ -1609,6 +2038,8 @@ impl EmbedderHost {
             async_realise: vtable.async_realise()?,
             vtable,
             ifd: std::sync::Arc::default(),
+            virtual_files: crate::host::VirtualFiles::default(),
+            drv_writes: std::sync::Arc::default(),
         })
     }
 
@@ -1622,6 +2053,136 @@ impl EmbedderHost {
         }
     }
 
+    /// Hand every derivation answered since the last flush to the embedder's
+    /// store, as one batch.
+    ///
+    /// Why the write is deferred at all: `Host::write_derivation` is asked
+    /// once per `builtins.derivationStrict` and its answer, the store path,
+    /// is a function of the ATerm the evaluator already holds. Asking the
+    /// store per derivation made every one a daemon round trip (measured on
+    /// the real home-manager closure: 23k writes at 600 us each, the largest
+    /// single cost of an edited-config evaluation, and most of them for
+    /// derivations the store already held). So the host answers from the
+    /// bytes and queues the write.
+    ///
+    /// Why it is flushed where it is: a queued derivation is invisible to the
+    /// store, and the evaluation must never observe that. Every question
+    /// whose answer could -- a build (`realise`, blocking or begun), a
+    /// validity or sealing check, `ensure_path` or `builtins.storePath` of
+    /// the path, a read of the path, a `toFile` that references it -- flushes
+    /// first. The crossing back to the embedder is ONE place: the scheduler
+    /// settles every finished evaluation through [`Host::settle`]
+    /// (`eval::settle_job`), so a forced handle, a render, a memo
+    /// verification and a derivation-set walk are all covered by
+    /// construction, because the embedder may build what it was just handed.
+    /// (A flush at each entry point was tried first and missed `ixe_render`,
+    /// whose deep force is where `nix-instantiate --eval --strict` builds its
+    /// derivations.) A question about a path that is not pending does not
+    /// flush: the check is one set lookup, and a NixOS evaluation asks 139k
+    /// directory listings.
+    ///
+    /// A refused batch poisons the host (`DrvWrites::failed`): this returns
+    /// the failure, every later `write_derivation` returns it, every store
+    /// question that consults the queue (`settle_writes_if`) routes here
+    /// and returns it, and the question-answer path asks before recording, so
+    /// a result whose derivations are not all in the store is neither
+    /// returned quietly nor memoised.
+    fn flush_derivations(&self) -> Result<(), crate::host::StoreError> {
+        // No hook: nothing was ever queued (`write_derivation` answers
+        // `NoStore` before it gets that far).
+        let Some(f) = self.vtable.write_derivations else {
+            return Ok(());
+        };
+        let mut writes = self
+            .drv_writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(why) = &writes.failed {
+            return Err(crate::host::StoreError::Failed(why.clone()));
+        }
+        if writes.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut writes.pending);
+        writes.paths.clear();
+        let batch = crate::store_batch::encode(&pending).map_err(|error| {
+            let why = format!(
+                "preparing {} derivation(s) for the store: {error}",
+                pending.len()
+            );
+            writes.failed = Some(why.clone());
+            crate::host::StoreError::Failed(why)
+        })?;
+        // The lock is held across the call on purpose: a second flush from
+        // another clone must not interleave, and the embedder's writer does
+        // not call back into this host.
+        let (rc, answer) = ask_embedder!(f, self.vtable.ctx, batch.as_ptr(), batch.len());
+        crate::perf::note_drv_write_flush(pending.len() as u64);
+        if rc == IXE_OK {
+            return Ok(());
+        }
+        let why = format!(
+            "writing {} derivation(s) to the store: {}",
+            pending.len(),
+            text_of(answer)
+        );
+        writes.failed = Some(why.clone());
+        Err(crate::host::StoreError::Failed(why))
+    }
+
+    /// Flush if `path` is, or lies under, a derivation answered and not yet
+    /// written. `path` is an ambient (store-directory) path; a mounted root
+    /// is a tree the evaluator reads directly and is never a `.drv`.
+    fn settle_writes_under(&self, path: &str) -> Result<(), crate::host::StoreError> {
+        self.settle_writes_if(|writes| {
+            store_object_of(path).is_some_and(|object| writes.paths.contains(object))
+        })
+    }
+
+    /// Flush when `pending` says the queue holds what the caller is about to
+    /// ask the store about, and always once a batch has failed: the failure
+    /// is sticky, and a store question after it must return it rather than
+    /// proceed as if the queue were simply empty. The `paths` emptiness test
+    /// keeps the common case (nothing queued) to one lock and one branch.
+    fn settle_writes_if(
+        &self,
+        pending: impl FnOnce(&DrvWrites) -> bool,
+    ) -> Result<(), crate::host::StoreError> {
+        let settle = {
+            let writes = self
+                .drv_writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            writes.failed.is_some() || (!writes.paths.is_empty() && pending(&writes))
+        };
+        if settle {
+            self.flush_derivations()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// [`EmbedderHost::settle_writes_under`] for a path value: only an
+    /// ambient path can name a store object.
+    fn settle_writes_for(&self, path: &crate::value2::PathValue) -> Result<(), String> {
+        match path.root {
+            crate::value2::Root::Ambient => self
+                .settle_writes_under(&path.path)
+                .map_err(|error| error.to_string()),
+            crate::value2::Root::Mounted(_) => Ok(()),
+        }
+    }
+
+    /// Flush if any of `references` is a pending derivation: a `toFile`
+    /// that references a `.drv` is registered with that reference, and the
+    /// store refuses a reference it does not hold.
+    fn settle_writes_referenced(
+        &self,
+        references: &[String],
+    ) -> Result<(), crate::host::StoreError> {
+        self.settle_writes_if(|writes| references.iter().any(|r| writes.paths.contains(r)))
+    }
+
     /// How this host's evaluations find out they have been interrupted, or
     /// `None` when the embedder cannot be asked.
     fn interrupt(&self) -> Option<crate::vm::InterruptHook> {
@@ -1633,7 +2194,49 @@ impl EmbedderHost {
         Some(Box::new(move || unsafe { f(ctx) } != 0))
     }
 
-    /// Turn a worker's `realise_build` answer into the realise result,
+    /// Phase 1, on the calling thread: the embedder's validity checks (and
+    /// their read-set recording) and its allow-import-from-derivation
+    /// refusal, for a context this host is about to realise. Both routes
+    /// come through here, so a question is checked exactly once.
+    fn check_realise(
+        &self,
+        fns: AsyncRealiseFns,
+        encoded: &[u8],
+    ) -> Result<Checked, crate::host::StoreError> {
+        let mut error_class = IxeRealiseErrorClass::Other as i32;
+        let (rc, answer) = ask_embedder!(
+            fns.check,
+            self.vtable.ctx,
+            encoded.as_ptr(),
+            encoded.len(),
+            &raw mut error_class
+        );
+        match IxeRealiseCheck::decode(rc) {
+            Ok(IxeRealiseCheck::Build) => Ok(Checked::Build),
+            Ok(IxeRealiseCheck::Nothing) => Ok(Checked::Nothing),
+            Ok(IxeRealiseCheck::Failed) => {
+                let message = String::from_utf8_lossy(&answer).into_owned();
+                Err(match IxeRealiseErrorClass::decode(error_class) {
+                    Ok(IxeRealiseErrorClass::Other) => crate::host::StoreError::Failed(message),
+                    Ok(IxeRealiseErrorClass::ImportFromDerivation) => {
+                        crate::host::StoreError::ImportFromDerivation(message)
+                    }
+                    // A protocol fault, not a store fault: reported as a
+                    // failure with the integer, never coerced into a class
+                    // it did not name.
+                    Err(other) => crate::host::StoreError::Failed(format!(
+                        "realise check hook failed with error class {other}, which \
+                         ixe.h does not define: {message}"
+                    )),
+                })
+            }
+            Err(other) => Err(crate::host::StoreError::Failed(format!(
+                "realise check hook answered status {other}, which ixe.h does not define"
+            ))),
+        }
+    }
+
+    /// Turn a realise question's settled outcome into its result,
     /// running phase 3 -- the allow-list registration -- on the calling
     /// thread, which is the collecting thread, which is the evaluation
     /// thread. That placement is the point: the allow list is a plain set
@@ -1643,15 +2246,14 @@ impl EmbedderHost {
     fn finish_realise(
         &self,
         fns: AsyncRealiseFns,
-        rc: i32,
-        answer: &[u8],
+        realised: Realised,
     ) -> Result<std::collections::BTreeMap<String, String>, crate::host::StoreError> {
-        if rc != 0 {
-            return Err(crate::host::StoreError::Failed(
-                String::from_utf8_lossy(answer).into_owned(),
-            ));
-        }
-        let (rewrites, outputs) = split_build_answer(answer)?;
+        let answer = match realised {
+            Realised::Nothing => return Ok(std::collections::BTreeMap::new()),
+            Realised::Failed(why) => return Err(why),
+            Realised::Built(answer) => answer,
+        };
+        let (rewrites, outputs) = split_build_answer(&answer)?;
         let (rc, message) =
             ask_embedder!(fns.allow, self.vtable.ctx, outputs.as_ptr(), outputs.len());
         if rc != 0 {
@@ -1710,6 +2312,18 @@ fn bytes_of(s: &str) -> (*const u8, usize) {
     (s.as_ptr(), s.len())
 }
 
+/// Store paths each followed by a NUL, the encoding the allow hooks take
+/// (`ixe_allow_paths_fn`, `ixe_realise_allow_fn`); unambiguous because a
+/// store path cannot contain one.
+fn nul_terminated(paths: &[String]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for path in paths {
+        encoded.extend_from_slice(path.as_bytes());
+        encoded.push(0);
+    }
+    encoded
+}
+
 /// Store paths packed the way [`StoreTextFn`] documents: each followed by a
 /// NUL, which is unambiguous because a store path cannot contain one.
 fn pack_references(references: &[String]) -> Vec<u8> {
@@ -1722,18 +2336,73 @@ fn pack_references(references: &[String]) -> Vec<u8> {
 }
 
 impl Host for EmbedderHost {
+    fn settle(&self) -> Result<(), crate::host::StoreError> {
+        self.flush_derivations()
+    }
+
+    fn import_source(
+        &self,
+        path: &crate::value2::PathValue,
+    ) -> Result<crate::host::ImportedSource, String> {
+        self.settle_writes_for(path)?;
+        self.virtual_files.import_source_or(path, || {
+            let Some(reads) = self.reads else {
+                return crate::host::RealFs.import_source(path);
+            };
+            let answer = ask_about_path_bytes(reads.import_source, self.vtable.ctx, path)?;
+            decode_imported_source(&answer)
+        })
+    }
+
     fn get_env(&self, name: &str) -> Option<String> {
         crate::host::RealFs.get_env(name)
     }
 
-    fn copy_to_store(&self, path: &str) -> Result<String, crate::host::StoreError> {
+    fn copy_to_store(
+        &self,
+        path: &crate::value2::PathValue,
+    ) -> Result<String, crate::host::StoreError> {
         let f = self
             .vtable
             .copy_to_store
             .ok_or(crate::host::StoreError::NoStore)?;
-        let (p, len) = bytes_of(path);
-        let (rc, answer) = ask_embedder!(f, self.vtable.ctx, p, len);
+        let accessor_path = path.accessor_path();
+        let (r, r_len) = bytes_of(path.root.wire_name());
+        let (p, len) = bytes_of(accessor_path);
+        let (rc, answer) = ask_embedder!(f, self.vtable.ctx, r, r_len, p, len);
         store_answer(rc, answer)
+    }
+
+    fn store_path(
+        &self,
+        path: &crate::value2::PathValue,
+    ) -> Result<crate::host::StorePathResult, crate::host::StoreError> {
+        let f = self
+            .vtable
+            .store_path
+            .ok_or(crate::host::StoreError::NoStore)?;
+        if let crate::value2::Root::Ambient = path.root {
+            self.settle_writes_under(&path.path)?;
+        }
+        let accessor_path = path.accessor_path();
+        let (r, r_len) = bytes_of(path.root.wire_name());
+        let (p, len) = bytes_of(accessor_path);
+        let (rc, answer) = ask_embedder!(f, self.vtable.ctx, r, r_len, p, len);
+        let answer = store_answer(rc, answer)?;
+        let Some((store_path, visible_path)) = answer.split_once('\0') else {
+            return Err(crate::host::StoreError::Failed(
+                "builtins.storePath answer has no store-path separator".to_owned(),
+            ));
+        };
+        if store_path.is_empty() || visible_path.is_empty() || visible_path.contains('\0') {
+            return Err(crate::host::StoreError::Failed(
+                "builtins.storePath answer is malformed".to_owned(),
+            ));
+        }
+        Ok(crate::host::StorePathResult {
+            path: visible_path.to_owned(),
+            store_path: store_path.to_owned(),
+        })
     }
 
     fn store_text(
@@ -1746,6 +2415,7 @@ impl Host for EmbedderHost {
             .vtable
             .store_text
             .ok_or(crate::host::StoreError::NoStore)?;
+        self.settle_writes_referenced(references)?;
         let refs = pack_references(references);
         let (n, n_len) = bytes_of(name);
         let (c, c_len) = bytes_of(contents);
@@ -1762,30 +2432,41 @@ impl Host for EmbedderHost {
         store_answer(rc, answer)
     }
 
-    fn write_derivation(
-        &self,
-        name: &str,
-        aterm: &str,
-        references: &[String],
-    ) -> Result<String, crate::host::StoreError> {
-        let f = self
-            .vtable
-            .write_derivation
-            .ok_or(crate::host::StoreError::NoStore)?;
-        let refs = pack_references(references);
-        let (n, n_len) = bytes_of(name);
-        let (a, a_len) = bytes_of(aterm);
-        let (rc, answer) = ask_embedder!(
-            f,
-            self.vtable.ctx,
-            n,
-            n_len,
-            a,
-            a_len,
-            refs.as_ptr(),
-            refs.len(),
-        );
-        store_answer(rc, answer)
+    /// Answered here, from the bytes, and queued for the store; see
+    /// [`EmbedderHost::flush_derivations`] for why and for when the store
+    /// hears about it. Rust validates the canonical ATerm once and retains
+    /// its reference set beside the bytes until ingestion. Memo replay takes
+    /// this same route, so cached bytes cannot bypass validation.
+    fn write_derivation(&self, name: &str, aterm: &str) -> Result<String, crate::host::StoreError> {
+        if self.vtable.write_derivations.is_none() {
+            return Err(crate::host::StoreError::NoStore);
+        }
+        let Some(store_dir) = crate::eval::store_dir() else {
+            return Err(crate::host::StoreError::Failed(format!(
+                "derivation '{name}': no store directory was set for this evaluator"
+            )));
+        };
+        let drv =
+            PendingDrv::new(store_dir, name, aterm).map_err(crate::host::StoreError::Failed)?;
+        let expected = drv.expected.clone();
+        let full = {
+            let mut writes = self
+                .drv_writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(why) = &writes.failed {
+                return Err(crate::host::StoreError::Failed(why.clone()));
+            }
+            if writes.paths.insert(expected.clone()) {
+                writes.pending.push(drv);
+                crate::perf::note_drv_write_deferred();
+            }
+            writes.pending.len() >= DRV_WRITE_BATCH
+        };
+        if full {
+            self.flush_derivations()?;
+        }
+        Ok(expected)
     }
 
     fn ensure_path(&self, path: &str) -> Result<(), crate::host::StoreError> {
@@ -1793,6 +2474,7 @@ impl Host for EmbedderHost {
             .vtable
             .ensure_path
             .ok_or(crate::host::StoreError::NoStore)?;
+        self.settle_writes_under(path)?;
         let (p, len) = bytes_of(path);
         let (rc, answer) = ask_embedder!(f, self.vtable.ctx, p, len);
         match rc {
@@ -1801,11 +2483,184 @@ impl Host for EmbedderHost {
         }
     }
 
+    fn valid_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, crate::host::StoreError> {
+        let f = self
+            .vtable
+            .valid_paths
+            .ok_or(crate::host::StoreError::NoStore)?;
+        // A pending derivation answers this wrongly, so the queue is flushed
+        // when any asked path is (or lies under) one; a question about
+        // anything else -- the copy memo's candidate, a fetched tree -- does
+        // not wait for the writes. Measured before this test (l2ba1, l2ca1):
+        // the copy memo's 1006 validity asks spent 1.9 s, p50 65 us, p99 31
+        // ms, and the tail was the flushes they forced.
+        self.settle_writes_if(|writes| {
+            paths.iter().any(|path| {
+                store_object_of(path).is_some_and(|object| writes.paths.contains(object))
+            })
+        })?;
+        let request = paths.join("\n");
+        let (p, len) = bytes_of(&request);
+        let (rc, answer) = ask_embedder!(f, self.vtable.ctx, p, len);
+        if rc != 0 {
+            return Err(crate::host::StoreError::Failed(text_of(answer)));
+        }
+        // Strict, as `sealed_paths` is: each line is authorisation to serve a
+        // row by validity, so a line that is not one of the paths asked about
+        // (a trailing `\r` included: split on `\n` alone) refuses the whole
+        // answer and every row asks.
+        let text = text_of(answer);
+        let mut present = std::collections::BTreeSet::new();
+        for line in text.split('\n').filter(|line| !line.is_empty()) {
+            if !paths.iter().any(|asked| asked == line) {
+                return Err(crate::host::StoreError::Failed(format!(
+                    "valid_paths: {line:?} was not asked about"
+                )));
+            }
+            present.insert(line.to_owned());
+        }
+        Ok(present)
+    }
+
+    fn sealed_paths(
+        &self,
+        objects: &[String],
+    ) -> Result<crate::host::Links, crate::host::StoreError> {
+        let f = self
+            .vtable
+            .sealed_paths
+            .ok_or(crate::host::StoreError::NoStore)?;
+        self.flush_derivations()?;
+        let request = objects.join("\n");
+        let (p, len) = bytes_of(&request);
+        let (rc, answer) = ask_embedder!(f, self.vtable.ctx, p, len);
+        if rc != 0 {
+            return Err(crate::host::StoreError::Failed(text_of(answer)));
+        }
+        // Strict, and one bad line refuses the whole answer: a line is
+        // authorisation to replay reads without asking, so anything the
+        // contract does not spell -- an object not asked about, an odd field,
+        // an empty or non-relative link path -- is a host this decoder does
+        // not understand, and every row asks. Split on `\n` alone: `lines()`
+        // would strip a trailing `\r` and rename a link.
+        let text = text_of(answer);
+        let mut links = crate::host::Links::new();
+        for line in text.split('\n').filter(|line| !line.is_empty()) {
+            let fields: Vec<&str> = line.split('\t').collect();
+            let [object, pairs @ ..] = fields.as_slice() else {
+                unreachable!("split yields at least one field");
+            };
+            if !objects.iter().any(|asked| asked == object) || pairs.len() % 2 != 0 {
+                return Err(crate::host::StoreError::Failed(format!(
+                    "sealed_paths: malformed line for {object:?}"
+                )));
+            }
+            let mut object_links = Vec::with_capacity(pairs.len() / 2);
+            for pair in pairs.chunks_exact(2) {
+                let &[path, target] = pair else {
+                    unreachable!("chunks_exact(2) yields pairs");
+                };
+                let canonical = !path.is_empty()
+                    && path
+                        .split('/')
+                        .all(|c| !c.is_empty() && c != "." && c != "..");
+                if !canonical {
+                    return Err(crate::host::StoreError::Failed(format!(
+                        "sealed_paths: link path {path:?} under {object:?} is not object-relative"
+                    )));
+                }
+                object_links.push(crate::host::Symlink {
+                    path: path.to_owned(),
+                    target: target.to_owned(),
+                });
+            }
+            links.insert((*object).to_owned(), object_links);
+        }
+        Ok(links)
+    }
+
+    fn allow_paths(&self, paths: &[String]) -> Result<(), crate::host::StoreError> {
+        // `allowPath` per path, as the live copy, fetch and tree hooks do.
+        let f = self
+            .vtable
+            .allow_paths
+            .ok_or(crate::host::StoreError::NoStore)?;
+        let encoded = nul_terminated(paths);
+        let (rc, message) = ask_embedder!(f, self.vtable.ctx, encoded.as_ptr(), encoded.len());
+        if rc != 0 {
+            return Err(crate::host::StoreError::Failed(
+                String::from_utf8_lossy(&message).into_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn allow_closures(&self, outputs: &[String]) -> Result<(), crate::host::StoreError> {
+        // Phase 3 of the realise protocol on its own: the allow-list
+        // registration, in the encoding `finish_realise` hands it --
+        // NUL-terminated store paths -- and with its closure semantics.
+        let Some(fns) = self.async_realise else {
+            return Err(crate::host::StoreError::NoStore);
+        };
+        let encoded = nul_terminated(outputs);
+        let (rc, message) =
+            ask_embedder!(fns.allow, self.vtable.ctx, encoded.as_ptr(), encoded.len());
+        if rc != 0 {
+            return Err(crate::host::StoreError::Failed(
+                String::from_utf8_lossy(&message).into_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn realise(
         &self,
         context: &[crate::value2::ContextElem],
     ) -> Result<std::collections::BTreeMap<String, String>, crate::host::StoreError> {
-        realise_through_embedder(self.vtable.realise, self.vtable.ctx, context)
+        // No hooks is a host with no store behind it, which refuses by name
+        // rather than reading a path nothing built.
+        let Some(fns) = self.async_realise else {
+            return Err(crate::host::StoreError::NoStore);
+        };
+        // A build reads `.drv`s, and the check phase ensures drv-deep
+        // elements: everything queued lands first.
+        self.flush_derivations()?;
+        let started = std::time::Instant::now();
+        let encoded = encode_realise_request(context);
+        let checked = self.check_realise(fns, &encoded)?;
+        let outcome = match checked {
+            Checked::Nothing => "nothing",
+            Checked::Build => "build",
+        };
+        let realised = match checked {
+            Checked::Nothing => Realised::Nothing,
+            Checked::Build => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.enqueue_ifd(fns.build, encoded, tx)?;
+                self.dispatch_ifd();
+                rx.recv().map_err(|_| crate::host::StoreError::Failed(
+                    "build dispatcher stopped before answering".into()
+                ))?
+            }
+        };
+        let answer = self.finish_realise(fns, realised);
+        if crate::perf::replay_trace() {
+            // One line per question, the instrument for a slow record: what
+            // the evaluation asked to be built, whether the check phase
+            // settled it without a build, and what it cost.
+            eprintln!(
+                "ixe question: Realise elements={} outcome={outcome} ns={} first={}",
+                context.len(),
+                started.elapsed().as_nanos(),
+                context
+                    .first()
+                    .map_or(String::new(), |elem| format!("{elem:?}"))
+            );
+        }
+        answer
     }
 
     fn store_filtered(
@@ -1818,6 +2673,9 @@ impl Host for EmbedderHost {
             .ok_or(crate::host::StoreError::NoStore)?;
         let encoded = encode_filtered_copy(request);
         let (rc, answer) = ask_embedder!(f, self.vtable.ctx, encoded.as_ptr(), encoded.len());
+        // The trace line for this ask is the recorder's
+        // (`readset::store_filtered_trace`, `served=walk` for a copy that
+        // reached here), one per ask whichever route answered.
         store_answer(rc, answer)
     }
 
@@ -1840,8 +2698,21 @@ impl Host for EmbedderHost {
             .fetch_tree
             .ok_or(crate::host::StoreError::NoStore)?;
         let encoded = encode_fetch_tree(request);
+        let started = std::time::Instant::now();
         let (rc, answer) = ask_embedder!(f, self.vtable.ctx, encoded.as_ptr(), encoded.len());
-        three_way(rc, answer).map(|(text, _)| text)
+        let answer = three_way(rc, answer).map(|(text, _)| text);
+        if crate::perf::replay_trace() {
+            // The edit arm spends ~1.5 s on 22 of these (~66 ms each) with
+            // every input locked; this names the fetcher and the cost so the
+            // slow ones can be told from the cheap ones.
+            eprintln!(
+                "ixe question: FetchTree fetcher={} ns={} -> {}",
+                request.fetcher.as_str(),
+                started.elapsed().as_nanos(),
+                answer.as_deref().map_or("error", |text| head(text, 200))
+            );
+        }
+        answer
     }
 
     fn lock_flake(
@@ -1885,7 +2756,7 @@ impl Host for EmbedderHost {
         &self,
         entries: &[crate::task::SearchPathEntry],
         name: &str,
-    ) -> Result<String, crate::host::LookupError> {
+    ) -> Result<crate::value2::PathValue, crate::host::LookupError> {
         let f = self
             .vtable
             .find_file
@@ -1900,18 +2771,31 @@ impl Host for EmbedderHost {
             n,
             n_len,
         );
-        let answer = text_of(answer);
         match rc {
-            IXE_OK => Ok(answer),
+            // A success whose payload does not decode is the embedder
+            // breaking the protocol, not this backend declining: `Failed`,
+            // never `Unsupported`, which is reserved for an explicit
+            // IXE_ERR_UNIMPLEMENTED answer.
+            IXE_OK => {
+                let (path, contents) =
+                    decode_find_file_answer(&answer).map_err(crate::host::LookupError::Failed)?;
+                // Bytes for a path this evaluator cannot read off the world:
+                // held by this host, and served to every later question
+                // about the path, the atomic import included.
+                if let Some(contents) = contents {
+                    self.virtual_files.insert(path.as_ref(), &contents);
+                }
+                Ok(path)
+            }
             // The status the C side uses for a thrown error everywhere else,
             // so "not found" stays catchable by `builtins.tryEval` as it is
             // in cppnix.
-            IXE_ERR_THROWN => Err(crate::host::LookupError::NotFound(answer)),
+            IXE_ERR_THROWN => Err(crate::host::LookupError::NotFound(text_of(answer))),
             // The status the C side uses for an unimplemented construct, so a
             // resolved path this evaluator cannot read scores `unimplemented`
             // rather than a mismatch.
-            IXE_ERR_UNIMPLEMENTED => Err(crate::host::LookupError::Unsupported(answer)),
-            _ => Err(crate::host::LookupError::Failed(answer)),
+            IXE_ERR_UNIMPLEMENTED => Err(crate::host::LookupError::Unsupported(text_of(answer))),
+            _ => Err(crate::host::LookupError::Failed(text_of(answer))),
         }
     }
 
@@ -1963,23 +2847,21 @@ impl Host for EmbedderHost {
     /// structures the thread-safety audit found unsafe (the access allow
     /// list, the read-set tracker) rather than a lock around either.
     ///
-    /// # One thread per build in flight, not a pool
-    ///
-    /// The count is already bounded by something small: a root has at most
-    /// one open suspension, so at most one thread exists per live root --
-    /// the same reasoning as [`crate::host::ThreadedHost`]. The alternative,
-    /// a fixed-size pool, costs a queue in front of a bound that is not
-    /// being reached: the K+1th build would wait for a worker while the
-    /// evaluation thread believes it is in flight, which is precisely the
-    /// serialisation this path exists to remove, bought back for no memory
-    /// saved.
+    /// The session owns one dispatcher, which batches pending contexts into
+    /// one store request. A Worker per root multiplies both substitution
+    /// budgets and downloads of shared dependencies. The store now owns
+    /// concurrency and deduplication across every root in the batch.
     fn begin(&self, question: &crate::host::Slow<'_>) -> Option<crate::host::Ticket> {
-        let crate::host::Slow::Realise(context) = question else {
+        let &crate::host::Slow::Realise(context) = question else {
             return None;
         };
         let fns = self.async_realise?;
-        // Nothing to build: only opaque or drv-deep elements. The synchronous
-        // path answers this from validity checks alone, so a thread would
+        // The build thread reads `.drv`s this evaluation wrote. A failed flush
+        // declines the ticket; the blocking route then asks again and reports
+        // the poisoned host's failure.
+        self.flush_derivations().ok()?;
+        // Nothing to build: only opaque or drv-deep elements. The blocking
+        // route answers this from the check phase alone, so a thread would
         // cost more than it hides.
         if !context
             .iter()
@@ -1988,39 +2870,39 @@ impl Host for EmbedderHost {
             return None;
         }
         let encoded = encode_realise_request(context);
-        // Phase 1, on this thread: the validity checks and the
-        // allow-import-from-derivation refusal, which touch the read-set
-        // tracker and the settings. A decline is not an error here -- the
-        // synchronous fallback re-runs the same checks and reports the
-        // failure with the text and catchability the blocking flow always
-        // had, so the two flows cannot disagree about what a refusal says.
-        let (rc, _) = ask_embedder!(fns.check, self.vtable.ctx, encoded.as_ptr(), encoded.len());
-        if rc != 0 {
-            return None;
+        // Phase 1, on this thread. Whatever it settles without a build --
+        // nothing to build, or a refusal with its class -- is filed ready
+        // under the ticket, so `collect` delivers it as it would a build's
+        // answer and the check never runs a second time.
+        let (checked, check_ns) = crate::perf::timed(|| self.check_realise(fns, &encoded));
+        let trace = crate::perf::replay_trace();
+        if trace {
+            // The check runs on the evaluation thread before the ticket
+            // exists, so no question counter sees it; this line does.
+            eprintln!(
+                "ixe slow: Realise check_ns={check_ns} build={}",
+                matches!(checked, Ok(Checked::Build))
+            );
         }
+        let settled = match checked {
+            Ok(Checked::Build) => None,
+            Ok(Checked::Nothing) => Some(Realised::Nothing),
+            Err(refused) => Some(Realised::Failed(refused)),
+        };
         let id = self
             .ifd
             .next
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .wrapping_add(1);
         let (tx, rx) = std::sync::mpsc::channel();
-        let build = fns.build;
-        let ctx = SendCtx(self.vtable.ctx);
-        // The send failing means the evaluation was abandoned and the
-        // receiver dropped, which is not this thread's problem to report.
-        std::thread::Builder::new()
-            .name(format!("nix-eval-ifd-{id}"))
-            .spawn(move || {
-                // Bind the wrapper whole before destructuring: closure
-                // capture is per-field, and capturing `.0` alone would be
-                // capturing the raw pointer, which is the thing `SendCtx`
-                // exists to carry.
-                let ctx = ctx;
-                let SendCtx(ctx) = ctx;
-                let (rc, answer) = ask_embedder!(build, ctx, encoded.as_ptr(), encoded.len());
-                drop(tx.send((rc, answer)));
-            })
-            .ok()?;
+        if let Some(settled) = settled {
+            drop(tx.send(settled));
+        } else {
+            let ready = tx.clone();
+            if let Err(why) = self.enqueue_ifd(fns.build, encoded, tx) {
+                let _ = ready.send(Realised::Failed(why));
+            }
+        }
         let mut inflight = self
             .ifd
             .inflight
@@ -2032,6 +2914,9 @@ impl Host for EmbedderHost {
 
     fn collect(&self, ticket: crate::host::Ticket, block: bool) -> Option<crate::host::SlowAnswer> {
         let fns = self.async_realise?;
+        // The scheduler has advanced all runnable roots before collecting.
+        // Releasing here lets the first wave share a Worker too.
+        self.dispatch_ifd();
         let mut inflight = self
             .ifd
             .inflight
@@ -2043,16 +2928,21 @@ impl Host for EmbedderHost {
         // make one slow build block every other collect.
         drop(inflight);
         let received = if block {
-            rx.recv().ok()
+            Some(rx.recv().unwrap_or_else(|_| Realised::Failed(
+                crate::host::StoreError::Failed("build dispatcher stopped before answering".into())
+            )))
         } else {
-            rx.try_recv().ok()
+            match rx.try_recv() {
+                Ok(answer) => Some(answer),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Realised::Failed(
+                    crate::host::StoreError::Failed("build dispatcher stopped before answering".into())
+                )),
+            }
         };
-        let Some((rc, answer)) = received else {
-            // Not ready. Put the receiver back so the next collect finds it;
-            // a `recv` that failed while blocking means the worker died
-            // without sending, and dropping the receiver here turns the next
-            // collect into the "unknown ticket" case, which the scheduler
-            // reports as a stuck evaluation rather than a hang.
+        let Some(realised) = received else {
+            // Only a live, empty channel reaches here. A stopped dispatcher
+            // produces an explicit failure above, even for a polling collect.
             if !block {
                 let mut inflight = self
                     .ifd
@@ -2064,12 +2954,13 @@ impl Host for EmbedderHost {
             return None;
         };
         Some(crate::host::SlowAnswer::Realise(
-            self.finish_realise(fns, rc, &answer),
+            self.finish_realise(fns, realised),
         ))
     }
 
-    fn read_file(&self, path: &str) -> Result<String, String> {
-        crate::host::read_file_or_virtual(path, || {
+    fn read_file(&self, path: &crate::value2::PathValue) -> Result<String, String> {
+        self.settle_writes_for(path)?;
+        self.virtual_files.read_file_or(path, || {
             let Some(reads) = self.reads else {
                 return crate::host::RealFs.read_file(path);
             };
@@ -2082,8 +2973,9 @@ impl Host for EmbedderHost {
         })
     }
 
-    fn read_file_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
-        crate::host::read_file_bytes_or_virtual(path, || {
+    fn read_file_bytes(&self, path: &crate::value2::PathValue) -> Result<Vec<u8>, String> {
+        self.settle_writes_for(path)?;
+        self.virtual_files.read_file_bytes_or(path, || {
             let Some(reads) = self.reads else {
                 return crate::host::RealFs.read_file_bytes(path);
             };
@@ -2094,30 +2986,60 @@ impl Host for EmbedderHost {
         })
     }
 
-    fn read_dir(&self, path: &str) -> Result<Vec<(String, crate::host::FileType)>, String> {
+    fn read_dir(
+        &self,
+        path: &crate::value2::PathValue,
+    ) -> Result<Vec<(String, crate::host::FileType)>, String> {
+        self.settle_writes_for(path)?;
         let Some(reads) = self.reads else {
             return crate::host::RealFs.read_dir(path);
         };
-        let (p, len) = bytes_of(path);
-        let (rc, bytes) = ask_embedder!(reads.read_dir, self.vtable.ctx, p, len);
+        let accessor_path = path.accessor_path();
+        let (r, r_len) = bytes_of(path.root.wire_name());
+        let (p, len) = bytes_of(accessor_path);
+        let (rc, bytes) = ask_embedder!(reads.read_dir, self.vtable.ctx, r, r_len, p, len);
         if rc != IXE_OK {
             return Err(text_of(bytes));
         }
         decode_dir_entries(&bytes)
     }
 
-    fn path_exists(&self, path: &str) -> bool {
-        crate::host::path_exists_or_virtual(path, || {
+    fn path_exists_checked(&self, path: &crate::value2::PathValue) -> Result<bool, String> {
+        self.settle_writes_for(path)?;
+        self.virtual_files.path_exists_checked_or(path, || {
             let Some(reads) = self.reads else {
-                return crate::host::RealFs.path_exists(path);
+                return crate::host::RealFs.path_exists_checked(path);
             };
-            // SAFETY: `path` is a live &str for the duration of the call.
-            unsafe { (reads.path_exists)(self.vtable.ctx, path.as_ptr(), path.len()) == 1 }
+            match ask_about_path(reads.path_exists, self.vtable.ctx, path)?.as_str() {
+                "1" => Ok(true),
+                "0" => Ok(false),
+                other => Err(format!("pathExists answer is neither 0 nor 1: {other:?}")),
+            }
         })
     }
 
-    fn file_type(&self, path: &str) -> Result<Option<crate::host::FileType>, String> {
-        crate::host::file_type_or_virtual(path, || {
+    fn dir_exists_checked(&self, path: &crate::value2::PathValue) -> Result<bool, String> {
+        self.settle_writes_for(path)?;
+        self.virtual_files.dir_exists_checked_or(path, || {
+            let Some(reads) = self.reads else {
+                return crate::host::RealFs.dir_exists_checked(path);
+            };
+            match ask_about_path(reads.dir_exists, self.vtable.ctx, path)?.as_str() {
+                "1" => Ok(true),
+                "0" => Ok(false),
+                other => Err(format!(
+                    "directory-existence answer is neither 0 nor 1: {other:?}"
+                )),
+            }
+        })
+    }
+
+    fn file_type(
+        &self,
+        path: &crate::value2::PathValue,
+    ) -> Result<Option<crate::host::FileType>, String> {
+        self.settle_writes_for(path)?;
+        self.virtual_files.file_type_or(path, || {
             let Some(reads) = self.reads else {
                 return crate::host::RealFs.file_type(path);
             };
@@ -2125,8 +3047,12 @@ impl Host for EmbedderHost {
         })
     }
 
-    fn file_type_resolved(&self, path: &str) -> Result<crate::host::FileType, String> {
-        crate::host::file_type_resolved_or_virtual(path, || {
+    fn file_type_resolved(
+        &self,
+        path: &crate::value2::PathValue,
+    ) -> Result<crate::host::FileType, String> {
+        self.settle_writes_for(path)?;
+        self.virtual_files.file_type_resolved_or(path, || {
             let Some(reads) = self.reads else {
                 return crate::host::RealFs.file_type_resolved(path);
             };
@@ -2144,6 +3070,114 @@ impl Host for EmbedderHost {
 /// evaluator reporting a failure with no text.
 fn text_of(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The first `at_most` bytes of `text`, cut back to a character boundary so
+/// the slice is valid (`text.get(..n)` is `None` inside a multi-byte
+/// character, and a trace that fell back to the whole text on that would
+/// print an unbounded line).
+fn head(text: &str, at_most: usize) -> &str {
+    let mut cut = at_most.min(text.len());
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &text[..cut]
+}
+
+/// The store object `path` names, when it lies in the evaluator's store
+/// directory: `/nix/store/<hash>-<name>` for `/nix/store/<hash>-<name>/x`.
+/// `None` for a path anywhere else and when no store directory is set.
+fn store_object_of(path: &str) -> Option<&str> {
+    let store_dir = crate::eval::store_dir()?;
+    let rest = path.strip_prefix(store_dir)?.strip_prefix('/')?;
+    let object_len = rest.find('/').unwrap_or(rest.len());
+    if object_len == 0 {
+        return None;
+    }
+    Some(&path[..store_dir.len() + 1 + object_len])
+}
+
+/// A `findFile` success: `root NUL path`, or `root NUL path NUL contents`
+/// when the embedder resolved into an accessor this evaluator cannot read
+/// and hands the bytes over instead. Contents only make sense for an ambient
+/// path -- a mounted root is a real accessor -- and are refused with one.
+fn decode_find_file_answer(
+    bytes: &[u8],
+) -> Result<(crate::value2::PathValue, Option<String>), String> {
+    let mut fields = bytes.splitn(3, |byte| *byte == 0);
+    let (Some(root), Some(path)) = (fields.next(), fields.next()) else {
+        return Err("findFile answer has no root separator".to_owned());
+    };
+    let root =
+        std::str::from_utf8(root).map_err(|_| "findFile answer root is not UTF-8".to_owned())?;
+    let path =
+        std::str::from_utf8(path).map_err(|_| "findFile answer path is not UTF-8".to_owned())?;
+    let rooted = crate::value2::PathValue::from_wire(root, path)?;
+    let contents = fields
+        .next()
+        .map(|c| {
+            std::str::from_utf8(c)
+                .map(str::to_owned)
+                .map_err(|_| "findFile answer contents are not UTF-8".to_owned())
+        })
+        .transpose()?;
+    if contents.is_some() && !root.is_empty() {
+        return Err(format!(
+            "findFile answer carries contents for a mounted path under '{root}', which is a real accessor"
+        ));
+    }
+    Ok((rooted, contents))
+}
+
+fn decode_imported_source(bytes: &[u8]) -> Result<crate::host::ImportedSource, String> {
+    // A source root is empty or absolute, so this tag cannot be a source
+    // response. Preserve the existing source wire shape verbatim.
+    if let Some(bytes) = bytes.strip_prefix(b"derivation\0") {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|error| format!("invalid imported derivation: {error}"))?;
+        let object = value.as_object()
+            .ok_or_else(|| "imported derivation is not an object".to_owned())?;
+        if object.len() != 3 {
+            return Err("imported derivation must contain path, name and outputs".to_owned());
+        }
+        let text = |key: &str| -> Result<String, String> {
+            object.get(key).and_then(serde_json::Value::as_str).map(str::to_owned)
+                .ok_or_else(|| format!("imported derivation {key} is not a string"))
+        };
+        let path = text("path")?;
+        crate::value2::PathValue::from_wire("", &path)?;
+        let outputs = object.get("outputs").and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "imported derivation outputs is not an object".to_owned())?
+            .iter().map(|(name, value)| {
+                value.as_str().map(|path| (name.clone(), path.to_owned()))
+                    .ok_or_else(|| format!("imported derivation output {name} is not a string"))
+            }).collect::<Result<_, _>>()?;
+        return Ok(crate::host::ImportedSource::Derivation(crate::host::ImportedDerivation {
+            path,
+            name: text("name")?,
+            outputs,
+        }));
+    }
+    let Some(first) = bytes.iter().position(|byte| *byte == 0) else {
+        return Err("import answer has no root separator".to_owned());
+    };
+    let Some(second_relative) = bytes
+        .get(first + 1..)
+        .and_then(|tail| tail.iter().position(|byte| *byte == 0))
+    else {
+        return Err("import answer has no path separator".to_owned());
+    };
+    let second = first + 1 + second_relative;
+    let root = std::str::from_utf8(bytes.get(..first).unwrap_or_default())
+        .map_err(|_| "import answer root is not UTF-8".to_owned())?;
+    let path = std::str::from_utf8(bytes.get(first + 1..second).unwrap_or_default())
+        .map_err(|_| "import answer path is not UTF-8".to_owned())?;
+    let text = std::str::from_utf8(bytes.get(second + 1..).unwrap_or_default())
+        .map_err(|_| "imported source is not UTF-8".to_owned())?;
+    Ok(crate::host::ImportedSource::Nix {
+        path: crate::value2::PathValue::from_wire(root, path)?,
+        text: text.to_owned(),
+    })
 }
 
 /// The two-outcome store contract: zero is the answer, anything else is the
@@ -2176,15 +3210,16 @@ fn three_way(rc: i32, answer: Vec<u8>) -> Result<(String, bool), crate::host::St
 }
 
 /// Ask the embedder a one-path question whose answer is a string, and copy
-/// the answer out of its buffer before returning. Shared by every hook above
-/// except `path_exists`, which does not use it because it has no buffer.
+/// the answer out of its buffer before returning.
 fn ask_about_path(
-    f: unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut *const u8, *mut usize) -> i32,
+    f: ReadFileFn,
     ctx: *mut c_void,
-    path: &str,
+    path: &crate::value2::PathValue,
 ) -> Result<String, String> {
-    let (p, len) = bytes_of(path);
-    let (rc, answer) = ask_embedder!(f, ctx, p, len);
+    let accessor_path = path.accessor_path();
+    let (r, r_len) = bytes_of(path.root.wire_name());
+    let (p, len) = bytes_of(accessor_path);
+    let (rc, answer) = ask_embedder!(f, ctx, r, r_len, p, len);
     let answer = text_of(answer);
     if rc == IXE_OK {
         Ok(answer)
@@ -2197,12 +3232,14 @@ fn ask_about_path(
 /// bytes, for `Host::read_file_bytes`. The failure side stays text, because
 /// an error is a message however the contents were going to be read.
 fn ask_about_path_bytes(
-    f: unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut *const u8, *mut usize) -> i32,
+    f: ReadFileFn,
     ctx: *mut c_void,
-    path: &str,
+    path: &crate::value2::PathValue,
 ) -> Result<Vec<u8>, String> {
-    let (p, len) = bytes_of(path);
-    let (rc, answer) = ask_embedder!(f, ctx, p, len);
+    let accessor_path = path.accessor_path();
+    let (r, r_len) = bytes_of(path.root.wire_name());
+    let (p, len) = bytes_of(accessor_path);
+    let (rc, answer) = ask_embedder!(f, ctx, r, r_len, p, len);
     if rc == IXE_OK {
         Ok(answer)
     } else {
@@ -2296,12 +3333,7 @@ pub extern "C" fn ixe_perf_snapshot() -> *mut c_char {
     if !cfg!(feature = "perf") {
         return std::ptr::null_mut();
     }
-    let line = crate::perf::render(
-        &crate::perf::snapshot(),
-        &crate::perf::by_kind(),
-        &crate::perf::by_yield(),
-        &crate::perf::by_op(),
-    );
+    let line = crate::perf::render(&crate::perf::counters());
     match CString::new(line) {
         Ok(s) => s.into_raw(),
         Err(_) => std::ptr::null_mut(),
@@ -2359,7 +3391,8 @@ pub unsafe extern "C" fn ixe_string_free(s: *mut c_char) {
 
 use crate::session::RenderMode;
 use crate::value2::{Slot, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 /// A value was asked for by a name or an index it does not have. Separate
 /// from `IXE_ERR_EVAL` because cppnix reports a missing attribute in a
@@ -2386,6 +3419,7 @@ const IXE_RENDER_JSON: i32 = 1;
 const IXE_RENDER_RAW: i32 = 2;
 const IXE_RENDER_VALUE_PRINTER: i32 = 3;
 const IXE_RENDER_XML: i32 = 4;
+const IXE_RENDER_PLAIN_LAZY: i32 = 5;
 
 /// Handle layout: the session's serial on top, the table index underneath.
 /// Splitting the word is what makes "handle from another session" a detected
@@ -2407,8 +3441,26 @@ static NEXT_SESSION_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// because they borrow the on-disk store and a session that owned both would
 /// be self-referential. A command evaluates once, so this costs one store
 /// open per command, which is three path joins (see `session::evaluate_once`).
+/// Explicit owner of decoded witness reuse, independent of every VM and host.
+/// Like evaluator sessions, this Rc-based handle is confined to its creating thread.
+pub struct IxeEvalCache {
+    retained: crate::readset::retained::Shared,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IxeEvalCacheStats {
+    pub memory_hits: u64,
+    pub disk_loads: u64,
+    pub retained_bytes: u64,
+    pub entries: u64,
+    pub evictions: u64,
+}
+
 pub struct IxeSession {
+    retained: Option<crate::readset::retained::Shared>,
     vm: crate::vm::Vm,
+    source_root: crate::value2::Root,
     /// The question this session is answering, while it is answering one.
     ///
     /// Present between `ixe_session_eval_question` and
@@ -2436,6 +3488,16 @@ pub struct IxeSession {
     /// by, and putting the token in the text would make every reword a
     /// silent reset of the population. Cleared with the message.
     last_refusal: Option<crate::refusal::RefusalToken>,
+    /// The memo row the last `ixe_session_eval_question` served an answer
+    /// from, for `ixe_session_question_reject`. Cleared by the next question.
+    served: Option<(crate::readset::EvalId, ix_kernel::Key)>,
+    /// The question in flight, between `ixe_session_eval_question` and the
+    /// call that ends it (`ixe_session_question_answer`, `_reject`, a served
+    /// answer, or a failure), for the two applications the key names and
+    /// therefore allows while it is open: [`ixe_question_apply`] and
+    /// [`ixe_auto_call`]. Every terminal path clears it, so a stale one
+    /// cannot be applied after its question is over.
+    question: Option<InFlightQuestion>,
     /// Damaged-store complaints, drained by the embedder.
     warnings: Vec<String>,
     /// Everything outside this crate that this session can ask, taken once
@@ -2470,19 +3532,39 @@ impl IxeSession {
     fn new(host: EmbedderHost) -> Self {
         let serial =
             NEXT_SESSION_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0xFF_FFFF;
-        let mut vm = crate::vm::Vm::with_settings(settings_for(&host));
+        // The compile cache is the session's for its whole life, so its store
+        // opens here rather than per evaluation: a session evaluates many
+        // expressions and every one of them imports through it. The result
+        // memo (`QuestionCache`) still opens per question, over the same
+        // directory.
+        let (store, unopened) =
+            crate::session::open_cache(eval_cache_dir().as_deref(), cache_max_bytes());
+        let mut vm = crate::vm::Vm::with_modules(
+            settings_for(&host),
+            store.map_or_else(
+                crate::modcache::ModuleCache::in_memory,
+                crate::modcache::ModuleCache::persistent,
+            ),
+        );
         if let Some(interrupt) = host.interrupt() {
             vm.set_interrupt(interrupt);
         }
         IxeSession {
+            retained: None,
             vm,
+            source_root: crate::value2::Root::Ambient,
             memo: None,
+            question: None,
             serial,
             next_index: 1,
             handles: BTreeMap::new(),
             last_error: None,
             last_refusal: None,
-            warnings: Vec::new(),
+            served: None,
+            warnings: unopened
+                .into_iter()
+                .map(|complaint| complaint.to_string())
+                .collect(),
             host,
         }
     }
@@ -2505,9 +3587,7 @@ impl IxeSession {
         let (status, message) = match error {
             EvalError::Unimplemented(refusal) => (IXE_ERR_UNIMPLEMENTED, refusal.detail.clone()),
             EvalError::Parse(message) => (IXE_ERR_PARSE, message.clone()),
-            EvalError::Eval(ErrKind::Eval, message, _) => (IXE_ERR_EVAL, message.clone()),
-            EvalError::Eval(ErrKind::Thrown, message, _) => (IXE_ERR_THROWN, message.clone()),
-            EvalError::Eval(ErrKind::Assertion, message, _) => (IXE_ERR_ASSERT, message.clone()),
+            EvalError::Eval(kind, message, _) => (status_of_kind(*kind), message.clone()),
         };
         self.last_refusal = match error {
             EvalError::Unimplemented(refusal) => Some(refusal.token),
@@ -2527,6 +3607,30 @@ impl IxeSession {
     }
 }
 
+/// What the question in flight allows the embedder to apply.
+///
+/// Both halves are in the memo key (`Selection::apply`, `Selection::auto_args`)
+/// and both are built from the key's own bytes, which is what makes applying
+/// them sound where `ixe_apply` on an injected value would not be.
+struct InFlightQuestion {
+    /// The exact typed request hashed into the memo key.
+    question: crate::session::Question,
+    /// The `IXE_QUESTION_*` kind the question was asked as. Each accessor
+    /// that reads a value "under the question in flight" (`ixe_derivation_set`
+    /// for derivation sets, `ixe_flake_document`) checks it: a document filed under
+    /// a select question's key would be served for that question later.
+    kind: i32,
+    /// For `IXE_QUESTION_FLAKE_DOCUMENT`: the directory the file's path
+    /// literals resolved against, under the file's root. The document spells
+    /// every path relative to it (`flake_doc::flake_document`).
+    flake_dir: Option<crate::value2::PathValue>,
+    apply: Option<crate::session::Apply>,
+    /// `--arg`/`--argstr` by name, each a cell shared by every formal it is
+    /// bound to: cppnix builds one `Bindings` and every auto-call reads from
+    /// it, so an argument's expression runs at most once.
+    auto_args: Vec<(String, Slot)>,
+}
+
 /// One question in flight: where it is filed, what it is filed under, and the
 /// recording that will become its read set.
 struct MemoScope {
@@ -2534,6 +3638,13 @@ struct MemoScope {
     identity: crate::readset::EvalId,
     /// Live while the embedder produces the answer.
     recorder: crate::readset::RecordingHost<EmbedderHost>,
+    /// The evaluation memo every force of this question shares
+    /// (`eval::Job::memo`). One question is one recording, and the embedder
+    /// answers it through many `ixe_force` calls; with one memo per force,
+    /// each re-asked the directories, imports and store paths the last one
+    /// had (measured: 15.6 listings per directory, `goals/rust-eval.md`
+    /// 2026-09-04). Dies with the scope, which is what makes sharing sound.
+    memo: crate::eval::JobMemo,
     /// The answer the cache gave, when this occasion is a sampled check of
     /// it. The check runs quiet and the served answer is what the caller is
     /// told to use, so the two halves agree with `session::evaluate`.
@@ -2562,7 +3673,7 @@ struct MemoScope {
 /// ENG-12915.
 ///
 /// Enforced rather than documented because the previous version of this rule
-/// *was* documented -- `mayBeMemoised` in `src/nix/rust-eval-session.cc`
+/// *was* documented -- `mayBeMemoised` in `src/libcmd/rust-eval-session.cc`
 /// refused to ask a question at all when the evaluand had arguments -- and a
 /// rule living in the embedder is a rule the next embedder does not have.
 fn refuse_injection_during_a_question(session: &mut IxeSession, what: &str) -> Option<i32> {
@@ -2584,18 +3695,42 @@ fn refuse_injection_during_a_question(session: &mut IxeSession, what: &str) -> O
 /// out of the read set, and the memo would then serve that answer again
 /// without ever re-checking the files it depended on. That is a wrong answer
 /// rather than a slow one, and it would appear only on the second run.
-fn machine_and_host(session: &mut IxeSession) -> (&mut crate::vm::Vm, &dyn Host) {
+///
+/// The memo travels with the recorder for the same reason: a question's
+/// forces share the scope's memo, and a drive outside any question gets
+/// `fresh`, which the caller made for this one drive and drops with it.
+fn machine_and_host<'s>(
+    session: &'s mut IxeSession,
+    fresh: &'s mut crate::eval::JobMemo,
+) -> (
+    &'s mut crate::vm::Vm,
+    &'s dyn Host,
+    &'s mut crate::eval::JobMemo,
+) {
     let IxeSession { vm, memo, host, .. } = session;
-    let host: &dyn Host = match memo {
-        Some(scope) => &scope.recorder,
-        None => host,
+    let (host, memo): (&dyn Host, &mut crate::eval::JobMemo) = match memo {
+        Some(scope) => (&scope.recorder, &mut scope.memo),
+        None => (host, fresh),
     };
-    (vm, host)
+    (vm, host, memo)
 }
 
 /// Borrow a session from a caller's pointer, or return `IXE_ERR_BADCALL`.
 /// A null session has nowhere to record a message, which is why this is the
 /// one failure with no retrievable text.
+/// The C status an evaluation error class reports. One table, used by the
+/// expression entry point and by every session failure, so a new class cannot
+/// be mapped in one and forgotten in the other.
+fn status_of_kind(kind: ErrKind) -> i32 {
+    match kind {
+        ErrKind::Eval => IXE_ERR_EVAL,
+        ErrKind::Thrown => IXE_ERR_THROWN,
+        ErrKind::Assertion => IXE_ERR_ASSERT,
+        ErrKind::ImportFromDerivation => IXE_ERR_IFD,
+        ErrKind::MissingArgument => IXE_ERR_MISSING_ARGUMENT,
+    }
+}
+
 macro_rules! session {
     ($ptr:expr) => {
         match unsafe { $ptr.as_mut() } {
@@ -2604,6 +3739,13 @@ macro_rules! session {
         }
     };
 }
+
+mod command;
+mod flake_check;
+mod flake_show;
+mod persistent;
+mod search;
+mod source_position;
 
 /// The settings this session evaluates under: the process configuration,
 /// with the one field that is not process state taken from the host.
@@ -2619,15 +3761,39 @@ fn settings_for(host: &EmbedderHost) -> crate::eval::Settings {
     settings
 }
 
+fn require_host_cache_identity(
+    host: &EmbedderHost,
+    settings: &crate::eval::Settings,
+    persistent: bool,
+) -> Result<(), &'static str> {
+    if persistent
+        && host.vtable.has_callbacks()
+        && !settings
+            .host_build_identity
+            .as_deref()
+            .is_some_and(|identity| !identity.is_empty())
+    {
+        return Err("persistent external-host caching requires a host build identity");
+    }
+    Ok(())
+}
+
+fn require_session_cache_identity(session: &IxeSession) -> Result<(), &'static str> {
+    require_host_cache_identity(
+        &session.host,
+        session.vm.settings(),
+        eval_cache_dir().is_some() || session.vm.modules().store().is_some(),
+    )
+}
+
 /// Create an evaluation session that answers through `host`.
 ///
 /// `host` is copied, so the caller may free the struct as soon as this
 /// returns -- but everything it points at, including `ctx` and any buffer a
 /// hook writes into, must outlive the session.
 ///
-/// Returns null when the vtable is malformed, which today means a partial set
-/// of the five filesystem read hooks; [`ixe_take_setting_conflict`] then
-/// carries the reason. A null `host` is also refused: a session with no host
+/// Returns null for a malformed vtable or persistent external-host caching
+/// without a build identity; [`ixe_take_setting_conflict`] carries the reason. A null `host` is also refused: a session with no host
 /// is not a useful object, and accepting one would put the "which embedder
 /// answers this" question back where it was.
 ///
@@ -2643,7 +3809,15 @@ pub unsafe extern "C" fn ixe_session_new(host: *const IxeHostVtable) -> *mut Ixe
         return std::ptr::null_mut();
     };
     match EmbedderHost::new(vtable) {
-        Ok(host) => Box::into_raw(Box::new(IxeSession::new(host))),
+        Ok(host) => {
+            if let Err(why) =
+                require_host_cache_identity(&host, &settings_for(&host), eval_cache_dir().is_some())
+            {
+                set_last_setting_conflict(why.to_owned());
+                return std::ptr::null_mut();
+            }
+            Box::into_raw(Box::new(IxeSession::new(host)))
+        }
         Err(why) => {
             set_last_setting_conflict(why.to_owned());
             std::ptr::null_mut()
@@ -2671,7 +3845,7 @@ pub unsafe extern "C" fn ixe_session_new(host: *const IxeHostVtable) -> *mut Ixe
 /// refusals; the pipe operators were the last, so the current subject is a
 /// runtime one: `genericClosure` refuses list-typed keys by name because
 /// cppnix's comparison switch has no case for them. The token must stay
-/// different from `unimplemented-builtin`, which
+/// different from `store-unavailable`, which
 /// `two_refusal_kinds_report_two_tokens` uses as its second row.
 #[cfg(test)]
 const REFUSED_EXPRESSION: &str = "builtins.genericClosure { startSet = [ { key = [ 1 ]; } { key = [ 2 ]; } ]; \
@@ -2687,6 +3861,80 @@ fn session_without_embedder() -> *mut IxeSession {
     // SAFETY: points at a live local for the duration of the call, which is
     // all `ixe_session_new` needs -- it copies the struct.
     unsafe { ixe_session_new(&raw const vtable) }
+}
+
+/// Create an explicitly bounded witness owner. Zero in either budget disables
+/// retention. No VM values, handles, host pointers, or mutable inputs are retained.
+#[unsafe(no_mangle)]
+pub extern "C" fn ixe_eval_cache_new(max_bytes: u64, max_entries: usize) -> *mut IxeEvalCache {
+    Box::into_raw(Box::new(IxeEvalCache {
+        retained: std::rc::Rc::new(std::cell::RefCell::new(
+            crate::readset::retained::Retained::new(max_bytes, max_entries),
+        )),
+    }))
+}
+
+/// Release the owner's reference. Attached sessions retain their own reference.
+/// # Safety
+/// `cache` must be null or a live handle from ixe_eval_cache_new, on its creating
+/// thread. A non-null handle must be freed exactly once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ixe_eval_cache_free(cache: *mut IxeEvalCache) {
+    if !cache.is_null() {
+        // SAFETY: ownership follows the caller contract above.
+        drop(unsafe { Box::from_raw(cache) });
+    }
+}
+
+/// Snapshot counters and accounted retained payload bytes; not process RSS.
+/// # Safety
+/// A non-null `cache` must be live on its creating thread; `output` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ixe_eval_cache_stats(
+    cache: *const IxeEvalCache,
+    output: *mut IxeEvalCacheStats,
+) -> i32 {
+    if output.is_null() {
+        return IXE_ERR_BADCALL;
+    }
+    // SAFETY: output is writable under the caller contract.
+    unsafe {
+        *output = IxeEvalCacheStats::default();
+    }
+    // SAFETY: a non-null cache follows the caller contract.
+    let Some(cache) = (unsafe { cache.as_ref() }) else {
+        return IXE_ERR_BADCALL;
+    };
+    let stats = cache.retained.borrow().stats();
+    // SAFETY: output is writable under the caller contract.
+    unsafe {
+        *output = IxeEvalCacheStats {
+            memory_hits: stats.memory_hits,
+            disk_loads: stats.disk_loads,
+            retained_bytes: stats.retained_bytes,
+            entries: stats.entries,
+            evictions: stats.evictions,
+        };
+    }
+    IXE_OK
+}
+
+/// Attach shared witness ownership to an idle session; null detaches it.
+/// # Safety
+/// Both non-null pointers must be live on this thread. Attachment retains its
+/// own reference, so the cache handle may subsequently be freed before the session.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ixe_session_set_eval_cache(
+    session: *mut IxeSession,
+    cache: *const IxeEvalCache,
+) -> i32 {
+    let session = session!(session);
+    if session.question.is_some() || session.memo.is_some() {
+        return session.bad("cannot replace evaluation cache ownership during a question");
+    }
+    // SAFETY: non-null cache pointers follow the caller contract.
+    session.retained = unsafe { cache.as_ref() }.map(|cache| cache.retained.clone());
+    IXE_OK
 }
 
 /// Destroy a session and every handle it issued.
@@ -2915,11 +4163,20 @@ pub unsafe extern "C" fn ixe_session_eval(
     if src.is_null() || out.is_null() {
         return session.bad("null source or output pointer");
     }
+    // Like `ixe_apply` and the other injections: a value built from a source
+    // the question's key never saw, then forced inside the question, would
+    // record its reads under that question's row (review, 2026-09-04).
+    if let Some(status) = refuse_injection_during_a_question(session, "ixe_session_eval") {
+        return status;
+    }
     // Re-take the process configuration for this evaluation. The embedder may
     // have called a setter since `ixe_session_new`, and a session outlives any
     // one call; within the evaluation below the settings then hold still,
     // which is what lets the memo key describe the run it labels (ENG-12939).
     session.vm.reload_settings_from_process();
+    if let Err(why) = require_session_cache_identity(session) {
+        return session.bad(why);
+    }
 
     let base = match unsafe { borrow_str(base_dir, base_dir_len) } {
         Ok(None) => ".".to_owned(),
@@ -2946,35 +4203,14 @@ pub unsafe extern "C" fn ixe_session_eval(
         Some(path) => crate::compile::Origin::File(path),
         None => crate::compile::Origin::String,
     };
-    let host = session.host.clone();
-    let (answer, warnings) = crate::session::evaluate_value_once(
-        &mut session.vm,
-        &host,
+    eval_uncached(
+        session,
         text,
         &base,
         origin,
-        eval_cache_dir().as_deref(),
-    );
-    // Labelled on the way in, so `ixe_session_take_warning` keeps handing the
-    // embedder one string and the severity still survives to the log line.
-    session
-        .warnings
-        .extend(warnings.into_iter().map(|complaint| {
-            let label = match complaint.severity {
-                crate::readset::Severity::Warning => "warning",
-                crate::readset::Severity::Error => "error",
-            };
-            format!("{label}: {}", complaint.message)
-        }));
-    match answer {
-        Ok(value) => {
-            let handle = session.insert(Slot::value(value));
-            // SAFETY: out is non-null, checked above.
-            unsafe { *out = handle };
-            IXE_OK
-        }
-        Err(error) => session.fail(&error),
-    }
+        &crate::session::Arguments::none(),
+        out,
+    )
 }
 
 // -- the whole question -----------------------------------------------------
@@ -3004,12 +4240,23 @@ pub unsafe extern "C" fn ixe_session_eval(
 // (ENG-12801).
 
 /// Question kinds, kept in step with ixe.h.
-const IXE_QUESTION_SELECT: i32 = 0;
-const IXE_QUESTION_DERIVATION: i32 = 1;
+pub(crate) const IXE_QUESTION_SELECT: i32 = 0;
+pub(crate) const IXE_QUESTION_DERIVATION: i32 = 1;
+pub(crate) const IXE_QUESTION_APP: i32 = 2;
+pub(crate) const IXE_QUESTION_FLAKE_SHOW: i32 = 3;
+pub(crate) const IXE_QUESTION_DERIVATION_PATH: i32 = 4;
+pub(crate) const IXE_QUESTION_DERIVATION_SET: i32 = 5;
+pub(crate) const IXE_QUESTION_FLAKE_DOCUMENT: i32 = 6;
+pub(crate) const IXE_QUESTION_SOURCE_POSITION: i32 = 7;
+pub(crate) const IXE_QUESTION_SEARCH_PACKAGES: i32 = 8;
+pub(crate) const IXE_QUESTION_FLAKE_CHECK: i32 = 9;
 
 /// Argument kinds, kept in step with ixe.h.
 const IXE_ARG_JSON: i32 = 0;
 const IXE_ARG_INTERNAL_PRIMOP: i32 = 1;
+
+pub(crate) const IXE_AUTO_ARG_EXPR: i32 = 0;
+pub(crate) const IXE_AUTO_ARG_STRING: i32 = 1;
 
 /// A counted byte string the embedder owns for the length of the call.
 ///
@@ -3030,6 +4277,18 @@ pub struct IxeArgument {
     /// `IXE_ARG_JSON` or `IXE_ARG_INTERNAL_PRIMOP`.
     pub kind: i32,
     /// The document, or the primop's name.
+    pub text: IxeBytes,
+}
+
+/// One `--arg`/`--argstr`: what a function met on the walk is applied to.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IxeAutoArg {
+    /// The formal it binds.
+    pub name: IxeBytes,
+    /// `IXE_AUTO_ARG_EXPR` (parsed under the working directory, evaluated
+    /// lazily) or `IXE_AUTO_ARG_STRING` (the bytes, no context).
+    pub kind: i32,
     pub text: IxeBytes,
 }
 
@@ -3217,6 +4476,11 @@ pub unsafe extern "C" fn ixe_session_eval_question(
     attr_paths: *const IxeBytes,
     attr_paths_len: usize,
     index_lists: i32,
+    apply: *const u8,
+    apply_len: usize,
+    auto_args: *const IxeAutoArg,
+    auto_args_len: usize,
+    auto_call: i32,
     render: i32,
     out_mode: *mut i32,
     out_root: *mut u64,
@@ -3226,6 +4490,12 @@ pub unsafe extern "C" fn ixe_session_eval_question(
     if src.is_null() || out_mode.is_null() || out_root.is_null() || out_answer.is_null() {
         return session.bad("null source or output pointer");
     }
+    // A question that starts ends the last one: its applications, and its
+    // recording and memo if the embedder never answered it, belong to the
+    // question they were keyed with and to nothing after it. Left in place,
+    // a stale scope would record this question's reads under the old
+    // identity and hand its memo to a new recording (review, 2026-09-04).
+    abandon_question(session);
     // Re-take the process configuration for this evaluation. The embedder may
     // have called a setter since `ixe_session_new`, and a session outlives any
     // one call; within the evaluation below the settings then hold still,
@@ -3239,6 +4509,10 @@ pub unsafe extern "C" fn ixe_session_eval_question(
         *out_mode = IXE_SERVE_EVALUATE;
         *out_root = 0;
         *out_answer = std::ptr::null_mut();
+    }
+
+    if let Err(why) = require_session_cache_identity(session) {
+        return session.bad(why);
     }
 
     let base = match unsafe { borrow_str(base_dir, base_dir_len) } {
@@ -3263,9 +4537,39 @@ pub unsafe extern "C" fn ixe_session_eval_question(
         Ok(paths) => paths,
         Err(status) => return status,
     };
+    // `nix eval --apply`, parsed under the working directory as cppnix parses
+    // it (`rootPath(".")`); the directory is in the key beside the text.
+    // Present when the pointer is, not when the text is: `--apply ''` is an
+    // expression that fails to parse, and reading it as "no apply" would
+    // serve the unapplied answer for it.
+    let apply = if apply.is_null() {
+        None
+    } else {
+        // SAFETY: caller contract; apply points to apply_len bytes.
+        let bytes = unsafe { slice::from_raw_parts(apply, apply_len) };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return session.bad("--apply expression is not UTF-8");
+        };
+        let base = match working_directory(session) {
+            Ok(base) => base,
+            Err(status) => return status,
+        };
+        Some(crate::session::Apply {
+            text: text.to_owned(),
+            base,
+        })
+    };
+    // SAFETY: caller contract.
+    let auto_args = match unsafe { decode_auto_args(session, auto_args, auto_args_len) } {
+        Ok(auto_args) => auto_args,
+        Err(status) => return status,
+    };
     let selection = crate::session::Selection {
         attr_paths,
         index_lists: index_lists != 0,
+        apply,
+        auto_args,
+        auto_call: auto_call != 0,
     };
     // SAFETY: caller contract.
     let arguments = match unsafe { decode_arguments(session, args, args_len) } {
@@ -3277,38 +4581,109 @@ pub unsafe extern "C" fn ixe_session_eval_question(
             let Some(render) = render_mode_of(render) else {
                 return session.bad(format!("unknown render mode {render}"));
             };
-            crate::session::Question::Select { selection, render }
+            crate::session::Question::Select {
+                selection: selection.clone(),
+                render,
+            }
         }
-        IXE_QUESTION_DERIVATION => crate::session::Question::Derivation { selection },
+        IXE_QUESTION_DERIVATION => crate::session::Question::Derivation {
+            selection: selection.clone(),
+        },
+        IXE_QUESTION_DERIVATION_SET => crate::session::Question::DerivationSet {
+            selection: selection.clone(),
+        },
+        IXE_QUESTION_APP => crate::session::Question::Application {
+            selection: selection.clone(),
+        },
+        IXE_QUESTION_SOURCE_POSITION => crate::session::Question::SourcePosition {
+            selection: selection.clone(),
+        },
+        IXE_QUESTION_SEARCH_PACKAGES => crate::session::Question::SearchPackages {
+            selection: selection.clone(),
+            scope: match render {
+                0 => crate::session::SearchScope::Selected,
+                1 => crate::session::SearchScope::FlakeDefaults,
+                _ => return session.bad("unknown search scope"),
+            },
+        },
+        IXE_QUESTION_FLAKE_CHECK => crate::session::Question::FlakeCheck {
+            selection: selection.clone(),
+            options: match crate::flake_check::Options::from_flags(render) {
+                Ok(options) => options,
+                Err(why) => return session.bad(why),
+            },
+        },
+        IXE_QUESTION_FLAKE_SHOW => crate::session::Question::FlakeShow {
+            selection: selection.clone(),
+            flags: render,
+        },
+        IXE_QUESTION_DERIVATION_PATH => crate::session::Question::DerivationPath {
+            selection: selection.clone(),
+        },
+        IXE_QUESTION_FLAKE_DOCUMENT => crate::session::Question::FlakeDocument,
         other => return session.bad(format!("unknown question kind {other}")),
     };
-    let origin = match &file {
-        Some(path) => crate::compile::Origin::File(path),
-        None => crate::compile::Origin::String,
+    // The arguments' cells, built before anything can be served: an `--arg`
+    // that does not parse fails the command whether or not the cache holds
+    // an answer, as it does under cppnix, which parses them first.
+    let mut in_flight = match in_flight_question(session, &selection, kind, question.clone()) {
+        Ok(in_flight) => in_flight,
+        Err(status) => return status,
     };
-
+    // After the question is known to be well-formed: a call refused above
+    // leaves no question in flight, as the API says.
+    let source_root = session.source_root.clone();
+    if matches!(source_root, crate::value2::Root::Mounted(_)) {
+        for path in std::iter::once(base.as_str()).chain(file.as_deref()) {
+            if let Err(error) = crate::value2::PathValue::try_new(source_root.clone(), path) {
+                return session.bad(error);
+            }
+        }
+    }
+    let origin = match (&file, &source_root) {
+        (Some(path), crate::value2::Root::Mounted(mount_point)) => {
+            crate::compile::Origin::MountedFile { path, mount_point }
+        }
+        (Some(path), crate::value2::Root::Ambient) => crate::compile::Origin::File(path),
+        (None, crate::value2::Root::Ambient) => crate::compile::Origin::String,
+        (None, crate::value2::Root::Mounted(_)) => {
+            return session.bad("mounted source has no file");
+        }
+    };
+    if matches!(question, crate::session::Question::FlakeDocument) {
+        in_flight.flake_dir = Some(match &file {
+            Some(path) => crate::value2::PathValue::normalized(origin.root(), path).parent(),
+            None => crate::value2::PathValue::normalized(origin.root(), &base),
+        });
+    }
+    // In flight from here: everything above was validation, and a question
+    // that never got past it must leave no state for the accessors to find.
+    // Every failure below this line goes through `abandon_question`.
+    session.question = Some(in_flight);
     // No cache, or one that will not open: evaluate the way `ixe_session_eval`
     // does. A cache is an optimisation and the expression is still owed an
     // answer.
     let Some(dir) = eval_cache_dir() else {
         return eval_uncached(session, text, &base, origin, &arguments, out_root);
     };
-    let mut cache = match crate::session::QuestionCache::open(&dir, verify_rate()) {
-        Ok(cache) => cache,
-        Err(reason) => {
-            session
-                .warnings
-                .push(format!("warning: {reason}; evaluating without it"));
-            return eval_uncached(session, text, &base, origin, &arguments, out_root);
-        }
-    };
+    let mut cache =
+        match crate::session::QuestionCache::open(&dir, verify_rate(), cache_max_bytes()) {
+            Ok(cache) => cache.with_retained(session.retained.clone()),
+            Err(reason) => {
+                session
+                    .warnings
+                    .push(format!("warning: {reason}; evaluating without it"));
+                return eval_uncached(session, text, &base, origin, &arguments, out_root);
+            }
+        };
 
     // Compile first: the module digest is half the key, and the compile cache
-    // is the part of the saving a cold process gets even on a memo miss.
+    // is the part of the saving a cold process gets even on a memo miss. The
+    // machine's cache, opened with the session: the one its imports go
+    // through.
     let compiled = {
-        let mut modules = cache.modules();
-        let outcome = modules.compile(text, &base, origin, session.vm.settings());
-        let corruption = modules.take_corruption();
+        let outcome = session.vm.compile(text, &base, origin);
+        let corruption = session.vm.modules_mut().take_corruption();
         for message in corruption {
             cache.complain(crate::readset::Complaint::warning(message));
         }
@@ -3317,6 +4692,7 @@ pub unsafe extern "C" fn ixe_session_eval_question(
             Err(error) => {
                 let failure = crate::session::compile_failure(&error);
                 drain_cache(session, &mut cache);
+                abandon_question(session);
                 return fail_with(session, &failure);
             }
         }
@@ -3329,8 +4705,10 @@ pub unsafe extern "C" fn ixe_session_eval_question(
         &question,
     );
 
+    session.served = None;
     let verifying = match cache.serve(&identity, &session.host, session.vm.settings()) {
         crate::session::Served::Answer(result) => {
+            session.served = cache.last_served();
             drain_cache(session, &mut cache);
             // SAFETY: checked non-null above.
             unsafe { *out_mode = IXE_SERVE_ANSWER };
@@ -3353,6 +4731,8 @@ pub unsafe extern "C" fn ixe_session_eval_question(
         other => other,
     };
 
+    // A sampled whole-question verifier must execute imported subtrees too.
+    session.vm.set_import_cache_enabled(verifying.is_none());
     let served_text = verifying.as_ref().map(|result| result.value.clone());
     let recorder = if verifying.is_some() {
         // Quiet: this run is a check of an answer the cache already gave, and
@@ -3362,16 +4742,30 @@ pub unsafe extern "C" fn ixe_session_eval_question(
     } else {
         crate::readset::RecordingHost::new(session.host.clone())
     };
+    // Filtered copies from the cache's own memo where sound, on both paths:
+    // a verification checks the whole-evaluation answer, and the copy memo
+    // confirms every path it serves with the store, so nothing it can say
+    // would pass a check that the walk would fail. Realisations with nothing
+    // to build likewise: the recorder confirms every path they stand on with
+    // the store before answering without the build.
+    let recorder = recorder
+        .with_copy_memo(cache.copy_memo())
+        .realising_by_validity(
+            session.vm.settings().ca_derivations,
+            session.vm.settings().allow_import_from_derivation,
+        );
     session.memo = Some(MemoScope {
         cache,
         identity,
         recorder,
+        memo: crate::eval::JobMemo::default(),
         verifying,
     });
 
     let module = compiled.module;
-    let (vm, host) = machine_and_host(session);
-    match crate::session::run_to_value(vm, &module, host) {
+    let mut fresh = crate::eval::JobMemo::default();
+    let (vm, host, memo) = machine_and_host(session, &mut fresh);
+    match crate::session::run_to_value_with(vm, &module, host, memo) {
         Ok(value) => {
             // Inside the scope, deliberately: applying `call-flake.nix` to a
             // lock file forces its outer lambdas, and any world read that
@@ -3432,6 +4826,10 @@ pub unsafe extern "C" fn ixe_session_question_answer(
     answer_len: usize,
 ) -> i32 {
     let session = session!(session);
+    // The answer ends the question, filed or not, cached or not.
+    drain_scope(session);
+    session.vm.set_import_cache_enabled(true);
+    session.question = None;
     let Some(mut scope) = session.memo.take() else {
         return IXE_OK;
     };
@@ -3477,8 +4875,56 @@ pub unsafe extern "C" fn ixe_session_question_answer(
     IXE_OK
 }
 
+/// The embedder could not use the answer the last `ixe_session_eval_question`
+/// served: forget that row and its witness, so that asking again evaluates
+/// and no later process is served it either. `why` is the embedder's reason,
+/// reported through the warnings. An error when nothing was served, or when
+/// the store refused the removal: an answer that cannot be forgotten must not
+/// be silently served twice.
+///
+/// # Safety
+/// `session` must be live; `why` must point to `why_len` readable bytes or be
+/// null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ixe_session_question_reject(
+    session: *mut IxeSession,
+    why: *const u8,
+    why_len: usize,
+) -> i32 {
+    let session = session!(session);
+    session.question = None;
+    let why = match unsafe { borrow_str(why, why_len) } {
+        Ok(text) => text.unwrap_or("no reason given").to_owned(),
+        Err(()) => return session.bad("rejection reason is not UTF-8"),
+    };
+    let Some((identity, key)) = session.served.take() else {
+        return session.bad("no served answer to reject");
+    };
+    let Some(dir) = eval_cache_dir() else {
+        return session.bad("a served answer was rejected but no evaluation cache is configured");
+    };
+    let mut cache =
+        match crate::session::QuestionCache::open(&dir, verify_rate(), cache_max_bytes()) {
+            Ok(cache) => cache.with_retained(session.retained.clone()),
+            Err(reason) => {
+                return session.bad(format!(
+                    "cannot reopen the evaluation cache to forget a rejected answer: {reason}"
+                ));
+            }
+        };
+    let forgotten = cache.forget(&identity, key, &why);
+    drain_cache(session, &mut cache);
+    match forgotten {
+        Ok(()) => IXE_OK,
+        Err(reason) => session.bad(format!(
+            "could not forget a rejected memoised answer: {reason}"
+        )),
+    }
+}
+
 /// Evaluate to a root handle with no result cache: `ixe_session_eval`'s body,
-/// shared so the fallback cannot drift from the thing it falls back to.
+/// and `ixe_session_eval_question`'s fallback when the result cache is not
+/// there, shared so the fallback cannot drift from the thing it falls back to.
 fn eval_uncached(
     session: &mut IxeSession,
     text: &str,
@@ -3487,21 +4933,17 @@ fn eval_uncached(
     arguments: &crate::session::Arguments,
     out_root: *mut u64,
 ) -> i32 {
-    // `None` rather than the configured directory: either there is none, or
-    // it has already been complained about, and asking again would produce a
-    // second copy of the same warning.
+    // Through the machine's own compile cache, whatever it is: the result memo
+    // is what failed to open or was never configured, and that has already
+    // been complained about once.
     let host = session.host.clone();
     let (answer, warnings) =
-        crate::session::evaluate_value_once(&mut session.vm, &host, text, base, origin, None);
+        crate::session::evaluate_value_once(&mut session.vm, &host, text, base, origin);
+    // Labelled on the way in, so `ixe_session_take_warning` keeps handing the
+    // embedder one string and the severity still survives to the log line.
     session
         .warnings
-        .extend(warnings.into_iter().map(|complaint| {
-            let label = match complaint.severity {
-                crate::readset::Severity::Warning => "warning",
-                crate::readset::Severity::Error => "error",
-            };
-            format!("{label}: {}", complaint.message)
-        }));
+        .extend(warnings.into_iter().map(|complaint| complaint.to_string()));
     match answer {
         Ok(value) => {
             // The same application the cached path performs, so a caller with
@@ -3512,14 +4954,22 @@ fn eval_uncached(
             // key cannot see.
             let root = match apply_arguments(session, value, arguments) {
                 Ok(root) => root,
-                Err(status) => return status,
+                Err(status) => {
+                    abandon_question(session);
+                    return status;
+                }
             };
             let handle = session.insert(root);
-            // SAFETY: the one caller checked it.
+            // SAFETY: both callers checked it.
             unsafe { *out_root = handle };
             IXE_OK
         }
-        Err(error) => session.fail(&error),
+        // No question survives a failed evaluation (`ixe_session_eval` has
+        // none in flight, and clearing nothing is free).
+        Err(error) => {
+            abandon_question(session);
+            session.fail(&error)
+        }
     }
 }
 
@@ -3530,6 +4980,10 @@ fn serve_answer(
     result: &crate::readset::EvalResult,
     out_answer: *mut *mut c_char,
 ) -> i32 {
+    // A served question is over: nothing is walked, so nothing may be
+    // applied under its key.
+    session.question = None;
+    crate::perf::note_memo_served();
     if result.status == crate::session::OK {
         // SAFETY: the callers checked it.
         return out_string(result.value.clone(), unsafe { &mut *out_answer });
@@ -3560,18 +5014,25 @@ fn drain_cache(session: &mut IxeSession, cache: &mut crate::session::QuestionCac
 
 /// The same, for a caller that already holds the cache apart from the session.
 fn drain_cache_of(warnings: &mut Vec<String>, cache: &mut crate::session::QuestionCache) {
-    for complaint in cache.take_complaints() {
-        let label = match complaint.severity {
-            crate::readset::Severity::Warning => "warning",
-            crate::readset::Severity::Error => "error",
-        };
-        warnings.push(format!("{label}: {}", complaint.message));
-    }
+    warnings.extend(
+        cache
+            .take_complaints()
+            .into_iter()
+            .map(|complaint| complaint.to_string()),
+    );
 }
 
 /// Drain the in-flight question's complaints without ending it.
 fn drain_scope(session: &mut IxeSession) {
-    let IxeSession { memo, warnings, .. } = session;
+    let IxeSession {
+        memo, warnings, vm, ..
+    } = session;
+    warnings.extend(
+        vm.modules_mut()
+            .take_corruption()
+            .into_iter()
+            .map(|message| format!("warning: {message}")),
+    );
     if let Some(scope) = memo {
         drain_cache_of(warnings, &mut scope.cache);
     }
@@ -3579,6 +5040,9 @@ fn drain_scope(session: &mut IxeSession) {
 
 /// End the question in flight without filing anything.
 fn abandon_question(session: &mut IxeSession) {
+    drain_scope(session);
+    session.vm.set_import_cache_enabled(true);
+    session.question = None;
     if let Some(mut scope) = session.memo.take() {
         drain_cache_of(&mut session.warnings, &mut scope.cache);
     }
@@ -3592,6 +5056,7 @@ fn render_mode_of(mode: i32) -> Option<RenderMode> {
         IXE_RENDER_RAW => Some(RenderMode::Raw),
         IXE_RENDER_VALUE_PRINTER => Some(RenderMode::ValuePrinter),
         IXE_RENDER_XML => Some(RenderMode::Xml),
+        IXE_RENDER_PLAIN_LAZY => Some(RenderMode::PlainLazy),
         _ => None,
     }
 }
@@ -3626,8 +5091,9 @@ fn force_slot(session: &mut IxeSession, slot: Slot) -> Result<Value, i32> {
         return Ok(value);
     }
     session.vm.start_force(slot);
-    let (vm, host) = machine_and_host(session);
-    match crate::eval::drive(vm, host) {
+    let mut fresh = crate::eval::JobMemo::default();
+    let (vm, host, memo) = machine_and_host(session, &mut fresh);
+    match crate::eval::drive_with(vm, host, memo) {
         Ok(value) => Ok(value),
         Err(error) => Err(session.fail(&crate::eval::map_vm_error(error))),
     }
@@ -3675,7 +5141,8 @@ pub unsafe extern "C" fn ixe_value_type(session: *mut IxeSession, handle: u64) -
 }
 
 /// Release one handle. Freeing an unknown handle is a no-op, so double frees
-/// are quiet rather than fatal.
+/// are quiet rather than fatal. Dropping the slot also releases any dynamic
+/// attribute-origin records reachable only through this handle.
 ///
 /// # Safety
 /// `session` must be live.
@@ -3786,7 +5253,8 @@ pub unsafe extern "C" fn ixe_attrs_names(
     IXE_OK
 }
 
-/// Release a buffer from `ixe_attrs_names`. Freeing null is a no-op.
+/// Release a buffer from `ixe_attrs_names` or `ixe_get_string_context`.
+/// Freeing null is a no-op.
 ///
 /// Separate from `ixe_string_free` because the two own different shapes: that
 /// one round-trips a `CString`, this one a boxed slice whose length cannot be
@@ -3794,14 +5262,14 @@ pub unsafe extern "C" fn ixe_attrs_names(
 /// `strlen` would report the first name's length and free the wrong extent.
 ///
 /// # Safety
-/// `names` must be a pointer from `ixe_attrs_names` and `len` the length it
-/// reported, or null.
+/// `names` must be a pointer from either producing function and `len` the
+/// length it reported, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ixe_names_free(names: *mut c_char, len: usize) {
     if names.is_null() {
         return;
     }
-    // SAFETY: ownership round-trip of a Box<[u8]> from ixe_attrs_names.
+    // SAFETY: ownership round-trip of a Box<[u8]> from either producer.
     drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(names.cast::<u8>(), len)) });
 }
 
@@ -4011,11 +5479,10 @@ pub unsafe extern "C" fn ixe_get_bool(session: *mut IxeSession, handle: u64, out
 /// memoisation -- right on the first look, wrong later, and nothing in
 /// between says so.
 ///
-/// The doc this replaces said context "cannot cross yet: this VM does not
-/// carry one". It carries one now (ENG-12465), and the sentence stopped being
-/// true without the code changing. Letting the context cross is ENG-12492; a
-/// caller that needs it has no way to ask today, and a refusal is the honest
-/// version of that.
+/// This bare-string entry point deliberately continues to reject context.
+/// Callers that need it read the bytes with `ixe_render(IXE_RENDER_RAW)` and
+/// the dependency records separately with `ixe_get_string_context`; making
+/// the lossy call succeed would still be a silent dependency drop.
 ///
 /// # Safety
 /// `session` must be live; `out` must be a valid non-null pointer.
@@ -4048,6 +5515,48 @@ pub unsafe extern "C" fn ixe_get_string(
     }
 }
 
+/// Return a forced string's context in cppnix's wire spelling.
+///
+/// The buffer has one NUL-terminated `NixStringContextElem::parse` input per
+/// element. It uses the same codec as the realise hook, so application
+/// programs and realised strings cannot disagree about a dependency's kind.
+///
+/// # Safety
+/// `session` must be live; `out` and `out_len` must be valid non-null pointers.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ixe_get_string_context(
+    session: *mut IxeSession,
+    handle: u64,
+    out: *mut *mut c_char,
+    out_len: *mut usize,
+) -> i32 {
+    let session = session!(session);
+    if out.is_null() || out_len.is_null() {
+        return session.bad("null output pointer");
+    }
+    let context = match force_handle(session, handle) {
+        Err(status) => return status,
+        Ok(Value::Str(text)) => {
+            let context = text.context_set();
+            encode_realise_request(&context)
+        }
+        Ok(other) => {
+            let what = crate::value2::type_name(&other);
+            return session.bad(format!("expected a string but found {what}"));
+        }
+    };
+    let len = context.len();
+    unsafe {
+        *out_len = len;
+        *out = if len == 0 {
+            std::ptr::null_mut()
+        } else {
+            Box::into_raw(context.into_boxed_slice()).cast::<c_char>()
+        };
+    }
+    IXE_OK
+}
+
 /// Render a handle's value to the bytes a command prints. `mode` is one of
 /// the `IXE_RENDER_*` values. Ownership of `*out` transfers.
 ///
@@ -4074,14 +5583,16 @@ pub unsafe extern "C" fn ixe_render(
         IXE_RENDER_RAW => RenderMode::Raw,
         IXE_RENDER_VALUE_PRINTER => RenderMode::ValuePrinter,
         IXE_RENDER_XML => RenderMode::Xml,
+        IXE_RENDER_PLAIN_LAZY => RenderMode::PlainLazy,
         other => return session.bad(format!("unknown render mode {other}")),
     };
     let value = match force_handle(session, handle) {
         Err(status) => return status,
         Ok(value) => value,
     };
-    let (vm, host) = machine_and_host(session);
-    match crate::session::render(vm, host, value, mode) {
+    let mut fresh = crate::eval::JobMemo::default();
+    let (vm, host, memo) = machine_and_host(session, &mut fresh);
+    match crate::session::render_with(vm, host, value, mode, memo) {
         // Raw bytes, as cppnix writes them: only NUL cannot cross a C string.
         Ok(text) => out_bytes(&text, out),
         Err(error) => session.fail(&error),
@@ -4104,11 +5615,12 @@ pub unsafe extern "C" fn ixe_render(
 // `parseJSON`, `internalPrimOps`), and a flake is what the *bridge* builds
 // out of them.
 //
-// None of these can reach the memo table. `ixe_session_eval` is the only call
-// that memoises, and it memoises the source it was handed; a handle produced
-// here is applied and forced through `force_handle`, which drives the VM
-// against `RealFs` with no recording host attached. So an injected value
-// cannot be keyed on -- and cannot silently answer for a different one.
+// None of these can reach the memo table. `ixe_session_eval_question` is the
+// only call that files a result, keyed on the source it was handed; a handle
+// produced here is applied and forced through `force_handle`, which outside
+// a question drives the VM with no recording host attached, and inside one
+// is turned away by `refuse_injection_during_a_question`. So an injected
+// value cannot be keyed on -- and cannot silently answer for a different one.
 
 // The escape a JSON document uses to say "this string is a store path".
 //
@@ -4213,7 +5725,7 @@ fn json_document_value(session: &mut IxeSession, text: &str) -> Result<Value, i3
 /// so no program can name it, and the flake machinery reaches it through that
 /// map instead. This is the same map with the same one member today,
 /// `fetchFinalTree`, and the same rule decides membership -- `Gate::Never` in
-/// `CPP_PRIMOP_GATES`, which is also what keeps the name out of `builtins`.
+/// the owned builtin catalogue, which is also what keeps the name out of `builtins`.
 ///
 /// A name that is registered ordinarily is refused rather than served: it is
 /// reachable as `builtins.<name>` and handing it over here as well would be a
@@ -4258,7 +5770,7 @@ pub unsafe extern "C" fn ixe_internal_primop(
 /// same lookup with the same two refusals -- rather than two spellings that
 /// can come to disagree about which names exist.
 fn internal_primop_value(session: &mut IxeSession, name: &str) -> Result<Value, i32> {
-    if crate::builtins_gen::gate_of(name) != Some(crate::builtins_gen::Gate::Never) {
+    if crate::builtin_catalogue::gate_of(name) != Some(crate::builtin_catalogue::Gate::Never) {
         return Err(session.bad(format!(
             "'{name}' is not one of cppnix's internal primops; an ordinarily \
              registered primop is reachable as builtins.{name}"
@@ -4305,7 +5817,9 @@ fn internal_primop_value(session: &mut IxeSession, name: &str) -> Result<Value, 
 /// them: the application. The other is reading the function's formals -- their
 /// names, and which of them have defaults -- so the caller can build the set
 /// to apply. The handle API cannot answer that today; `ixe_value_type` says
-/// only `IXE_TYPE_FUNCTION`.
+/// only `IXE_TYPE_FUNCTION`. (`ixe_flake_document` reads a lambda's formals
+/// in-process for the one document that needs their names, and is a reader
+/// of a whole file, not an accessor a caller can point at a function.)
 ///
 /// Written down because there are two callers wanting one semantic: flake
 /// output selection, which is served, and `-A` over a function root such as a
@@ -4357,6 +5871,721 @@ pub unsafe extern "C" fn ixe_apply(
     IXE_OK
 }
 
+/// Apply the question's `--apply` expression to a value, lazily.
+///
+/// The one application allowed while a question is in flight, because it is
+/// the one the key names: the expression's text and the directory it is
+/// parsed under are in the question's fingerprint, so a row filed for this
+/// question is filed for this application too. The expression is compiled
+/// and forced through the question's recorder, so what it reads is in the
+/// row's read set like every other force between the question and its answer.
+///
+/// # Safety
+/// `out` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ixe_question_apply(
+    session: *mut IxeSession,
+    arg: u64,
+    out: *mut u64,
+) -> i32 {
+    let session = session!(session);
+    if out.is_null() {
+        return session.bad("null output pointer");
+    }
+    let Some(apply) = session.question.as_ref().and_then(|q| q.apply.clone()) else {
+        return session.bad("ixe_question_apply with no --apply in the question in flight");
+    };
+    let Some(argument) = session.get(arg).cloned() else {
+        return session.bad("unknown argument handle");
+    };
+    let module = match session
+        .vm
+        .compile(&apply.text, &apply.base, crate::compile::Origin::String)
+    {
+        Ok(compiled) => compiled.module,
+        Err(error) => return session.fail(&crate::eval::EvalError::from(error)),
+    };
+    let f = {
+        let mut fresh = crate::eval::JobMemo::default();
+        let (vm, host, memo) = machine_and_host(session, &mut fresh);
+        match crate::session::run_to_value_with(vm, &module, host, memo) {
+            Ok(value) => value,
+            Err(error) => return session.fail(&error),
+        }
+    };
+    if !is_callable(session, &f) {
+        // The user's expression, not the embedder's call: cppnix's
+        // `callFunction` type error, in its words and class.
+        let what = crate::value2::type_name(&f);
+        return session.fail(&crate::eval::EvalError::eval(
+            ErrKind::Eval,
+            format!("attempt to call something which is not a function but {what}"),
+        ));
+    }
+    let handle = session.insert(Slot::pending(Slot::value(f), vec![argument]));
+    // SAFETY: out is non-null, checked above.
+    unsafe { *out = handle };
+    IXE_OK
+}
+
+/// The working directory, as the base every command-line expression is
+/// parsed under (cppnix's `rootPath(".")`).
+///
+/// Refused rather than transliterated when it is not UTF-8: a lossy spelling
+/// would put two directories under one key.
+fn working_directory(session: &mut IxeSession) -> Result<String, i32> {
+    let dir = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(error) => return Err(session.bad(format!("working directory: {error}"))),
+    };
+    dir.into_os_string().into_string().map_err(|_| {
+        session.last_error = Some("the working directory is not UTF-8".to_owned().into());
+        session.last_refusal = Some(crate::refusal::RefusalToken::NonUtf8Boundary);
+        IXE_ERR_UNIMPLEMENTED
+    })
+}
+
+/// Decode the `--arg`/`--argstr` list of a question call.
+///
+/// # Safety
+/// `args` must point to `args_len` readable [`IxeAutoArg`]s, or be null when
+/// `args_len` is zero.
+unsafe fn decode_auto_args(
+    session: &mut IxeSession,
+    args: *const IxeAutoArg,
+    args_len: usize,
+) -> Result<Vec<crate::session::AutoArg>, i32> {
+    if args_len == 0 {
+        return Ok(Vec::new());
+    }
+    if args.is_null() {
+        return Err(session.bad("null auto-argument array with a non-zero length"));
+    }
+    // SAFETY: caller contract.
+    let raw = unsafe { slice::from_raw_parts(args, args_len) };
+    let mut out = Vec::with_capacity(args_len);
+    for (n, argument) in raw.iter().enumerate() {
+        // SAFETY: caller contract.
+        let Ok(name) = (unsafe { bytes_str(&argument.name) }) else {
+            return Err(session.bad(format!("auto-argument {n}'s name is not UTF-8")));
+        };
+        // SAFETY: caller contract.
+        let Ok(text) = (unsafe { bytes_str(&argument.text) }) else {
+            return Err(session.bad(format!("auto-argument {n} is not UTF-8")));
+        };
+        let value = match argument.kind {
+            IXE_AUTO_ARG_EXPR => crate::session::AutoArgValue::Expr {
+                text: text.to_owned(),
+                base: working_directory(session)?,
+            },
+            IXE_AUTO_ARG_STRING => crate::session::AutoArgValue::Str(text.to_owned()),
+            other => return Err(session.bad(format!("unknown auto-argument kind {other}"))),
+        };
+        out.push(crate::session::AutoArg {
+            name: name.to_owned(),
+            value,
+        });
+    }
+    Ok(out)
+}
+
+/// Build the cells a question's applications read from.
+///
+/// An `--arg` is compiled now and evaluated when a formal first reads it,
+/// under the root environment, which is where cppnix's `mkThunk_` puts it
+/// (`MixEvalArgs::getAutoArgs`); a `--argstr` is a string value. One cell per
+/// name, shared by every formal that takes it.
+fn in_flight_question(
+    session: &mut IxeSession,
+    selection: &crate::session::Selection,
+    kind: i32,
+    question: crate::session::Question,
+) -> Result<InFlightQuestion, i32> {
+    let mut auto_args = Vec::with_capacity(selection.auto_args.len());
+    for crate::session::AutoArg { name, value } in &selection.auto_args {
+        let slot = match value {
+            crate::session::AutoArgValue::Expr { text, base } => {
+                let module = match session
+                    .vm
+                    .compile(text, base, crate::compile::Origin::String)
+                {
+                    Ok(compiled) => compiled.module,
+                    Err(error) => return Err(session.fail(&crate::eval::EvalError::from(error))),
+                };
+                let entry = module.entry;
+                Slot::thunk(module, entry, Rc::new(crate::value2::EnvNode::Root))
+            }
+            crate::session::AutoArgValue::Str(text) => {
+                Slot::value(Value::Str(crate::value2::NixStr::from(text.as_str())))
+            }
+        };
+        auto_args.push((name.clone(), slot));
+    }
+    Ok(InFlightQuestion {
+        question,
+        kind,
+        flake_dir: None,
+        apply: selection.apply.clone(),
+        auto_args,
+    })
+}
+
+/// The question in flight is one of `kind`, or the accessor `who` is refused:
+/// no question at all, or a question of another kind whose memo row the
+/// accessor's answer would otherwise be filed under.
+fn require_question(session: &mut IxeSession, kind: i32, who: &str) -> Result<(), i32> {
+    match session.question.as_ref() {
+        Some(question) if question.kind == kind => Ok(()),
+        Some(question) => {
+            let found = question.kind;
+            Err(session.bad(format!(
+                "{who} under a question of kind {found}, not {kind}"
+            )))
+        }
+        None => Err(session.bad(format!("{who} with no question in flight"))),
+    }
+}
+
+/// The cell bound to `name` by the question in flight, if any.
+fn auto_arg_named(session: &IxeSession, name: &str) -> Option<Slot> {
+    session
+        .question
+        .as_ref()
+        .and_then(|q| q.auto_args.iter().find(|(n, _)| n == name))
+        .map(|(_, cell)| cell.clone())
+}
+
+/// cppnix's `autoCallFunction` (`eval.cc`) on one cell, under the question's
+/// `--arg`/`--argstr`.
+///
+/// A set with a `__functor` is applied to itself and the result treated the
+/// same way; a lambda with formals is applied to the set its formals select
+/// from the arguments -- every argument under an ellipsis, otherwise each
+/// formal's own or its default, and a formal with neither is the
+/// missing-argument error in cppnix's words; anything else is handed back
+/// untouched. The application is lazy, as [`ixe_apply`]'s is: the caller
+/// forces where cppnix forces.
+fn auto_call(session: &mut IxeSession, slot: Slot) -> Result<Slot, i32> {
+    let mut current = slot;
+    loop {
+        let value = force_slot(session, current.clone())?;
+        match &value {
+            Value::Attrs(attrs) => {
+                let functor = session.vm.intern("__functor");
+                let Some(f) = attrs.get(&functor).cloned() else {
+                    return Ok(current);
+                };
+                let applied = Slot::pending(f, vec![current.clone()]);
+                // cppnix forces the functor's result before looking at it
+                // again, so a functor that fails does so here.
+                force_slot(session, applied.clone())?;
+                current = applied;
+            }
+            Value::Closure(closure) => {
+                let Some(unit) = closure.module.units.get(closure.unit as usize) else {
+                    return Err(session.bad("internal: bad closure unit"));
+                };
+                let Some(crate::ir::Param::Formals {
+                    fields, ellipsis, ..
+                }) = &unit.param
+                else {
+                    return Ok(current);
+                };
+                let mut map = BTreeMap::new();
+                if *ellipsis {
+                    // Everything on offer: an ellipsis accepts what it does
+                    // not name.
+                    let given: Vec<(String, Slot)> = session
+                        .question
+                        .as_ref()
+                        .map(|q| q.auto_args.clone())
+                        .unwrap_or_default();
+                    for (name, cell) in given {
+                        map.insert(session.vm.intern(&name), cell);
+                    }
+                } else {
+                    for formal in fields {
+                        let name = closure
+                            .module
+                            .symbols
+                            .get(formal.sym as usize)
+                            .cloned()
+                            .unwrap_or_default();
+                        match (auto_arg_named(session, &name), formal.default) {
+                            (Some(cell), _) => {
+                                map.insert(session.vm.intern(&name), cell);
+                            }
+                            (None, Some(_)) => {}
+                            (None, None) => {
+                                let pos = (formal.pos != crate::ir::NO_POS)
+                                    .then(|| closure.module.line_col(formal.pos))
+                                    .flatten()
+                                    .map(|(line, column)| crate::vm::SrcPos {
+                                        file: match &closure.module.origin {
+                                            crate::ir::SrcOrigin::File(path) => {
+                                                Some(Rc::from(path.as_str()))
+                                            }
+                                            crate::ir::SrcOrigin::String => None,
+                                        },
+                                        line,
+                                        column,
+                                    });
+                                return Err(session.fail(&crate::eval::EvalError::Eval(
+                                    ErrKind::MissingArgument,
+                                    format!(
+                                        "cannot evaluate a function that has an argument without a value ('{name}')\n\
+                                         Nix attempted to evaluate a function as a top level expression; in\n\
+                                         this case it must have its arguments supplied either by default\n\
+                                         values, or passed explicitly with '--arg' or '--argstr'. See\n\
+                                         https://nix.dev/manual/nix/stable/language/syntax.html#functions."
+                                    ),
+                                    pos,
+                                )));
+                            }
+                        }
+                    }
+                }
+                let argument = Slot::value(Value::Attrs(Rc::new(crate::value2::Attrs::new(map))));
+                return Ok(Slot::pending(current, vec![argument]));
+            }
+            _ => return Ok(current),
+        }
+    }
+}
+
+/// Auto-call a value the way cppnix's `findAlongAttrPath`, `processExpr` and
+/// `getDerivations` do, under the `--arg`/`--argstr` of the question in
+/// flight, and hand back the result: an application when the value took one
+/// (lazy; force it where cppnix does), the value itself otherwise.
+///
+/// Refused outside a question: the arguments are in the key of the question
+/// that carried them, and applying them under any other would put a value in
+/// a row whose key does not name it.
+///
+/// # Safety
+/// `session` must be live; `out` must be a valid non-null pointer to write
+/// one handle through.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ixe_auto_call(session: *mut IxeSession, value: u64, out: *mut u64) -> i32 {
+    let session = session!(session);
+    if out.is_null() {
+        return session.bad("null output pointer");
+    }
+    if session.question.is_none() {
+        return session.bad("ixe_auto_call with no question in flight");
+    }
+    let Some(slot) = session.get(value).cloned() else {
+        return session.bad("unknown value handle");
+    };
+    let called = match auto_call(session, slot) {
+        Ok(called) => called,
+        Err(status) => return status,
+    };
+    let handle = session.insert(called);
+    // SAFETY: out is non-null, checked above.
+    unsafe { *out = handle };
+    IXE_OK
+}
+
+/// One record of a derivation-set answer: what `nix-build` builds.
+struct FoundDerivation {
+    drv_path: String,
+    output_name: String,
+}
+
+/// One step of the derivation walk, on an explicit stack so a set nested as
+/// deep as `max-call-depth` allows cannot exhaust this thread's stack the
+/// way recursion would.
+enum Visit {
+    /// `getDerivations`: auto-call, then the derivation test, then the
+    /// walk of a set or a list.
+    Walk { slot: Slot, depth: u32 },
+    /// One attribute of a set: `getDerivation`, then descend only into a set
+    /// that asks for it (`recurseForDerivations`).
+    Attr { slot: Slot, depth: u32 },
+    /// One element of a list: `getDerivation`, then `getDerivations` on
+    /// anything that was not one.
+    Elem { slot: Slot, depth: u32 },
+}
+
+/// The names the derivation walk reads, interned once.
+struct DerivationWalkNames {
+    type_: crate::value2::Sym,
+    name: crate::value2::Sym,
+    drv_path: crate::value2::Sym,
+    output_name: crate::value2::Sym,
+    recurse: crate::value2::Sym,
+    combine: crate::value2::Sym,
+}
+
+/// cppnix's `getDerivation` (`get-drvs.cc`) on one cell: record the value if
+/// it is a derivation not yet seen, and say whether the caller should look
+/// inside it (`false` for any derivation, seen or not).
+fn get_derivation(
+    session: &mut IxeSession,
+    names: &DerivationWalkNames,
+    done: &mut BTreeSet<usize>,
+    found: &mut Vec<FoundDerivation>,
+    slot: &Slot,
+) -> Result<(bool, Value), i32> {
+    let value = force_slot(session, slot.clone())?;
+    let Value::Attrs(attrs) = &value else {
+        return Ok((true, value));
+    };
+    let Some(type_slot) = attrs.get(&names.type_).cloned() else {
+        return Ok((true, value));
+    };
+    // `isDerivation`: a `type` that is not the string "derivation" -- or
+    // not a string -- is not one, without complaint.
+    let is_derivation = matches!(
+        force_slot(session, type_slot)?,
+        Value::Str(s) if s.as_str() == Some("derivation")
+    );
+    if !is_derivation {
+        return Ok((true, value));
+    }
+    // `Done`: the set's identity, so `rec { x = derivation ..; y = x; }`
+    // is one derivation.
+    if !done.insert(Rc::as_ptr(attrs) as usize) {
+        return Ok((false, value));
+    }
+    let Some(name_slot) = attrs.get(&names.name).cloned() else {
+        return Err(session.fail(&crate::eval::EvalError::eval(
+            ErrKind::Eval,
+            "derivation name missing",
+        )));
+    };
+    force_string_no_context(
+        session,
+        name_slot,
+        "while evaluating the 'name' attribute of a derivation",
+    )?;
+    let drv_path = match attrs.get(&names.drv_path).cloned() {
+        Some(slot) => match force_slot(session, slot)? {
+            Value::Str(s) => s.as_str().unwrap_or_default().to_owned(),
+            Value::Path(p) => AsRef::<str>::as_ref(&*p).to_owned(),
+            other => {
+                return Err(session.fail(&crate::eval::EvalError::eval(
+                    ErrKind::Eval,
+                    format!(
+                        "cannot coerce {} to a string: while evaluating the 'drvPath' attribute of a derivation",
+                        crate::value2::type_name(&other)
+                    ),
+                )));
+            }
+        },
+        None => {
+            return Err(session.fail(&crate::eval::EvalError::eval(
+                ErrKind::Eval,
+                "derivation does not contain a 'drvPath' attribute",
+            )));
+        }
+    };
+    let output_name = match attrs.get(&names.output_name).cloned() {
+        Some(slot) => force_string_no_context(
+            session,
+            slot,
+            "while evaluating the output name of a derivation",
+        )?,
+        None => String::new(),
+    };
+    found.push(FoundDerivation {
+        drv_path,
+        output_name,
+    });
+    Ok((false, value))
+}
+
+/// cppnix's `getDerivations` (`get-drvs.cc`), from `root`, in its order.
+///
+/// Auto-called at every level, attributes in name order and only those that
+/// spell a path component, a set entered when it carries
+/// `recurseForDerivations = true` or when its parent carries
+/// `_combineChannels`, every element of a list, and each derivation once
+/// however many names reach it. A derivation's `name` is forced as cppnix's
+/// `queryName` forces it, so a name that fails fails the walk here too.
+fn derivation_set(session: &mut IxeSession, root: Slot) -> Result<Vec<FoundDerivation>, i32> {
+    let max_depth = session.vm.settings().max_call_depth;
+    let names = DerivationWalkNames {
+        type_: session.vm.intern("type"),
+        name: session.vm.intern("name"),
+        drv_path: session.vm.intern("drvPath"),
+        output_name: session.vm.intern("outputName"),
+        recurse: session.vm.intern("recurseForDerivations"),
+        combine: session.vm.intern("_combineChannels"),
+    };
+    let mut found = Vec::new();
+    let mut done: BTreeSet<usize> = BTreeSet::new();
+    let mut stack = vec![Visit::Walk {
+        slot: root,
+        depth: 0,
+    }];
+    while let Some(visit) = stack.pop() {
+        match visit {
+            Visit::Walk { slot, depth } => {
+                // `addCallDepth`, with cppnix's message.
+                if depth > max_depth {
+                    return Err(session.fail(&crate::eval::EvalError::eval(
+                        ErrKind::Eval,
+                        "stack overflow; max-call-depth exceeded",
+                    )));
+                }
+                let called = auto_call(session, slot)?;
+                let (look_inside, value) =
+                    get_derivation(session, &names, &mut done, &mut found, &called)?;
+                if !look_inside {
+                    continue;
+                }
+                match &value {
+                    Value::Attrs(attrs) => {
+                        let combine = attrs.contains_key(&names.combine);
+                        let mut children: Vec<(String, Slot)> = attrs
+                            .iter()
+                            .map(|(sym, child)| {
+                                (session.vm.sym_name(*sym).to_owned(), child.clone())
+                            })
+                            .filter(|(name, _)| is_attr_path_component(name))
+                            .collect();
+                        children.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                        // Reversed onto the stack, so the first name pops
+                        // first and its descent runs before its sibling.
+                        for (_, child) in children.into_iter().rev() {
+                            stack.push(if combine {
+                                Visit::Walk {
+                                    slot: child,
+                                    depth: depth + 1,
+                                }
+                            } else {
+                                Visit::Attr { slot: child, depth }
+                            });
+                        }
+                    }
+                    Value::List(items) => {
+                        for item in items.iter().rev() {
+                            stack.push(Visit::Elem {
+                                slot: item.clone(),
+                                depth,
+                            });
+                        }
+                    }
+                    _ => {
+                        return Err(session.fail(&crate::eval::EvalError::eval(
+                            ErrKind::Eval,
+                            "expression does not evaluate to a derivation (or a set or list of those)",
+                        )));
+                    }
+                }
+            }
+            Visit::Attr { slot, depth } => {
+                let (look_inside, value) =
+                    get_derivation(session, &names, &mut done, &mut found, &slot)?;
+                if !look_inside {
+                    continue;
+                }
+                let Value::Attrs(attrs) = &value else {
+                    continue;
+                };
+                let Some(flag) = attrs.get(&names.recurse).cloned() else {
+                    continue;
+                };
+                let recurse = match force_slot(session, flag)? {
+                    Value::Bool(b) => b,
+                    other => {
+                        return Err(session.fail(&crate::eval::EvalError::eval(
+                            ErrKind::Eval,
+                            format!(
+                                "expected a Boolean but found {}: while evaluating the attribute `recurseForDerivations`",
+                                crate::value2::type_name(&other)
+                            ),
+                        )));
+                    }
+                };
+                if recurse {
+                    stack.push(Visit::Walk {
+                        slot,
+                        depth: depth + 1,
+                    });
+                }
+            }
+            Visit::Elem { slot, depth } => {
+                let (look_inside, _) =
+                    get_derivation(session, &names, &mut done, &mut found, &slot)?;
+                if look_inside {
+                    stack.push(Visit::Walk {
+                        slot,
+                        depth: depth + 1,
+                    });
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// cppnix's `forceStringNoCtx`: the string, refusing one that carries a
+/// store-path context, in cppnix's words.
+fn force_string_no_context(
+    session: &mut IxeSession,
+    slot: Slot,
+    what: &str,
+) -> Result<String, i32> {
+    match force_slot(session, slot)? {
+        Value::Str(s) => {
+            let text = s.as_str().unwrap_or_default().to_owned();
+            if s.has_context() {
+                return Err(session.fail(&crate::eval::EvalError::eval(
+                    ErrKind::Eval,
+                    format!("the string '{text}' is not allowed to refer to a store path: {what}"),
+                )));
+            }
+            Ok(text)
+        }
+        other => Err(session.fail(&crate::eval::EvalError::eval(
+            ErrKind::Eval,
+            format!(
+                "expected a string but found {}: {what}",
+                crate::value2::type_name(&other)
+            ),
+        ))),
+    }
+}
+
+/// cppnix's `isAttrPathComponent` (`get-drvs.cc`): `[A-Za-z_][A-Za-z0-9_+-]*`.
+fn is_attr_path_component(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '+')
+}
+
+/// Encode the records of a derivation-set answer.
+///
+/// Netstrings, two per record: `<len>:<drvPath>,<len>:<outputName>,`. Every
+/// field is length-delimited, so a name carrying a tab or a newline is one
+/// field of that length and not two records; a decoder that reaches the end
+/// mid-field has a malformed answer, not a short one. Records concatenate,
+/// which is what lets one answer hold the walks of several `-A` paths.
+fn encode_derivation_set(found: &[FoundDerivation]) -> String {
+    let mut out = String::new();
+    for record in found {
+        for field in [&record.drv_path, &record.output_name] {
+            out.push_str(&field.len().to_string());
+            out.push(':');
+            out.push_str(field);
+            out.push(',');
+        }
+    }
+    out
+}
+
+/// Walk `root` for derivations the way `nix-build` does (cppnix's
+/// `getDerivations`, `get-drvs.cc`), under the question in flight, and hand
+/// back the records found, encoded as [`encode_derivation_set`] says. The
+/// caller frees the string with `ixe_string_free`.
+///
+/// # Safety
+/// `session` must be live; `out` must be a valid non-null pointer to write
+/// one string through.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ixe_derivation_set(
+    session: *mut IxeSession,
+    root: u64,
+    out: *mut *mut c_char,
+) -> i32 {
+    let session = session!(session);
+    if out.is_null() {
+        return session.bad("null output pointer");
+    }
+    if let Err(status) =
+        require_question(session, IXE_QUESTION_DERIVATION_SET, "ixe_derivation_set")
+    {
+        return status;
+    }
+    let Some(slot) = session.get(root).cloned() else {
+        return session.bad("unknown value handle");
+    };
+    let found = match derivation_set(session, slot) {
+        Ok(found) => found,
+        Err(status) => return status,
+    };
+    out_string(encode_derivation_set(&found), out)
+}
+
+/// cppnix's `readFlake` over `root`, under the question in flight: the
+/// document [`crate::flake_doc::flake_document`] describes, as one JSON
+/// string the caller frees with `ixe_string_free`.
+///
+/// Under the question, so every force the reader performs -- and it forces
+/// only what `forceTrivialValue` would -- lands in the row's read set, and a
+/// later run is served the document without touching the file.
+///
+/// # Safety
+/// `session` must be live; `out` must be a valid non-null pointer to write
+/// one string through.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ixe_flake_document(
+    session: *mut IxeSession,
+    root: u64,
+    out: *mut *mut c_char,
+) -> i32 {
+    let session = session!(session);
+    if out.is_null() {
+        return session.bad("null output pointer");
+    }
+    if let Err(status) =
+        require_question(session, IXE_QUESTION_FLAKE_DOCUMENT, "ixe_flake_document")
+    {
+        return status;
+    }
+    let Some(slot) = session.get(root).cloned() else {
+        return session.bad("unknown value handle");
+    };
+    let Some(flake_dir) = session.question.as_ref().and_then(|q| q.flake_dir.clone()) else {
+        return session.bad("ixe_flake_document under a document question with no flake directory");
+    };
+    let document = {
+        let mut fresh = crate::eval::JobMemo::default();
+        let (vm, host, memo) = machine_and_host(session, &mut fresh);
+        crate::flake_doc::flake_document(vm, host, memo, slot, &flake_dir)
+    };
+    match document {
+        Ok(document) => out_string(document, out),
+        Err(error) => session.fail(&error),
+    }
+}
+
+/// Set the root used for file-backed question sources. Its identity is part
+/// of the compiled module and therefore of every result-cache key.
+///
+/// # Safety
+/// `session` must be live and `root` must name `root_len` readable bytes,
+/// or be null for the ambient filesystem.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ixe_session_set_source_root(
+    session: *mut IxeSession,
+    root: *const u8,
+    root_len: usize,
+) -> i32 {
+    let session = session!(session);
+    if session.question.is_some() || session.memo.is_some() {
+        return session.bad("cannot change source root during a question");
+    }
+    // SAFETY: caller provides the bytes described above.
+    let name = match unsafe { borrow_str(root, root_len) } {
+        Ok(name) => name.unwrap_or(""),
+        Err(()) => return session.bad("source root is not UTF-8"),
+    };
+    match crate::value2::Root::from_wire_name(name) {
+        Ok(root) => {
+            session.source_root = root;
+            IXE_OK
+        }
+        Err(error) => session.bad(error),
+    }
+}
+
 /// Borrow an optional UTF-8 string from a pointer and length.
 ///
 /// # Safety
@@ -4395,15 +6624,16 @@ enum Accounting {
 const SETTER_ACCOUNTING: &[(&str, Accounting)] = &[
     ("ixe_set_max_call_depth", Accounting::InKey),
     ("ixe_set_nix_version", Accounting::InKey),
+    ("ixe_set_host_build_identity", Accounting::InKey),
     ("ixe_set_store_dir", Accounting::InKey),
     ("ixe_set_current_system", Accounting::InKey),
     ("ixe_set_pure_eval", Accounting::InKey),
     ("ixe_set_restrict_eval", Accounting::InKey),
-    ("ixe_set_cpp_builtin_names", Accounting::InKey),
+    ("ixe_set_builtin_features", Accounting::InKey),
     ("ixe_set_home_dir", Accounting::InKey),
     // Not a setter, and in this table because it carries what the fourteen
     // deleted `ixe_set_*` hook installers used to: the host vtable. Only one
-    // thing about that vtable can change an answer -- whether the five
+    // thing about that vtable can change an answer -- whether the six
     // filesystem reads go through the embedder's accessor, which decides what
     // `pure-eval` refuses -- and `settings_for` folds exactly that into
     // `Settings::path_reads`. Everything else the vtable carries is a hook
@@ -4411,26 +6641,20 @@ const SETTER_ACCOUNTING: &[(&str, Accounting)] = &[
     // deleted rows made one at a time.
     ("ixe_session_new", Accounting::InKey),
     (
+        "ixe_session_set_eval_cache",
+        Accounting::CannotChangeAnAnswer(
+            "attaches only bounded decoded dependency witnesses, which are replayed \
+             against the current host before any result can be served. No VM value \
+             or host context is retained, and replacement during a question is refused.",
+        ),
+    ),
+    (
         "ixe_set_eval_cache_dir",
         Accounting::CannotChangeAnAnswer(
             "this is the cache itself. Keying the cache on its own location \
              would give every directory a private cache and defeat the point; \
              what stops it changing an answer is every other setting being in \
              the key, plus the tests in tests/cache_semantics.rs.",
-        ),
-    ),
-    (
-        "ixe_add_virtual_file",
-        Accounting::CannotChangeAnAnswer(
-            "registers file contents for a path that is not on disk, which \
-             `<nix/fetchurl.nix>` resolves to. It plainly changes answers -- \
-             and it is already in the key, because `RealFs::read_file` serves \
-             the virtual file itself, so the evaluator asks through `Host` and \
-             the read set records a `ReadFile` question whose digest covers \
-             the contents. Change the bytes and the key moves. Same argument \
-             the store hooks make -- what they answer is recorded and \
-             replayed -- and it holds only while the lookup stays inside \
-             `read_file`: move it earlier and this row becomes wrong.",
         ),
     ),
     (
@@ -4444,6 +6668,15 @@ const SETTER_ACCOUNTING: &[(&str, Accounting)] = &[
              substituted its own result would hide the bug it exists to find.",
         ),
     ),
+    (
+        "ixe_set_eval_cache_max_bytes",
+        Accounting::CannotChangeAnAnswer(
+            "the cache's byte cap. A sweep removes completed entries, and every \
+             entry is Policy::Keyed, so removing one can only make the next \
+             lookup a miss that re-performs; nothing it removes was ever the \
+             answer, only a way to reach it.",
+        ),
+    ),
     // The trace family's two halves, and they are opposite kinds of thing.
     // The vtable's `warn` and `trace` say where a line goes, which cannot
     // change a value; these two decide whether the expression has a value at
@@ -4451,6 +6684,18 @@ const SETTER_ACCOUNTING: &[(&str, Accounting)] = &[
     ("ixe_set_trace_verbose", Accounting::InKey),
     ("ixe_set_abort_on_warn", Accounting::InKey),
     ("ixe_set_ca_derivations", Accounting::InKey),
+    ("ixe_set_blake3_hashes", Accounting::InKey),
+    // Host policy the witness verifier would otherwise serve across: a
+    // realisation or fetch served by validity never reaches the host check
+    // that enforces these, so the key carries them.
+    ("ixe_set_allow_import_from_derivation", Accounting::InKey),
+    ("ixe_set_allowed_uris", Accounting::InKey),
+    (
+        "ixe_set_repair",
+        Accounting::CannotChangeAnAnswer(
+            "it turns the memo off: nothing is served under --repair, so no answer is shared across it",
+        ),
+    ),
     // The three parser lints and the pipe-operators feature are compile-time
     // settings: each decides what a module compiles to (a fatal lint makes
     // the linted literal a compile error, the feature makes `|>` a call
@@ -4549,6 +6794,7 @@ mod setter_accounting_tests {
         // this table asks did not stop applying just because the spelling
         // changed.
         "ixe_session_new",
+        "ixe_session_set_eval_cache",
     ];
 
     #[test]
@@ -4567,10 +6813,11 @@ mod setter_accounting_tests {
                 continue;
             };
             // Every mutating verb, not just `ixe_set_`. The scan used to key
-            // on that one prefix, and `ixe_add_virtual_file` -- which decides
-            // what `<nix/fetchurl.nix>` evaluates to -- sailed past it
-            // unasked, because it is spelled `add`. A gate that keys on a
-            // naming convention only covers the surfaces that follow it.
+            // on that one prefix, and the virtual-file registration (since
+            // folded into the findFile answer) -- which decided what
+            // `<nix/fetchurl.nix>` evaluates to -- sailed past it unasked,
+            // because it was spelled `add`. A gate that keys on a naming
+            // convention only covers the surfaces that follow it.
             //
             // Known residual weakness, stated rather than papered over: a
             // mutator named outside these verbs still escapes. The complete
@@ -4640,31 +6887,36 @@ mod setter_accounting_tests {
         let crate::eval::Settings {
             store_dir: _,
             nix_version: _,
+            host_build_identity: _,
             current_system: _,
             max_call_depth: _,
             pure_eval: _,
             restrict_eval: _,
-            cpp_builtin_names: _,
+            builtin_features: _,
             path_reads: _,
             trace_verbose: _,
             abort_on_warn: _,
             home_dir: _,
             ca_derivations: _,
+            blake3_hashes: _,
             lint_url_literals: _,
             lint_short_path_literals: _,
             lint_absolute_path_literals: _,
             pipe_operators: _,
             parse_toml_timestamps: _,
+            allow_import_from_derivation: _,
+            allowed_uris: _,
+            repair: _,
         } = crate::eval::Settings::current();
         assert_eq!(
-            in_key, 17,
+            in_key, 21,
             "the number of settings in the memo key changed; update this \
              count and check `Settings` gained or lost the matching field"
         );
     }
 }
 
-/// The C ABI of the five filesystem reads, exercised the way the bridge calls
+/// The C ABI of the seven filesystem reads, exercised the way the bridge calls
 /// it: raw pointers, out parameters, a partial set refused.
 ///
 /// # No guard, and that is the change worth noticing
@@ -4683,16 +6935,35 @@ mod setter_accounting_tests {
 #[cfg(test)]
 mod path_read_tests {
     use super::{
-        EmbedderHost, FileTypeFn, IxeHostVtable, PathExistsFn, ReadDirFn, ReadFileFn,
-        decode_dir_entries, decode_file_type, settings_for,
+        EmbedderHost, FileTypeFn, FindFileFn, IXE_OK, ImportFn, IxeHostVtable, PathExistsFn,
+        ReadDirFn, ReadFileFn, decode_dir_entries, decode_file_type, decode_imported_source, settings_for,
     };
     use crate::host::{FileType, Host};
     use std::ffi::c_void;
+
+    unsafe extern "C" fn fake_store_path(
+        _ctx: *mut c_void,
+        _root: *const u8,
+        _root_len: usize,
+        _path: *const u8,
+        _path_len: usize,
+        out: *mut *const u8,
+        out_len: *mut usize,
+    ) -> i32 {
+        const ANSWER: &[u8] = b"/nix/store/00000000000000000000000000000000-source\0/nix/store/00000000000000000000000000000000-source/sub";
+        unsafe {
+            *out = ANSWER.as_ptr();
+            *out_len = ANSWER.len();
+        }
+        0
+    }
 
     /// Answers for one fixed path and reports every other as missing, in
     /// cppnix's own wording, which is what the real accessor produces.
     unsafe extern "C" fn fake_read_file(
         _ctx: *mut c_void,
+        _root: *const u8,
+        _root_len: usize,
         path: *const u8,
         path_len: usize,
         out: *mut *const u8,
@@ -4718,19 +6989,51 @@ mod path_read_tests {
         rc
     }
 
+    unsafe extern "C" fn fake_import(
+        _ctx: *mut c_void,
+        _root: *const u8,
+        _root_len: usize,
+        _path: *const u8,
+        _path_len: usize,
+        out: *mut *const u8,
+        out_len: *mut usize,
+    ) -> i32 {
+        const ANSWER: &[u8] = b"\0/bridged/hello.nix\0{ a = 1; }";
+        unsafe {
+            *out = ANSWER.as_ptr();
+            *out_len = ANSWER.len();
+        }
+        0
+    }
+
     unsafe extern "C" fn fake_path_exists(
         _ctx: *mut c_void,
+        _root: *const u8,
+        _root_len: usize,
         path: *const u8,
         path_len: usize,
+        out: *mut *const u8,
+        out_len: *mut usize,
     ) -> i32 {
         // SAFETY: as above.
         let asked =
             unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(path, path_len)) };
-        i32::from(asked == "/bridged/hello.nix")
+        let answer: &'static str = if asked == "/bridged/hello.nix" {
+            "1"
+        } else {
+            "0"
+        };
+        unsafe {
+            *out = answer.as_ptr();
+            *out_len = answer.len();
+        }
+        0
     }
 
     unsafe extern "C" fn fake_read_dir(
         _ctx: *mut c_void,
+        _root: *const u8,
+        _root_len: usize,
         _path: *const u8,
         _path_len: usize,
         out: *mut *const u8,
@@ -4747,6 +7050,8 @@ mod path_read_tests {
 
     unsafe extern "C" fn fake_file_type(
         _ctx: *mut c_void,
+        _root: *const u8,
+        _root_len: usize,
         _path: *const u8,
         _path_len: usize,
         out: *mut *const u8,
@@ -4769,6 +7074,8 @@ mod path_read_tests {
     /// cannot tell which one `resolve_import` asked.
     unsafe extern "C" fn fake_file_type_resolved(
         _ctx: *mut c_void,
+        _root: *const u8,
+        _root_len: usize,
         path: *const u8,
         path_len: usize,
         out: *mut *const u8,
@@ -4789,11 +7096,72 @@ mod path_read_tests {
         0
     }
 
-    /// A vtable whose five reads are all answered by the fakes above.
+    unsafe extern "C" fn fake_import_derivation(
+        _ctx: *mut c_void,
+        _root: *const u8,
+        _root_len: usize,
+        _path: *const u8,
+        _path_len: usize,
+        out: *mut *const u8,
+        out_len: *mut usize,
+    ) -> i32 {
+        const ANSWER: &[u8] = b"derivation\0{\"path\":\"/nix/store/11111111111111111111111111111111-demo.drv\",\"name\":\"demo\",\"outputs\":{\"out\":\"/nix/store/22222222222222222222222222222222-demo\",\"dev\":\"/downstream-placeholder\"}}";
+        // SAFETY: the callback's live out parameters receive a static buffer.
+        unsafe {
+            *out = ANSWER.as_ptr();
+            *out_len = ANSWER.len();
+        }
+        0
+    }
+
+    #[test]
+    fn a_typed_drv_import_preserves_output_wrappers_and_contexts() {
+        let _held = crate::eval::globals_shared();
+        let host = EmbedderHost::new(IxeHostVtable {
+            import_source: Some(fake_import_derivation as ImportFn),
+            ..bridged()
+        }).expect("complete read hooks");
+        let expression = r#"
+          let d = import /nix/store/11111111111111111111111111111111-demo.drv;
+          in assert d.type == "derivation" && d.name == "demo";
+             assert d.outputName == "dev" && d.outPath == "/downstream-placeholder";
+             assert map (x: x.outputName) d.all == [ "dev" "out" ];
+             assert d.out.dev.out.outputName == "out";
+             assert builtins.attrNames d == [ "all" "dev" "drvPath" "name" "out" "outPath" "outputName" "type" ];
+             assert builtins.getContext d.drvPath == {
+               "/nix/store/11111111111111111111111111111111-demo.drv" = { allOutputs = true; };
+             };
+             assert builtins.getContext d.outPath == {
+               "/nix/store/11111111111111111111111111111111-demo.drv" = { outputs = [ "dev" ]; };
+             };
+             assert builtins.getContext d.out.outPath == {
+               "/nix/store/11111111111111111111111111111111-demo.drv" = { outputs = [ "out" ]; };
+             };
+             true
+        "#;
+        assert_eq!(crate::eval::render_with(&crate::eval::settings_with_store(), &host, expression), "true");
+    }
+
+    #[test]
+    fn a_malformed_typed_drv_import_is_not_reparsed_as_source() {
+        for bytes in [
+            b"derivation\0{}".as_slice(),
+            b"derivation\0{\"path\":\"/x.drv\",\"name\":\"x\",\"outputs\":{\"out\":42}}".as_slice(),
+            b"derivation\0{\"path\":\"relative.drv\",\"name\":\"x\",\"outputs\":{}}".as_slice(),
+        ] {
+            assert!(decode_imported_source(bytes).is_err());
+        }
+        assert!(matches!(decode_imported_source(b"\0/a.drv\0{ answer = 42; }"),
+            Ok(crate::host::ImportedSource::Nix { .. })));
+    }
+
+    /// A vtable whose seven reads are all answered by the fakes above.
     fn bridged() -> IxeHostVtable {
         IxeHostVtable {
+            import_source: Some(fake_import as ImportFn),
             read_file: Some(fake_read_file as ReadFileFn),
             path_exists: Some(fake_path_exists as PathExistsFn),
+            dir_exists: Some(fake_path_exists as PathExistsFn),
             read_dir: Some(fake_read_dir as ReadDirFn),
             file_type: Some(fake_file_type as FileTypeFn),
             file_type_resolved: Some(fake_file_type_resolved as FileTypeFn),
@@ -4804,6 +7172,8 @@ mod path_read_tests {
     /// Reports every path missing, in the accessor's own wording.
     unsafe extern "C" fn denies_everything(
         _ctx: *mut c_void,
+        _root: *const u8,
+        _root_len: usize,
         _path: *const u8,
         _path_len: usize,
         out: *mut *const u8,
@@ -4820,43 +7190,139 @@ mod path_read_tests {
 
     unsafe extern "C" fn denies_existence(
         _ctx: *mut c_void,
+        _root: *const u8,
+        _root_len: usize,
         _path: *const u8,
         _path_len: usize,
+        out: *mut *const u8,
+        out_len: *mut usize,
     ) -> i32 {
+        const ANSWER: &str = "0";
+        unsafe {
+            *out = ANSWER.as_ptr();
+            *out_len = ANSWER.len();
+        }
         0
     }
 
-    /// A file registered with `ixe_add_virtual_file` is readable through a
-    /// bridged host, even though that host's accessor reports it missing.
+    unsafe extern "C" fn missing_mount(
+        _ctx: *mut c_void,
+        _root: *const u8,
+        _root_len: usize,
+        _path: *const u8,
+        _path_len: usize,
+        out: *mut *const u8,
+        out_len: *mut usize,
+    ) -> i32 {
+        const ANSWER: &str = "mounted path root '/nix/store/gone' disappeared";
+        unsafe {
+            *out = ANSWER.as_ptr();
+            *out_len = ANSWER.len();
+        }
+        1
+    }
+
+    /// The bytes a `findFile` answer carries are served by the host that
+    /// received them, to every later question about the path: existence,
+    /// kind, contents and the atomic import. Every read hook here refuses,
+    /// so an answer can only have come from those bytes.
     ///
-    /// This is the test that was absent. `RealFs` and `FnHost` both consulted
-    /// the registry and [`EmbedderHost`] did not, so the corepkgs file the
-    /// C++ bridge registers from `rustFindFile` was invisible to it and
-    /// `import <nix/fetchurl.nix>` failed with `path '/fetchurl.nix' does not
-    /// exist` -- the one `lang-diff` mismatch, `eval-okay-search-path`, and
-    /// nothing in the crate saw it because the two hosts the crate's own
-    /// tests use were the two that were right.
-    ///
-    /// Every read hook here refuses, so an answer can only have come from the
-    /// registry.
+    /// This is the seam that was missing twice: first `EmbedderHost` did not
+    /// consult the registry at all (`import <nix/fetchurl.nix>` failed with
+    /// `path '/fetchurl.nix' does not exist`, the one `lang-diff` mismatch),
+    /// then the registry was process-global and the atomic import bypassed
+    /// it (the same import refused under pure evaluation on the real
+    /// configuration). A second host from the same vtable sees nothing:
+    /// the bytes are the session's.
     #[test]
-    fn a_registered_file_is_read_through_a_bridged_host() {
-        // The registry and the process settings are both global, and the
-        // settings guard is a read lock, so the registry needs its own.
+    fn find_file_contents_are_served_by_the_host_that_received_them() {
         let _held = crate::eval::globals_shared();
-        let _registry = crate::host::registry_exclusive();
-        let denying = IxeHostVtable {
+        let vtable = IxeHostVtable {
+            import_source: Some(denies_everything as ImportFn),
             read_file: Some(denies_everything as ReadFileFn),
             path_exists: Some(denies_existence as PathExistsFn),
+            dir_exists: Some(denies_existence as PathExistsFn),
             read_dir: Some(denies_everything as ReadDirFn),
             file_type: Some(denies_everything as FileTypeFn),
             file_type_resolved: Some(denies_everything as FileTypeFn),
+            find_file: Some(answers_fetchurl as FindFileFn),
             ..IxeHostVtable::empty()
         };
-        let Ok(fs) = EmbedderHost::new(denying) else {
+        let Ok(fs) = EmbedderHost::new(vtable) else {
             unreachable!("a complete set of read hooks has to be accepted")
         };
-        crate::host::assert_answers_from_registered_files(&fs, "/fetchurl.nix");
+        let rooted = crate::value2::PathValue::ambient("/fetchurl.nix");
+        assert!(
+            !fs.path_exists_checked(&rooted)
+                .expect("existence question failed"),
+            "absent before the lookup, or this proves nothing"
+        );
+        assert_eq!(
+            fs.find_file(&[], "nix/fetchurl.nix").ok(),
+            Some(rooted.clone())
+        );
+        assert_eq!(
+            fs.read_file(&rooted).ok().as_deref(),
+            Some("{ registered = true; }")
+        );
+        assert!(
+            fs.path_exists_checked(&rooted)
+                .expect("existence question failed")
+        );
+        assert_eq!(fs.dir_exists_checked(&rooted), Ok(false));
+        // Regular and not a directory, or `resolve_import` appends
+        // `/default.nix` and turns this into a second missing path.
+        assert!(matches!(
+            fs.file_type(&rooted),
+            Ok(Some(crate::host::FileType::Regular))
+        ));
+        assert!(matches!(
+            fs.file_type_resolved(&rooted),
+            Ok(crate::host::FileType::Regular)
+        ));
+        assert_eq!(
+            fs.resolve_import(&rooted).ok().as_deref(),
+            Some("/fetchurl.nix")
+        );
+        let imported = fs
+            .import_source(&rooted)
+            .expect("the atomic import answers from the bytes");
+        assert_eq!(
+            imported,
+            crate::host::ImportedSource::Nix {
+                path: rooted.clone(), text: "{ registered = true; }".to_owned(),
+            }
+        );
+
+        let Ok(other) = EmbedderHost::new(vtable) else {
+            unreachable!("a complete set of read hooks has to be accepted")
+        };
+        assert!(
+            !other
+                .path_exists_checked(&rooted)
+                .expect("existence question failed"),
+            "a second host from the same vtable has not been handed the bytes"
+        );
+    }
+
+    /// `findFile` answering `/fetchurl.nix` with its bytes, as the C++
+    /// bridge does for cppnix's in-memory corepkgs.
+    unsafe extern "C" fn answers_fetchurl(
+        _ctx: *mut c_void,
+        _entries: *const u8,
+        _entries_len: usize,
+        _name: *const u8,
+        _name_len: usize,
+        out: *mut *const u8,
+        out_len: *mut usize,
+    ) -> i32 {
+        const ANSWER: &[u8] = b"\0/fetchurl.nix\0{ registered = true; }";
+        // SAFETY: a 'static buffer outlives the call by construction.
+        unsafe {
+            *out = ANSWER.as_ptr();
+            *out_len = ANSWER.len();
+        }
+        IXE_OK
     }
 
     /// The whole seam in one pass: build a host from the vtable, ask each
@@ -4869,17 +7335,26 @@ mod path_read_tests {
             unreachable!("a complete set of read hooks has to be accepted")
         };
         assert_eq!(
-            fs.read_file("/bridged/hello.nix").ok().as_deref(),
+            fs.read_file(&crate::value2::ambient_path("/bridged/hello.nix"))
+                .ok()
+                .as_deref(),
             Some("{ a = 1; }")
         );
-        assert!(fs.path_exists("/bridged/hello.nix"));
-        assert!(!fs.path_exists("/bridged/absent.nix"));
+        assert!(
+            fs.path_exists_checked(&crate::value2::ambient_path("/bridged/hello.nix"))
+                .expect("existence question failed")
+        );
+        assert!(
+            !fs.path_exists_checked(&crate::value2::ambient_path("/bridged/absent.nix"))
+                .expect("existence question failed")
+        );
         assert_eq!(
-            fs.file_type("/bridged/hello.nix").ok(),
+            fs.file_type(&crate::value2::ambient_path("/bridged/hello.nix"))
+                .ok(),
             Some(Some(FileType::Regular))
         );
         assert_eq!(
-            fs.read_dir("/bridged").ok(),
+            fs.read_dir(&crate::value2::ambient_path("/bridged")).ok(),
             Some(vec![
                 ("hello.nix".to_owned(), FileType::Regular),
                 ("sub".to_owned(), FileType::Directory),
@@ -4887,11 +7362,15 @@ mod path_read_tests {
         );
         // An `import` is the *resolving* kind question and then `read_file`.
         assert_eq!(
-            fs.file_type_resolved("/bridged/hello.nix").ok(),
+            fs.file_type_resolved(&crate::value2::ambient_path("/bridged/hello.nix"))
+                .ok(),
             Some(FileType::Regular)
         );
         assert_eq!(
-            fs.resolve_import("/bridged/hello.nix").ok().as_deref(),
+            fs.resolve_import(&crate::value2::ambient_path("/bridged/hello.nix"))
+                .ok()
+                .map(|p| p.to_string())
+                .as_deref(),
             Some("/bridged/hello.nix")
         );
         // The discriminating pair. `lstat` says regular and `stat` says
@@ -4899,16 +7378,20 @@ mod path_read_tests {
         // `/default.nix` asked the resolving hook and one that does not asked
         // the plain one. Asking the plain one is ENG-12871.
         assert_eq!(
-            fs.file_type("/bridged/link-to-dir").ok(),
+            fs.file_type(&crate::value2::ambient_path("/bridged/link-to-dir"))
+                .ok(),
             Some(Some(FileType::Regular))
         );
         assert_eq!(
-            fs.resolve_import("/bridged/link-to-dir").ok().as_deref(),
+            fs.resolve_import(&crate::value2::ambient_path("/bridged/link-to-dir"))
+                .ok()
+                .map(|p| p.to_string())
+                .as_deref(),
             Some("/bridged/link-to-dir/default.nix")
         );
 
         // A refusal arrives as the embedder's own text, not as this crate's.
-        let Err(denied) = fs.read_file("/bridged/absent.nix") else {
+        let Err(denied) = fs.read_file(&crate::value2::ambient_path("/bridged/absent.nix")) else {
             unreachable!("a read under pure eval must be refused")
         };
         assert!(
@@ -4923,13 +7406,57 @@ mod path_read_tests {
             unreachable!("an empty vtable is a legitimate standalone embedding")
         };
         assert_eq!(
-            standalone.read_file("/bridged/hello.nix").err().as_deref(),
+            standalone
+                .read_file(&crate::value2::ambient_path("/bridged/hello.nix"))
+                .err()
+                .as_deref(),
             Some("path '/bridged/hello.nix' does not exist")
         );
         // The bridged host still answers, so the two did not share anything.
         assert_eq!(
-            fs.read_file("/bridged/hello.nix").ok().as_deref(),
+            fs.read_file(&crate::value2::ambient_path("/bridged/hello.nix"))
+                .ok()
+                .as_deref(),
             Some("{ a = 1; }")
+        );
+    }
+
+    #[test]
+    fn an_existence_hook_error_is_not_a_negative_answer() {
+        let vtable = IxeHostVtable {
+            path_exists: Some(missing_mount as PathExistsFn),
+            dir_exists: Some(missing_mount as PathExistsFn),
+            ..bridged()
+        };
+        let Ok(host) = EmbedderHost::new(vtable) else {
+            unreachable!("a complete read vtable is valid")
+        };
+        let answer = host.path_exists_checked(&crate::value2::ambient_path("/gone"));
+        assert!(matches!(answer, Err(message) if message.contains("disappeared")));
+        let answer = host.dir_exists_checked(&crate::value2::ambient_path("/gone/"));
+        assert!(matches!(answer, Err(message) if message.contains("disappeared")));
+    }
+
+    #[test]
+    fn store_path_keeps_visible_subpath_and_store_object_context_separate() {
+        let vtable = IxeHostVtable {
+            store_path: Some(fake_store_path),
+            ..IxeHostVtable::empty()
+        };
+        let Ok(host) = EmbedderHost::new(vtable) else {
+            unreachable!("storePath hook is valid")
+        };
+        let mount = "/nix/store/00000000000000000000000000000000-source";
+        let path = crate::value2::PathValue::new(
+            crate::value2::Root::mounted(mount),
+            format!("{mount}/sub"),
+        );
+        assert_eq!(
+            host.store_path(&path),
+            Ok(crate::host::StorePathResult {
+                path: format!("{mount}/sub"),
+                store_path: mount.to_owned(),
+            })
         );
     }
 
@@ -5010,7 +7537,7 @@ mod path_read_tests {
         unsafe { super::ixe_session_free(session) };
     }
 
-    /// Supplying the hooks is what flips the purity table's five rows, and
+    /// Supplying the hooks is what flips the purity table's six rows, and
     /// what puts a different value in the memo key.
     ///
     /// Read off two hosts rather than off the process before and after an
@@ -5025,7 +7552,8 @@ mod path_read_tests {
             pure_eval: true,
             restrict_eval: false,
         };
-        let question = crate::task::NeedPath::Contents("/bridged/hello.nix".to_owned());
+        let question =
+            crate::task::NeedPath::Contents(crate::value2::ambient_path("/bridged/hello.nix"));
         let Ok(standalone) = EmbedderHost::new(IxeHostVtable::empty()) else {
             unreachable!("an empty vtable is a legitimate standalone embedding")
         };
@@ -5080,7 +7608,8 @@ mod path_read_tests {
 #[cfg(test)]
 mod async_realise_tests {
     use super::{
-        EmbedderHost, IxeHostVtable, RealiseAllowFn, RealiseBuildFn, RealiseCheckFn, RealiseFn,
+        EmbedderHost, IxeHostVtable, IxeRealiseCheck, IxeRealiseErrorClass, RealiseAllowFn,
+        RealiseBuildFn, RealiseCheckFn,
     };
     use crate::host::{Host, Slow, SlowAnswer};
     use crate::value2::ContextElem;
@@ -5094,6 +7623,11 @@ mod async_realise_tests {
     #[derive(Default)]
     struct FakeEmbedder {
         checks: AtomicU32,
+        build_calls: AtomicU32,
+        active_builds: AtomicU32,
+        max_active_builds: AtomicU32,
+        batch_sizes: Mutex<Vec<usize>>,
+        build_protocol_fault: AtomicU32,
         /// Set by the test to let the build finish; the build spins on it,
         /// so "not ready yet" is a state the test enters deterministically
         /// rather than by winning a race.
@@ -5110,19 +7644,24 @@ mod async_realise_tests {
         unsafe { &*ctx.cast::<FakeEmbedder>() }
     }
 
+    /// Answers the status the test set, and on `Failed` the disabled-IFD
+    /// class, so a test can see the class survive the crossing.
     unsafe extern "C" fn fake_check(
         ctx: *mut c_void,
         _request: *const u8,
         _request_len: usize,
+        error_class: *mut i32,
         out: *mut *const u8,
         out_len: *mut usize,
     ) -> i32 {
         let fake = embedder_of(ctx);
         fake.checks.fetch_add(1, Ordering::SeqCst);
-        // SAFETY: a 'static buffer outlives the call by construction.
+        // SAFETY: a 'static buffer outlives the call by construction, and
+        // `error_class` is the caller's local.
         unsafe {
             *out = b"declined".as_ptr();
             *out_len = 8;
+            *error_class = IxeRealiseErrorClass::ImportFromDerivation as i32;
         }
         fake.check_status.load(Ordering::SeqCst) as i32
     }
@@ -5131,23 +7670,42 @@ mod async_realise_tests {
     /// release first, and records which thread it ran on.
     unsafe extern "C" fn fake_build(
         ctx: *mut c_void,
-        _request: *const u8,
-        _request_len: usize,
-        out: *mut *const u8,
-        out_len: *mut usize,
+        requests: *const super::IxeRealiseRequest,
+        count: usize,
+        results: *mut super::IxeRealiseResult,
     ) -> i32 {
         let fake = embedder_of(ctx);
+        let active = fake.active_builds.fetch_add(1, Ordering::SeqCst) + 1;
+        fake.max_active_builds.fetch_max(active, Ordering::SeqCst);
+        fake.batch_sizes.lock().unwrap_or_else(|e| e.into_inner()).push(count);
+        fake.build_calls.fetch_add(1, Ordering::SeqCst);
         while !fake.release_build.load(Ordering::SeqCst) {
             std::thread::yield_now();
         }
         *fake.build_thread.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(std::thread::current().id());
         const ANSWER: &[u8] = b"from\0to\0\0/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-out\0";
-        // SAFETY: as `fake_check`.
-        unsafe {
-            *out = ANSWER.as_ptr();
-            *out_len = ANSWER.len();
+        let fault = fake.build_protocol_fault.load(Ordering::SeqCst);
+        if fault != 0 {
+            fake.active_builds.fetch_sub(1, Ordering::SeqCst);
+            // 1 fails the callback; 2 succeeds but omits every result slot.
+            return if fault == 1 { 7 } else { 0 };
         }
+        // SAFETY: the caller provides count live request and result slots.
+        let requests = unsafe { std::slice::from_raw_parts(requests, count) };
+        let results = unsafe { std::slice::from_raw_parts_mut(results, count) };
+        for (request, result) in requests.iter().zip(results) {
+            // SAFETY: each request buffer stays live for the callback.
+            let encoded = unsafe { std::slice::from_raw_parts(request.data, request.len) };
+            let failed = encoded.windows(4).any(|part| part == b"fail");
+            let answer: &[u8] = if failed { b"one build failed" } else { ANSWER };
+            *result = super::IxeRealiseResult {
+                status: i32::from(failed),
+                data: answer.as_ptr(),
+                len: answer.len(),
+            };
+        }
+        fake.active_builds.fetch_sub(1, Ordering::SeqCst);
         0
     }
 
@@ -5174,28 +7732,9 @@ mod async_realise_tests {
         0
     }
 
-    /// The synchronous hook, present because the group requires it; refuses,
-    /// so a test that lands here by mistake fails loudly.
-    unsafe extern "C" fn fake_sync_realise(
-        _ctx: *mut c_void,
-        _request: *const u8,
-        _request_len: usize,
-        out: *mut *const u8,
-        out_len: *mut usize,
-    ) -> i32 {
-        const ANSWER: &str = "the synchronous path was taken";
-        // SAFETY: as `fake_check`.
-        unsafe {
-            *out = ANSWER.as_ptr();
-            *out_len = ANSWER.len();
-        }
-        1
-    }
-
     fn threaded(fake: &FakeEmbedder) -> IxeHostVtable {
         IxeHostVtable {
             ctx: std::ptr::from_ref(fake).cast_mut().cast(),
-            realise: Some(fake_sync_realise as RealiseFn),
             realise_check: Some(fake_check as RealiseCheckFn),
             realise_build: Some(fake_build as RealiseBuildFn),
             realise_allow: Some(fake_allow as RealiseAllowFn),
@@ -5208,6 +7747,321 @@ mod async_realise_tests {
             drv: "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-x.drv".into(),
             output: "out".into(),
         }]
+    }
+
+    #[test]
+    fn callback_failure_and_missing_result_slot_never_allow_outputs() {
+        for (fault, expected) in [
+            (1, "realise build batch failed with status 7"),
+            (2, "realise build hook did not fill a result slot"),
+        ] {
+            let fake = Box::leak(Box::new(FakeEmbedder::default()));
+            fake.release_build.store(true, Ordering::SeqCst);
+            fake.build_protocol_fault.store(fault, Ordering::SeqCst);
+            let host = EmbedderHost::new(threaded(fake)).expect("complete host");
+            let result = host.realise(&built_context());
+            assert!(matches!(result, Err(crate::host::StoreError::Failed(message)) if message == expected));
+            assert!(fake.allowed.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        }
+    }
+
+    #[test]
+    fn the_first_wave_runs_together_without_a_timing_delay() {
+        let fake = Box::leak(Box::new(FakeEmbedder::default()));
+        fake.release_build.store(true, Ordering::SeqCst);
+        let host = EmbedderHost::new(threaded(fake)).expect("complete host");
+        let context = built_context();
+        let tickets: Vec<_> = (0..8).map(|_| {
+            host.begin(&Slow::Realise(&context)).expect("queued ticket")
+        }).collect();
+        let before_collect = fake.build_calls.load(Ordering::SeqCst);
+        for ticket in tickets {
+            assert!(matches!(host.collect(ticket, true), Some(SlowAnswer::Realise(Ok(_)))));
+        }
+        assert_eq!(before_collect, 0, "all runnable roots must queue before the first build");
+        assert_eq!(*fake.batch_sizes.lock().unwrap_or_else(|e| e.into_inner()), vec![8]);
+    }
+
+    #[test]
+    fn pending_roots_share_bounded_batches_and_one_build_callback() {
+        let fake = Box::leak(Box::new(FakeEmbedder::default()));
+        let host = EmbedderHost::new(threaded(fake)).expect("complete host");
+        let context = built_context();
+        let first = host.begin(&Slow::Realise(&context)).expect("first ticket");
+        assert!(host.collect(first, false).is_none());
+        while fake.build_calls.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        // The first callback is held open, so every later request must queue.
+        let tickets: Vec<_> = (0..512).map(|_| {
+            host.begin(&Slow::Realise(&context)).expect("queued ticket")
+        }).collect();
+        let calls_before_release = fake.build_calls.load(Ordering::SeqCst);
+        fake.release_build.store(true, Ordering::SeqCst);
+        for ticket in std::iter::once(first).chain(tickets) {
+            assert!(matches!(host.collect(ticket, true), Some(SlowAnswer::Realise(Ok(_)))));
+        }
+        assert_eq!(calls_before_release, 1, "pending roots must not create more Workers");
+        assert_eq!(fake.max_active_builds.load(Ordering::SeqCst), 1);
+        assert_eq!(*fake.batch_sizes.lock().unwrap_or_else(|e| e.into_inner()), vec![1, 256, 256]);
+        assert_eq!(fake.checks.load(Ordering::SeqCst), 513, "each root must be checked");
+    }
+
+    #[test]
+    fn a_failed_request_does_not_fail_its_batch_peer() {
+        let fake = Box::leak(Box::new(FakeEmbedder::default()));
+        let host = EmbedderHost::new(threaded(fake)).expect("complete host");
+        let context = built_context();
+        let first = host.begin(&Slow::Realise(&context)).expect("first ticket");
+        assert!(host.collect(first, false).is_none());
+        while fake.build_calls.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        let failed_context = vec![ContextElem::Built {
+            drv: "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fail.drv".into(),
+            output: "out".into(),
+        }];
+        let failed = host.begin(&Slow::Realise(&failed_context)).expect("failed ticket");
+        let successful = host.begin(&Slow::Realise(&context)).expect("successful ticket");
+        fake.release_build.store(true, Ordering::SeqCst);
+        assert!(matches!(host.collect(first, true), Some(SlowAnswer::Realise(Ok(_)))));
+        assert!(matches!(host.collect(failed, true), Some(SlowAnswer::Realise(Err(
+            crate::host::StoreError::Failed(message)
+        ))) if message == "one build failed"));
+        assert!(matches!(host.collect(successful, true), Some(SlowAnswer::Realise(Ok(_)))));
+        assert_eq!(*fake.batch_sizes.lock().unwrap_or_else(|e| e.into_inner()), vec![1, 2]);
+        assert_eq!(fake.allowed.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            2 * b"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-out\0".len());
+    }
+
+    #[test]
+    fn dropping_the_host_joins_active_build_and_discards_queued_requests() {
+        let fake: &'static FakeEmbedder = Box::leak(Box::new(FakeEmbedder::default()));
+        let (dropping_tx, dropping_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let host = EmbedderHost::new(threaded(fake)).expect("complete host");
+            let context = built_context();
+            let first = host.begin(&Slow::Realise(&context)).expect("first ticket");
+            assert!(host.collect(first, false).is_none());
+            while fake.build_calls.load(Ordering::SeqCst) == 0 {
+                std::thread::yield_now();
+            }
+            for _ in 0..16 {
+                let _ = host.begin(&Slow::Realise(&context));
+            }
+            dropping_tx.send(()).expect("drop notification");
+            drop(host);
+            finished_tx.send(()).expect("completion notification");
+        });
+        dropping_rx.recv().expect("owner reached drop");
+        let before_release = finished_rx.recv_timeout(std::time::Duration::from_millis(30));
+        fake.release_build.store(true, Ordering::SeqCst);
+        owner.join().expect("owner joined");
+        assert!(matches!(before_release, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "session destruction must wait until the callback stops borrowing ctx");
+        assert_eq!(fake.active_builds.load(Ordering::SeqCst), 0);
+        assert_eq!(fake.build_calls.load(Ordering::SeqCst), 1, "abandoned queue must not start builds");
+    }
+
+    /// Exercise destruction through the exported session owner, including an
+    /// unwind that abandons outstanding work. Keep a separate safety reference
+    /// until worker exit so a broken no-join implementation fails without UAF.
+    #[test]
+    fn session_free_joins_borrowed_context_before_return_and_unwind() {
+        use std::sync::{Arc, Condvar, mpsc};
+        use std::time::{Duration, Instant};
+
+        #[derive(Default)]
+        struct GateState { entered: bool, released: bool }
+        #[derive(Default)]
+        struct Gate { state: Mutex<GateState>, changed: Condvar }
+        impl Gate {
+            fn release(&self) {
+                self.state.lock().unwrap_or_else(|e| e.into_inner()).released = true;
+                self.changed.notify_all();
+            }
+        }
+        struct ReleaseOnDrop(Arc<Gate>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) { self.0.release(); }
+        }
+        #[derive(Debug, PartialEq, Eq)]
+        struct FreeObservation { active: u32, final_reads: u32 }
+        #[derive(Default)]
+        struct Evidence {
+            checks: AtomicU32,
+            calls: AtomicU32,
+            active: AtomicU32,
+            final_reads: AtomicU32,
+            allowed: AtomicU32,
+            freed: Mutex<Option<FreeObservation>>,
+            context_dropped: Mutex<Option<u32>>,
+        }
+        struct Context {
+            gate: Arc<Gate>,
+            evidence: Arc<Evidence>,
+            answer: Vec<u8>,
+        }
+        impl Drop for Context {
+            fn drop(&mut self) {
+                *self.evidence.context_dropped.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(self.evidence.active.load(Ordering::SeqCst));
+            }
+        }
+        unsafe extern "C" fn check(
+            ctx: *mut c_void, _data: *const u8, _len: usize,
+            class: *mut i32, out: *mut *const u8, out_len: *mut usize,
+        ) -> i32 {
+            // SAFETY: the test retains Context until the dispatcher's final exit.
+            let context = unsafe { &*ctx.cast::<Context>() };
+            context.evidence.checks.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: the caller supplies writable slots; the answer is static.
+            unsafe { *class = 0; *out = b"".as_ptr(); *out_len = 0; }
+            IxeRealiseCheck::Build as i32
+        }
+        unsafe extern "C" fn build(
+            ctx: *mut c_void, _requests: *const super::IxeRealiseRequest,
+            count: usize, results: *mut super::IxeRealiseResult,
+        ) -> i32 {
+            // SAFETY: Context and its owned answer survive worker exit, even
+            // under the no-join mutant. No callback assertion unwinds over C.
+            let context = unsafe { &*ctx.cast::<Context>() };
+            context.evidence.calls.fetch_add(1, Ordering::SeqCst);
+            context.evidence.active.fetch_add(1, Ordering::SeqCst);
+            let mut state = context.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.entered = true;
+            context.gate.changed.notify_all();
+            let state = context.gate.changed.wait_while(state, |state| !state.released)
+                .unwrap_or_else(|e| e.into_inner());
+            drop(state);
+            // The final context read and the returned bytes are deliberately
+            // after the gate. The dispatcher still has to copy these bytes.
+            // SAFETY: the dispatcher provides exactly count writable slots.
+            for result in unsafe { std::slice::from_raw_parts_mut(results, count) } {
+                *result = super::IxeRealiseResult {
+                    status: 0, data: context.answer.as_ptr(), len: context.answer.len(),
+                };
+            }
+            context.evidence.final_reads.fetch_add(1, Ordering::SeqCst);
+            context.evidence.active.fetch_sub(1, Ordering::SeqCst);
+            0
+        }
+        unsafe extern "C" fn allow(
+            ctx: *mut c_void, _data: *const u8, _len: usize,
+            out: *mut *const u8, out_len: *mut usize,
+        ) -> i32 {
+            // SAFETY: Context remains live as for check/build above.
+            let context = unsafe { &*ctx.cast::<Context>() };
+            context.evidence.allowed.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: writable output slots and static answer.
+            unsafe { *out = b"".as_ptr(); *out_len = 0; }
+            0
+        }
+        struct SessionOwner { raw: *mut super::IxeSession, evidence: Arc<Evidence> }
+        impl Drop for SessionOwner {
+            fn drop(&mut self) {
+                // SAFETY: created on this thread and freed exactly once here.
+                unsafe { super::ixe_session_free(self.raw) };
+                *self.evidence.freed.lock().unwrap_or_else(|e| e.into_inner()) = Some(FreeObservation {
+                    active: self.evidence.active.load(Ordering::SeqCst),
+                    final_reads: self.evidence.final_reads.load(Ordering::SeqCst),
+                });
+            }
+        }
+
+        for unwind in [false, true] {
+            let gate = Arc::new(Gate::default());
+            let release = ReleaseOnDrop(gate.clone());
+            let evidence = Arc::new(Evidence::default());
+            let context = Arc::new(Context {
+                gate: gate.clone(), evidence: evidence.clone(),
+                answer: b"from\0to\0\0/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-out\0".to_vec(),
+            });
+            let owner_context = context.clone();
+            let (queue_tx, queue_rx) = mpsc::channel();
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let owner = std::thread::spawn(move || {
+                let _globals = crate::eval::globals_shared();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let vtable = IxeHostVtable {
+                        ctx: std::ptr::from_ref(owner_context.as_ref()).cast_mut().cast(),
+                        realise_check: Some(check), realise_build: Some(build), realise_allow: Some(allow),
+                        ..IxeHostVtable::empty()
+                    };
+                    // SAFETY: new copies the vtable; owner_context remains live.
+                    let raw = unsafe { super::ixe_session_new(&raw const vtable) };
+                    assert!(!raw.is_null(), "complete vtable must create a session");
+                    let session = SessionOwner { raw, evidence: owner_context.evidence.clone() };
+                    // SAFETY: borrow only on the creating thread, ending before free.
+                    let host = unsafe { &(*session.raw).host };
+                    let built = built_context();
+                    let Some(ticket) = host.begin(&Slow::Realise(&built)) else { panic!("first ticket absent") };
+                    assert!(host.collect(ticket, false).is_none());
+                    let state = owner_context.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+                    let (state, timeout) = owner_context.gate.changed.wait_timeout_while(
+                        state, Duration::from_secs(5), |state| !state.entered,
+                    ).unwrap_or_else(|e| e.into_inner());
+                    assert!(state.entered && !timeout.timed_out(), "callback never entered");
+                    drop(state);
+                    for _ in 0..16 { assert!(host.begin(&Slow::Realise(&built)).is_some()); }
+                    let observer = {
+                        let dispatcher = host.ifd.dispatcher.lock().unwrap_or_else(|e| e.into_inner());
+                        let Some(dispatcher) = dispatcher.as_ref() else { panic!("dispatcher absent") };
+                        dispatcher.queue.clone()
+                    };
+                    assert!(queue_tx.send(observer).is_ok());
+                    if unwind { std::panic::resume_unwind(Box::new("abandoned evaluation")); }
+                    drop(session);
+                }));
+                assert_eq!(outcome.is_err(), unwind, "unexpected owner unwind");
+                assert!(finished_tx.send(()).is_ok());
+            });
+            let observer = queue_rx.recv_timeout(Duration::from_secs(5));
+            let Ok(observer) = observer else {
+                gate.release();
+                // There is no worker-exit witness on this failure path. Keep
+                // the context alive even if the implementation detached work.
+                std::mem::forget(context);
+                assert!(owner.join().is_ok(), "owner failed before teardown");
+                panic!("owner did not expose the dispatcher");
+            };
+            // This is an actual Drop-entry witness, not a sleep guessing when
+            // destruction started. The observer does not retain a host/session.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !observer.0.lock().unwrap_or_else(|e| e.into_inner()).closed {
+                if Instant::now() >= deadline { break; }
+                std::thread::yield_now();
+            }
+            let closed = observer.0.lock().unwrap_or_else(|e| e.into_inner()).closed;
+            let before_release = finished_rx.recv_timeout(Duration::from_secs(1));
+            gate.release();
+            let joined = owner.join();
+            // A no-join mutant detaches the worker. Wait until its final queue
+            // reference is gone before dropping the owned callback buffer.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Arc::strong_count(&observer) != 1 && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            if Arc::strong_count(&observer) != 1 {
+                // A broken worker must fail safely, not turn this test into UAF.
+                std::mem::forget(context);
+                panic!("dispatcher did not finish after callback release");
+            }
+            drop(context);
+            drop(release);
+            assert!(joined.is_ok(), "session owner did not finish");
+            assert!(closed, "session_free never entered dispatcher teardown");
+            assert!(matches!(before_release, Err(mpsc::RecvTimeoutError::Timeout)),
+                "session_free returned while the callback still borrowed its context");
+            assert_eq!(*evidence.freed.lock().unwrap_or_else(|e| e.into_inner()),
+                Some(FreeObservation { active: 0, final_reads: 1 }),
+                "free must return only after the callback's final context access");
+            assert_eq!(*evidence.context_dropped.lock().unwrap_or_else(|e| e.into_inner()), Some(0));
+            assert_eq!(evidence.checks.load(Ordering::SeqCst), 17);
+            assert_eq!(evidence.calls.load(Ordering::SeqCst), 1, "queued callbacks must be discarded");
+            assert_eq!(evidence.allowed.load(Ordering::SeqCst), 0, "abandoned outputs must not be allowed");
+        }
     }
 
     /// The whole protocol in one pass: the check runs once on the calling
@@ -5277,24 +8131,131 @@ mod async_realise_tests {
         assert!(host.collect(ticket, false).is_none());
     }
 
-    /// A declined check does not begin. The synchronous fallback re-runs the
-    /// checks and owns the error report, so decline-and-fall-back is how a
-    /// policy refusal keeps its blocking-path text and catchability.
+    /// A refused check is begun and delivered: the refusal is filed ready
+    /// under the ticket with its class intact, no worker is started, and the
+    /// check has run exactly once -- there is no second route to re-run it.
     #[test]
-    fn a_declined_check_is_not_begun() {
+    fn a_refused_check_is_delivered_with_its_class() {
         let fake = Box::leak(Box::new(FakeEmbedder::default()));
-        fake.check_status.store(1, Ordering::SeqCst);
+        fake.check_status
+            .store(IxeRealiseCheck::Failed as u32, Ordering::SeqCst);
         let Ok(host) = EmbedderHost::new(threaded(fake)) else {
             unreachable!("a complete async realise group has to be accepted")
         };
         let context = built_context();
-        assert!(host.begin(&Slow::Realise(&context)).is_none());
-        assert_eq!(fake.checks.load(Ordering::SeqCst), 1, "the check ran");
+        let Some(ticket) = host.begin(&Slow::Realise(&context)) else {
+            unreachable!("a refused check is still a begun question")
+        };
+        let Some(SlowAnswer::Realise(Err(why))) = host.collect(ticket, true) else {
+            unreachable!("the refusal is what gets delivered")
+        };
+        assert!(
+            matches!(&why, crate::host::StoreError::ImportFromDerivation(m) if m == "declined"),
+            "{why:?}"
+        );
+        assert_eq!(fake.checks.load(Ordering::SeqCst), 1, "the check ran once");
+        assert!(
+            fake.build_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "no build was started"
+        );
     }
 
-    /// A context with nothing to build is not begun: the synchronous path
-    /// answers it from validity checks alone, so a thread would cost more
-    /// than it hides. The check hook is not even consulted.
+    /// A check that finds every element already valid answers the empty
+    /// rewrite map through the same ticket, with no worker and no allow
+    /// phase, since nothing was built.
+    #[test]
+    fn nothing_left_to_build_is_delivered_without_a_worker() {
+        let fake = Box::leak(Box::new(FakeEmbedder::default()));
+        fake.check_status
+            .store(IxeRealiseCheck::Nothing as u32, Ordering::SeqCst);
+        let Ok(host) = EmbedderHost::new(threaded(fake)) else {
+            unreachable!("a complete async realise group has to be accepted")
+        };
+        let context = built_context();
+        let Some(ticket) = host.begin(&Slow::Realise(&context)) else {
+            unreachable!("nothing to build is still a begun question")
+        };
+        let Some(SlowAnswer::Realise(Ok(rewrites))) = host.collect(ticket, true) else {
+            unreachable!("the empty map is what gets delivered")
+        };
+        assert!(rewrites.is_empty());
+        assert!(
+            fake.build_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+        );
+        assert!(
+            fake.allow_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+        );
+    }
+
+    /// The blocking route uses the same dispatcher, so it cannot start a
+    /// second store Worker while asynchronous IFD requests are in flight.
+    #[test]
+    fn the_blocking_route_runs_the_three_phases_in_turn() {
+        let fake = Box::leak(Box::new(FakeEmbedder::default()));
+        fake.release_build.store(true, Ordering::SeqCst);
+        let Ok(host) = EmbedderHost::new(threaded(fake)) else {
+            unreachable!("a complete async realise group has to be accepted")
+        };
+        let Ok(rewrites) = host.realise(&built_context()) else {
+            unreachable!("a released build answers")
+        };
+        assert_eq!(rewrites.get("from").map(String::as_str), Some("to"));
+        assert_eq!(fake.checks.load(Ordering::SeqCst), 1);
+        let here = std::thread::current().id();
+        assert_ne!(
+            *fake.build_thread.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(here)
+        );
+        assert_eq!(
+            *fake.allow_thread.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(here)
+        );
+        assert_eq!(
+            fake.allowed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            b"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-out\0"
+        );
+    }
+
+    /// A refusal through the blocking route keeps its class the same way.
+    #[test]
+    fn the_blocking_route_keeps_the_refusal_class() {
+        let fake = Box::leak(Box::new(FakeEmbedder::default()));
+        fake.check_status
+            .store(IxeRealiseCheck::Failed as u32, Ordering::SeqCst);
+        let Ok(host) = EmbedderHost::new(threaded(fake)) else {
+            unreachable!("a complete async realise group has to be accepted")
+        };
+        let Err(why) = host.realise(&built_context()) else {
+            unreachable!("a refused check refuses")
+        };
+        assert!(
+            matches!(&why, crate::host::StoreError::ImportFromDerivation(m) if m == "declined"),
+            "{why:?}"
+        );
+        assert!(
+            fake.build_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+        );
+    }
+
+    /// A context with nothing to build is not begun: the blocking route
+    /// answers it from the check phase alone, so a thread would cost more
+    /// than it hides. The check hook is not consulted by `begin`; it runs
+    /// once, on the blocking route.
     #[test]
     fn nothing_to_build_is_not_begun() {
         let fake = Box::leak(Box::new(FakeEmbedder::default()));
@@ -5328,9 +8289,7 @@ mod async_realise_tests {
         assert!(host.begin(&Slow::Fetch(&fetch)).is_none());
     }
 
-    /// The group is a protocol: some of it is worse than none of it, and a
-    /// group without its synchronous fallback would turn a policy refusal
-    /// into "no store behind this evaluator".
+    /// The group is a protocol: some of it is worse than none of it.
     #[test]
     fn the_async_realise_group_is_all_or_nothing() {
         let fake = Box::leak(Box::new(FakeEmbedder::default()));
@@ -5341,14 +8300,6 @@ mod async_realise_tests {
         assert!(
             EmbedderHost::new(partial).is_err(),
             "a partial async realise group has to be refused"
-        );
-        let missing_fallback = IxeHostVtable {
-            realise: None,
-            ..threaded(fake)
-        };
-        assert!(
-            EmbedderHost::new(missing_fallback).is_err(),
-            "the async group without the synchronous realise has to be refused"
         );
         assert!(EmbedderHost::new(threaded(fake)).is_ok());
     }
@@ -5498,6 +8449,16 @@ mod handle_tests {
         pub(super) fn ty(&self, handle: u64) -> i32 {
             unsafe { ixe_value_type(self.0, handle) }
         }
+
+        pub(super) fn live_dynamic_attr_origins(&self) -> usize {
+            // SAFETY: `Sess` owns this session pointer until its `Drop`.
+            unsafe { &*self.0 }.vm.live_dynamic_attr_origins()
+        }
+
+        pub(super) fn dynamic_attr_origin_slots(&self) -> usize {
+            // SAFETY: `Sess` owns this session pointer until its `Drop`.
+            unsafe { &*self.0 }.vm.dynamic_attr_origin_slots()
+        }
     }
 
     impl Drop for Sess {
@@ -5524,6 +8485,8 @@ mod handle_tests {
     /// comes from cppnix, which a unit test does not have.
     unsafe extern "C" fn fake_copy_to_store(
         _ctx: *mut c_void,
+        _root: *const u8,
+        _root_len: usize,
         _path: *const u8,
         _path_len: usize,
         out: *mut *const u8,
@@ -6025,6 +8988,40 @@ mod handle_tests {
         unsafe { ixe_handle_free(s.0, h) };
     }
 
+    /// Dynamic attribute origins follow set ownership. A failed request has
+    /// no handle to retain its set, and freeing the only successful handle
+    /// must release its origin without waiting for session destruction.
+    #[test]
+    fn dynamic_attribute_origins_follow_live_handles() {
+        let _globals = crate::eval::globals_shared();
+        let s = Sess::new();
+        let source = r#"let k = "x"; in builtins.seq ({ ${k} = 1; }) (throw "x")"#;
+        for _ in 0..128 {
+            assert_eq!(s.eval(source), Err(IXE_ERR_THROWN));
+        }
+        // No growth across the failures: at most the one slot the set used,
+        // and none at all when the module was compiled per call and went
+        // with the evaluation (a session with no `eval-cache-dir` compiles
+        // through a per-call memo, so nothing of it outlives the failure).
+        assert!(
+            s.dynamic_attr_origin_slots() <= 1,
+            "dynamic attribute origin slots grew across failed evaluations: {}",
+            s.dynamic_attr_origin_slots()
+        );
+        assert_eq!(s.live_dynamic_attr_origins(), 0);
+
+        let reset = s.eval("null").expect("the reset evaluation succeeds");
+        assert_eq!(s.live_dynamic_attr_origins(), 0);
+        unsafe { ixe_handle_free(s.0, reset) };
+
+        let dynamic = s
+            .eval(r#"let k = "x"; in { ${k} = 1; }"#)
+            .expect("the dynamic set evaluates");
+        assert_eq!(s.live_dynamic_attr_origins(), 1);
+        unsafe { ixe_handle_free(s.0, dynamic) };
+        assert_eq!(s.live_dynamic_attr_origins(), 0);
+    }
+
     /// A message read once must not be read again and blamed on a later
     /// call that succeeded.
     #[test]
@@ -6493,26 +9490,18 @@ mod one_call_token_tests {
     /// Two different refusals report two different tokens. One row alone
     /// would pass against an implementation that hard-coded any single name.
     ///
-    /// The second row needs a builtin this evaluator does not implement, so
-    /// it goes stale by design: `builtins.filterSource` stood here until it
-    /// landed, and the assertion below is what said so. `storePath` is the
-    /// replacement because realising a store path needs a build, which is
-    /// further out than anything on the current ladder. When it lands, pick
-    /// another name from `builtins::purity_tests::UNROUTED_IMPURITIES` --
-    /// that list is the enumeration of what is left.
+    /// The second row invokes an implemented builtin without its required host
+    /// capability. It must carry the store refusal through the same one-call ABI.
     #[test]
     fn two_refusal_kinds_report_two_tokens() {
         let _moving = crate::eval::globals_moving();
-        let (_, syntax) = eval_once(REFUSED_EXPRESSION);
-        let (_, builtin) = eval_once("builtins.storePath \"/nix/store/xxx\"");
-        assert_eq!(syntax.as_deref(), Some(REFUSED_EXPRESSION_TOKEN));
-        assert_eq!(
-            builtin.as_deref(),
-            Some("unimplemented-builtin"),
-            "this row needs an unimplemented builtin; if `storePath` now has an \
-             implementation, repoint it at another UNROUTED_IMPURITIES name"
-        );
-        assert_ne!(syntax, builtin);
+        let (comparison_status, comparison) = eval_once(REFUSED_EXPRESSION);
+        let (store_status, store) = eval_once("builtins.toFile \"token-test\" \"contents\"");
+        assert_eq!(comparison_status, IXE_ERR_UNIMPLEMENTED);
+        assert_eq!(store_status, IXE_ERR_UNIMPLEMENTED);
+        assert_eq!(comparison.as_deref(), Some(REFUSED_EXPRESSION_TOKEN));
+        assert_eq!(store.as_deref(), Some("store-unavailable"));
+        assert_ne!(comparison, store);
     }
 
     /// A failure that is *not* a refusal reports no token at all. Without
@@ -7056,6 +10045,7 @@ mod roundtrip_tests {
 /// the failure this whole change could most plausibly have introduced.
 #[cfg(test)]
 mod warm_starts {
+    use super::handle_tests::take_c_string;
     use super::*;
 
     fn scratch(label: &str) -> std::path::PathBuf {
@@ -7097,7 +10087,7 @@ mod warm_starts {
     /// same reasoning as `CacheDir`: the only way to reach the pin is through
     /// the thing that takes the lock, so a test cannot pin without
     /// serialising (ENG-12904).
-    struct SettingsPin {
+    pub(super) struct SettingsPin {
         at_entry: ix_kernel::hash::Hash,
         /// Dropped after `Drop::drop` runs, which is what lets the body read
         /// `Settings::current()` while the globals are still held. Field order
@@ -7109,9 +10099,10 @@ mod warm_starts {
     }
 
     impl SettingsPin {
-        fn exclusive() -> Self {
+        pub(super) fn exclusive() -> Self {
             let globals = crate::eval::globals_moving();
             assert!(crate::eval::set_store_dir("/nix/store").is_ok());
+            assert!(crate::eval::set_host_build_identity("nix-eval-rs-test-host").is_ok());
             SettingsPin {
                 at_entry: crate::eval::Settings::current().fingerprint(),
                 globals,
@@ -7178,7 +10169,7 @@ mod warm_starts {
     /// for.
     /// The guard is held for its `Drop`, never read, which `dead_code` sees
     /// as an unused field.
-    struct CacheDir(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    pub(super) struct CacheDir(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
     /// One holder of `eval-cache-dir` at a time.
     ///
@@ -7194,7 +10185,7 @@ mod warm_starts {
     static CACHE_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl CacheDir {
-        fn set(dir: &std::path::Path) -> Self {
+        pub(super) fn set(dir: &std::path::Path) -> Self {
             // The lock is taken by the guard rather than by each test, so a
             // test that sets the directory cannot forget to serialise: there
             // is no way to reach the setter except through this.
@@ -7271,6 +10262,11 @@ mod warm_starts {
                 &one_path(attr_path),
                 1,
                 1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
                 IXE_RENDER_RAW,
                 &mut mode,
                 &mut root,
@@ -7376,6 +10372,327 @@ mod warm_starts {
         );
     }
 
+    /// One flake-document question, driven the way the flake reader drives
+    /// it: ask, read the document off the root when told to, report. The
+    /// document (or the session's error text) and the `IXE_SERVE_*` mode.
+    fn ask_flake_document(source: &str) -> (Result<String, String>, i32) {
+        ask_flake_document_at(source, "", "/flake", "/flake/flake.nix")
+    }
+
+    fn ask_flake_document_at(
+        source: &str,
+        mount: &str,
+        base: &str,
+        file: &str,
+    ) -> (Result<String, String>, i32) {
+        // SAFETY: every pointer is to a live local, and the session is freed
+        // on every path out.
+        unsafe {
+            let session = session_without_embedder();
+            assert!(!session.is_null(), "no session");
+            assert_eq!(
+                ixe_session_set_source_root(session, mount.as_ptr(), mount.len()),
+                IXE_OK
+            );
+            let mut mode = -1;
+            let mut root = 0u64;
+            let mut answer: *mut c_char = std::ptr::null_mut();
+            let rc = ixe_session_eval_question(
+                session,
+                source.as_ptr(),
+                source.len(),
+                base.as_ptr(),
+                base.len(),
+                file.as_ptr(),
+                file.len(),
+                std::ptr::null(),
+                0,
+                IXE_QUESTION_FLAKE_DOCUMENT,
+                &one_path(""),
+                1,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                0,
+                IXE_RENDER_RAW,
+                &mut mode,
+                &mut root,
+                &mut answer,
+            );
+            if rc != IXE_OK {
+                let text = take_c_string(ixe_session_take_error(session, std::ptr::null_mut()))
+                    .unwrap_or_else(|| format!("status {rc} with no message"));
+                ixe_session_free(session);
+                return (Err(text), mode);
+            }
+            let served = take_c_string(answer);
+            if mode == IXE_SERVE_ANSWER {
+                ixe_session_free(session);
+                return (Ok(served.unwrap_or_default()), mode);
+            }
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let rc = ixe_flake_document(session, root, &mut out);
+            if rc != IXE_OK {
+                let text = take_c_string(ixe_session_take_error(session, std::ptr::null_mut()))
+                    .unwrap_or_else(|| format!("status {rc} with no message"));
+                ixe_session_free(session);
+                return (Err(text), mode);
+            }
+            let fresh = take_c_string(out).unwrap_or_default();
+            ixe_session_question_answer(session, IXE_OK, fresh.as_ptr(), fresh.len());
+            ixe_session_free(session);
+            let answer = if mode == IXE_SERVE_VERIFY {
+                served.unwrap_or_default()
+            } else {
+                fresh
+            };
+            (Ok(answer), mode)
+        }
+    }
+
+    fn flake_document_of(source: &str) -> serde_json::Value {
+        let (document, _) = ask_flake_document(source);
+        let text = match document {
+            Ok(text) => text,
+            Err(error) => panic!("the flake document failed: {error}"),
+        };
+        match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(error) => panic!("the flake document is not JSON ({error}): {text}"),
+        }
+    }
+
+    fn flake_document_error(source: &str) -> String {
+        match ask_flake_document(source) {
+            (Err(error), _) => error,
+            (Ok(text), _) => panic!("the flake document was produced: {text}"),
+        }
+    }
+
+    /// Rust validates declarations and returns normalized host operations,
+    /// without invoking the outputs function.
+    #[test]
+    fn a_flake_document_normalizes_declarations() {
+        // Sessions read the process globals (`store-dir`), so the test holds
+        // the pin every other session-building test holds.
+        let _pin = SettingsPin::exclusive();
+        let document = flake_document_of(
+            r#"{
+              description = "d";
+              inputs = {
+                nixpkgs = { url = "github:a/b"; flake = false; inputs.x.follows = "y"; };
+                local.url = ./sub;
+                signed.type = "git";
+                signed.publicKeys = [ { type = "ssh-ed25519"; key = "k"; } ];
+              };
+              outputs = { self, nixpkgs, ... }: throw "outputs is not called";
+              nixConfig = {
+                extra-substituters = [ "https://c" ];
+                allow-import-from-derivation = true;
+                max-jobs = 4;
+                flake-registry = ./registry.json;
+              };
+            }"#,
+        );
+        assert_eq!(
+            document,
+            serde_json::json!({
+                "description": "d",
+                "inputs": {
+                    "nixpkgs": {
+                        "reference": { "kind": "url", "value": "github:a/b" },
+                        "is_flake": false,
+                        "follows": null,
+                        "overrides": { "x": {
+                            "reference": null, "is_flake": true,
+                            "follows": ["y"], "overrides": {},
+                        } },
+                    },
+                    "local": {
+                        "reference": { "kind": "url", "value": "path:sub" },
+                        "is_flake": true, "follows": null, "overrides": {},
+                    },
+                    "signed": {
+                        "reference": { "kind": "attrs", "value": {
+                            "type": { "kind": "string", "value": "git" },
+                            "publicKeys": { "kind": "string", "value": r#"[{"key":"k","type":"ssh-ed25519"}]"# },
+                        } },
+                        "is_flake": true, "follows": null, "overrides": {},
+                    },
+                },
+                "self_attrs": {},
+                "config": {
+                    "extra-substituters": { "kind": "strings", "value": ["https://c"] },
+                    "allow-import-from-derivation": { "kind": "bool", "value": true },
+                    "max-jobs": { "kind": "int", "value": 4 },
+                    "flake-registry": { "kind": "path", "value": "registry.json" },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_document_keeps_its_mount_and_original_directory() {
+        let _pin = SettingsPin::exclusive();
+        let mount = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-source";
+        let base = format!("{mount}/config");
+        let file = format!("{mount}/flake.nix");
+        let (document, _) = ask_flake_document_at(
+            "{ inputs.dep.url = ./dep; outputs = args: {}; }",
+            mount,
+            &base,
+            &file,
+        );
+        let document: serde_json::Value =
+            serde_json::from_str(&document.expect("document")).expect("JSON");
+        assert_eq!(
+            document["inputs"]["dep"]["reference"]["value"],
+            "path:config/dep"
+        );
+        let (absolute, _) = ask_flake_document_at(
+            "{ inputs.dep.url = /dep; outputs = args: {}; }",
+            mount,
+            &base,
+            &file,
+        );
+        assert!(
+            absolute.is_err(),
+            "an ambient path crossed the flake's root"
+        );
+        for (base, file) in [
+            ("/outside", file.as_str()),
+            (base.as_str(), "/outside/flake.nix"),
+        ] {
+            let (outside, _) = ask_flake_document_at("{}", mount, base, file);
+            assert!(outside.is_err(), "a source outside the mount was accepted");
+        }
+    }
+
+    #[test]
+    fn a_flake_document_evaluates_computed_metadata_but_not_outputs() {
+        let _pin = SettingsPin::exclusive();
+        let document = flake_document_of(
+            r#"
+            let suffix = "b"; in {
+                description = "a" + suffix;
+                inputs.a.flake = !true;
+                nixConfig.extra-substituters = [ ("https://" + suffix) ];
+                outputs = { self }: throw "outputs called";
+            }
+        "#,
+        );
+        assert_eq!(document["description"], "ab");
+        assert_eq!(document["inputs"]["a"]["is_flake"], false);
+        assert_eq!(
+            document["config"]["extra-substituters"]["value"],
+            serde_json::json!(["https://b"])
+        );
+        assert!(document["inputs"].get("self").is_none());
+        assert!(
+            flake_document_error(r#"{ description = throw "metadata entered"; }"#)
+                .contains("metadata entered")
+        );
+        assert!(flake_document_error("42").contains("expected a set"));
+    }
+
+    #[test]
+    fn computed_input_graphs_reject_cycles_and_excessive_depth() {
+        let _pin = SettingsPin::exclusive();
+        let cycle = flake_document_error(
+            "let x = { a.inputs = x; }; in { inputs = x; outputs = args: {}; }",
+        );
+        assert!(cycle.contains("cyclic flake inputs"), "{cycle}");
+        let deep = flake_document_error(
+            "let mk = n: if n == 0 then {} else { a.inputs = mk (n - 1); }; in { inputs = mk 140; outputs = args: {}; }",
+        );
+        assert!(deep.contains("nesting exceeds 128"), "{deep}");
+        let shared = flake_document_of(
+            "let x = {}; in { inputs = { a.inputs = x; b.inputs = x; }; outputs = args: {}; }",
+        );
+        assert_eq!(shared["inputs"]["a"]["overrides"], serde_json::json!({}));
+        assert_eq!(shared["inputs"]["b"]["overrides"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn computed_document_reads_invalidate_and_reuse_previous_answers() {
+        let _pin = SettingsPin::exclusive();
+        let dir = scratch("computed-flake-document");
+        let _cache = CacheDir::set(&dir);
+        let file = scratch("computed-flake-description");
+        let source = format!(
+            "{{ description = builtins.readFile {}; outputs = args: throw \"outputs called\"; }}",
+            serde_json_string(&file.to_string_lossy())
+        );
+        for (contents, expected_mode) in [
+            ("before", IXE_SERVE_EVALUATE),
+            ("before", IXE_SERVE_ANSWER),
+            ("after", IXE_SERVE_EVALUATE),
+            ("after", IXE_SERVE_ANSWER),
+            ("before", IXE_SERVE_ANSWER),
+        ] {
+            std::fs::write(&file, contents).expect("write metadata");
+            let (answer, mode) = ask_flake_document(&source);
+            let document: serde_json::Value =
+                serde_json::from_str(&answer.expect("document")).expect("JSON");
+            assert_eq!(document["description"], contents);
+            assert_eq!(mode, expected_mode, "metadata {contents}");
+        }
+        std::fs::remove_file(file).expect("remove metadata");
+    }
+
+    #[test]
+    fn a_flake_document_rejects_invalid_declarations() {
+        // Sessions read the process globals (`store-dir`), so the test holds
+        // the pin every other session-building test holds.
+        let _pin = SettingsPin::exclusive();
+        let error = flake_document_error(r#"{ foo = 1; }"#);
+        assert!(error.contains("unsupported attribute 'foo'"), "{error}");
+        let error = flake_document_error(r#"{ outputs = 1; }"#);
+        assert!(
+            error.contains("expected a function but got an integer"),
+            "{error}"
+        );
+        let error = flake_document_error(r#"{ inputs.a.url = 1.5; }"#);
+        assert!(
+            error.contains("expected a string but got a float at inputs.a.url"),
+            "{error}"
+        );
+        let error = flake_document_error(r#"{ nixConfig.x = [ 1 ]; }"#);
+        assert!(error.contains("expected a string"), "{error}");
+    }
+
+    /// The document is a memoised answer like any other: the second session
+    /// is served it and reads nothing.
+    #[test]
+    fn a_flake_document_is_served_on_the_second_ask() {
+        let _pin = SettingsPin::exclusive();
+        let dir = scratch("flake-document");
+        let _cache = CacheDir::set(&dir);
+        let source = r#"{ description = "memoised"; outputs = { self }: self; }"#;
+
+        let (cold, cold_mode) = ask_flake_document(source);
+        let (warm, warm_mode) = ask_flake_document(source);
+
+        assert_eq!(
+            cold_mode, IXE_SERVE_EVALUATE,
+            "the first session was not cold"
+        );
+        assert_eq!(
+            warm_mode, IXE_SERVE_ANSWER,
+            "the second session evaluated instead of being served"
+        );
+        assert_eq!(
+            cold, warm,
+            "the served document differs from the evaluated one"
+        );
+        assert!(
+            cold.as_deref().is_ok_and(|text| text.contains("memoised")),
+            "{cold:?}"
+        );
+    }
+
     /// An edit to a file only the *walk* reads invalidates the row.
     ///
     /// The attribute is a thunk, so the first evaluation stops at the
@@ -7460,6 +10777,11 @@ mod warm_starts {
                     &one_path(attr),
                     1,
                     1,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    0,
                     IXE_RENDER_RAW,
                     &mut mode,
                     &mut root,
@@ -7581,6 +10903,11 @@ mod warm_starts {
                     &one_path(attr),
                     1,
                     1,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    0,
                     IXE_RENDER_RAW,
                     &mut mode,
                     &mut root,
@@ -7661,6 +10988,11 @@ mod warm_starts {
                     &one_path(attr_path),
                     1,
                     1,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    0,
                     IXE_RENDER_RAW,
                     &mut mode,
                     &mut root,
@@ -7916,6 +11248,11 @@ mod warm_starts {
                     &one_path(attr),
                     1,
                     1,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    0,
                     IXE_RENDER_RAW,
                     &mut mode,
                     &mut root,
@@ -7987,7 +11324,11 @@ mod memo_reach_tests {
     ///
     /// The list grew from two to three when the question protocol landed
     /// (ENG-12830), and this test is how that was noticed rather than
-    /// assumed. A prose claim would have gone stale silently.
+    /// assumed. A prose claim would have gone stale silently. It shrank again
+    /// when the compile cache moved onto the machine: `ixe_session_eval` had
+    /// only ever reached that cache, which is keyed on the source text by
+    /// construction and is not a memo table, and the scan had been counting
+    /// the directory read rather than the consult.
     ///
     /// **There is a second half this cannot see.** `ixe_session_eval_question`
     /// keys on the source, the base directory, the origin, the attribute
@@ -8001,8 +11342,16 @@ mod memo_reach_tests {
     /// function that does not consult the cache leaves no trace of not
     /// having done so.
     #[test]
-    fn only_the_two_source_entry_points_reach_the_memo_table() {
+    fn only_source_keyed_entry_points_reach_the_memo_table() {
         const WHOLE: &str = include_str!("capi.rs");
+        // What consulting the memo table looks like in source. The two calls
+        // are the only readers of it; the handle is how a new reader would
+        // get at the store without either.
+        const MEMO_REACHES: &[&str] = &[
+            "crate::session::evaluate_once(",
+            "crate::session::QuestionCache::open(",
+            "modules().store()",
+        ];
         // Everything before the first test module. Three reasons, each one
         // arriving after the cut before it had already gone wrong. Without a
         // cut the scanner finds its own matcher line and reports this test as
@@ -8045,13 +11394,14 @@ mod memo_reach_tests {
                 current = Some(name);
                 seen_declarations += 1;
             }
-            // The literal call, not a mention: the doc comments above talk
-            // about the cache and must not count as reaching it.
-            if trimmed.contains("eval_cache_dir()")
+            // The literal consult, not a mention: the doc comments above talk
+            // about the cache and must not count as reaching it. The store
+            // handle lives on the machine (`Vm::modules().store()`), so the
+            // marker is a call that reads the memo through it, or the handle
+            // itself where a caller takes it directly.
+            if MEMO_REACHES.iter().any(|reach| trimmed.contains(reach))
                 && !trimmed.starts_with("//")
-                && !trimmed.starts_with("///")
                 && let Some(name) = current
-                && name != "eval_cache_dir"
                 && !reaching.contains(&name)
             {
                 reaching.push(name);
@@ -8068,8 +11418,14 @@ mod memo_reach_tests {
             reaching,
             vec![
                 "ixe_eval_expr",
-                "ixe_session_eval",
-                "ixe_session_eval_question"
+                "ixe_session_eval_question",
+                // Takes no value and no source: it forgets the row the last
+                // question served, keyed on what that question computed, so
+                // nothing an embedder injects can reach a key through it.
+                "ixe_session_question_reject",
+                // Reads only whether persistence exists to enforce the external
+                // host identity precondition; never reads or writes memo rows.
+                "require_session_cache_identity"
             ],
             "the set of entry points that consult the eval cache has changed. \
              Each of these must take a source and key on it. If one that takes \
@@ -8229,3 +11585,63 @@ mod realise_wire_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod derivation_batch_tests {
+    use super::{EmbedderHost, IxeHostVtable, PendingDrv};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static WRITES: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn refuse_batch(
+        _ctx: *mut core::ffi::c_void,
+        _batch: *const u8,
+        _batch_len: usize,
+        _out: *mut *const u8,
+        _out_len: *mut usize,
+    ) -> i32 {
+        // The caller initializes an empty answer; no pointer access needed.
+        WRITES.fetch_add(1, Ordering::SeqCst);
+        1
+    }
+
+    #[test]
+    fn a_failed_import_poison_is_shared_and_never_retried() -> Result<(), String> {
+        let host = EmbedderHost::new(IxeHostVtable {
+            write_derivations: Some(refuse_batch),
+            ..IxeHostVtable::empty()
+        })?;
+        let drv = PendingDrv::new(
+            "/nix/store",
+            "batch-failure",
+            r#"Derive([],[],[],"x86_64-linux","/bin/sh",[],[])"#,
+        )?;
+        {
+            let mut writes = host
+                .drv_writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            writes.paths.insert(drv.expected.clone());
+            writes.pending.push(drv);
+        }
+        let before = WRITES.load(Ordering::SeqCst);
+        let failed = host.flush_derivations();
+        assert!(failed.is_err());
+        assert_eq!(WRITES.load(Ordering::SeqCst), before + 1);
+        let clone = host.clone();
+        assert_eq!(clone.flush_derivations(), failed);
+        assert_eq!(clone.settle_writes_if(|_| false), failed);
+        assert_eq!(WRITES.load(Ordering::SeqCst), before + 1);
+        let writes = host
+            .drv_writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(writes.pending.is_empty());
+        assert!(writes.paths.is_empty());
+        assert!(writes.failed.is_some());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod eval_cache_tests;

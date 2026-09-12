@@ -54,24 +54,24 @@
       ];
     };
   in {
-    nixosConfigurations.ci-runner = runner;
-    nixosConfigurations.baml = bamlRunner;
-    nixosConfigurations.flox = floxRunner;
+    nixosConfigurations = {
+      ci-runner = runner;
+      baml = bamlRunner;
+      flox = floxRunner;
+    };
 
     # A plain ix template leaves root-device and bootloader facts to the
     # platform's injected machine profile; extend as a container only for
     # the check, so the closure realizes without inventing guest hardware.
-    checks.x86_64-linux.ci-runner-template =
-      (runner.extendModules {
-        modules = [{boot.isContainer = true;}];
-      }).config.system.build.toplevel;
-    checks.x86_64-linux.baml-template =
-      (bamlRunner.extendModules {
-        modules = [{boot.isContainer = true;}];
-      }).config.system.build.toplevel;
-    checks.x86_64-linux.flox-template =
-      (floxRunner.extendModules {
-        modules = [{boot.isContainer = true;}];
-      }).config.system.build.toplevel;
+    checks.x86_64-linux = let
+      asContainer = configuration:
+        (configuration.extendModules {
+          modules = [{boot.isContainer = true;}];
+        }).config.system.build.toplevel;
+    in {
+      ci-runner-template = asContainer runner;
+      baml-template = asContainer bamlRunner;
+      flox-template = asContainer floxRunner;
+    };
   };
 }

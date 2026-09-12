@@ -1,7 +1,8 @@
 use super::*;
-use crate::session::tests::build_world_state_from_turn_context;
-use codex_model_provider_info::ModelProviderInfo;
-use codex_model_provider_info::WireApi;
+use codex_history::CodexHarnessMetadata;
+use codex_history::ResponseItemEnvelope;
+use codex_protocol::ResponseItemId;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use pretty_assertions::assert_eq;
@@ -16,19 +17,39 @@ async fn process_compacted_history_with_test_session(
     session
         .set_previous_turn_settings(previous_turn_settings.cloned())
         .await;
-    let world_state = Arc::new(build_world_state_from_turn_context(&session, &turn_context).await);
+    let step_context =
+        crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
+    let world_state = Arc::new(
+        session
+            .build_world_state_for_step(&step_context)
+            .await
+            .expect("world state should build"),
+    );
     let initial_context = session
         .build_initial_context_with_world_state(&turn_context, world_state.as_ref())
         .await;
-    let initial_context_injection = InitialContextInjection::BeforeLastUserMessage(world_state);
+    let initial_context_injection = InitialContextInjection::BeforeLastUserMessage {
+        world_state,
+        step_context,
+    };
     let (refreshed, _) = crate::compact_remote::process_compacted_history(
         &session,
-        &turn_context,
         compacted_history,
         &initial_context_injection,
     )
     .await;
     (refreshed, initial_context)
+}
+
+fn annotated(items: Vec<ResponseItem>) -> Vec<ResponseItemEnvelope> {
+    items.into_iter().map(ResponseItemEnvelope::new).collect()
+}
+
+fn raw(items: Vec<ResponseItemEnvelope>) -> Vec<ResponseItem> {
+    items
+        .into_iter()
+        .map(ResponseItemEnvelope::into_item)
+        .collect()
 }
 
 fn user_message(text: &str) -> ResponseItem {
@@ -47,6 +68,7 @@ fn compacted_user_message(text: &str) -> CompactedUserMessage {
     CompactedUserMessage {
         message: text.to_string(),
         internal_chat_message_metadata_passthrough: None,
+        harness_metadata: None,
     }
 }
 
@@ -85,7 +107,7 @@ fn content_items_to_text_ignores_image_only_content() {
 fn collect_user_messages_extracts_user_text_only() {
     let items = vec![
         ResponseItem::Message {
-            id: Some("assistant".to_string()),
+            id: Some(ResponseItemId::with_suffix("msg", "assistant")),
             role: "assistant".to_string(),
             content: vec![ContentItem::OutputText {
                 text: "ignored".to_string(),
@@ -94,7 +116,7 @@ fn collect_user_messages_extracts_user_text_only() {
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
-            id: Some("user".to_string()),
+            id: Some(ResponseItemId::with_suffix("msg", "user")),
             role: "user".to_string(),
             content: vec![ContentItem::InputText {
                 text: "first".to_string(),
@@ -108,6 +130,28 @@ fn collect_user_messages_extracts_user_text_only() {
     let collected = collect_user_messages(&items);
 
     assert_eq!(vec![compacted_user_message("first")], collected);
+}
+
+#[test]
+fn collect_annotated_user_messages_extracts_user_text_only() {
+    let items = vec![
+        ResponseItemEnvelope {
+            item: user_message("first"),
+            metadata: Some(CodexHarnessMetadata::default()),
+        },
+        ResponseItemEnvelope::new(ResponseItem::Other),
+    ];
+
+    let collected = collect_annotated_user_messages(&items);
+
+    assert_eq!(
+        vec![CompactedUserMessage {
+            message: "first".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+            harness_metadata: Some(CodexHarnessMetadata::default()),
+        }],
+        collected
+    );
 }
 
 #[test]
@@ -178,7 +222,11 @@ fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
     // that oversized user content is truncated.
     let max_tokens = 16;
     let big = "word ".repeat(200);
-    let user_message = compacted_user_message(&big);
+    let user_message = CompactedUserMessage {
+        message: big.clone(),
+        internal_chat_message_metadata_passthrough: None,
+        harness_metadata: Some(CodexHarnessMetadata::default()),
+    };
     let history = super::build_compacted_history_with_limit(
         Vec::new(),
         std::slice::from_ref(&user_message),
@@ -187,8 +235,8 @@ fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
     );
     assert_eq!(history.len(), 2);
 
-    let truncated_message = &history[0];
-    let summary_message = &history[1];
+    let truncated_message = &history[0].item;
+    let summary_message = &history[1].item;
 
     let truncated_text = match truncated_message {
         ResponseItem::Message { role, content, .. } if role == "user" => {
@@ -213,11 +261,13 @@ fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
         other => panic!("unexpected item in history: {other:?}"),
     };
     assert_eq!(summary_text, "SUMMARY");
+    assert_eq!(history[0].metadata, Some(CodexHarnessMetadata::default()));
+    assert_eq!(history[1].metadata, None);
 }
 
 #[test]
 fn build_token_limited_compacted_history_appends_summary_message() {
-    let initial_context: Vec<ResponseItem> = Vec::new();
+    let initial_context: Vec<ResponseItemEnvelope> = Vec::new();
     let user_messages = vec![compacted_user_message("first user message")];
     let summary_text = "summary text";
 
@@ -228,7 +278,7 @@ fn build_token_limited_compacted_history_appends_summary_message() {
     );
 
     let last = history.last().expect("history should have a summary entry");
-    let summary = match last {
+    let summary = match &last.item {
         ResponseItem::Message { role, content, .. } if role == "user" => {
             content_items_to_text(content).unwrap_or_default()
         }
@@ -246,40 +296,49 @@ fn build_compacted_history_preserves_user_message_passthrough_metadata() {
             internal_chat_message_metadata_passthrough: Some(
                 InternalChatMessageMetadataPassthrough {
                     turn_id: Some("turn-1".to_string()),
+                    content_item_kinds: Some(vec![
+                        ContentItemKind("user.image".to_string()),
+                        ContentItemKind("user.text".to_string()),
+                        ContentItemKind("user.audio".to_string()),
+                    ]),
+                    ..Default::default()
                 },
             ),
+            harness_metadata: Some(CodexHarnessMetadata::default()),
         }],
         "summary text",
     );
 
-    assert_eq!(history[0].turn_id(), Some("turn-1"));
-    assert_eq!(history[1].turn_id(), None);
+    assert_eq!(
+        history,
+        vec![
+            ResponseItemEnvelope {
+                item: ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "first user message".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: Some(
+                        InternalChatMessageMetadataPassthrough {
+                            turn_id: Some("turn-1".to_string()),
+                            content_item_kinds: Some(vec![ContentItemKind(
+                                "user.text".to_string()
+                            )]),
+                            ..Default::default()
+                        },
+                    ),
+                },
+                metadata: Some(CodexHarnessMetadata::default()),
+            },
+            ResponseItemEnvelope::new(ContextualUserFragment::into(CompactionSummary::new(
+                "summary text",
+            ))),
+        ]
+    );
 }
 
-#[test]
-fn should_use_remote_compact_task_for_azure_provider() {
-    let provider = ModelProviderInfo {
-        name: "Azure".into(),
-        base_url: Some("https://example.com/openai".into()),
-        env_key: Some("AZURE_OPENAI_API_KEY".into()),
-        env_key_instructions: None,
-        experimental_bearer_token: None,
-        auth: None,
-        aws: None,
-        wire_api: WireApi::Responses,
-        query_params: None,
-        http_headers: None,
-        env_http_headers: None,
-        request_max_retries: None,
-        stream_max_retries: None,
-        stream_idle_timeout_ms: None,
-        websocket_connect_timeout_ms: None,
-        requires_openai_auth: false,
-        supports_websockets: false,
-    };
-
-    assert!(should_use_remote_compact_task(&provider));
-}
 #[tokio::test]
 async fn process_compacted_history_replaces_developer_messages() {
     let compacted_history = vec![
@@ -577,6 +636,15 @@ async fn process_compacted_history_reinjects_model_switch_message() {
 
 #[test]
 fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() {
+    let agent_completion = ResponseItem::AgentMessage {
+        id: None,
+        author: "child".to_string(),
+        recipient: "parent".to_string(),
+        content: vec![AgentMessageInputContent::InputText {
+            text: "Message Type: FINAL_ANSWER\nPayload:\nchild completion".to_string(),
+        }],
+        internal_chat_message_metadata_passthrough: None,
+    };
     let compacted_history = vec![
         ResponseItem::Message {
             id: None,
@@ -596,6 +664,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
+        agent_completion.clone(),
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -616,8 +685,10 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
         internal_chat_message_metadata_passthrough: None,
     }];
 
-    let refreshed =
-        insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context);
+    let refreshed = raw(insert_initial_context_before_last_real_user_or_summary(
+        annotated(compacted_history),
+        annotated(initial_context),
+    ));
     let expected = vec![
         ResponseItem::Message {
             id: None,
@@ -646,6 +717,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
+        agent_completion,
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -661,11 +733,21 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_summary_last() 
 
 #[test]
 fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last() {
-    let compacted_history = vec![ResponseItem::Compaction {
+    let agent_task = ResponseItem::AgentMessage {
         id: None,
-        encrypted_content: "encrypted".to_string(),
+        author: "parent".to_string(),
+        recipient: "child".to_string(),
+        content: Vec::new(),
         internal_chat_message_metadata_passthrough: None,
-    }];
+    };
+    let compacted_history = vec![
+        agent_task.clone(),
+        ResponseItem::Compaction {
+            id: None,
+            encrypted_content: "encrypted".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
     let initial_context = vec![ResponseItem::Message {
         id: None,
         role: "developer".to_string(),
@@ -676,8 +758,10 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
         internal_chat_message_metadata_passthrough: None,
     }];
 
-    let refreshed =
-        insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context);
+    let refreshed = raw(insert_initial_context_before_last_real_user_or_summary(
+        annotated(compacted_history),
+        annotated(initial_context),
+    ));
     let expected = vec![
         ResponseItem::Message {
             id: None,
@@ -688,6 +772,7 @@ fn insert_initial_context_before_last_real_user_or_summary_keeps_compaction_last
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
+        agent_task,
         ResponseItem::Compaction {
             id: None,
             encrypted_content: "encrypted".to_string(),

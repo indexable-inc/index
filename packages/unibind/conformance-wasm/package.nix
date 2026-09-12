@@ -1,5 +1,6 @@
 {
   id = "unibind-conformance-wasm";
+  workspaceIfdRoots = true;
   inRustWorkspace = true;
   # Linux-only like the ts conformance package: CI runs the Node end-to-end
   # suite on the linux builders, and the wasm32 unit graph + pinned

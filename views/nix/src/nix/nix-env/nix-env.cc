@@ -114,93 +114,9 @@ static bool parseInstallSourceOptions(Globals & globals, Strings::iterator & i, 
     return true;
 }
 
-static bool isNixExpr(const SourcePath & path, struct SourceAccessor::Stat & st)
-{
-    return st.type == SourceAccessor::tRegular
-           || (st.type == SourceAccessor::tDirectory && (path / "default.nix").resolveSymlinks().pathExists());
-}
-
-static constexpr size_t maxAttrs = 1024;
-
-static void getAllExprs(EvalState & state, const SourcePath & path, StringSet & seen, BindingsBuilder & attrs)
-{
-    StringSet namesSorted;
-    for (auto & [name, _] : path.resolveSymlinks().readDirectory())
-        namesSorted.insert(name);
-
-    for (auto & i : namesSorted) {
-        /* Ignore the manifest.nix used by profiles.  This is
-           necessary to prevent it from showing up in channels (which
-           are implemented using profiles). */
-        if (i == "manifest.nix")
-            continue;
-
-        auto path2 = (path / i).resolveSymlinks();
-
-        SourceAccessor::Stat st;
-        try {
-            st = path2.lstat();
-        } catch (Error &) {
-            continue; // ignore dangling symlinks in ~/.nix-defexpr
-        }
-
-        if (isNixExpr(path2, st) && (st.type != SourceAccessor::tRegular || hasSuffix(path2.baseName(), ".nix"))) {
-            /* Strip off the `.nix' filename suffix (if applicable),
-               otherwise the attribute cannot be selected with the
-               `-A' option.  Useful if you want to stick a Nix
-               expression directly in ~/.nix-defexpr. */
-            std::string attrName = i;
-            if (hasSuffix(attrName, ".nix"))
-                attrName = std::string(attrName, 0, attrName.size() - 4);
-            if (!seen.insert(attrName).second) {
-                std::string suggestionMessage = "";
-                if (path2.path.abs().find("channels") != std::string::npos
-                    && path.path.abs().find("channels") != std::string::npos)
-                    suggestionMessage =
-                        fmt("\nsuggestion: remove '%s' from either the root channels or the user channels", attrName);
-                printError(
-                    "warning: name collision in input Nix expressions, skipping '%1%'"
-                    "%2%",
-                    path2,
-                    suggestionMessage);
-                continue;
-            }
-            /* Load the expression on demand. */
-            auto vArg = state.allocValue();
-            vArg->mkPath(path2, state.mem);
-            if (seen.size() == maxAttrs)
-                throw Error("too many Nix expressions in directory '%1%'", path);
-            attrs.alloc(attrName).mkApp(&state.getBuiltin("import"), vArg);
-        } else if (st.type == SourceAccessor::tDirectory)
-            /* `path2' is a directory (with no default.nix in it);
-               recurse into it. */
-            getAllExprs(state, path2, seen, attrs);
-    }
-}
-
 static void loadSourceExpr(EvalState & state, const SourcePath & path, Value & v)
 {
-    auto st = path.resolveSymlinks().lstat();
-
-    if (isNixExpr(path, st))
-        state.evalFile(path, v);
-
-    /* The path is a directory.  Put the Nix expressions in the
-       directory in a set, with the file name of each expression as
-       the attribute name.  Recurse into subdirectories (but keep the
-       set flat, not nested, to make it easier for a user to have a
-       ~/.nix-defexpr directory that includes some system-wide
-       directory). */
-    else if (st.type == SourceAccessor::tDirectory) {
-        auto attrs = state.buildBindings(maxAttrs);
-        attrs.insert(state.symbols.create("_combineChannels"), &Value::vEmptyList);
-        StringSet seen;
-        getAllExprs(state, path, seen, attrs);
-        v.mkAttrs(attrs);
-    }
-
-    else
-        throw Error("path '%s' is not a directory or a Nix expression", path);
+    state.requireBackendCanServe();
 }
 
 static void loadDerivations(
@@ -426,21 +342,8 @@ static void queryInstSources(
        argument, e.g., if the file is `./foo.nix', then the
        argument `x: x.bar' is equivalent to `(x: x.bar)
        (import ./foo.nix)' = `(import ./foo.nix).bar'. */
-    case srcNixExprs: {
-
-        Value vArg;
-        loadSourceExpr(state, *instSource.nixExprPath, vArg);
-
-        for (auto & i : args) {
-            Expr * eFun = state.parseExprFromString(i, state.rootPath("."));
-            Value vFun, vTmp;
-            state.eval(eFun, vFun);
-            vTmp.mkApp(&vFun, &vArg);
-            getDerivations(state, vTmp, "", *instSource.autoArgs, elems, true);
-        }
-
-        break;
-    }
+    case srcNixExprs:
+        state.requireBackendCanServe();
 
     /* The available user environment elements are specified as a
        list of store paths (which may or may not be

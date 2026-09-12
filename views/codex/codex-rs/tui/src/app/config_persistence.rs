@@ -5,6 +5,7 @@
 //! loop.
 
 use super::*;
+use codex_config::ConfigLayerSource;
 #[cfg(target_os = "windows")]
 use codex_utils_approval_presets::ApprovalPreset;
 
@@ -22,6 +23,32 @@ async fn build_config_on_runtime_worker(
         Ok(build_result) => build_result.wrap_err(error_context),
         Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
         Err(err) => Err(err).wrap_err_with(|| format!("{error_context} task failed")),
+    }
+}
+
+pub(super) fn resume_model_settings_for_overrides(
+    config: &Config,
+    harness_overrides: &ConfigOverrides,
+) -> crate::app_server_session::ResumeModelSettings {
+    let has_layer_override = config.config_layer_stack.layers_high_to_low().any(|layer| {
+        matches!(
+            &layer.name,
+            ConfigLayerSource::SessionFlags
+                | ConfigLayerSource::User {
+                    profile: Some(_),
+                    ..
+                }
+        ) && ["model", "model_provider", "model_reasoning_effort"]
+            .iter()
+            .any(|key| layer.config.get(*key).is_some())
+    });
+    if harness_overrides.model.is_some()
+        || harness_overrides.model_provider.is_some()
+        || has_layer_override
+    {
+        crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig
+    } else {
+        crate::app_server_session::ResumeModelSettings::RestoreFromThread
     }
 }
 
@@ -156,7 +183,8 @@ impl App {
         self.config = config;
 
         if let Some(policy) = approval_policy {
-            self.runtime_approval_policy_override = Some(policy);
+            self.runtime_approval_policy_override =
+                Some(RuntimeApprovalPolicyOverride::Explicit(policy));
             self.chat_widget.set_approval_policy(policy);
         }
         if let Err(err) = self.chat_widget.set_permission_profile_with_active_profile(
@@ -209,7 +237,14 @@ impl App {
         let mut config = self
             .rebuild_config_for_cwd(self.chat_widget.config_ref().cwd.to_path_buf())
             .await?;
-        self.apply_runtime_policy_overrides(&mut config);
+        self.apply_runtime_policy_overrides(&mut config, RuntimePolicyOverrideScope::All);
+        self.local_settings = crate::local_settings::LocalSettings::from(&config);
+        // Other preferences have runtime caches and are adopted when the widget is replaced.
+        self.chat_widget
+            .local_settings
+            .tui
+            .terminal_resize_reflow_max_rows =
+            self.local_settings.tui.terminal_resize_reflow_max_rows;
         self.config = config;
         self.chat_widget.sync_plugin_mentions_config(&self.config);
         Ok(())
@@ -251,9 +286,12 @@ impl App {
         &mut self,
         current_cwd: &Path,
         resume_cwd: PathBuf,
-    ) -> Result<Config> {
+    ) -> Result<(Config, crate::local_settings::LocalSettings)> {
         match self.rebuild_config_for_cwd(resume_cwd.clone()).await {
-            Ok(config) => Ok(config),
+            Ok(config) => {
+                let local_settings = crate::local_settings::LocalSettings::from(&config);
+                Ok((config, local_settings))
+            }
             Err(err) => {
                 if crate::session_resume::cwds_differ(current_cwd, &resume_cwd) {
                     Err(err)
@@ -264,22 +302,46 @@ impl App {
                         cwd = %resume_cwd_display,
                         "failed to rebuild config for same-cwd resume; using current in-memory config"
                     );
-                    Ok(self.config.clone())
+                    Ok((self.config.clone(), self.local_settings.clone()))
                 }
             }
         }
     }
 
-    pub(super) fn apply_runtime_policy_overrides(&mut self, config: &mut Config) {
-        if let Some(policy) = self.runtime_approval_policy_override.as_ref()
-            && let Err(err) = config.permissions.approval_policy.set(policy.to_core())
+    pub(super) fn apply_runtime_policy_overrides(
+        &mut self,
+        config: &mut Config,
+        scope: RuntimePolicyOverrideScope,
+    ) {
+        if let Some(policy) = self.runtime_approval_policy_override
+            && (scope == RuntimePolicyOverrideScope::All
+                || matches!(policy, RuntimeApprovalPolicyOverride::Explicit(_)))
+            && let Err(err) = config
+                .permissions
+                .approval_policy
+                .set(policy.policy().to_core())
         {
             tracing::warn!(%err, "failed to carry forward approval policy override");
             self.chat_widget.add_error_message(format!(
                 "Failed to carry forward approval policy override: {err}"
             ));
         }
-        if let Some(profile_override) = self.runtime_permission_profile_override.as_ref() {
+        if let Some(profile_override) = self.runtime_permission_profile_override.as_ref()
+            && (scope == RuntimePolicyOverrideScope::All
+                || profile_override.turn_override
+                    == RuntimePermissionProfileTurnOverride::LegacySandbox)
+        {
+            match config
+                .config_layer_stack
+                .requirements()
+                .approvals_reviewer
+                .can_set(&profile_override.approvals_reviewer)
+            {
+                Ok(()) => config.approvals_reviewer = profile_override.approvals_reviewer,
+                Err(error) => self.chat_widget.add_error_message(format!(
+                    "Failed to carry forward approvals reviewer: {error}"
+                )),
+            }
             match config
                 .permissions
                 .set_permission_profile_from_session_snapshot(
@@ -734,10 +796,89 @@ impl App {
     }
 
     pub(super) fn on_update_reasoning_effort(&mut self, effort: Option<ReasoningEffortConfig>) {
+        let clear_ephemeral_plan_effort = effort != Some(ReasoningEffortConfig::Ultra)
+            && self.chat_widget.config_ref().plan_mode_reasoning_effort
+                == Some(ReasoningEffortConfig::Ultra)
+            && self.config.plan_mode_reasoning_effort != Some(ReasoningEffortConfig::Ultra);
         // TODO(aibrahim): Remove this and don't use config as a state object.
         // Instead, explicitly pass the stored collaboration mode's effort into new sessions.
         self.config.model_reasoning_effort = effort.clone();
-        self.chat_widget.set_reasoning_effort(effort);
+        self.chat_widget.set_reasoning_effort(effort.clone());
+        if clear_ephemeral_plan_effort {
+            self.chat_widget.set_plan_mode_reasoning_effort(effort);
+        }
+    }
+
+    pub(super) fn on_update_plan_mode_reasoning_effort(
+        &mut self,
+        effort: Option<ReasoningEffortConfig>,
+    ) {
+        let clear_ephemeral_default_effort = effort != Some(ReasoningEffortConfig::Ultra)
+            && self
+                .chat_widget
+                .current_collaboration_mode()
+                .reasoning_effort()
+                == Some(ReasoningEffortConfig::Ultra)
+            && self.config.model_reasoning_effort != Some(ReasoningEffortConfig::Ultra);
+        self.config.plan_mode_reasoning_effort = effort.clone();
+        self.chat_widget
+            .set_plan_mode_reasoning_effort(effort.clone());
+        if clear_ephemeral_default_effort {
+            self.chat_widget.set_reasoning_effort(effort);
+        }
+    }
+
+    pub(super) fn on_apply_advanced_reasoning(
+        &mut self,
+        model: &str,
+        effort: ReasoningEffortConfig,
+    ) -> Option<ReasoningEffortConfig> {
+        let default_effort = self.default_reasoning_effort_for_conversation_model(model);
+        if let Some(default_effort) = default_effort.as_ref() {
+            self.config.model = Some(model.to_string());
+            self.config.model_reasoning_effort = Some(default_effort.clone());
+        }
+        self.chat_widget.set_model(model);
+        self.chat_widget.set_reasoning_effort(Some(effort.clone()));
+        self.chat_widget
+            .set_plan_mode_reasoning_effort(Some(effort));
+        default_effort
+    }
+
+    fn default_reasoning_effort_for_conversation_model(
+        &self,
+        model: &str,
+    ) -> Option<ReasoningEffortConfig> {
+        let configured_effort = self
+            .config
+            .model_reasoning_effort
+            .as_ref()
+            .filter(|effort| **effort != ReasoningEffortConfig::Ultra);
+        let preset = self
+            .model_catalog
+            .try_list_models()
+            .ok()?
+            .into_iter()
+            .find(|preset| preset.model == model)?;
+        let supported = &preset.supported_reasoning_efforts;
+
+        configured_effort
+            .filter(|effort| supported.iter().any(|option| option.effort == **effort))
+            .cloned()
+            .or_else(|| {
+                (preset.default_reasoning_effort != ReasoningEffortConfig::Ultra)
+                    .then_some(preset.default_reasoning_effort)
+            })
+            .or_else(|| {
+                supported
+                    .iter()
+                    .find(|option| option.effort != ReasoningEffortConfig::Ultra)
+                    .map(|option| option.effort.clone())
+            })
+    }
+
+    pub(super) fn resume_model_settings(&self) -> crate::app_server_session::ResumeModelSettings {
+        resume_model_settings_for_overrides(&self.config, &self.harness_overrides)
     }
 
     pub(super) fn on_update_personality(&mut self, personality: Personality) {
@@ -746,26 +887,28 @@ impl App {
     }
 
     pub(super) fn sync_tui_theme_selection(&mut self, name: String) {
-        self.config.tui_theme = Some(name.clone());
+        self.local_settings.tui.theme = Some(name.clone());
         self.chat_widget.set_tui_theme(Some(name));
     }
 
     #[cfg(test)]
     pub(super) fn sync_tui_pet_selection(&mut self, pet: String) {
-        self.config.tui_pet = Some(pet.clone());
+        self.local_settings.tui.pet = Some(pet.clone());
         self.chat_widget.set_tui_pet(Some(pet));
     }
 
     pub(super) fn sync_tui_pet_disabled(&mut self) {
         let pet = crate::pets::DISABLED_PET_ID.to_string();
-        self.config.tui_pet = Some(pet.clone());
+        self.local_settings.tui.pet = Some(pet.clone());
         self.chat_widget.set_tui_pet(Some(pet));
     }
 
     pub(super) fn restore_runtime_theme_from_config(&self) {
-        if let Some(name) = self.config.tui_theme.as_deref()
-            && let Some(theme) =
-                crate::render::highlight::resolve_theme_by_name(name, Some(&self.config.codex_home))
+        if let Some(name) = self.local_settings.tui.theme.as_deref()
+            && let Some(theme) = crate::render::highlight::resolve_theme_by_name(
+                name,
+                Some(&self.local_settings.codex_home),
+            )
         {
             crate::render::highlight::set_syntax_theme(theme);
             return;
@@ -774,7 +917,7 @@ impl App {
         let auto_theme_name = crate::render::highlight::adaptive_default_theme_name();
         if let Some(theme) = crate::render::highlight::resolve_theme_by_name(
             auto_theme_name,
-            Some(&self.config.codex_home),
+            Some(&self.local_settings.codex_home),
         ) {
             crate::render::highlight::set_syntax_theme(theme);
         }
@@ -1059,12 +1202,19 @@ fn windows_toml_from_json(value: &serde_json::Value) -> Option<WindowsToml> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::app::test_support::app_enabled_in_effective_config;
     use crate::app::test_support::make_test_app;
     use crate::legacy_core::config::edit::ConfigEdit;
     use crate::test_support::PathBufExt;
+    use codex_config::ConfigLayerEntry;
+    use codex_config::ConfigLayerStack;
     use codex_protocol::models::PermissionProfile;
+    use codex_protocol::openai_models::ReasoningEffortPreset;
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyEvent;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -1083,6 +1233,249 @@ mod tests {
         assert_eq!(
             app.config.model_reasoning_effort,
             Some(ReasoningEffortConfig::High)
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_reasoning_uses_compatible_default_for_new_threads() {
+        for (configured_effort, expected_default_effort) in [
+            (ReasoningEffortConfig::Low, ReasoningEffortConfig::Low),
+            (
+                ReasoningEffortConfig::Custom("unsupported".to_string()),
+                ReasoningEffortConfig::Medium,
+            ),
+            (ReasoningEffortConfig::Ultra, ReasoningEffortConfig::Medium),
+        ] {
+            let mut app = make_test_app().await;
+            app.config.model = Some("gpt-5.4".to_string());
+            app.config.model_reasoning_effort = Some(configured_effort.clone());
+            app.chat_widget
+                .set_reasoning_effort(Some(configured_effort));
+
+            let default_effort =
+                app.on_apply_advanced_reasoning("gpt-5.4", ReasoningEffortConfig::Ultra);
+            let new_thread_config = app.fresh_session_config();
+
+            assert_eq!(default_effort, Some(expected_default_effort.clone()));
+            assert_eq!(app.chat_widget.current_model(), "gpt-5.4");
+            assert_eq!(
+                app.chat_widget.current_reasoning_effort(),
+                Some(ReasoningEffortConfig::Ultra)
+            );
+            assert_eq!(
+                (
+                    new_thread_config.model.as_deref(),
+                    new_thread_config.model_reasoning_effort,
+                ),
+                (Some("gpt-5.4"), Some(expected_default_effort))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_reasoning_keeps_previous_default_for_ultra_only_model() {
+        let mut app = make_test_app().await;
+        app.config.model = Some("gpt-5.4".to_string());
+        app.config.model_reasoning_effort = Some(ReasoningEffortConfig::Low);
+        let mut preset = app
+            .model_catalog
+            .try_list_models()
+            .expect("model catalog is infallible")
+            .into_iter()
+            .find(|preset| preset.model == "gpt-5.4")
+            .expect("gpt-5.4 preset");
+        preset.model = "ultra-only".to_string();
+        preset.default_reasoning_effort = ReasoningEffortConfig::Ultra;
+        preset.supported_reasoning_efforts = vec![ReasoningEffortPreset {
+            effort: ReasoningEffortConfig::Ultra,
+            description: "Ultra reasoning".to_string(),
+        }];
+        app.model_catalog = Arc::new(ModelCatalog::new(vec![preset]));
+
+        let default_effort =
+            app.on_apply_advanced_reasoning("ultra-only", ReasoningEffortConfig::Ultra);
+        let new_thread_config = app.fresh_session_config();
+
+        assert_eq!(default_effort, None);
+        assert_eq!(app.chat_widget.current_model(), "ultra-only");
+        assert_eq!(
+            app.chat_widget.current_reasoning_effort(),
+            Some(ReasoningEffortConfig::Ultra)
+        );
+        assert_eq!(
+            (
+                new_thread_config.model.as_deref(),
+                new_thread_config.model_reasoning_effort,
+            ),
+            (Some("gpt-5.4"), Some(ReasoningEffortConfig::Low))
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_reasoning_updates_active_plan_without_changing_plan_default() {
+        let mut app = make_test_app().await;
+        app.config.model_reasoning_effort = Some(ReasoningEffortConfig::Low);
+        app.config.plan_mode_reasoning_effort = Some(ReasoningEffortConfig::High);
+        app.chat_widget
+            .set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+        app.chat_widget
+            .set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::High));
+        app.chat_widget
+            .handle_key_event(KeyEvent::from(KeyCode::BackTab));
+
+        let default_effort =
+            app.on_apply_advanced_reasoning("gpt-5.4", ReasoningEffortConfig::Ultra);
+
+        assert_eq!(default_effort, Some(ReasoningEffortConfig::Low));
+        assert_eq!(
+            app.chat_widget.current_reasoning_effort(),
+            Some(ReasoningEffortConfig::Ultra)
+        );
+        app.chat_widget
+            .handle_key_event(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(
+            app.chat_widget.current_reasoning_effort(),
+            Some(ReasoningEffortConfig::Ultra)
+        );
+        app.chat_widget
+            .handle_key_event(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(
+            app.chat_widget.current_reasoning_effort(),
+            Some(ReasoningEffortConfig::Ultra)
+        );
+        assert_eq!(
+            (
+                app.config.model_reasoning_effort.clone(),
+                app.config.plan_mode_reasoning_effort.clone(),
+            ),
+            (
+                Some(ReasoningEffortConfig::Low),
+                Some(ReasoningEffortConfig::High),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn leaving_conversation_ultra_in_default_clears_the_ephemeral_plan_effort() {
+        let mut app = make_test_app().await;
+        app.config.model_reasoning_effort = Some(ReasoningEffortConfig::Low);
+        app.config.plan_mode_reasoning_effort = Some(ReasoningEffortConfig::High);
+        app.chat_widget
+            .set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+        app.chat_widget
+            .set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::High));
+
+        app.on_apply_advanced_reasoning("gpt-5.4", ReasoningEffortConfig::Ultra);
+        app.on_update_reasoning_effort(Some(ReasoningEffortConfig::Medium));
+        app.chat_widget
+            .handle_key_event(KeyEvent::from(KeyCode::BackTab));
+
+        assert_eq!(
+            app.chat_widget.current_reasoning_effort(),
+            Some(ReasoningEffortConfig::Medium)
+        );
+        assert_eq!(
+            app.config.plan_mode_reasoning_effort,
+            Some(ReasoningEffortConfig::High)
+        );
+    }
+
+    #[tokio::test]
+    async fn leaving_conversation_ultra_in_plan_clears_the_ephemeral_default_effort() {
+        let mut app = make_test_app().await;
+        app.config.model_reasoning_effort = Some(ReasoningEffortConfig::Low);
+        app.config.plan_mode_reasoning_effort = Some(ReasoningEffortConfig::High);
+        app.chat_widget
+            .set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+        app.chat_widget
+            .set_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::High));
+        app.chat_widget
+            .handle_key_event(KeyEvent::from(KeyCode::BackTab));
+
+        app.on_apply_advanced_reasoning("gpt-5.4", ReasoningEffortConfig::Ultra);
+        app.on_update_plan_mode_reasoning_effort(Some(ReasoningEffortConfig::Medium));
+        app.chat_widget
+            .handle_key_event(KeyEvent::from(KeyCode::BackTab));
+
+        assert_eq!(
+            app.chat_widget.current_reasoning_effort(),
+            Some(ReasoningEffortConfig::Medium)
+        );
+        assert_eq!(
+            app.config.model_reasoning_effort,
+            Some(ReasoningEffortConfig::Low)
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_model_settings_preserves_only_explicit_model_overrides() {
+        let mut app = make_test_app().await;
+
+        assert_eq!(
+            app.resume_model_settings(),
+            crate::app_server_session::ResumeModelSettings::RestoreFromThread
+        );
+        let profile_path = test_path_buf("/tmp/work.config.toml").abs();
+        let profile = "work"
+            .parse::<codex_config::ProfileV2Name>()
+            .expect("valid profile name");
+        for (key, expected) in [
+            (
+                "model",
+                crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+            ),
+            (
+                "model_provider",
+                crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+            ),
+            (
+                "model_reasoning_effort",
+                crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+            ),
+            (
+                "sandbox_mode",
+                crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+            ),
+        ] {
+            let config = TomlValue::Table(toml::map::Map::from_iter([(
+                key.to_string(),
+                TomlValue::String("value".to_string()),
+            )]));
+            app.config.config_layer_stack = ConfigLayerStack::new(
+                vec![ConfigLayerEntry::new(
+                    ConfigLayerSource::SessionFlags,
+                    config.clone(),
+                )],
+                Default::default(),
+                Default::default(),
+            )
+            .expect("session flags layer stack");
+            assert_eq!(app.resume_model_settings(), expected);
+
+            app.config.config_layer_stack = ConfigLayerStack::default()
+                .with_user_config_profile(&profile_path, Some(&profile), config)
+                .expect("user config profile layer stack");
+            assert_eq!(app.resume_model_settings(), expected);
+        }
+
+        app.config.config_layer_stack = ConfigLayerStack::default()
+            .with_user_config(
+                &profile_path,
+                TomlValue::Table(toml::map::Map::from_iter([(
+                    "model_reasoning_effort".to_string(),
+                    TomlValue::String("high".to_string()),
+                )])),
+            )
+            .expect("user config layer stack");
+        assert_eq!(
+            app.resume_model_settings(),
+            crate::app_server_session::ResumeModelSettings::RestoreFromThread
+        );
+
+        app.harness_overrides.model_provider = Some("custom-provider".to_string());
+        assert_eq!(
+            app.resume_model_settings(),
+            crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig
         );
     }
 
@@ -1244,6 +1637,8 @@ enabled = false
     #[tokio::test]
     async fn refresh_in_memory_config_from_disk_updates_resize_reflow_config() -> Result<()> {
         let mut app = make_test_app().await;
+        let mut expected_widget_settings = app.chat_widget.local_settings.clone();
+        expected_widget_settings.tui.terminal_resize_reflow_max_rows = Some(9000);
         let codex_home = tempdir()?;
         app.config.codex_home = codex_home.path().to_path_buf().abs();
         std::fs::write(
@@ -1251,15 +1646,18 @@ enabled = false
             r#"
 [tui]
 terminal_resize_reflow_max_rows = 9000
+theme = "dracula"
 "#,
         )?;
 
         app.refresh_in_memory_config_from_disk().await?;
 
         assert_eq!(
-            app.config.terminal_resize_reflow.max_rows,
+            app.local_settings.terminal_resize_reflow().max_rows,
             crate::legacy_core::config::TerminalResizeReflowMaxRows::Limit(9000)
         );
+        assert_eq!(app.local_settings.tui.theme.as_deref(), Some("dracula"));
+        assert_eq!(app.chat_widget.local_settings, expected_widget_settings);
         Ok(())
     }
 
@@ -1307,6 +1705,7 @@ terminal_resize_reflow_max_rows = 9000
     async fn rebuild_config_for_resume_or_fallback_uses_current_config_on_same_cwd_error()
     -> Result<()> {
         let mut app = make_test_app().await;
+        app.sync_tui_theme_selection("dracula".to_string());
         let codex_home = tempdir()?;
         app.config.codex_home = codex_home.path().to_path_buf().abs();
         std::fs::write(codex_home.path().join("config.toml"), "[broken")?;
@@ -1317,7 +1716,7 @@ terminal_resize_reflow_max_rows = 9000
             .rebuild_config_for_resume_or_fallback(&current_cwd, current_cwd.to_path_buf())
             .await?;
 
-        assert_eq!(resume_config, current_config);
+        assert_eq!(resume_config, (current_config, app.local_settings.clone()));
         Ok(())
     }
 
@@ -1345,11 +1744,31 @@ terminal_resize_reflow_max_rows = 9000
 
         app.sync_tui_theme_selection("dracula".to_string());
 
-        assert_eq!(app.config.tui_theme.as_deref(), Some("dracula"));
+        assert_eq!(app.local_settings.tui.theme.as_deref(), Some("dracula"));
         assert_eq!(
-            app.chat_widget.config_ref().tui_theme.as_deref(),
+            app.chat_widget.local_settings.tui.theme.as_deref(),
             Some("dracula")
         );
+    }
+
+    #[tokio::test]
+    async fn replacement_preserves_live_local_settings_and_server_auth_requirement() -> Result<()> {
+        let mut app = make_test_app().await;
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        app.sync_tui_theme_selection("dracula".to_string());
+        app.chat_widget.requires_openai_auth = false;
+        let mut legacy_config = app.config.clone();
+        legacy_config.tui_theme = Some("nord".to_string());
+        legacy_config.model_provider.requires_openai_auth = true;
+        let init = app.chatwidget_init_for_forked_or_resumed_thread(
+            &mut tui,
+            legacy_config,
+            /*initial_user_message*/ None,
+        );
+        let replacement = ChatWidget::new_with_app_event(init);
+        assert_eq!(replacement.local_settings, app.local_settings);
+        assert!(!replacement.requires_openai_auth);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1358,9 +1777,9 @@ terminal_resize_reflow_max_rows = 9000
 
         app.sync_tui_pet_selection("chefito".to_string());
 
-        assert_eq!(app.config.tui_pet.as_deref(), Some("chefito"));
+        assert_eq!(app.local_settings.tui.pet.as_deref(), Some("chefito"));
         assert_eq!(
-            app.chat_widget.config_ref().tui_pet.as_deref(),
+            app.chat_widget.local_settings.tui.pet.as_deref(),
             Some("chefito")
         );
     }
@@ -1372,11 +1791,11 @@ terminal_resize_reflow_max_rows = 9000
         app.sync_tui_pet_disabled();
 
         assert_eq!(
-            app.config.tui_pet.as_deref(),
+            app.local_settings.tui.pet.as_deref(),
             Some(crate::pets::DISABLED_PET_ID)
         );
         assert_eq!(
-            app.chat_widget.config_ref().tui_pet.as_deref(),
+            app.chat_widget.local_settings.tui.pet.as_deref(),
             Some(crate::pets::DISABLED_PET_ID)
         );
     }

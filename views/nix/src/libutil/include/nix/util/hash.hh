@@ -54,6 +54,22 @@ enum struct HashFormat : int {
 
 extern const StringSet hashFormats;
 
+/**
+ * Experimental-feature settings with `blake3-hashes` enabled, for
+ * constructing a BLAKE3 `Hash` whose algorithm the user did not choose.
+ *
+ * `Hash` gates BLAKE3 on that feature because it governs BLAKE3 as a
+ * *store* content address the user picks. An identifier minted by another
+ * system is not a choice: a jj commit id, a jj tree id, or the content
+ * address of a store object that is such an id (`fixed:jj-tree:blake3:`)
+ * are BLAKE3 because jj is, and refusing to read them would make an
+ * unrelated experimental feature a prerequisite for reading a repository
+ * whose ids the user cannot change, with an error naming a feature they
+ * never asked for. Parse those against these settings, never the global
+ * ones.
+ */
+const ExperimentalFeatureSettings & nativeIdXpSettings();
+
 struct Hash
 {
     /** Opaque handle type for the hash calculation state. */
@@ -95,7 +111,8 @@ struct Hash
      * Parse a plain hash that musst not have any prefix indicating the type.
      * The type is passed in to disambiguate.
      */
-    static Hash parseNonSRIUnprefixed(std::string_view s, HashAlgorithm algo);
+    static Hash parseNonSRIUnprefixed(
+        std::string_view s, HashAlgorithm algo, const ExperimentalFeatureSettings & xpSettings = experimentalFeatureSettings);
 
     /**
      * Like `parseNonSRIUnprefixed`, but the hash format has been

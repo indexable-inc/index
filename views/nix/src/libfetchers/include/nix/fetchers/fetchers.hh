@@ -127,8 +127,6 @@ public:
         return attrs < other.attrs;
     }
 
-    bool contains(const Input & other) const;
-
     /**
      * Fetch the entire input into the Nix store, returning the
      * location in the Nix store and the locked input.
@@ -173,6 +171,12 @@ public:
      */
     void putFile(const CanonPath & path, std::string_view contents, std::optional<std::string> commitMsg) const;
 
+    /**
+     * Whether a `putFile` into this input has to be committed to leave the
+     * source usable. See `InputScheme::putFileRequiresCommit`.
+     */
+    bool putFileRequiresCommit() const;
+
     std::string getName() const;
 
     StorePath computeStorePath(Store & store) const;
@@ -180,6 +184,19 @@ public:
     // Convenience functions for common attributes.
     std::string getType() const;
     std::optional<Hash> getNarHash() const;
+
+    /**
+     * The `treeHash` attribute: the BLAKE3 id of the input's root tree
+     * as jj's native object store names it, in SRI form
+     * (`blake3-<base64>`). It is the lock identity of a `jj` input, in
+     * place of `narHash`: the store path is
+     * `makeFixedOutputPath(name, {JjTree, treeHash})`, derived with no
+     * file reads, and a locked input is verified by comparing ids, never
+     * by ingesting the tree. Read through the scheme, which owns the
+     * meaning of its attributes (`InputScheme::getTreeHash`).
+     */
+    std::optional<Hash> getTreeHash() const;
+
     std::optional<std::string> getRef() const;
     std::optional<Hash> getRev() const;
     std::optional<uint64_t> getRevCount() const;
@@ -262,8 +279,6 @@ struct InputScheme
 
     virtual ParsedURL toURL(const Input & input) const;
 
-    virtual Input applyOverrides(const Input & input, std::optional<std::string> ref, std::optional<Hash> rev) const;
-
     virtual void
     clone(const Settings & settings, Store & store, const Input & input, const std::filesystem::path & destDir) const;
 
@@ -274,6 +289,26 @@ struct InputScheme
         const CanonPath & path,
         std::string_view contents,
         std::optional<std::string> commitMsg) const;
+
+    /**
+     * Does writing a file into this input's source destroy the identity
+     * that source is fetched by, unless the write is committed?
+     *
+     * A source identified by a commit (Git) has one: the moment a file is
+     * written into its working tree, no revision describes what is on
+     * disk, and the next fetch of that input refuses it rather than
+     * inventing one. Writing into such a source is therefore only
+     * meaningful together with a commit, and the caller has to have asked
+     * for one.
+     *
+     * A source that re-derives its identity from whatever is on disk
+     * (Jujutsu, which snapshots at every fetch) does not, which is why a
+     * jj workspace needs no flag: the snapshot is the commit.
+     */
+    virtual bool putFileRequiresCommit() const
+    {
+        return false;
+    }
 
     virtual std::pair<ref<SourceAccessor>, Input>
     getAccessor(const Settings & settings, Store & store, const Input & input) const = 0;
@@ -297,6 +332,15 @@ struct InputScheme
     {
         return false;
     }
+
+    /**
+     * Read the input's `treeHash` attribute, see `Input::getTreeHash`.
+     * The default parses it as a BLAKE3 SRI hash and throws `UsageError`
+     * for any other algorithm, the mirror of `narHash` having to be
+     * SHA-256. A scheme whose attributes cannot carry a tree id has no
+     * reason to override: an input without the attribute reads as none.
+     */
+    virtual std::optional<Hash> getTreeHash(const Input & input) const;
 
     virtual std::optional<std::filesystem::path> isRelative(const Input & input) const
     {

@@ -73,15 +73,16 @@ subRev=$(git -C "$subRepo" rev-parse HEAD)
 [[ $(nix eval --no-write-lock-file --raw "$flakeref#subRev") = "$subRev" ]]
 [[ $(nix eval --no-write-lock-file --raw "$flakeref#plainRev") = missing ]]
 
-# The stamped values are recorded in the lock file.
-nix flake lock "$flakeref"
+# The stamped values are recorded in the lock file. A git source takes its
+# lock file only as a commit (flakes/lock-file-writes.sh), so the commit that
+# used to follow the write is the write.
+GIT_AUTHOR_DATE="$rootTime +0000" GIT_COMMITTER_DATE="$rootTime +0000" \
+  nix flake lock "$flakeref" --commit-lock-file
 [[ $(jq -r '.nodes.sub.locked.lastModified' "$rootRepo"/flake.lock) = "$subTime" ]]
 [[ $(jq -r '.nodes.plain.locked.lastModified' "$rootRepo"/flake.lock) = null ]]
 [[ $(jq -r '.nodes.sub.locked.rev' "$rootRepo"/flake.lock) = "$subRev" ]]
+[[ -z "$(git -C "$rootRepo" status --porcelain)" ]]
 
 # The enriched lock must round-trip: a fresh evaluation of the committed
 # lock still works and reproduces the same values.
-git -C "$rootRepo" add flake.lock
-GIT_AUTHOR_DATE="$rootTime +0000" GIT_COMMITTER_DATE="$rootTime +0000" \
-  git -C "$rootRepo" commit -m lock
 [[ $(nix eval --json "$flakeref#subLastModified") = "$subTime" ]]

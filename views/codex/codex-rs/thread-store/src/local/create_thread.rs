@@ -2,7 +2,6 @@ use super::LocalThreadStore;
 use crate::CreateThreadParams;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
-use crate::error::reject_paginated_history_mode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutRecorder;
@@ -12,7 +11,6 @@ pub(super) async fn create_thread(
     store: &LocalThreadStore,
     params: CreateThreadParams,
 ) -> ThreadStoreResult<RolloutRecorder> {
-    reject_paginated_history_mode(params.history_mode)?;
     let cwd = params
         .metadata
         .cwd
@@ -22,7 +20,7 @@ pub(super) async fn create_thread(
         })?;
     let config = RolloutConfig {
         codex_home: store.config.codex_home.clone(),
-        sqlite_home: store.config.sqlite_home.clone(),
+        sqlite: store.config.sqlite.clone(),
         cwd,
         model_provider_id: params.metadata.model_provider.clone(),
         generate_memories: matches!(params.metadata.memory_mode, ThreadMemoryMode::Enabled),
@@ -43,6 +41,14 @@ pub(super) async fn create_thread(
         .with_selected_capability_roots(params.selected_capability_roots)
         .with_multi_agent_version(params.multi_agent_version)
         .with_history_mode(params.history_mode)
+        .with_history_base(params.history_base)
+        .with_forked_from_ordinal_exclusive(
+            params
+                .forked_from_id
+                .and(params.history_base)
+                .map(|base| base.end_ordinal_exclusive),
+        )
+        .with_subagent_history_start_ordinal(params.subagent_history_start_ordinal)
         .with_initial_window_id(params.initial_window_id),
     )
     .await

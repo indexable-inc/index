@@ -81,6 +81,7 @@ export class Thread {
       threadId: this._id,
       images,
       model: options?.model,
+      threadSource: options?.threadSource,
       sandboxMode: options?.sandboxMode,
       workingDirectory: options?.workingDirectory,
       skipGitRepoCheck: options?.skipGitRepoCheck,
@@ -103,6 +104,8 @@ export class Thread {
         }
         if (parsed.type === "thread.started") {
           this._id = parsed.thread_id;
+        } else if (parsed.type === "turn.completed") {
+          parsed.usage.cache_write_input_tokens ??= 0;
         }
         yield parsed;
       }

@@ -15,6 +15,8 @@ impl ChatWidget {
             return;
         }
 
+        let was_replaying_turn_completion = self.thread_usage.replaying_turn_completion;
+        self.thread_usage.replaying_turn_completion = replay_kind.is_some();
         let from_replay = replay_kind.is_some();
         let is_resume_initial_replay =
             matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages));
@@ -58,9 +60,13 @@ impl ChatWidget {
                 self.on_thread_settings_updated(notification);
             }
             ServerNotification::TurnStarted(notification) => {
+                if replay_kind.is_none() {
+                    self.clear_misalignment_for_new_turn(&notification.turn.id);
+                }
                 self.turn_lifecycle.last_turn_id = Some(notification.turn.id);
                 self.last_non_retry_error = None;
                 if !matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages)) {
+                    self.warning_display_state.startup_complete = true;
                     self.on_task_started();
                 }
             }
@@ -68,7 +74,7 @@ impl ChatWidget {
                 self.handle_turn_completed_notification(notification, replay_kind);
             }
             ServerNotification::ItemStarted(notification) => {
-                self.handle_item_started_notification(notification, replay_kind.is_some());
+                self.handle_item_started_notification(notification, replay_kind);
             }
             ServerNotification::ItemCompleted(notification) => {
                 self.handle_item_completed_notification(notification, replay_kind);
@@ -134,10 +140,20 @@ impl ChatWidget {
                         notification.turn_id.clone(),
                         notification.error.message.clone(),
                     ));
-                    self.handle_non_retry_error(
-                        notification.error.message,
-                        notification.error.codex_error_info,
-                    );
+                    if !from_replay
+                        && notification.error.codex_error_info
+                            == Some(AppServerCodexErrorInfo::MisalignmentPolicyViolation)
+                    {
+                        self.on_misalignment_error(
+                            Some(notification.turn_id),
+                            notification.error.misalignment,
+                        );
+                    } else {
+                        self.handle_non_retry_error(
+                            notification.error.message,
+                            notification.error.codex_error_info,
+                        );
+                    }
                 }
             }
             ServerNotification::SkillsChanged(_) => {
@@ -150,19 +166,47 @@ impl ChatWidget {
             ServerNotification::ModelSafetyBufferingUpdated(notification) => {
                 self.on_model_safety_buffering_updated(notification, replay_kind)
             }
+            ServerNotification::AuthRecoveryStarted(notification) => {
+                self.add_info_message(notification.message, /*hint*/ None)
+            }
+            ServerNotification::AuthRecoveryCompleted(notification) => {
+                self.add_plain_history_lines(vec![
+                    vec!["✓ ".green(), notification.message.into()].into(),
+                ]);
+            }
             ServerNotification::Warning(notification) => self.on_warning(notification.message),
             ServerNotification::GuardianWarning(notification) => {
-                self.on_warning(notification.message)
+                if !notification
+                    .message
+                    .starts_with("Automatic approval review approved (")
+                {
+                    self.on_warning(notification.message);
+                }
+            }
+            ServerNotification::StrictReviewRequired(_) => {
+                self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                    history_cell::new_warning_event(
+                        "This request requires additional safety checks, some tool calls might take extra time"
+                            .to_string(),
+                    ),
+                )));
+                self.request_redraw();
             }
             ServerNotification::DeprecationNotice(notification) => {
                 self.on_deprecation_notice(notification.summary, notification.details)
             }
-            ServerNotification::ConfigWarning(notification) => self.on_warning(
-                notification
+            ServerNotification::ConfigWarning(notification) => {
+                let message = notification
                     .details
                     .map(|details| format!("{}: {details}", notification.summary))
-                    .unwrap_or(notification.summary),
-            ),
+                    .unwrap_or(notification.summary);
+                if self.warning_display_state.startup_complete {
+                    self.on_warning(message);
+                } else if self.warning_display_state.should_display(&message) {
+                    self.add_to_history(history_cell::StartupWarningsCell::new(vec![message]));
+                    self.request_redraw();
+                }
+            }
             ServerNotification::McpServerStatusUpdated(notification) => {
                 self.on_mcp_server_status_updated(notification)
             }
@@ -196,17 +240,23 @@ impl ChatWidget {
             | ServerNotification::AccountRateLimitsUpdated(_)
             | ServerNotification::ThreadStarted(_)
             | ServerNotification::ThreadStatusChanged(_)
+            | ServerNotification::ThreadReverted(_)
+            | ServerNotification::ThreadQueueChanged(_)
             | ServerNotification::ThreadArchived(_)
             | ServerNotification::ThreadDeleted(_)
             | ServerNotification::ThreadUnarchived(_)
             | ServerNotification::RawResponseItemCompleted(_)
+            | ServerNotification::RawResponseCompleted(_)
             | ServerNotification::CommandExecOutputDelta(_)
             | ServerNotification::ProcessOutputDelta(_)
             | ServerNotification::ProcessExited(_)
+            | ServerNotification::McpServerEventStream(_)
             | ServerNotification::FileChangePatchUpdated(_)
             | ServerNotification::McpToolCallProgress(_)
             | ServerNotification::McpServerOauthLoginCompleted(_)
             | ServerNotification::AppListUpdated(_)
+            | ServerNotification::EnvironmentConnected(_)
+            | ServerNotification::EnvironmentDisconnected(_)
             | ServerNotification::RemoteControlStatusChanged(_)
             | ServerNotification::ExternalAgentConfigImportProgress(_)
             | ServerNotification::ExternalAgentConfigImportCompleted(_)
@@ -216,6 +266,9 @@ impl ChatWidget {
             | ServerNotification::FuzzyFileSearchSessionCompleted(_)
             | ServerNotification::ThreadRealtimeStarted(_)
             | ServerNotification::ThreadRealtimeItemAdded(_)
+            | ServerNotification::ThreadRealtimeItemStarted(_)
+            | ServerNotification::ThreadRealtimeItemTranscriptDelta(_)
+            | ServerNotification::ThreadRealtimeItemCompleted(_)
             | ServerNotification::ThreadRealtimeOutputAudioDelta(_)
             | ServerNotification::ThreadRealtimeError(_)
             | ServerNotification::ThreadRealtimeClosed(_)
@@ -224,9 +277,12 @@ impl ChatWidget {
             | ServerNotification::ThreadRealtimeTranscriptDone(_)
             | ServerNotification::WindowsWorldWritableWarning(_)
             | ServerNotification::WindowsSandboxSetupCompleted(_)
-            | ServerNotification::AccountLoginCompleted(_) => {}
+            | ServerNotification::AccountLoginCompleted(_)
+            | ServerNotification::ProjectChanged(_)
+            | ServerNotification::ThreadProjectUpdated(_) => {}
             ServerNotification::ContextCompacted(_) => {}
         }
+        self.thread_usage.replaying_turn_completion = was_replaying_turn_completion;
     }
 
     pub(super) fn handle_turn_completed_notification(
@@ -238,14 +294,47 @@ impl ChatWidget {
         // this TUI already rendered locally. Once that turn ends, another
         // client can submit the same text and it still needs its own user cell.
         self.last_rendered_user_message_display = None;
+        let was_replaying_turn_completion = self.thread_usage.replaying_turn_completion;
+        self.thread_usage.replaying_turn_completion = replay_kind.is_some();
         match notification.turn.status {
             TurnStatus::Completed => {
+                let last_agent_message =
+                    notification
+                        .turn
+                        .items
+                        .iter()
+                        .rev()
+                        .find_map(|item| match item {
+                            ThreadItem::AgentMessage {
+                                id,
+                                text,
+                                phase: Some(MessagePhase::FinalAnswer) | None,
+                                ..
+                            } => Some((item.clone(), id.clone(), text.clone())),
+                            _ => None,
+                        });
+                if let Some((item, id, _)) = &last_agent_message
+                    && self
+                        .transcript
+                        .last_completed_agent_message
+                        .as_ref()
+                        .is_none_or(|(turn_id, item_id)| {
+                            turn_id != &notification.turn.id || item_id != id
+                        })
+                {
+                    self.handle_thread_item(
+                        item.clone(),
+                        notification.turn.id.clone(),
+                        replay_kind
+                            .map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
+                    );
+                }
                 self.last_non_retry_error = None;
                 self.on_task_complete(
-                    /*last_agent_message*/ None,
+                    last_agent_message.map(|(_, _, text)| text),
                     notification.turn.duration_ms,
                     replay_kind.is_some(),
-                )
+                );
             }
             TurnStatus::Interrupted => {
                 self.last_non_retry_error = None;
@@ -261,7 +350,13 @@ impl ChatWidget {
             }
             TurnStatus::Failed => {
                 if let Some(error) = notification.turn.error {
-                    if self.last_non_retry_error.as_ref()
+                    if replay_kind.is_none()
+                        && error.codex_error_info
+                            == Some(AppServerCodexErrorInfo::MisalignmentPolicyViolation)
+                    {
+                        self.on_misalignment_error(Some(notification.turn.id), error.misalignment);
+                        self.last_non_retry_error = None;
+                    } else if self.last_non_retry_error.as_ref()
                         == Some(&(notification.turn.id.clone(), error.message.clone()))
                     {
                         self.last_non_retry_error = None;
@@ -277,14 +372,30 @@ impl ChatWidget {
             }
             TurnStatus::InProgress => {}
         }
+        self.thread_usage.replaying_turn_completion = was_replaying_turn_completion;
     }
 
     fn handle_item_started_notification(
         &mut self,
         notification: ItemStartedNotification,
-        from_replay: bool,
+        replay_kind: Option<ReplayKind>,
     ) {
         match notification.item {
+            ThreadItem::ContextCompaction { id }
+                if !matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages)) =>
+            {
+                // Buffered starts reconstruct an in-flight compaction when switching tasks.
+                let elapsed = if replay_kind == Some(ReplayKind::ThreadSnapshot) {
+                    let elapsed_ms = chrono::Utc::now()
+                        .timestamp_millis()
+                        .saturating_sub(notification.started_at_ms)
+                        .max(0);
+                    Duration::from_millis(elapsed_ms as u64)
+                } else {
+                    Duration::ZERO
+                };
+                self.on_context_compaction_started(id, elapsed);
+            }
             item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_started(item),
             ThreadItem::FileChange { id: _, changes, .. } => {
                 self.on_patch_apply_begin(file_update_changes_to_display(changes));
@@ -317,8 +428,7 @@ impl ChatWidget {
                 reasoning_effort,
                 agents_states,
             }),
-            item @ ThreadItem::SubAgentActivity { .. } => self.on_sub_agent_activity(item),
-            ThreadItem::EnteredReviewMode { review, .. } if !from_replay => {
+            ThreadItem::EnteredReviewMode { review, .. } if replay_kind.is_none() => {
                 self.enter_review_mode_with_hint(review, /*from_replay*/ false);
             }
             _ => {}
@@ -330,10 +440,13 @@ impl ChatWidget {
         notification: ItemCompletedNotification,
         replay_kind: Option<ReplayKind>,
     ) {
-        self.handle_thread_item(
-            notification.item,
-            notification.turn_id,
-            replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
-        );
+        match notification.item {
+            item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_completed(item),
+            item => self.handle_thread_item(
+                item,
+                notification.turn_id,
+                replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
+            ),
+        }
     }
 }

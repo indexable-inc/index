@@ -56,7 +56,7 @@ Another technique is that of a [Merkle graph](https://en.wikipedia.org/wiki/Merk
 In particular, the Merkle graphs can match the original graph structure of file system objects:
 we can first hash (serialised) child file system objects, and then hash parent objects using the hashes of their children in the serialisation (to be hashed) of the parent file system objects.
 
-Currently, there is one such Merkle DAG content addressing method supported.
+Currently, there are two such Merkle DAG content addressing methods supported.
 
 ### Git ([experimental][xp-feature-git-hashing]) { #git }
 
@@ -79,6 +79,12 @@ To avoid an address collision, attempts to hash a bare executable file or symlin
 Thus, Git can encode some, but not all of Nix's "File System Objects", and this sort of content-addressing is likewise partial.
 
 In the future, we may support a Git-like hash for such file system objects, or we may adopt another Merkle DAG format which is capable of representing all Nix file system objects.
+
+### Jujutsu tree { #jj-tree }
+
+[Jujutsu](https://jj-vcs.github.io/)'s native object store gives every directory tree a BLAKE3 Merkle id, maintained incrementally each time the working copy is snapshotted. Nix uses that id as the content address of the tree, and of nothing else: the method addresses only what a jj store already named.
+
+Unlike every other method on this page, Nix does not implement the serialisation. It cannot compute the id of a tree; it reads the id from the object store together with the tree, and `nix hash path --mode jj-tree` refuses. The id depends only on the tree's content, never on its position, so the same directory has the same id as a subtree of one repository and as the root of another. That is what lets a relative `path:./sub` flake input inside a jj-backed flake be addressed as its own store object with no identity of its own in the lock file.
 
 
 [file system object]: ../file-system-object.md

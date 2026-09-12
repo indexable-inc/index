@@ -115,16 +115,6 @@ struct IndirectInputScheme : InputScheme
         return url;
     }
 
-    Input applyOverrides(const Input & _input, std::optional<std::string> ref, std::optional<Hash> rev) const override
-    {
-        auto input(_input);
-        if (rev)
-            input.attrs.insert_or_assign("rev", rev->gitRev());
-        if (ref)
-            input.attrs.insert_or_assign("ref", *ref);
-        return input;
-    }
-
     std::pair<ref<SourceAccessor>, Input>
     getAccessor(const Settings & settings, Store & store, const Input & input) const override
     {

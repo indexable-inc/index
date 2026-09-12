@@ -50,7 +50,7 @@
     # than papering a missing name over with a sentinel that surfaces far downstream.
     crateName = a: a.pname or (throw "rust.buildPackage: set `pname`.");
     # Shortcut: pass `srcRoot = ./.` for a repo-owned crate whose tracked tree
-    # is the build closure. Expands to the standard `gitTracked` filter, defaults
+    # is the build closure. Imports the whole `srcRoot` tree, defaults
     # `meta.mainProgram` to `pname`, and keeps the resolver's `cargoLock` default
     # (`src + "/Cargo.lock"`) intact.
     rawArgs =
@@ -63,7 +63,7 @@
         // {
           src = lib.fileset.toSource {
             root = srcRoot;
-            fileset = lib.fileset.gitTracked srcRoot;
+            fileset = srcRoot;
           };
           meta =
             (expandedArgs.meta or {})

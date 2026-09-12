@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_http_client::HttpClientFactory;
 use futures::future::BoxFuture;
+use http::HeaderMap;
+use tokio::sync::watch;
 
 use crate::ExecServerError;
 use crate::HttpRequestParams;
@@ -31,6 +34,7 @@ pub struct RemoteExecServerConnectArgs {
     pub connect_timeout: Duration,
     pub initialize_timeout: Duration,
     pub resume_session_id: Option<String>,
+    pub http_client_factory: HttpClientFactory,
 }
 
 /// Registry-authorized material for one Noise rendezvous connection attempt.
@@ -59,6 +63,7 @@ pub struct NoiseRendezvousConnectArgs {
     pub connect_timeout: Duration,
     pub initialize_timeout: Duration,
     pub resume_session_id: Option<String>,
+    pub http_client_factory: HttpClientFactory,
 }
 
 /// Supplies fresh registry-authorized material for Noise rendezvous connections.
@@ -88,13 +93,23 @@ pub(crate) struct StdioExecServerCommand {
     pub cwd: Option<PathBuf>,
 }
 
+pub(crate) type DeferredEnvironmentReadiness = watch::Receiver<Option<Result<(), String>>>;
+
+#[derive(Clone)]
+pub(crate) struct Deferred<T> {
+    pub readiness: DeferredEnvironmentReadiness,
+    pub transport: T,
+}
+
 /// Parameters used to connect to a remote exec-server environment.
 #[derive(Clone)]
 pub(crate) enum ExecServerTransportParams {
+    Deferred(Box<Deferred<ExecServerTransportParams>>),
     WebSocketUrl {
         websocket_url: String,
         connect_timeout: Duration,
         initialize_timeout: Duration,
+        http_headers: HeaderMap,
     },
     NoiseRendezvous {
         provider: Arc<dyn NoiseRendezvousConnectProvider>,
@@ -110,15 +125,21 @@ pub(crate) enum ExecServerTransportParams {
 impl std::fmt::Debug for ExecServerTransportParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Deferred(deferred) => f
+                .debug_struct("Deferred")
+                .field("transport", &deferred.transport)
+                .finish_non_exhaustive(),
             Self::WebSocketUrl {
                 websocket_url,
                 connect_timeout,
                 initialize_timeout,
+                ..
             } => f
                 .debug_struct("WebSocketUrl")
                 .field("websocket_url", websocket_url)
                 .field("connect_timeout", connect_timeout)
                 .field("initialize_timeout", initialize_timeout)
+                .field("http_headers", &"<redacted>")
                 .finish(),
             Self::NoiseRendezvous { .. } => {
                 f.debug_struct("NoiseRendezvous").finish_non_exhaustive()
@@ -141,6 +162,7 @@ impl ExecServerTransportParams {
             websocket_url,
             connect_timeout,
             initialize_timeout: DEFAULT_REMOTE_EXEC_SERVER_INITIALIZE_TIMEOUT,
+            http_headers: HeaderMap::new(),
         }
     }
 }

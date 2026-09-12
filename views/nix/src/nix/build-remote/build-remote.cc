@@ -28,8 +28,6 @@
 using namespace nix;
 using std::cin;
 
-static void handleAlarm(int sig) {}
-
 std::string escapeUri(std::string uri)
 {
     std::replace(uri.begin(), uri.end(), '/', '_');
@@ -41,6 +39,19 @@ static std::filesystem::path currentLoad;
 static AutoCloseFD openSlotLock(const Machine & m, uint64_t slot)
 {
     return openLockFile(currentLoad / fmt("%s-%d", escapeUri(m.storeUri.render()), slot), true);
+}
+
+static AutoCloseFD openUploadLock(const std::string & storeUri)
+{
+    auto path = currentLoad / (escapeUri(storeUri) + ".upload-lock");
+    try {
+        return openLockFile(path, true);
+    } catch (SystemError & e) {
+        if (!e.is(std::errc::filename_too_long))
+            throw;
+        auto hash = hashString(HashAlgorithm::MD5, storeUri);
+        return openLockFile(currentLoad / (hash.to_string(HashFormat::Base64, false) + ".upload-lock"), true);
+    }
 }
 
 static bool allSupportedLocally(Store & store, const StringSet & requiredFeatures)
@@ -93,6 +104,7 @@ static int main_build_remote(int argc, char ** argv)
 
         std::shared_ptr<Store> sshStore;
         AutoCloseFD bestSlotLock;
+        AutoCloseFD uploadLock;
 
         auto machines = Machine::parseConfig({settings.thisSystem}, settings.getWorkerSettings().builders);
         debug("got %d remote builders", machines.size());
@@ -134,6 +146,7 @@ static int main_build_remote(int argc, char ** argv)
 
             while (true) {
                 bestSlotLock = -1;
+                uploadLock = -1;
                 AutoCloseFD lock = openLockFile(currentLoad / "main-lock", true);
                 lockFile(lock.get(), ltWrite, true);
 
@@ -162,6 +175,12 @@ static int main_build_remote(int argc, char ** argv)
                         if (!free) {
                             continue;
                         }
+                        // Waiting uploads must not occupy an admitted remote
+                        // connection. Try the local serialization lock before
+                        // opening SSH; a busy machine can be retried later.
+                        auto candidateUploadLock = openUploadLock(m.storeUri.render());
+                        if (!lockFile(candidateUploadLock.get(), ltWrite, false))
+                            continue;
                         bool best = false;
                         if (!bestSlotLock) {
                             best = true;
@@ -177,6 +196,7 @@ static int main_build_remote(int argc, char ** argv)
                             }
                         }
                         if (best) {
+                            uploadLock = std::move(candidateUploadLock);
                             bestLoad = load;
                             bestSlotLock = std::move(free);
                             bestMachine = &m;
@@ -257,33 +277,6 @@ static int main_build_remote(int argc, char ** argv)
         auto inputs = readStrings<StringSet>(source);
         auto wantedOutputs = readStrings<StringSet>(source);
 
-        AutoCloseFD uploadLock;
-        {
-            auto setUpdateLock = [&](auto && fileName) {
-                uploadLock = openLockFile(currentLoad / (escapeUri(fileName) + ".upload-lock"), true);
-            };
-            try {
-                setUpdateLock(storeUri);
-            } catch (SystemError & e) {
-                if (!e.is(std::errc::filename_too_long))
-                    throw;
-                // Try again hashing the store URL so we have a shorter path
-                auto h = hashString(HashAlgorithm::MD5, storeUri);
-                setUpdateLock(h.to_string(HashFormat::Base64, false));
-            }
-        }
-
-        {
-            Activity act(*logger, lvlTalkative, actUnknown, fmt("waiting for the upload lock to '%s'", storeUri));
-
-            auto old = signal(SIGALRM, handleAlarm);
-            alarm(15 * 60);
-            if (!lockFile(uploadLock.get(), ltWrite, true))
-                printError("somebody is hogging the upload lock for '%s', continuing...");
-            alarm(0);
-            signal(SIGALRM, old);
-        }
-
         auto substitute = settings.getWorkerSettings().buildersUseSubstitutes ? Substitute : NoSubstitute;
 
         {
@@ -353,19 +346,25 @@ static int main_build_remote(int argc, char ** argv)
             for (auto & outputName : wantedOutputs) {
                 auto thisOutputHash = outputHashes.at(outputName);
                 auto thisOutputId = DrvOutput{thisOutputHash, outputName};
-                if (!store->queryRealisation(thisOutputId)) {
-                    debug("missing output %s", outputName);
-                    assert(optResult);
-                    auto & result = *optResult;
-                    if (auto * successP = result.tryGetSuccess()) {
-                        auto & success = *successP;
-                        auto i = success.builtOutputs.find(outputName);
-                        assert(i != success.builtOutputs.end());
-                        auto & newRealisation = i->second;
-                        missingRealisations.insert(newRealisation);
-                        missingPaths.insert(newRealisation.outPath);
-                    }
+                // A present local realisation may be the invalid historical
+                // mapping that caused this rebuild. Consume the remote result
+                // and let guarded registration validate any replacement.
+                assert(optResult);
+                auto * success = optResult->tryGetSuccess();
+                if (!success) {
+                    auto * failure = optResult->tryGetFailure();
+                    throw Error(
+                        "remote build of '%s' on '%s' failed: %s",
+                        store->printStorePath(*drvPath), storeUri,
+                        failure ? failure->message() : "no successful build result");
                 }
+                auto i = success->builtOutputs.find(outputName);
+                if (i == success->builtOutputs.end() || i->second.id != thisOutputId)
+                    throw Error(
+                        "remote build of '%s' returned no matching realisation for '%s'",
+                        store->printStorePath(*drvPath), outputName);
+                missingRealisations.insert(i->second);
+                missingPaths.insert(i->second.outPath);
             }
         } else {
             auto outputPaths = drv.outputsAndOptPaths(*store);

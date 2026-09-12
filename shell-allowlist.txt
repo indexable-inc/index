@@ -62,6 +62,7 @@ packages/claude-code/default.nix:writeNushellApplication:1
 packages/claude-code/statusline.nu
 packages/claude-code/update.nix:writeNushellApplication:2
 packages/codex/rust.nix:writeBashApplication:1
+packages/nix/rust-toolchain.nix:writeBashApplication:1
 packages/pi-harnesses/omp/smoke/claude-hooks-smoke.sh
 skills/antithesis/setup/assets/antithesis/setup-complete.sh
 skills/antithesis/triage/assets/download-logs.sh

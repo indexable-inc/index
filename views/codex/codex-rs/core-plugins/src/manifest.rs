@@ -2,13 +2,25 @@ use codex_config::HooksFile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
+use codex_utils_plugins::AGENT_PLUGIN_MANIFEST_RELATIVE_PATH;
 use codex_utils_plugins::find_plugin_manifest_path;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::fs;
+use std::io;
 use std::path::Path;
+use std::path::PathBuf;
 const MAX_DEFAULT_PROMPT_COUNT: usize = 3;
 const MAX_DEFAULT_PROMPT_LEN: usize = 128;
+
+#[path = "agent_plugin_manifest.rs"]
+mod agent_plugin_manifest;
+
+#[cfg(test)]
+#[path = "agent_plugin_manifest_tests.rs"]
+mod agent_plugin_manifest_tests;
+
+use agent_plugin_manifest::parse_agent_plugin_manifest_uri;
 
 pub type PluginManifest = codex_plugin::manifest::PluginManifest<AbsolutePathBuf>;
 pub type PluginManifestHooks = codex_plugin::manifest::PluginManifestHooks<AbsolutePathBuf>;
@@ -17,7 +29,18 @@ pub type PluginManifestMcpServers =
     codex_plugin::manifest::PluginManifestMcpServers<AbsolutePathBuf>;
 pub type PluginManifestPaths = codex_plugin::manifest::PluginManifestPaths<AbsolutePathBuf>;
 
-pub(crate) type UriPluginManifest = codex_plugin::manifest::PluginManifest<PathUri>;
+pub type UriPluginManifest = codex_plugin::manifest::PluginManifest<PathUri>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PluginManifestFormat {
+    Legacy,
+    AgentPlugin,
+}
+
+pub(crate) struct LoadedPluginManifest {
+    pub manifest: PluginManifest,
+    pub format: PluginManifestFormat,
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +65,12 @@ struct RawPluginManifest {
     hooks: Option<RawPluginManifestHooks>,
     #[serde(default)]
     interface: Option<RawPluginManifestInterface>,
+}
+
+#[derive(Deserialize)]
+struct RawPluginCommandManifest {
+    #[serde(default)]
+    commands: Option<RawPluginManifestPaths>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -118,17 +147,49 @@ enum RawPluginManifestMcpServers {
 enum RawPluginManifestHooks {
     Path(String),
     Paths(Vec<String>),
-    Inline(HooksFile),
+    Inline(Box<HooksFile>),
     InlineList(Vec<HooksFile>),
     Invalid(JsonValue),
 }
 
 /// Loads a plugin manifest from the local host filesystem.
 pub fn load_plugin_manifest(plugin_root: &Path) -> Option<PluginManifest> {
+    load_plugin_manifest_with_format(plugin_root).map(|loaded| loaded.manifest)
+}
+
+pub fn is_agent_plugin_manifest(plugin_root: &Path) -> bool {
+    load_plugin_manifest_with_format(plugin_root)
+        .is_some_and(|loaded| loaded.format == PluginManifestFormat::AgentPlugin)
+}
+
+pub(crate) fn load_plugin_manifest_with_format(plugin_root: &Path) -> Option<LoadedPluginManifest> {
     let manifest_path = find_plugin_manifest_path(plugin_root)?;
     let contents = fs::read_to_string(&manifest_path).ok()?;
-    match parse_plugin_manifest(plugin_root, &manifest_path, &contents) {
-        Ok(manifest) => Some(manifest),
+    let is_agent_plugin = manifest_path == plugin_root.join(AGENT_PLUGIN_MANIFEST_RELATIVE_PATH);
+    let overlay = if is_agent_plugin {
+        let overlay_path = plugin_root.join(".codex-plugin/plugin.json");
+        fs::read_to_string(&overlay_path)
+            .ok()
+            .map(|contents| (overlay_path, contents))
+    } else {
+        None
+    };
+    match parse_resolved_plugin_manifest(
+        plugin_root,
+        &manifest_path,
+        &contents,
+        overlay
+            .as_ref()
+            .map(|(path, contents)| (path.as_path(), contents.as_str())),
+    ) {
+        Ok(manifest) => Some(LoadedPluginManifest {
+            manifest,
+            format: if is_agent_plugin {
+                PluginManifestFormat::AgentPlugin
+            } else {
+                PluginManifestFormat::Legacy
+            },
+        }),
         Err(err) => {
             tracing::warn!(
                 path = %manifest_path.display(),
@@ -139,23 +200,97 @@ pub fn load_plugin_manifest(plugin_root: &Path) -> Option<PluginManifest> {
     }
 }
 
+pub(crate) fn load_plugin_command_paths(plugin_root: &Path) -> io::Result<Option<Vec<PathBuf>>> {
+    let Some(manifest_path) = find_plugin_manifest_path(plugin_root) else {
+        return Ok(None);
+    };
+    let manifest =
+        serde_json::from_str::<RawPluginCommandManifest>(&fs::read_to_string(manifest_path)?)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    let Some(commands) = manifest.commands else {
+        return Ok(None);
+    };
+    let plugin_root = PathUri::from_host_native_path(plugin_root)?;
+    resolve_manifest_paths(&plugin_root, "commands", Some(&commands))
+        .into_iter()
+        .map(|path| Ok(path.to_abs_path()?.into_path_buf()))
+        .collect::<io::Result<Vec<_>>>()
+        .map(Some)
+}
+
 pub(crate) fn parse_plugin_manifest(
     plugin_root: &Path,
     manifest_path: &Path,
     contents: &str,
 ) -> Result<PluginManifest, serde_json::Error> {
+    parse_resolved_plugin_manifest(plugin_root, manifest_path, contents, /*overlay*/ None)
+}
+
+fn parse_resolved_plugin_manifest(
+    plugin_root: &Path,
+    manifest_path: &Path,
+    contents: &str,
+    overlay: Option<(&Path, &str)>,
+) -> Result<PluginManifest, serde_json::Error> {
     let plugin_root_uri =
         PathUri::from_host_native_path(plugin_root).map_err(serde_json::Error::io)?;
     let manifest_path_uri =
         PathUri::from_host_native_path(manifest_path).map_err(serde_json::Error::io)?;
-    parse_plugin_manifest_uri(&plugin_root_uri, &manifest_path_uri, contents)?
-        .try_map_resources(|path| path.to_abs_path().map_err(serde_json::Error::io))
+    let overlay = overlay
+        .map(|(path, contents)| {
+            PathUri::from_host_native_path(path)
+                .map(|path| (path, contents))
+                .map_err(serde_json::Error::io)
+        })
+        .transpose()?;
+    parse_resolved_plugin_manifest_uri(
+        &plugin_root_uri,
+        &manifest_path_uri,
+        contents,
+        overlay.as_ref().map(|(path, contents)| (path, *contents)),
+    )?
+    .try_map_resources(|path| path.to_abs_path().map_err(serde_json::Error::io))
 }
 
-pub(crate) fn parse_plugin_manifest_uri(
+pub fn parse_plugin_manifest_uri(
     plugin_root: &PathUri,
     manifest_path: &PathUri,
     contents: &str,
+) -> Result<UriPluginManifest, serde_json::Error> {
+    parse_resolved_plugin_manifest_uri(plugin_root, manifest_path, contents, /*overlay*/ None)
+}
+
+pub(crate) fn parse_resolved_plugin_manifest_uri(
+    plugin_root: &PathUri,
+    manifest_path: &PathUri,
+    contents: &str,
+    overlay: Option<(&PathUri, &str)>,
+) -> Result<UriPluginManifest, serde_json::Error> {
+    let root_manifest_path = plugin_root
+        .join(AGENT_PLUGIN_MANIFEST_RELATIVE_PATH)
+        .map_err(path_uri_json_error)?;
+    if manifest_path == &root_manifest_path {
+        return parse_agent_plugin_manifest_uri(plugin_root, manifest_path, contents, overlay);
+    }
+    parse_legacy_plugin_manifest_uri(plugin_root, manifest_path, contents)
+}
+
+fn parse_legacy_plugin_manifest_uri(
+    plugin_root: &PathUri,
+    manifest_path: &PathUri,
+    contents: &str,
+) -> Result<UriPluginManifest, serde_json::Error> {
+    resolve_raw_plugin_manifest(
+        plugin_root,
+        manifest_path,
+        serde_json::from_str::<RawPluginManifest>(contents)?,
+    )
+}
+
+fn resolve_raw_plugin_manifest(
+    plugin_root: &PathUri,
+    manifest_path: &PathUri,
+    raw: RawPluginManifest,
 ) -> Result<UriPluginManifest, serde_json::Error> {
     let RawPluginManifest {
         name: raw_name,
@@ -167,7 +302,7 @@ pub(crate) fn parse_plugin_manifest_uri(
         apps,
         hooks,
         interface,
-    } = serde_json::from_str::<RawPluginManifest>(contents)?;
+    } = raw;
     let name = plugin_root
         .basename()
         .filter(|_| raw_name.trim().is_empty())
@@ -267,6 +402,14 @@ pub(crate) fn parse_plugin_manifest_uri(
     })
 }
 
+fn compatibility_json_error(message: impl Into<String>) -> serde_json::Error {
+    serde_json::Error::io(io::Error::new(io::ErrorKind::InvalidData, message.into()))
+}
+
+fn path_uri_json_error(error: impl std::fmt::Display) -> serde_json::Error {
+    compatibility_json_error(error.to_string())
+}
+
 fn resolve_manifest_hooks(
     plugin_root: &PathUri,
     hooks: Option<RawPluginManifestHooks>,
@@ -285,7 +428,7 @@ fn resolve_manifest_hooks(
         }
         RawPluginManifestHooks::Inline(hooks) => {
             Some(codex_plugin::manifest::PluginManifestHooks::Inline(vec![
-                hooks,
+                *hooks,
             ]))
         }
         RawPluginManifestHooks::InlineList(hooks) => (!hooks.is_empty())
@@ -530,7 +673,6 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::ExecutorPluginProvider;
-
     const ALTERNATE_PLUGIN_MANIFEST_RELATIVE_PATH: &str = ".claude-plugin/plugin.json";
 
     fn write_manifest(plugin_root: &Path, version: Option<&str>, interface: &str) {

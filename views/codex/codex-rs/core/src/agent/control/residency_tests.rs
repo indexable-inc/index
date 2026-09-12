@@ -1,3 +1,4 @@
+use crate::StartThreadOptions;
 use crate::ThreadManager;
 use crate::agent::AgentControl;
 use crate::codex_thread::CodexThread;
@@ -7,7 +8,7 @@ use crate::thread_manager::ThreadManagerState;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_protocol::ThreadId;
-use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -33,7 +34,7 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let root = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start root thread");
     let control = manager.agent_control();
@@ -53,8 +54,10 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
         .await
         .expect("second resident slot should evict the first idle agent");
     match manager.get_thread(first.thread_id).await {
-        Err(CodexErr::ThreadNotFound(thread_id)) => assert_eq!(thread_id, first.thread_id),
-        Err(err) => panic!("expected evicted thread to be missing, got {err:?}"),
+        Err(err) => match err.details() {
+            CodexErrorDetails::ThreadNotFound(thread_id) => assert_eq!(*thread_id, first.thread_id),
+            _ => panic!("expected evicted thread to be missing, got {err:?}"),
+        },
         Ok(_) => panic!("expected evicted thread to be missing"),
     }
     let second = spawn_v2_subagent(&control, &state, config, root.thread_id, "worker-2").await;
@@ -79,7 +82,7 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let root = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start root thread");
     let control = manager.agent_control();
@@ -99,8 +102,10 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
         .await
         .expect("second resident slot should evict the first interrupted idle agent");
     match manager.get_thread(first.thread_id).await {
-        Err(CodexErr::ThreadNotFound(thread_id)) => assert_eq!(thread_id, first.thread_id),
-        Err(err) => panic!("expected evicted thread to be missing, got {err:?}"),
+        Err(err) => match err.details() {
+            CodexErrorDetails::ThreadNotFound(thread_id) => assert_eq!(*thread_id, first.thread_id),
+            _ => panic!("expected evicted thread to be missing, got {err:?}"),
+        },
         Ok(_) => panic!("expected evicted thread to be missing"),
     }
     let second =
@@ -109,19 +114,21 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
     mark_thread_completed(second.thread.as_ref()).await;
 
     let err = control
-        .ensure_v2_agent_loaded(config, first.thread_id)
+        .ensure_v2_agent_loaded(config, first.thread_id, /*parent*/ None)
         .await
         .expect_err("evicted interrupted agent should stay lost");
-    match err {
-        CodexErr::ThreadNotFound(thread_id) => assert_eq!(thread_id, first.thread_id),
-        err => panic!("expected ThreadNotFound, got {err:?}"),
+    match err.details() {
+        CodexErrorDetails::ThreadNotFound(thread_id) => assert_eq!(*thread_id, first.thread_id),
+        _ => panic!("expected ThreadNotFound, got {err:?}"),
     }
 
     assert!(manager.get_thread(root.thread_id).await.is_ok());
     assert!(manager.get_thread(second.thread_id).await.is_ok());
     match manager.get_thread(first.thread_id).await {
-        Err(CodexErr::ThreadNotFound(thread_id)) => assert_eq!(thread_id, first.thread_id),
-        Err(err) => panic!("expected evicted thread to be missing, got {err:?}"),
+        Err(err) => match err.details() {
+            CodexErrorDetails::ThreadNotFound(thread_id) => assert_eq!(*thread_id, first.thread_id),
+            _ => panic!("expected evicted thread to be missing, got {err:?}"),
+        },
         Ok(_) => panic!("expected evicted thread to be missing"),
     }
 }
@@ -138,6 +145,7 @@ async fn spawn_v2_subagent(
             config,
             control.clone(),
             SessionSource::SubAgent(SubAgentSource::Other(label.to_string())),
+            /*history_mode*/ None,
             Some(parent_thread_id),
             /*forked_from_thread_id*/ None,
             Some(ThreadSource::Subagent),
@@ -151,15 +159,16 @@ async fn spawn_v2_subagent(
 }
 
 async fn mark_thread_completed(thread: &CodexThread) {
-    let turn = thread.codex.session.new_default_turn().await;
+    let turn = thread.session.new_default_turn().await;
     thread
-        .codex
         .session
         .send_event(
             turn.as_ref(),
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: turn.sub_id.clone(),
+                started_at: None,
                 last_agent_message: Some("done".to_string()),
+                error: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -170,14 +179,14 @@ async fn mark_thread_completed(thread: &CodexThread) {
 }
 
 async fn mark_thread_interrupted(thread: &CodexThread) {
-    let turn = thread.codex.session.new_default_turn().await;
+    let turn = thread.session.new_default_turn().await;
     thread
-        .codex
         .session
         .send_event(
             turn.as_ref(),
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn.sub_id.clone()),
+                started_at: None,
                 reason: TurnAbortReason::Interrupted,
                 completed_at: None,
                 duration_ms: None,
@@ -189,5 +198,5 @@ async fn mark_thread_interrupted(thread: &CodexThread) {
 
 async fn clear_active_turn(thread: &CodexThread) {
     // The fixture has no task runner to clear the turn after the terminal event.
-    *thread.codex.session.active_turn.lock().await = None;
+    *thread.session.active_turn.lock().await = None;
 }

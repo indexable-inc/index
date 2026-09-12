@@ -37,6 +37,7 @@ pub(crate) use codex_app_server_transport::start_websocket_acceptor;
 pub use codex_app_server_transport::take_remote_control_disabled_env;
 
 pub(crate) struct ConnectionState {
+    pub(crate) origin: ConnectionOrigin,
     pub(crate) outbound_initialized: Arc<AtomicBool>,
     pub(crate) outbound_experimental_api_enabled: Arc<AtomicBool>,
     pub(crate) outbound_opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
@@ -45,12 +46,13 @@ pub(crate) struct ConnectionState {
 
 impl ConnectionState {
     pub(crate) fn new(
-        _origin: ConnectionOrigin,
+        origin: ConnectionOrigin,
         outbound_initialized: Arc<AtomicBool>,
         outbound_experimental_api_enabled: Arc<AtomicBool>,
         outbound_opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
     ) -> Self {
         Self {
+            origin,
             outbound_initialized,
             outbound_experimental_api_enabled,
             outbound_opted_out_notification_methods,
@@ -105,15 +107,15 @@ fn should_skip_notification_for_connection(
         return false;
     };
     match message {
-        OutgoingMessage::AppServerNotification(notification) => {
-            if notification.experimental_reason().is_some()
+        OutgoingMessage::AppServerNotification(envelope) => {
+            if envelope.notification.experimental_reason().is_some()
                 && !connection_state
                     .experimental_api_enabled
                     .load(Ordering::Acquire)
             {
                 return true;
             }
-            let method = notification.to_string();
+            let method = envelope.notification.to_string();
             opted_out_notification_methods.contains(method.as_str())
         }
         _ => false,

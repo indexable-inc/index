@@ -6,12 +6,14 @@ use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
-use codex_protocol::items::SleepItem;
+use codex_extension_items::ExtensionItem;
+use codex_extension_items::sleep::SleepItem;
 use codex_protocol::items::TurnItem;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ResponsesApiTool;
+use codex_tools::ToolExposure;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
@@ -67,7 +69,14 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
         create_sleep_tool()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn exposure(&self) -> ToolExposure {
+        ToolExposure::DirectModelOnly
+    }
+
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             let ToolInvocation {
                 session,
@@ -89,10 +98,10 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
             }
 
             let started = Instant::now();
-            let item = TurnItem::Sleep(SleepItem {
+            let item = TurnItem::Extension(ExtensionItem::Sleep(SleepItem {
                 id: call_id,
                 duration_ms: args.duration_ms,
-            });
+            }));
             session.emit_turn_item_started(turn.as_ref(), &item).await;
             let turn_state = session
                 .input_queue
@@ -147,4 +156,8 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
     }
 }
 
-impl CoreToolRuntime for SleepHandler {}
+impl CoreToolRuntime for SleepHandler {
+    fn is_builtin_control_tool(&self) -> bool {
+        true
+    }
+}

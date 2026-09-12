@@ -1,6 +1,6 @@
 #include "nix/util/current-process.hh"
 #include "run.hh"
-#include "nix/cmd/command-installable-value.hh"
+#include "nix/cmd/command.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/util/signals.hh"
@@ -12,6 +12,9 @@
 #include "nix/expr/eval.hh"
 #include "nix/util/util.hh"
 #include "nix/store/globals.hh"
+#include "nix/store/outputs-spec.hh"
+#include "nix/expr/rust-eval-refusal.hh"
+#include "nix/cmd/rust-eval-session.hh"
 
 #include <filesystem>
 
@@ -114,10 +117,8 @@ void execProgramInStore(
 
 } // namespace nix
 
-struct CmdRun : InstallableValueCommand, MixEnvironment
+struct CmdRun : RawInstallableCommand, MixEnvironment
 {
-    using InstallableCommand::run;
-
     std::vector<std::string> args;
 
     CmdRun()
@@ -156,24 +157,28 @@ struct CmdRun : InstallableValueCommand, MixEnvironment
         return res;
     }
 
-    void run(ref<Store> store, ref<InstallableValue> installable) override
+    void run(ref<Store> store) override
     {
-        auto state = getEvalState();
-
         lockFlags.applyNixConfig = true;
-        auto app = installable->toApp(*state).resolve(getEvalStore(), store);
+        auto prefix = ExtendedOutputsSpec::parse(rawInstallable()).first;
+        auto source = rustSourceOf(*this);
+        auto state = getEvalState();
+        auto app = rustEvalApp(*state, rustEvaluandOf(*this, state, source, prefix));
+        runApp(store, state, std::move(app));
+    }
 
-        Strings allArgs{app.program.string()};
+    void runApp(ref<Store> store, ref<EvalState> state, UnresolvedApp app)
+    {
+        auto resolved = app.resolve(getEvalStore(), store);
+
+        Strings allArgs{resolved.program.string()};
         for (auto & i : args)
             allArgs.push_back(i);
 
-        // Release our references to eval caches to ensure they are persisted to disk, because
-        // we are about to exec out of this process without running C++ destructors.
         state->evalCaches.clear();
-
+        state->maybePrintStats();
         setEnviron();
-
-        execProgramInStore(store, UseLookupPath::DontUse, app.program.string(), allArgs);
+        execProgramInStore(store, UseLookupPath::DontUse, resolved.program.string(), allArgs);
     }
 };
 

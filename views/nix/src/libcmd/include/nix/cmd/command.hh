@@ -107,7 +107,6 @@ struct CopyCommand : virtual StoreCommand
  */
 struct EvalCommand : virtual StoreCommand, MixEvalArgs
 {
-    bool startReplOnEvalErrors = false;
     bool ignoreExceptionsDuringTry = false;
 
     EvalCommand();
@@ -226,13 +225,9 @@ struct InstallablesCommand : RawInstallablesCommand
 /**
  * A command that operates on exactly one "installable".
  */
-struct InstallableCommand : virtual Args, SourceExprCommand
+struct RawInstallableCommand : virtual Args, SourceExprCommand
 {
-    InstallableCommand();
-
-    virtual void run(ref<Store> store, ref<Installable> installable) = 0;
-
-    void run(ref<Store> store) override;
+    RawInstallableCommand();
 
     std::vector<FlakeRef> getFlakeRefsForCompletion() override;
 
@@ -241,10 +236,10 @@ protected:
     /**
      * The installable exactly as the user wrote it, before parsing.
      *
-     * A command that does not route through the C++ evaluator cannot use the
-     * parsed form: parsing an `--expr`/`--file` installable evaluates it on
-     * the way (`parseInstallables` calls `EvalState::eval`), which is the one
-     * thing a command serving a different backend must not do.
+     * Parsing an installable answers one question of it -- which derivations
+     * it selects (`rustParseInstallables`). A command that asks the Rust evaluator a
+     * different question of the same argument (`nix run` wants an app, `nix
+     * eval` a rendered value) starts from the string instead.
      */
     const std::string & rawInstallable() const
     {
@@ -254,6 +249,12 @@ protected:
 private:
 
     std::string _installable{"."};
+};
+
+struct InstallableCommand : RawInstallableCommand
+{
+    virtual void run(ref<Store> store, ref<Installable> installable) = 0;
+    void run(ref<Store> store) override;
 };
 
 struct MixOperateOnOptions : virtual Args

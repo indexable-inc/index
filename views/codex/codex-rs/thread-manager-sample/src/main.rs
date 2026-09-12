@@ -16,6 +16,7 @@ use codex_core_api::AskForApproval;
 use codex_core_api::AuthCredentialsStoreMode;
 use codex_core_api::AuthManager;
 use codex_core_api::AutoCompactTokenLimitScope;
+use codex_core_api::CodexAppsToolsCache;
 use codex_core_api::CodexHomeUserInstructionsProvider;
 use codex_core_api::CodexThread;
 use codex_core_api::Config;
@@ -35,7 +36,6 @@ use codex_core_api::NewThread;
 use codex_core_api::Notice;
 use codex_core_api::OAuthCredentialsStoreMode;
 use codex_core_api::OPENAI_PROVIDER_ID;
-use codex_core_api::Op;
 use codex_core_api::OtelConfig;
 use codex_core_api::PermissionProfile;
 use codex_core_api::Permissions;
@@ -44,6 +44,9 @@ use codex_core_api::RealtimeAudioConfig;
 use codex_core_api::RealtimeConfig;
 use codex_core_api::SessionPickerViewMode;
 use codex_core_api::SessionSource;
+use codex_core_api::SqliteConfig;
+use codex_core_api::StartIfIdleSubmission;
+use codex_core_api::StartThreadOptions;
 use codex_core_api::TerminalResizeReflowConfig;
 use codex_core_api::ThreadManager;
 use codex_core_api::ThreadStoreConfig;
@@ -51,10 +54,12 @@ use codex_core_api::ToolSuggestConfig;
 use codex_core_api::TuiKeymap;
 use codex_core_api::TuiNotificationSettings;
 use codex_core_api::TuiPetAnchor;
+use codex_core_api::TurnInputRequest;
 use codex_core_api::UriBasedFileOpener;
 use codex_core_api::UserInput;
 use codex_core_api::WebSearchMode;
 use codex_core_api::arg0_dispatch_or_else;
+use codex_core_api::build_models_manager;
 use codex_core_api::built_in_model_providers;
 use codex_core_api::find_codex_home;
 use codex_core_api::init_state_db;
@@ -112,15 +117,19 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     let state_db = init_state_db(&config).await;
 
     let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await?;
     let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
         config.codex_self_exe.clone(),
         config.codex_linux_sandbox_exe.clone(),
     )?;
     let thread_store = thread_store_from_config(&config, state_db.clone());
     let environment_manager = Arc::new(
-        EnvironmentManager::from_codex_home(config.codex_home.clone(), Some(local_runtime_paths))
-            .await?,
+        EnvironmentManager::from_codex_home(
+            config.codex_home.clone(),
+            Some(local_runtime_paths),
+            config.http_client_factory(),
+        )
+        .await?,
     );
     let installation_id = resolve_installation_id(&config.codex_home).await?;
     let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
@@ -132,7 +141,9 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     });
     let thread_manager = ThreadManager::new(
         &config,
-        auth_manager,
+        Arc::clone(&auth_manager),
+        build_models_manager(&config, auth_manager),
+        CodexAppsToolsCache::default(),
         SessionSource::Exec,
         environment_manager,
         Arc::new(extensions.build()),
@@ -148,7 +159,7 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     let NewThread {
         thread_id, thread, ..
     } = thread_manager
-        .start_thread(config)
+        .start_thread(StartThreadOptions::new(config))
         .await
         .context("start Codex thread")?;
 
@@ -197,12 +208,14 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         hide_agent_reasoning: false,
         show_raw_agent_reasoning: false,
         base_instructions: None,
+        base_instructions_provenance: None,
         developer_instructions: None,
         guardian_policy_config: None,
         include_permissions_instructions: false,
         include_apps_instructions: false,
         include_collaboration_mode_instructions: false,
         include_skill_instructions: false,
+        skill_max_context_tokens: None,
         orchestrator_skills_enabled: false,
         orchestrator_mcp_enabled: false,
         include_environment_context: false,
@@ -211,6 +224,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         tui_notifications: TuiNotificationSettings::default(),
         animations: true,
         show_tooltips: true,
+        tui_auto_recap: true,
         model_availability_nux: ModelAvailabilityNuxConfig::default(),
         tui_alternate_screen: AltScreenMode::Auto,
         tui_status_line: None,
@@ -223,31 +237,32 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         terminal_resize_reflow: TerminalResizeReflowConfig::default(),
         tui_keymap: TuiKeymap::default(),
         tui_session_picker_view: SessionPickerViewMode::Dense,
+        tui_resume_cwd: None,
         tui_vim_mode_default: false,
         cwd: cwd.clone(),
         workspace_roots: vec![cwd],
         workspace_roots_explicit: false,
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
         mcp_servers: Constrained::allow_any(HashMap::new()),
+        non_prefixed_mcp_tool_servers: None,
         mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode::File,
         mcp_oauth_callback_port: None,
         mcp_oauth_callback_url: None,
+        mcp_optional_startup_grace: std::time::Duration::from_secs(1),
         model_providers,
         project_doc_max_bytes: 32 * 1024,
         project_doc_fallback_filenames: Vec::new(),
         tool_output_token_limit: None,
+        agents_enabled: true,
         agent_max_threads: Some(6),
-        agent_job_max_runtime_seconds: None,
+        agent_default_subagent_model: None,
+        agent_default_subagent_reasoning_effort: None,
         agent_interrupt_message_enabled: false,
         agent_max_depth: 1,
         agent_roles: BTreeMap::new(),
         memories: MemoriesConfig::default(),
-        sqlite_home: codex_home.to_path_buf(),
+        sqlite: SqliteConfig::from_sqlite_home(codex_home.clone()),
         log_dir: codex_home.join("log").to_path_buf(),
-        config_lock_export_dir: None,
-        config_lock_allow_codex_version_mismatch: false,
-        config_lock_save_fields_resolved_from_model_catalog: true,
-        config_lock_toml: None,
         codex_home,
         history: History::default(),
         ephemeral: true,
@@ -260,12 +275,12 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         model_reasoning_effort: None,
         plan_mode_reasoning_effort: None,
         model_reasoning_summary: None,
-        model_supports_reasoning_summaries: None,
         model_catalog: None,
         model_verbosity: None,
         chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
         respect_system_proxy: false,
         apps_mcp_product_sku: None,
+        responses_api_metadata: BTreeMap::new(),
         realtime_audio: RealtimeAudioConfig::default(),
         experimental_realtime_ws_base_url: None,
         experimental_realtime_webrtc_call_base_url: None,
@@ -274,21 +289,24 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         experimental_realtime_ws_backend_prompt: None,
         experimental_realtime_ws_startup_context: None,
         experimental_realtime_start_instructions: None,
-        experimental_thread_config_endpoint: None,
         experimental_thread_store: ThreadStoreConfig::Local,
         forced_chatgpt_workspace_id: None,
         forced_login_method: None,
         web_search_mode: Constrained::allow_any(WebSearchMode::Disabled),
         web_search_config: None,
         experimental_request_user_input_enabled: true,
+        update_plan_enabled: true,
+        tool_registry: Default::default(),
         code_mode: Default::default(),
-        use_experimental_unified_exec_tool: false,
         background_terminal_max_timeout: 300_000,
+        thread_unload_delay: std::time::Duration::from_secs(60),
         ghost_snapshot: GhostSnapshotConfig::default(),
         multi_agent_v2: MultiAgentV2Config::default(),
+        max_goal_token_budget: None,
         token_budget: None,
         rollout_budget: None,
         current_time_reminder: None,
+        sleep_tool_mode: Default::default(),
         features: Default::default(),
         suppress_unstable_features_warning: false,
         active_project: ProjectConfig { trust_level: None },
@@ -308,19 +326,16 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
 }
 
 async fn run_turn(thread: &CodexThread, thread_id: &str, prompt: String) -> anyhow::Result<()> {
-    thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: prompt,
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+    let submission = thread
+        .start_turn_if_idle(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: prompt,
+            text_elements: Vec::new(),
+        }]))
         .await
         .context("submit user input")?;
+    if let StartIfIdleSubmission::NotSubmitted { reason } = submission {
+        bail!("turn input was not submitted: {reason:?}");
+    }
 
     let mut current_turn_id: Option<String> = None;
     let mut stdout = std::io::stdout().lock();

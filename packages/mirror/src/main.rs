@@ -4,7 +4,7 @@
 //! source tree (inlined workspace inheritance, pruned `Cargo.lock`, banner
 //! README) snapshot-synced into a read-only GitHub mirror repo (`gen` /
 //! `publish`). The monorepo stays the source of truth. De-forked packages
-//! are NOT this tool's product. They live as jj views in this repository.
+//! are NOT this tool's product. They live as jj views (`views.toml`) here.
 //!
 //! CI drives this from `.github/workflows/mirror-sync.yml`.
 

@@ -7,18 +7,15 @@
   nixpkgsFor,
   self,
   officialRelease,
-}:
-let
+}: let
   inherit (inputs) nixpkgs nixpkgs-regression;
 
-  installScriptFor =
-    tarballs:
+  installScriptFor = tarballs:
     nixpkgsFor.x86_64-linux.native.callPackage ./installer {
       inherit tarballs;
     };
 
-  testNixVersions =
-    pkgs: daemon:
+  testNixVersions = pkgs: daemon:
     pkgs.nixComponents2.nix-functional-tests.override {
       pname = "nix-daemon-compat-tests";
       version = "${pkgs.nix.version}-with-daemon-${daemon.version}";
@@ -30,12 +27,11 @@ let
   # convention to transpose it, and to transpose it efficiently, we need to
   # enumerate them manually, so that we don't evaluate unnecessary package sets.
   # See listingIsComplete below.
-  forAllPackages = forAllPackages' { };
-  forAllPackages' =
-    {
-      enableBindings ? false,
-      enableDocs ? false, # already have separate attrs for these
-    }:
+  forAllPackages = forAllPackages' {};
+  forAllPackages' = {
+    enableBindings ? false,
+    enableDocs ? false, # already have separate attrs for these
+  }:
     lib.genAttrs (
       [
         "nix-everything"
@@ -75,37 +71,39 @@ let
         "nix-external-api-docs"
       ]
     );
-in
-rec {
+in rec {
   /**
-    An internal check to make sure our package listing is complete.
+  An internal check to make sure our package listing is complete.
   */
-  listingIsComplete =
-    let
-      arbitrarySystem = "x86_64-linux";
-      listedPkgs = forAllPackages' {
-        enableBindings = true;
-        enableDocs = true;
-      } (_: null);
-      actualPkgs = lib.concatMapAttrs (
-        k: v: if lib.strings.hasPrefix "nix-" k then { ${k} = null; } else { }
-      ) nixpkgsFor.${arbitrarySystem}.native.nixComponents2;
-      diff = lib.concatStringsSep "\n" (
-        lib.concatLists (
-          lib.mapAttrsToList (
-            k: _:
-            if (listedPkgs ? ${k}) && !(actualPkgs ? ${k}) then
-              [ "- ${k}: redundant?" ]
-            else if !(listedPkgs ? ${k}) && (actualPkgs ? ${k}) then
-              [ "- ${k}: missing?" ]
-            else
-              [ ]
-          ) (listedPkgs // actualPkgs)
-        )
-      );
-    in
-    if listedPkgs == actualPkgs then
-      { }
+  listingIsComplete = let
+    arbitrarySystem = "x86_64-linux";
+    listedPkgs = forAllPackages' {
+      enableBindings = true;
+      enableDocs = true;
+    } (_: null);
+    actualPkgs =
+      lib.concatMapAttrs (
+        k: v:
+          if lib.strings.hasPrefix "nix-" k
+          then {${k} = null;}
+          else {}
+      )
+      nixpkgsFor.${arbitrarySystem}.native.nixComponents2;
+    diff = lib.concatStringsSep "\n" (
+      lib.concatLists (
+        lib.mapAttrsToList (
+          k: _:
+            if (listedPkgs ? ${k}) && !(actualPkgs ? ${k})
+            then ["- ${k}: redundant?"]
+            else if !(listedPkgs ? ${k}) && (actualPkgs ? ${k})
+            then ["- ${k}: missing?"]
+            else []
+        ) (listedPkgs // actualPkgs)
+      )
+    );
+  in
+    if listedPkgs == actualPkgs
+    then {}
     else
       throw ''
         Please update the components list in hydra.nix (or fix this check)
@@ -116,42 +114,42 @@ rec {
   # Binary package for various platforms.
   build = forAllPackages (
     pkgName:
-    lib.filterAttrs (
-      system: _do_not_touch:
-      pkgName == "nix-nswrapper" -> nixpkgsFor.${system}.native.stdenv.hostPlatform.isLinux
-    ) (forAllSystems (system: nixpkgsFor.${system}.native.nixComponents2.${pkgName}))
+      lib.filterAttrs (
+        system: _do_not_touch:
+          pkgName == "nix-nswrapper" -> nixpkgsFor.${system}.native.stdenv.hostPlatform.isLinux
+      ) (forAllSystems (system: nixpkgsFor.${system}.native.nixComponents2.${pkgName}))
   );
 
   shellInputs = removeAttrs (forAllSystems (
     system: self.devShells.${system}.default.inputDerivation
-  )) [ "i686-linux" ];
+  )) ["i686-linux"];
 
   buildStatic = forAllPackages (
     pkgName:
-    lib.genAttrs linux64BitSystems (
-      system: nixpkgsFor.${system}.native.pkgsStatic.nixComponents2.${pkgName}
-    )
+      lib.genAttrs linux64BitSystems (
+        system: nixpkgsFor.${system}.native.pkgsStatic.nixComponents2.${pkgName}
+      )
   );
 
   buildCross = forAllPackages (
     pkgName:
     # Hack to avoid non-evaling package
-    (
-      if pkgName == "nix-functional-tests" then
-        lib.flip builtins.removeAttrs [ "x86_64-w64-mingw32" ]
-      else if pkgName == "nix-nswrapper" then
-        lib.filterAttrs (
-          crossSystem: _do_not_touch: nixpkgsFor.x86_64-linux.cross.${crossSystem}.stdenv.hostPlatform.isLinux
-        )
-      else
-        lib.id
-    )
+      (
+        if pkgName == "nix-functional-tests"
+        then lib.flip builtins.removeAttrs ["x86_64-w64-mingw32"]
+        else if pkgName == "nix-nswrapper"
+        then
+          lib.filterAttrs (
+            crossSystem: _do_not_touch: nixpkgsFor.x86_64-linux.cross.${crossSystem}.stdenv.hostPlatform.isLinux
+          )
+        else lib.id
+      )
       (
         forAllCrossSystems (
           crossSystem:
-          lib.genAttrs [ "x86_64-linux" ] (
-            system: nixpkgsFor.${system}.cross.${crossSystem}.nixComponents2.${pkgName}
-          )
+            lib.genAttrs ["x86_64-linux"] (
+              system: nixpkgsFor.${system}.cross.${crossSystem}.nixComponents2.${pkgName}
+            )
         )
       )
   );
@@ -160,57 +158,53 @@ rec {
   # point to buildWithSanitizers in order to reduce the load on hydra.
   buildNoGc = buildWithSanitizers;
 
-  buildWithSanitizers =
-    let
-      components = forAllSystems (
-        system:
-        let
-          pkgs = nixpkgsFor.${system}.native;
-        in
+  buildWithSanitizers = let
+    components = forAllSystems (
+      system: let
+        pkgs = nixpkgsFor.${system}.native;
+      in
         pkgs.nixComponents2.overrideScope (
           self: super: {
             # Boost coroutines fail with ASAN on darwin.
             withASan = !pkgs.stdenv.buildPlatform.isDarwin;
             withUBSan = true;
-            nix-expr = super.nix-expr.override { enableGC = false; };
+            nix-expr = super.nix-expr.override {enableGC = false;};
             # Unclear how to make Perl bindings work with a dynamically linked ASAN.
             nix-perl-bindings = null;
           }
         )
-      );
-    in
+    );
+  in
     forAllPackages (
       pkgName:
-      lib.filterAttrs (
-        system: _do_not_touch:
-        pkgName == "nix-nswrapper" -> nixpkgsFor.${system}.native.stdenv.hostPlatform.isLinux
-      ) (forAllSystems (system: components.${system}.${pkgName}))
+        lib.filterAttrs (
+          system: _do_not_touch:
+            pkgName == "nix-nswrapper" -> nixpkgsFor.${system}.native.stdenv.hostPlatform.isLinux
+        ) (forAllSystems (system: components.${system}.${pkgName}))
     );
 
   buildNoTests = forAllSystems (system: nixpkgsFor.${system}.native.nixComponents2.nix-cli);
 
   # Toggles some settings for better coverage. Windows needs these
   # library combinations, and Debian build Nix with GNU readline too.
-  buildReadlineNoMarkdown =
-    let
-      components = forAllSystems (
-        system:
+  buildReadlineNoMarkdown = let
+    components = forAllSystems (
+      system:
         nixpkgsFor.${system}.native.nixComponents2.overrideScope (
           self: super: {
             nix-cmd = super.nix-cmd.override {
               enableMarkdown = false;
-              readlineFlavor = "readline";
             };
           }
         )
-      );
-    in
+    );
+  in
     forAllPackages (
       pkgName:
-      lib.filterAttrs (
-        system: _do_not_touch:
-        pkgName == "nix-nswrapper" -> nixpkgsFor.${system}.native.stdenv.hostPlatform.isLinux
-      ) (forAllSystems (system: components.${system}.${pkgName}))
+        lib.filterAttrs (
+          system: _do_not_touch:
+            pkgName == "nix-nswrapper" -> nixpkgsFor.${system}.native.stdenv.hostPlatform.isLinux
+        ) (forAllSystems (system: components.${system}.${pkgName}))
     );
 
   # Perl bindings for various platforms.
@@ -220,14 +214,14 @@ rec {
   # with the closure of 'nix' package, and the second half of
   # the installation script.
   binaryTarball = forAllSystems (
-    system: nixpkgsFor.${system}.native.callPackage ./binary-tarball.nix { }
+    system: nixpkgsFor.${system}.native.callPackage ./binary-tarball.nix {}
   );
 
-  binaryTarballCross = lib.genAttrs [ "x86_64-linux" ] (
+  binaryTarballCross = lib.genAttrs ["x86_64-linux"] (
     system:
-    forAllCrossSystems (
-      crossSystem: nixpkgsFor.${system}.cross.${crossSystem}.callPackage ./binary-tarball.nix { }
-    )
+      forAllCrossSystems (
+        crossSystem: nixpkgsFor.${system}.cross.${crossSystem}.callPackage ./binary-tarball.nix {}
+      )
   );
 
   # The first half of the installation script. This is uploaded
@@ -249,36 +243,38 @@ rec {
 
   installerScriptForGHA = forAllSystems (
     system:
-    nixpkgsFor.${system}.native.callPackage ./installer {
-      tarballs = [ self.hydraJobs.binaryTarball.${system} ];
-    }
+      nixpkgsFor.${system}.native.callPackage ./installer {
+        tarballs = [self.hydraJobs.binaryTarball.${system}];
+      }
   );
 
   # `NixOS/nix-installer` with this revision's Nix closure embedded.
   rustInstaller =
     lib.genAttrs
-      (
-        linux64BitSystems
-        ++ [
-          "x86_64-darwin"
-          "aarch64-darwin"
-        ]
-      )
-      (
-        system:
-        let
-          pkgs = nixpkgsFor.${system}.native;
-          # Embed the native (glibc) Nix even though the Linux installer
-          # binary is static/musl.
-          tarball = pkgs.callPackage ./rust-installer/tarball.nix {
-            nix = pkgs.nixComponents2.nix-everything;
-          };
-          builder = if pkgs.stdenv.hostPlatform.isLinux then pkgs.pkgsStatic else pkgs;
-        in
+    (
+      linux64BitSystems
+      ++ [
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ]
+    )
+    (
+      system: let
+        pkgs = nixpkgsFor.${system}.native;
+        # Embed the native (glibc) Nix even though the Linux installer
+        # binary is static/musl.
+        tarball = pkgs.callPackage ./rust-installer/tarball.nix {
+          nix = pkgs.nixComponents2.nix-everything;
+        };
+        builder =
+          if pkgs.stdenv.hostPlatform.isLinux
+          then pkgs.pkgsStatic
+          else pkgs;
+      in
         builder.callPackage ./rust-installer {
           inherit tarball;
         }
-      );
+    );
 
   # docker image with Nix inside
   dockerImage = lib.genAttrs linux64BitSystems (system: self.packages.${system}.dockerImage);
@@ -292,9 +288,9 @@ rec {
       nixFlake = null;
       getStdenv = p: p.clangStdenv;
     }).codeCoverage.coverageReports.overrideAttrs
-      {
-        name = "nix-coverage"; # For historical consistency
-      };
+    {
+      name = "nix-coverage"; # For historical consistency
+    };
 
   # Nix's manual
   manual = nixpkgsFor.x86_64-linux.native.nixComponents2.nix-manual;
@@ -314,14 +310,12 @@ rec {
       inherit (self.inputs) nixpkgs-23-11;
     }
     // {
-
       # Make sure that nix-env still produces the exact same result
       # on a particular version of Nixpkgs.
-      evalNixpkgs =
-        let
-          inherit (nixpkgsFor.x86_64-linux.native) runCommand nix;
-        in
-        runCommand "eval-nixos" { buildInputs = [ nix ]; } ''
+      evalNixpkgs = let
+        inherit (nixpkgsFor.x86_64-linux.native) runCommand nix;
+      in
+        runCommand "eval-nixos" {buildInputs = [nix];} ''
           type -p nix-env
           # Note: we're filtering out nixos-install-tools because https://github.com/NixOS/nixpkgs/pull/153594#issuecomment-1020530593.
           (
@@ -334,11 +328,11 @@ rec {
 
       nixpkgsLibTests = forAllSystems (
         system:
-        import (nixpkgs + "/lib/tests/test-with-nix.nix") {
-          lib = nixpkgsFor.${system}.native.lib;
-          nix = self.packages.${system}.nix-cli;
-          pkgs = nixpkgsFor.${system}.native;
-        }
+          import (nixpkgs + "/lib/tests/test-with-nix.nix") {
+            lib = nixpkgsFor.${system}.native.lib;
+            nix = self.packages.${system}.nix-cli;
+            pkgs = nixpkgsFor.${system}.native;
+          }
       );
     };
 
@@ -348,19 +342,20 @@ rec {
   };
 
   installTests = forAllSystems (
-    system:
-    let
+    system: let
       pkgs = nixpkgsFor.${system}.native;
     in
-    pkgs.runCommand "install-tests" {
-      againstSelf = testNixVersions pkgs pkgs.nix;
-      againstCurrentLatest =
-        # FIXME: temporarily disable this on macOS because of #3605.
-        if system == "x86_64-linux" then testNixVersions pkgs pkgs.nixVersions.latest else null;
-      # Disabled because the latest stable version doesn't handle
-      # `NIX_DAEMON_SOCKET_PATH` which is required for the tests to work
-      # againstLatestStable = testNixVersions pkgs pkgs.nixStable;
-    } "touch $out"
+      pkgs.runCommand "install-tests" {
+        againstSelf = testNixVersions pkgs pkgs.nix;
+        againstCurrentLatest =
+          # FIXME: temporarily disable this on macOS because of #3605.
+          if system == "x86_64-linux"
+          then testNixVersions pkgs pkgs.nixVersions.latest
+          else null;
+        # Disabled because the latest stable version doesn't handle
+        # `NIX_DAEMON_SOCKET_PATH` which is required for the tests to work
+        # againstLatestStable = testNixVersions pkgs pkgs.nixStable;
+      } "touch $out"
   );
 
   installerTests = import ../tests/installer {

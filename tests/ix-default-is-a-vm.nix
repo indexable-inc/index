@@ -34,7 +34,7 @@
 }: let
   hostSystem = pkgs.stdenv.hostPlatform.system;
 
-  # The `index` flake input as a project flake sees it: `importIxWasm` plus the
+  # The index surface as a project flake sees it: `importIxWasm` plus the
   # builders. The `*For` swap matches `exampleFleetsFor` so any wrapper
   # derivation would target this system rather than the default one.
   indexShim = {
@@ -47,11 +47,33 @@
       };
   };
 
+  # The `ix` flake input as a project flake sees it, which is how every
+  # in-tree example reaches index since the guest-Nix injection: their inputs
+  # are `ix.url = ...` and their outputs bind `index = ix.index` (flake.nix
+  # `withNixPackage` is the WHY). `index` here is the same shim as the legacy
+  # direct input above: inside this evaluation `ix` (the lib) already carries
+  # whatever guest Nix this instantiation was given, so the shim IS the
+  # injected surface when the gate runs from ix, and the standalone refusals
+  # stay lazy exactly as they do for `exampleFleetsFor` (nothing on the
+  # ix.default path forces an image build). `inputs.nixpkgs` carries the REAL
+  # nixpkgs this check evaluates under, for the one example that reaches
+  # through the flake record for it (templates/workers' host-side eval
+  # check): this gate runs inside an evaluation where the real value exists,
+  # so the stub does not invent one.
+  ixShim = {
+    index = indexShim;
+    inputs = {inherit nixpkgs;};
+  };
+
   # Flake inputs this gate can stand in for. Anything else required makes the
-  # flake unevaluable here, and it falls to the source check below.
+  # flake unevaluable here, and it falls to the source check below. `ix` is
+  # the migrated examples' one input; `index` stays suppliable for
+  # switch-multi (converter-only, deliberately on the bare index flake) and
+  # any pre-migration out-of-tree shape that lands in the walk.
   suppliable = [
     "self"
     "index"
+    "ix"
     "nixpkgs"
   ];
 
@@ -144,6 +166,7 @@
     supplied = builtins.intersectAttrs args {
       self = dir;
       index = indexShim;
+      ix = ixShim;
       inherit nixpkgs;
     };
     outputs = builtins.addErrorContext "while evaluating the flake outputs of ${fileOf rel} for tests/ix-default-is-a-vm.nix" (

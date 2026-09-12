@@ -1,4 +1,7 @@
 #include <queue>
+#include <algorithm>
+#include <map>
+#include <set>
 
 #include <boost/unordered/unordered_flat_set.hpp>
 
@@ -9,6 +12,7 @@
 #include "nix/util/executable-path.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/util/mounted-source-accessor.hh"
+#include "nix/store/outputs-spec.hh"
 
 using namespace nix;
 
@@ -78,6 +82,12 @@ struct CmdShell : InstallablesCommand, MixEnvironment
         for (auto & path : outPaths)
             todo.push(path);
 
+        // `--ignore-env` clears NIX_SHOW_STATS_PATH and NIX_SHOW_SYMBOLS.
+        // Flush while those settings still describe the parent process; the
+        // environment below belongs to the child we are about to exec.
+        state->evalCaches.clear();
+        state->maybePrintStats();
+
         setEnviron();
 
         std::vector<std::string> pathAdditions;
@@ -111,10 +121,6 @@ struct CmdShell : InstallablesCommand, MixEnvironment
         Strings args;
         for (auto & arg : command)
             args.push_back(arg);
-
-        // Release our references to eval caches to ensure they are persisted to disk, because
-        // we are about to exec out of this process without running C++ destructors.
-        state->evalCaches.clear();
 
         execProgramInStore(store, UseLookupPath::Use, *command.begin(), args);
     }

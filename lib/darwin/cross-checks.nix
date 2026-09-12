@@ -85,6 +85,23 @@
             ;;
         esac
       done
+      # Every PATH dir the spec prepends must hold Mac executables too. The
+      # cross lane hands codex the Linux build host's pkgs, and once (hydra HM
+      # gen 738, 2026-09-03) the Darwin spec named an ELF ripgrep and bubblewrap
+      # while this check stayed green (packages/codex/default.nix `pathPrepend`).
+      for dir in $(jq -r '.path_prepend[]' "$spec"); do
+        for bin in "$dir"/*; do
+          info=$(file -bL "$bin")
+          echo "$bin: $info"
+          case "$info" in
+            *Mach-O*arm64*) ;;
+            *)
+              echo "expected Mach-O arm64 on the spec's PATH, got: $info" >&2
+              exit 1
+              ;;
+          esac
+        done
+      done
     '';
   };
   # btop is the first non-Rust cross package: a plain CMake/C++ build

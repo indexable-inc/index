@@ -49,6 +49,12 @@ struct RemoteStore : public virtual Store, public virtual GcStore, public virtua
 
     /* Implementations of abstract store API methods. */
 
+    // Availability is live owner state, independent of cached registration metadata.
+    bool isValidPath(const StorePath & path) override
+    {
+        return isValidPathUncached(path);
+    }
+
     bool isValidPathUncached(const StorePath & path) override;
 
     StorePathSet queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute = NoSubstitute) override;
@@ -111,7 +117,10 @@ struct RemoteStore : public virtual Store, public virtual GcStore, public virtua
     buildPaths(const std::vector<DerivedPath> & paths, BuildMode buildMode, std::shared_ptr<Store> evalStore) override;
 
     std::vector<KeyedBuildResult> buildPathsWithResults(
-        const std::vector<DerivedPath> & paths, BuildMode buildMode, std::shared_ptr<Store> evalStore) override;
+        const std::vector<DerivedPath> & paths,
+        BuildMode buildMode,
+        std::shared_ptr<Store> evalStore,
+        BuildFailureMode failureMode = BuildFailureMode::Configured) override;
 
     BuildResult buildDerivation(const StorePath & drvPath, const BasicDerivation & drv, BuildMode buildMode) override;
 

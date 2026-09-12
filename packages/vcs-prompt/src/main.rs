@@ -115,7 +115,17 @@ fn segment(workspace: &Workspace, cwd: &Path, color: bool) -> Result<String> {
                 let view = scope.spawn(|| views::at(root, cwd));
                 (jj::head(root), view.join().expect("the views thread"))
             });
-            render::jj(&head?, view.as_ref(), color)
+            // A failed view lookup is rendered, never dropped: the report goes
+            // to stderr (starship logs it) and the segment shows `view:ERR`.
+            let view = match view {
+                Ok(Some(view)) => views::Segment::Inside(view),
+                Ok(None) => views::Segment::Outside,
+                Err(error) => {
+                    eprintln!("vcs-prompt: {error:#}");
+                    views::Segment::Failed
+                }
+            };
+            render::jj(&head?, &view, color)
         }
         Workspace::Git(root) => render::git(&git::head(root)?, color),
     })

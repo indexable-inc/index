@@ -16,7 +16,6 @@
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/util/json-utils.hh"
 #include "nix/util/util.hh"
-#include "nix/util/archive.hh"
 #include "nix/util/mounted-source-accessor.hh"
 
 #include <regex>
@@ -441,14 +440,6 @@ struct GitInputScheme : InputScheme
                 {},
             },
             {
-                "dirtyRev",
-                {},
-            },
-            {
-                "dirtyShortRev",
-                {},
-            },
-            {
                 "verifyCommit",
                 {},
             },
@@ -532,18 +523,6 @@ struct GitInputScheme : InputScheme
         return url;
     }
 
-    Input applyOverrides(const Input & input, std::optional<std::string> ref, std::optional<Hash> rev) const override
-    {
-        auto res(input);
-        if (rev)
-            res.attrs.insert_or_assign("rev", rev->gitRev());
-        if (ref)
-            res.attrs.insert_or_assign("ref", *ref);
-        if (!res.getRef() && res.getRev())
-            throw Error("Git input '%s' has a commit hash but no branch/tag name", res.to_string());
-        return res;
-    }
-
     void clone(const Settings & settings, Store & store, const Input & input, const std::filesystem::path & destDir)
         const override
     {
@@ -571,6 +550,15 @@ struct GitInputScheme : InputScheme
         return getRepoInfo(input).getPath();
     }
 
+    /* Writing into a Git working tree makes it dirty, and a dirty tree has
+       no revision to be fetched by (see `pinCheckedOutCommit`). The write is
+       only usable as part of a commit, so this scheme refuses one that does
+       not come with a commit message. */
+    bool putFileRequiresCommit() const override
+    {
+        return true;
+    }
+
     void putFile(
         const Input & input,
         const CanonPath & path,
@@ -583,8 +571,18 @@ struct GitInputScheme : InputScheme
             throw Error(
                 "cannot commit '%s' to Git repository '%s' because it's not a working tree", path, input.to_string());
 
-        writeFile(*repoPath / path.rel(), contents);
+        if (!commitMsg)
+            throw Error(
+                "cannot write '%s' into Git repository '%s' without committing it, because the write would leave "
+                "the working tree with uncommitted changes and no revision to fetch it by",
+                path,
+                input.to_string());
 
+        /* Ask before writing: a path Git ignores would be written to disk
+           and then left out of the commit, so the tree would come back
+           clean while no fetch of this input could ever see the file. That
+           is a success that produced nothing, so it is refused here rather
+           than discovered later. */
         auto result = runProgram(
             RunOptions{
                 .program = "git",
@@ -606,41 +604,47 @@ struct GitInputScheme : InputScheme
 #endif
             ;
 
-        if (exitCode != 0) {
-            // The path is not `.gitignore`d, we can add the file.
-            runProgram(
-                "git",
-                true,
-                {
-                    OS_STR("-C"),
-                    repoPath->native(),
-                    OS_STR("--git-dir"),
-                    string_to_os_string(repoInfo.gitDir),
-                    OS_STR("add"),
-                    OS_STR("--intent-to-add"),
-                    OS_STR("--"),
-                    string_to_os_string(std::string(path.rel())),
-                });
+        if (exitCode == 0)
+            throw Error(
+                "cannot write '%s' into Git repository '%s' because Git is configured to ignore that path, so it "
+                "could not be committed and no fetch of this input would ever see it",
+                path,
+                input.to_string());
 
-            if (commitMsg) {
-                // Pause the logger to allow for user input (such as a gpg passphrase) in `git commit`
-                auto suspension = logger->suspend();
-                runProgram(
-                    "git",
-                    true,
-                    {
-                        OS_STR("-C"),
-                        repoPath->native(),
-                        OS_STR("--git-dir"),
-                        string_to_os_string(repoInfo.gitDir),
-                        OS_STR("commit"),
-                        string_to_os_string(std::string(path.rel())),
-                        OS_STR("-F"),
-                        OS_STR("-"),
-                    },
-                    *commitMsg);
-            }
-        }
+        writeFile(*repoPath / path.rel(), contents);
+
+        /* `git commit <path>` needs the path to be known to the index, which
+           a brand new file is not. */
+        runProgram(
+            "git",
+            true,
+            {
+                OS_STR("-C"),
+                repoPath->native(),
+                OS_STR("--git-dir"),
+                string_to_os_string(repoInfo.gitDir),
+                OS_STR("add"),
+                OS_STR("--intent-to-add"),
+                OS_STR("--"),
+                string_to_os_string(std::string(path.rel())),
+            });
+
+        // Pause the logger to allow for user input (such as a gpg passphrase) in `git commit`
+        auto suspension = logger->suspend();
+        runProgram(
+            "git",
+            true,
+            {
+                OS_STR("-C"),
+                repoPath->native(),
+                OS_STR("--git-dir"),
+                string_to_os_string(repoInfo.gitDir),
+                OS_STR("commit"),
+                string_to_os_string(std::string(path.rel())),
+                OS_STR("-F"),
+                OS_STR("-"),
+            },
+            *commitMsg);
     }
 
     struct RepoInfo
@@ -668,17 +672,6 @@ struct GitInputScheme : InputScheme
                 return *path;
             else
                 return std::nullopt;
-        }
-
-        void warnDirty(const Settings & settings) const
-        {
-            if (workdirInfo.isDirty) {
-                if (!settings.allowDirty)
-                    throw Error("Git tree '%s' is dirty", locationToArg());
-
-                if (settings.warnDirty)
-                    warn("Git tree '%s' is dirty", locationToArg());
-            }
         }
 
         std::string gitDir = ".git";
@@ -926,24 +919,6 @@ struct GitInputScheme : InputScheme
         return *head;
     }
 
-    static MakeNotAllowedError makeNotAllowedError(std::filesystem::path repoPath)
-    {
-        return [repoPath{std::move(repoPath)}](const CanonPath & path) -> RestrictedPathError {
-            if (pathExists(repoPath / path.rel()))
-                return RestrictedPathError(
-                    "Path '%1%' in the repository %2% is not tracked by Git.\n"
-                    "\n"
-                    "To make it visible to Nix, run:\n"
-                    "\n"
-                    "git -C %2% add \"%1%\"",
-                    path.rel(),
-                    PathFmt(repoPath));
-            else
-                return RestrictedPathError(
-                    "Path '%s' does not exist in Git repository %s.", path.rel(), PathFmt(repoPath));
-        };
-    }
-
     void verifyCommit(const Input & input, std::shared_ptr<GitRepo> repo) const
     {
         auto publicKeys = getPublicKeys(input.attrs);
@@ -953,15 +928,37 @@ struct GitInputScheme : InputScheme
             if (input.getRev() && repo)
                 repo->verifyCommit(*input.getRev(), publicKeys);
             else
+                /* Every road through this fetcher resolves a rev before it
+                   builds an accessor, so this is a bug rather than a
+                   user-facing condition; it stays as a check because
+                   silently skipping a requested signature check is the one
+                   failure mode this option exists to prevent. */
                 throw Error(
-                    "commit verification is required for Git repository '%s', but it's dirty", input.to_string());
+                    "commit verification is required for Git repository '%s', but no revision was resolved for it",
+                    input.to_string());
         }
     }
 
-    std::pair<ref<SourceAccessor>, Input>
-    getAccessorFromCommit(const Settings & settings, Store & store, RepoInfo & repoInfo, Input && input) const
+    /* `checkout`: the working tree this commit was read off (its HEAD, pinned
+       by `pinCheckedOutCommit`), when there is one. It matters for
+       submodules only, and there it decides where their objects are read
+       from; see the submodule loop below. */
+    std::pair<ref<SourceAccessor>, Input> getAccessorFromCommit(
+        const Settings & settings,
+        Store & store,
+        RepoInfo & repoInfo,
+        Input && input,
+        const std::optional<std::filesystem::path> & checkout) const
     {
-        assert(!repoInfo.workdirInfo.isDirty);
+        /* Whether the working tree is dirty is not this function's business:
+           everything below reads objects, and an input that names a commit
+           (`?rev=`) is served from those objects whatever the checkout looks
+           like. Refusing a dirty tree belongs to `pinCheckedOutCommit`, which
+           is the only road that has to derive a revision from a checkout.
+           There used to be an `assert(!isDirty)` here, from when a dirty
+           working tree had an accessor of its own; with that road gone the
+           assert only meant that a caller naming an explicit `ref` on a dirty
+           local repository aborted instead of fetching. */
 
         auto origRev = input.getRev();
 
@@ -977,12 +974,19 @@ struct GitInputScheme : InputScheme
         std::filesystem::path repoDir;
 
         if (auto repoPath = repoInfo.getPath()) {
-            if (!ref)
-                ref = getDefaultRef(settings, repoInfo, shallow);
-            input.attrs.insert_or_assign("ref", *ref);
             repoDir = *repoPath;
-            if (!input.getRev())
+            /* A ref is only needed to name a rev. When the rev is already
+               known -- pinned by the caller, or read off the checked-out
+               HEAD by `pinCheckedOutCommit` -- resolving one would either
+               repeat work or, on a detached HEAD, record a branch name
+               that does not contain the commit. */
+            if (!input.getRev()) {
+                if (!ref)
+                    ref = getDefaultRef(settings, repoInfo, shallow);
                 input.attrs.insert_or_assign("rev", GitRepo::openRepo(repoDir, {})->resolveRef(*ref).gitRev());
+            }
+            if (ref)
+                input.attrs.insert_or_assign("ref", *ref);
         } else {
             auto repoUrl = std::get<ParsedURL>(repoInfo.location);
             std::filesystem::path cacheDir = getCachePath(repoUrl.to_string(), shallow);
@@ -1121,6 +1125,14 @@ struct GitInputScheme : InputScheme
         auto accessor = repo->getAccessor(
             rev, {.exportIgnore = exportIgnore, .smudgeLfs = smudgeLfs}, "«" + input.to_string() + "»");
 
+        /* No `knownTreeRoot` here, on purpose. This accessor does read a Git
+           tree object out of the object store, but a git input is locked by
+           `narHash` (`Input::fetchToStore`), so its one identity is the NAR
+           hash of the served tree: a mount addressing the same input by its
+           git tree id would give it a second store path and could never
+           verify the lock it was handed (`paths.cc`, `ingestionMethodFor`).
+           Git is the boundary bridge; tree-id addressing is jj's. */
+
         /* Record the commit time on the accessor so consumers composing
            accessors (submodule mounts) can surface it per subtree. */
         accessor->lastModified = input.getLastModified();
@@ -1133,36 +1145,82 @@ struct GitInputScheme : InputScheme
             std::map<CanonPath, nix::ref<SourceAccessor>> mounts;
 
             for (auto & [submodule, submoduleRev] : repo->getSubmodules(rev, exportIgnore)) {
-                auto resolved = repo->resolveSubmoduleUrl(submodule.url);
-                debug(
-                    "Git submodule %s: %s %s %s -> %s",
-                    submodule.path,
-                    submodule.url,
-                    submodule.branch,
-                    submoduleRev.gitRev(),
-                    resolved);
                 fetchers::Attrs attrs;
                 attrs.insert_or_assign("type", "git");
-                attrs.insert_or_assign("url", resolved);
-                if (submodule.branch != "") {
-                    // A special value of . is used to indicate that the name of the branch in the submodule
-                    // should be the same name as the current branch in the current repository.
-                    // https://git-scm.com/docs/gitmodules
-                    if (submodule.branch == ".") {
-                        /* The parent's ref is unresolved when its pinned rev
-                           was already cached; the submodule is pinned by rev
-                           below either way. */
-                        if (ref)
-                            attrs.insert_or_assign("ref", *ref);
-                    } else {
-                        attrs.insert_or_assign("ref", submodule.branch);
-                    }
-                }
-                attrs.insert_or_assign("rev", submoduleRev.gitRev());
                 attrs.insert_or_assign("exportIgnore", Explicit<bool>{exportIgnore});
                 attrs.insert_or_assign("submodules", Explicit<bool>{true});
                 attrs.insert_or_assign("lfs", Explicit<bool>{smudgeLfs});
-                attrs.insert_or_assign("allRefs", Explicit<bool>{true});
+                /* On the checkout road, the objects a submodule's gitlink
+                   names usually live in that submodule's own checkout inside
+                   the working tree: a commit made there and never pushed
+                   exists only there. When that repository exists and has the
+                   object it is the source; otherwise the URL `.gitmodules`
+                   names is (an uninitialised or missing checkout is not a
+                   refusal, just not a source). The same `rev` is pinned on
+                   both arms, so the served bytes are identical by
+                   construction and fully determined by the superproject's
+                   commit: a submodule checkout that is dirty or sitting on
+                   some other commit changes nothing, exactly as for an
+                   explicit `?rev=` (flakes/flake-in-submodule.sh pins the
+                   dirty half, fetchGitSubmodules.sh the drifted half).
+
+                   One level deep, deliberately: the nested input below
+                   carries `rev` and no checkout of its own, so ITS
+                   submodules resolve through their `.gitmodules`/config
+                   URLs. For a checkout made by `git submodule update --init
+                   --recursive` those point back into the checkout, which is
+                   where never-pushed nested commits live; threading the
+                   checkout further down would have to ride the input
+                   attributes, a second channel for what the URL already
+                   carries. */
+                auto fromCheckout = [&]() -> std::optional<std::filesystem::path> {
+                    if (!checkout)
+                        return std::nullopt;
+                    auto submoduleCheckout = *checkout / submodule.path.rel();
+                    if (!pathExists(submoduleCheckout / ".git"))
+                        return std::nullopt;
+                    if (!GitRepo::openRepo(submoduleCheckout, {})->hasObject(submoduleRev))
+                        return std::nullopt;
+                    return submoduleCheckout;
+                }();
+                if (fromCheckout) {
+                    /* Named in the log so the two arms are distinguishable
+                       from outside; fetchGitSubmodules.sh asserts on this
+                       line for both arms. */
+                    debug(
+                        "Git submodule %s: gitlink %s served from its checkout %s",
+                        submodule.path,
+                        submoduleRev.gitRev(),
+                        fromCheckout->string());
+                    attrs.insert_or_assign("url", fromCheckout->string());
+                    attrs.insert_or_assign("rev", submoduleRev.gitRev());
+                } else {
+                    auto resolved = repo->resolveSubmoduleUrl(submodule.url);
+                    debug(
+                        "Git submodule %s: %s %s %s -> %s",
+                        submodule.path,
+                        submodule.url,
+                        submodule.branch,
+                        submoduleRev.gitRev(),
+                        resolved);
+                    attrs.insert_or_assign("url", resolved);
+                    if (submodule.branch != "") {
+                        // A special value of . is used to indicate that the name of the branch in the submodule
+                        // should be the same name as the current branch in the current repository.
+                        // https://git-scm.com/docs/gitmodules
+                        if (submodule.branch == ".") {
+                            /* The parent's ref is unresolved when its pinned rev
+                               was already cached; the submodule is pinned by rev
+                               below either way. */
+                            if (ref)
+                                attrs.insert_or_assign("ref", *ref);
+                        } else {
+                            attrs.insert_or_assign("ref", submodule.branch);
+                        }
+                    }
+                    attrs.insert_or_assign("rev", submoduleRev.gitRev());
+                    attrs.insert_or_assign("allRefs", Explicit<bool>{true});
+                }
                 auto submoduleInput = fetchers::Input::fromAttrs(settings, std::move(attrs));
                 auto [submoduleAccessor, submoduleInput2] = submoduleInput.getAccessor(settings, store);
                 submoduleAccessor->setPathDisplay("«" + submoduleInput.to_string() + "»");
@@ -1183,91 +1241,66 @@ struct GitInputScheme : InputScheme
         return {accessor, std::move(input)};
     }
 
-    std::pair<ref<SourceAccessor>, Input>
-    getAccessorFromWorkdir(const Settings & settings, Store & store, RepoInfo & repoInfo, Input && input) const
+    /* Resolve a local checkout that nothing pins to the commit it has
+       checked out, or refuse it.
+
+       This is the only place in the fetcher that looks at a Git *working
+       tree* at all; everything after it reads objects. A working tree is
+       not a source: it changes while an evaluation reads it, and a lock
+       file has no way to name the state that was read. A commit does have
+       an identity, so a bare checkout is served as its HEAD commit -- by
+       the same road an explicit `?rev=` takes, which is what makes the two
+       spellings produce one store path instead of two. */
+    void pinCheckedOutCommit(const RepoInfo & repoInfo, Input & input) const
     {
-        auto repoPath = repoInfo.getPath().value();
+        auto repoPath = *repoInfo.getPath();
+        auto & workdirInfo = repoInfo.workdirInfo;
 
-        if (getSubmodulesAttr(input))
-            /* Create mountpoints for the submodules. */
-            for (auto & submodule : repoInfo.workdirInfo.submodules)
-                repoInfo.workdirInfo.files.insert(submodule.path);
+        if (workdirInfo.isDirty) {
+            /* Untracked files are not changes: Git does not report them
+               here (the status walk does not ask for them) and they are
+               invisible to the accessor either way, so they neither make a
+               tree unfetchable nor end up in the result. */
+            std::vector<std::string> changes;
+            for (auto & file : workdirInfo.dirtyFiles)
+                changes.emplace_back(file.rel());
+            for (auto & file : workdirInfo.deletedFiles)
+                changes.push_back(std::string(file.rel()) + " (deleted)");
 
-        auto repo = GitRepo::openRepo(repoPath, {});
+            constexpr size_t maxListed = 10;
+            std::string listed;
+            for (size_t i = 0; i < changes.size() && i < maxListed; ++i)
+                listed += "\n  " + changes[i];
+            if (changes.size() > maxListed)
+                listed += fmt("\n  ...and %d more", changes.size() - maxListed);
 
-        auto exportIgnore = getExportIgnoreAttr(input);
-
-        ref<SourceAccessor> accessor =
-            repo->getAccessor(repoInfo.workdirInfo, {.exportIgnore = exportIgnore}, makeNotAllowedError(repoPath));
-
-        /* If the repo has submodules, return a mounted input accessor
-           consisting of the accessor for the top-level repo and the
-           accessors for the submodule workdirs. */
-        if (getSubmodulesAttr(input) && !repoInfo.workdirInfo.submodules.empty()) {
-            std::map<CanonPath, nix::ref<SourceAccessor>> mounts;
-
-            for (auto & submodule : repoInfo.workdirInfo.submodules) {
-                auto submodulePath = repoPath / submodule.path.rel();
-                fetchers::Attrs attrs;
-                attrs.insert_or_assign("type", "git");
-                attrs.insert_or_assign("url", submodulePath.string());
-                attrs.insert_or_assign("exportIgnore", Explicit<bool>{exportIgnore});
-                attrs.insert_or_assign("submodules", Explicit<bool>{true});
-                // TODO: fall back to getAccessorFromCommit-like fetch when submodules aren't checked out
-                // attrs.insert_or_assign("allRefs", Explicit<bool>{ true });
-
-                auto submoduleInput = fetchers::Input::fromAttrs(settings, std::move(attrs));
-                auto [submoduleAccessor, submoduleInput2] = submoduleInput.getAccessor(settings, store);
-                submoduleAccessor->setPathDisplay("«" + submoduleInput.to_string() + "»");
-
-                /* If the submodule is dirty, mark this repo dirty as
-                   well. */
-                if (!submoduleInput2.getRev())
-                    repoInfo.workdirInfo.isDirty = true;
-
-                mounts.insert_or_assign(submodule.path, submoduleAccessor);
-            }
-
-            mounts.insert_or_assign(CanonPath::root, accessor);
-            accessor = makeMountedSourceAccessor(std::move(mounts));
+            throw Error(
+                "Git working tree '%s' has uncommitted changes to %d tracked file(s), so there is no revision to lock "
+                "this input to:%s\n"
+                "Commit them ('git -C %s commit -a') and Nix will fetch the resulting commit, or name a commit "
+                "explicitly as 'git+file://%s?rev=<commit>'.",
+                repoPath.string(),
+                changes.size(),
+                listed,
+                repoPath.string(),
+                repoPath.string());
         }
 
-        if (!repoInfo.workdirInfo.isDirty) {
-            auto repo = GitRepo::openRepo(repoPath, {});
+        if (!workdirInfo.headRev)
+            throw Error(
+                "Git repository '%s' has no commits, so there is nothing to fetch from it. "
+                "Commit its contents ('git -C %s add . && git -C %s commit') first.",
+                repoPath.string(),
+                repoPath.string(),
+                repoPath.string());
 
-            if (auto ref = repo->getWorkdirRef())
-                input.attrs.insert_or_assign("ref", *ref);
+        /* A detached HEAD has no branch to record; `rev` alone identifies
+           the tree, and inventing a ref would name a branch that need not
+           contain the commit. */
+        if (auto ref = GitRepo::openRepo(repoPath, {})->getWorkdirRef())
+            input.attrs.insert_or_assign("ref", *ref);
 
-            /* Return a rev of 000... if there are no commits yet. */
-            auto rev = repoInfo.workdirInfo.headRev.value_or(nullRev);
-
-            input.attrs.insert_or_assign("rev", rev.gitRev());
-            if (!getShallowAttr(input)) {
-                input.attrs.insert_or_assign(
-                    "revCount", rev == nullRev ? 0 : getRevCount(settings, repoInfo, repoPath, rev));
-            }
-
-            verifyCommit(input, repo);
-        } else {
-            repoInfo.warnDirty(settings);
-
-            if (repoInfo.workdirInfo.headRev) {
-                input.attrs.insert_or_assign("dirtyRev", repoInfo.workdirInfo.headRev->gitRev() + "-dirty");
-                input.attrs.insert_or_assign("dirtyShortRev", repoInfo.workdirInfo.headRev->gitShortRev() + "-dirty");
-            }
-
-            verifyCommit(input, nullptr);
-        }
-
-        input.attrs.insert_or_assign(
-            "lastModified",
-            repoInfo.workdirInfo.headRev ? getLastModified(settings, repoInfo, repoPath, *repoInfo.workdirInfo.headRev)
-                                         : 0);
-
-        accessor->lastModified = input.getLastModified();
-        accessor->rev = input.getRev();
-
-        return {accessor, std::move(input)};
+        input.attrs.insert_or_assign("rev", workdirInfo.headRev->gitRev());
     }
 
     std::pair<ref<SourceAccessor>, Input>
@@ -1286,9 +1319,16 @@ struct GitInputScheme : InputScheme
             throw UnimplementedError("exportIgnore and submodules are not supported together yet");
         }
 
-        auto [accessor, final] = input.getRef() || input.getRev() || !repoInfo.getPath()
-                                     ? getAccessorFromCommit(settings, store, repoInfo, std::move(input))
-                                     : getAccessorFromWorkdir(settings, store, repoInfo, std::move(input));
+        /* `getRepoInfo` reads the working tree exactly in this case (local
+           path, nothing pinned), which is the case that has to be resolved
+           to a commit before anything else runs. */
+        std::optional<std::filesystem::path> checkout;
+        if (!input.getRef() && !input.getRev() && repoInfo.getPath()) {
+            pinCheckedOutCommit(repoInfo, input);
+            checkout = *repoInfo.getPath();
+        }
+
+        auto [accessor, final] = getAccessorFromCommit(settings, store, repoInfo, std::move(input), checkout);
 
         return {accessor, std::move(final)};
     }
@@ -1301,9 +1341,9 @@ struct GitInputScheme : InputScheme
 
         auto rev = input.getRev();
         if (!rev || *rev == nullRev)
-            /* Dirty or empty working trees have no commit to walk
-               from; they also never produce locked inputs, so there is
-               nothing deterministic to expose. */
+            /* An input that reaches here without a real commit was never
+               fetched (or was spelled with the null rev by hand); there is
+               no history to walk and nothing deterministic to expose. */
             return std::nullopt;
 
         auto cache = settings.getCache();
@@ -1333,79 +1373,17 @@ struct GitInputScheme : InputScheme
 
     std::optional<std::string> getFingerprint(Store & store, const Input & input) const override
     {
-        auto makeFingerprint = [&](const Hash & rev) {
-            return rev.gitRev() + (getSubmodulesAttr(input) ? ";s" : "") + (getExportIgnoreAttr(input) ? ";e" : "")
-                   + (getLfsAttr(input) ? ";l" : "");
-        };
+        /* Every tree this fetcher serves is a commit's: a local checkout is
+           resolved to the commit it has checked out before any accessor is
+           built (`pinCheckedOutCommit`), so an input that has reached a
+           fingerprint carries a rev. One that does not has not been fetched
+           yet, and there is nothing stable to key a cache on. */
+        auto rev = input.getRev();
+        if (!rev)
+            return std::nullopt;
 
-        if (auto rev = input.getRev())
-            return makeFingerprint(*rev);
-        else {
-            auto repoInfo = getRepoInfo(input);
-            auto repoPath = repoInfo.getPath();
-            if (!repoPath)
-                return std::nullopt;
-
-            /* Digest of everything that makes this workdir differ from
-               its HEAD commit: the content of modified/added files, the
-               names of deleted ones, and -- when this input mounts them
-               -- each submodule workdir's own state, recursively.
-
-               Submodules used to abort the fingerprint entirely, which
-               left every flake with `submodules = true` on a dirty
-               checkout permanently uncacheable: fetchToStore skips its
-               cache without a fingerprint, so the whole source tree was
-               re-hashed and re-copied into the store on every single
-               evaluation, forever (indexable-inc/index#4301). */
-            auto hashWorkdir = [&](auto & self,
-                                   const std::filesystem::path & path,
-                                   const GitRepo::WorkdirInfo & info,
-                                   bool withSubmodules,
-                                   HashSink & sink) -> bool {
-                for (auto & file : info.dirtyFiles) {
-                    writeString("modified:", sink);
-                    writeString(file.abs(), sink);
-                    dumpPath((path / file.rel()).string(), sink);
-                }
-                for (auto & file : info.deletedFiles) {
-                    writeString("deleted:", sink);
-                    writeString(file.abs(), sink);
-                }
-                if (!withSubmodules)
-                    /* The accessor renders unmounted submodules as empty
-                       directories, so their content cannot reach the
-                       result and must not reach the fingerprint. */
-                    return true;
-                for (auto & submodule : info.submodules) {
-                    auto submodulePath = path / submodule.path.rel();
-                    GitRepo::WorkdirInfo submoduleInfo;
-                    try {
-                        submoduleInfo = GitRepo::openRepo(submodulePath, {})->getWorkdirInfo();
-                    } catch (Error &) {
-                        /* Not checked out, or not a repo yet. The
-                           accessor will fail or fall back later; here we
-                           only decline to cache, which is what happened
-                           for every submodule before this patch. */
-                        return false;
-                    }
-                    writeString("submodule:", sink);
-                    writeString(submodule.path.abs(), sink);
-                    writeString(submoduleInfo.headRev.value_or(nullRev).gitRev(), sink);
-                    /* getAccessorFromWorkdir mounts nested submodules
-                       unconditionally, so recurse with them on. */
-                    if (!self(self, submodulePath, submoduleInfo, true, sink))
-                        return false;
-                }
-                return true;
-            };
-
-            HashSink hashSink{HashAlgorithm::SHA512};
-            if (!hashWorkdir(hashWorkdir, *repoPath, repoInfo.workdirInfo, getSubmodulesAttr(input), hashSink))
-                return std::nullopt;
-
-            return makeFingerprint(repoInfo.workdirInfo.headRev.value_or(nullRev))
-                   + ";d=" + hashSink.finish().hash.to_string(HashFormat::Base16, false);
-        }
+        return rev->gitRev() + (getSubmodulesAttr(input) ? ";s" : "") + (getExportIgnoreAttr(input) ? ";e" : "")
+               + (getLfsAttr(input) ? ";l" : "");
     }
 
     bool isLocked(const Settings & settings, const Input & input) const override

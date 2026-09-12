@@ -24,8 +24,9 @@ pub enum Yield {
     Force(Slot),
     /// Apply this function and step again with the result.
     Apply(Value, Slot),
-    /// Run this task and step again with its value.
-    Sub(Task),
+    /// Run this task and step again with its value. Boxed: `Task` is the fat
+    /// state machine, and a `Yield` is returned by every `Task::step`.
+    Sub(Box<Task>),
     /// Ask the scheduler about a path and step again with its answer. The
     /// only way a task reaches the filesystem: the VM itself performs no IO,
     /// so this leaves the machine through `Step::NeedPath` and comes back
@@ -45,7 +46,7 @@ pub enum Yield {
 #[derive(Debug, Clone)]
 pub enum NeedPath {
     /// Resolved path and source text, for `import`.
-    Import(String),
+    Import(Rc<crate::value2::PathValue>),
     /// Lock a flake reference and hand back everything needed to evaluate its
     /// outputs, for `builtins.getFlake`.
     ///
@@ -96,26 +97,32 @@ pub enum NeedPath {
     /// to produce (`flake-primops.cc`). The answer is the reference string.
     FlakeRefToString(std::collections::BTreeMap<String, TreeAttr>),
 
-    Contents(String),
+    /// The raw bytes of the file at this path, as a Nix string, for
+    /// `builtins.readFile` and for `builtins.wasm` (its module, and the
+    /// guest's `read_file`). Answered from [`crate::host::Host::read_file_bytes`]:
+    /// a Nix string is a byte string, and cppnix's `readFile` hands back
+    /// whatever the file holds, so an answer repaired to UTF-8 would be a
+    /// different file (it was, until `builtins.wasm` needed its `.wasm`
+    /// binary through here).
+    Contents(Rc<crate::value2::PathValue>),
     /// Hash the file at this path and answer the base16 digest, for
     /// `builtins.hashFile`.
     ///
     /// # Why the digest travels back and the bytes do not
     ///
     /// cppnix's `prim_hashFile` (`primops.cc:2432`) hashes the raw bytes of
-    /// the file and never builds an eval string from them. This evaluator's
-    /// strings are UTF-8 (`Value::Str` holds a Rust `String`, ENG-13147), so
-    /// routing the bytes through [`NeedPath::Contents`] repaired every
-    /// invalid sequence to U+FFFD before the hasher saw it, and
-    /// `hashFile` of a binary answered a digest of a file that does not
-    /// exist (ENG-13146). The algorithm travels with the question, the
-    /// answering side reads raw bytes ([`crate::host::Host::read_file_bytes`])
-    /// and hashes them, and no string ever carries the contents.
+    /// the file and never builds an eval string from them. Neither does this:
+    /// the algorithm travels with the question, the answering side reads the
+    /// bytes ([`crate::host::Host::read_file_bytes`]) and hashes them, and no
+    /// `Value` ever carries a file that is only being digested. Historically
+    /// this is also where ENG-13146 was fixed: [`NeedPath::Contents`] used to
+    /// answer text, repairing invalid UTF-8 to U+FFFD, and a digest of that
+    /// was a digest of a file that does not exist.
     HashFile {
-        path: String,
+        path: Rc<crate::value2::PathValue>,
         algo: crate::nixhash::HashAlgo,
     },
-    Exists(String),
+    Exists(Rc<crate::value2::PathValue>),
     /// The trailing-slash half of `builtins.pathExists`: whether `path` is a
     /// DIRECTORY, under full symlink resolution.
     ///
@@ -125,17 +132,16 @@ pub enum NeedPath {
     /// runs on the fully resolved path (`SymlinkResolution::Full` where the
     /// plain question resolves ancestors only) and anything but a directory
     /// answers `false`. A separate question from [`NeedPath::Exists`]
-    /// because both the resolution and the predicate differ; it is served by
-    /// the same hook as an `import`'s directory test
-    /// ([`crate::host::Host::file_type_resolved`]), so a recording host
-    /// files it as the `FileTypeResolved` read it is.
-    DirExists(String),
-    Entries(String),
+    /// because both the resolution and the predicate differ; its dedicated
+    /// [`crate::host::Host::dir_exists_checked`] operation preserves the
+    /// third, error outcome that an import's type query does not have.
+    DirExists(Rc<crate::value2::PathValue>),
+    Entries(Rc<crate::value2::PathValue>),
     /// `builtins.readFileType`: the type of a path that must be there.
     /// cppnix's `SourceAccessor::lstat`, which is `maybeLstat` plus a throw
     /// (`source-accessor.cc:73`). The throw is this side's, in
     /// [`crate::eval::answer`], not the embedder's -- see [`NeedPath::MaybeKind`].
-    Kind(String),
+    Kind(Rc<crate::value2::PathValue>),
     /// The type of a path that may not be there: cppnix's
     /// `SourceAccessor::maybeLstat`, answering `null` where [`NeedPath::Kind`]
     /// fails.
@@ -158,7 +164,7 @@ pub enum NeedPath {
     /// `builtins.path` under pure eval (ENG-13123), and answering `null`
     /// there makes `builtins.readFileType` of a missing file evaluate to
     /// `null` instead of failing.
-    MaybeKind(String),
+    MaybeKind(Rc<crate::value2::PathValue>),
     /// An environment variable, for `builtins.getEnv`.
     Env(String),
     /// Copy this path into the store and answer with the store path, for a
@@ -166,7 +172,12 @@ pub enum NeedPath {
     /// whose answer depends on a store rather than only on the filesystem,
     /// and it is here for the same reason `Env` is -- a coercion that reached
     /// the world some other way would be invisible to a read set.
-    StorePath(String),
+    StorePath(Rc<crate::value2::PathValue>),
+    /// Use an existing store object through `builtins.storePath`. Unlike
+    /// `StorePath`, this does not copy bytes. The host validates the rooted
+    /// source, ensures the object when cppnix would, and returns both the
+    /// visible path and the store object carried in its string context.
+    UseStorePath(Rc<crate::value2::PathValue>),
     /// Store this text and answer with its store path, for `builtins.toFile`.
     ///
     /// A store question like `StorePath`, and routed for the same reason, but
@@ -192,9 +203,8 @@ pub enum NeedPath {
     /// The store operation is the same one: cppnix's `writeDerivation`
     /// (`derivations.cc:170`) is `addTextToStore` of the ATerm under
     /// `<name>.drv` with the input sources and input derivations as
-    /// references, and an embedder should perform it with the same call it
-    /// uses for `builtins.toFile`. What differs is the *contract on the
-    /// answer*, in two ways that matter:
+    /// references. What differs is the *contract on the answer*, in two ways
+    /// that matter:
     ///
     /// * `expected` is already known. The evaluator computed the path from
     ///   these very bytes on its way here, so an answer that disagrees is not
@@ -220,9 +230,6 @@ pub enum NeedPath {
         /// The ATerm, already rendered. Nothing re-renders it: two renderings
         /// of one derivation are two chances to disagree about the path.
         aterm: String,
-        /// `inputSrcs` plus every `inputDrvs` key, sorted and deduplicated.
-        /// Unlike `StoreText`'s, these legitimately include `.drv` paths.
-        references: Vec<String>,
         /// Where the evaluator computed this `.drv` goes. The embedder is not
         /// asked to trust it: it is here so a disagreement is caught at the
         /// derivation that caused it rather than as a missing path much later.
@@ -529,7 +536,7 @@ pub struct AcceptedPath {
 pub struct FilteredCopy {
     /// The directory or file to copy, absolute. Not symlink-resolved: cppnix
     /// resolves it inside `addPath`, and so must the embedder.
-    pub root: String,
+    pub root: Rc<crate::value2::PathValue>,
     /// The store path's name. cppnix defaults it to the root's base name, and
     /// that default is applied before the question is asked.
     pub name: String,
@@ -560,6 +567,17 @@ pub struct FilteredCopy {
     /// The evaluator has already realised the context and rewritten `root` by
     /// the time this is sent, so the query is against the built output.
     pub inherit_references: bool,
+}
+
+impl FilteredCopy {
+    /// How many paths the filter accepted, or `unfiltered`, for a trace line.
+    #[must_use]
+    pub fn accepted_label(&self) -> String {
+        self.accepted.as_ref().map_or_else(
+            || "unfiltered".to_owned(),
+            |accepted| accepted.len().to_string(),
+        )
+    }
 }
 
 /// Which of cppnix's two fixed-output fetchers is being asked for.
@@ -787,6 +805,20 @@ pub struct FetchTreeRequest {
     pub fetcher: TreeFetcher,
 }
 
+impl FetchTreeRequest {
+    /// Whether this is a final tree with a `narHash`: `fetchFinalTree` over
+    /// a locked input, whose every emitted attribute is one of the locked
+    /// ones or computed from them (`emitTreeAttrs`; the `outPath` is the
+    /// fixed-output path of the `narHash`), so the answer is a function of
+    /// `attrs`, and asking again could return nothing else, or fail to
+    /// fetch. The read-set replay takes such a row from its record
+    /// (`readset::Question::answer_by_validity`).
+    #[must_use]
+    pub fn locked_final(&self) -> bool {
+        self.fetcher == TreeFetcher::FinalTree && self.attrs.contains_key("narHash")
+    }
+}
+
 pub enum Task {
     Builtin {
         idx: u16,
@@ -807,6 +839,15 @@ pub enum Task {
     /// asked yet" from "answered"; the task machinery already carries that
     /// distinction as `incoming`.
     NixPath,
+}
+
+impl Yield {
+    /// The one constructor for [`Yield::Sub`]. The box is one allocation per
+    /// sub-task start; from then on the task moves as one word, so the yield
+    /// and the frame that carries it stay the size of their small variants.
+    pub fn sub(task: Task) -> Yield {
+        Yield::Sub(Box::new(task))
+    }
 }
 
 impl Task {
@@ -1342,7 +1383,9 @@ fn scalar_cmp(l: &Value, r: &Value) -> Result<Ordering> {
         (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal),
         // cppnix compares the `std::string`s, which is a byte compare.
         (Value::Str(a), Value::Str(b)) => a.bytes().cmp(b.bytes()),
-        (Value::Path(a), Value::Path(b)) => a.as_ref().cmp(b.as_ref()),
+        // cppnix's `builtins.lessThan` compares only `pathStrView()` here;
+        // accessor identity participates in equality, but not ordering.
+        (Value::Path(a), Value::Path(b)) => a.path.as_ref().cmp(b.path.as_ref()),
         _ => {
             return Err(VmError::eval(format!(
                 "cannot compare {} with {}",

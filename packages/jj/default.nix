@@ -2,7 +2,7 @@
   ix,
   lib,
 }: let
-  # The jj view carries the submodule and view-management commits.
+  # The jj view carries the submodule commits.
   source = ix.jjSrc;
 
   workspace = ix.cargoUnit.buildWorkspace {
@@ -21,22 +21,20 @@
         "-p"
         "jj-cli"
       ]
-      # Our two crates are not in the `-p jj-cli` graph and so had no units to
-      # lint: jj-cli reaches jj-vfs only behind its optional `fs` feature, and
-      # never reaches jj-views at all, which is its own binary. A second cargo
-      # execution puts them in the merged graph. Widening `cargoTargets` leaves
-      # the jj-cli roots byte-identical (see the `cargoTargets` doc), so this
-      # costs a unit-graph query and no rebuild of the shipped binary.
+      # Our crate is not in the `-p jj-cli` graph and so had no units to
+      # lint: jj-cli reaches jj-vfs only behind its optional `fs` feature. A
+      # second cargo execution puts it in the merged graph. Widening
+      # `cargoTargets` leaves the jj-cli roots byte-identical (see the
+      # `cargoTargets` doc), so this costs a unit-graph query and no rebuild
+      # of the shipped binary.
       [
         "-p"
         "jj-vfs"
-        "-p"
-        "jj-views"
       ]
       # A third execution, with `--tests`, is what makes the fork's own test
       # suites exist as units at all. Without it `workspace.testChecksByTarget`
-      # is empty and `ciChecks.rust-jj` holds exactly two entries, both clippy
-      # (clippy-jj-vfs, clippy-jj-views), so a change to the fork compiles and
+      # is empty and `ciChecks.rust-jj` holds exactly one entry, clippy
+      # (clippy-jj-vfs), so a change to the fork compiles and
       # nothing runs it. Measured on the workspace-add fix (a9df7a0ec4d1, +182
       # /-20 with 138 new lines in cli/tests/test_workspaces.rs): the gate saw
       # candidate=923 identical=908 changed=15 and index-rust-jj was not among
@@ -51,14 +49,11 @@
         "jj-lib"
         "-p"
         "jj-vfs"
-        "-p"
-        "jj-views"
         "--tests"
       ]
     ];
     # jj's own test suites shell out to the `git` binary: testutils/src/git.rs
-    # spawns `git clone`, and cli/tests/test_views_command.rs spawns `git`
-    # directly. The nix test sandbox has no git otherwise, so those tests panic
+    # spawns `git clone`. The nix test sandbox has no git otherwise, so those tests panic
     # spawning it (`Os { code: 2, NotFound }`) rather than failing on anything
     # jj did. Same shape as the `clone-cli` and `mirror` entries in
     # lib/rust/workspace.nix.
@@ -94,13 +89,12 @@
       cargoAudit.enable = false;
       cargoMachete.enable = false;
       clippy = {
-        # Clippy is the one gate that does apply, because two of this
-        # workspace's members are ours. `packages` is what keeps it to those
-        # two rather than adopting upstream's whole tree; cargo PACKAGE names,
+        # Clippy is the one gate that does apply, because one of this
+        # workspace's members is ours. `packages` is what keeps it to that
+        # one rather than adopting upstream's whole tree; cargo PACKAGE names,
         # so hyphens, not the underscored unit keys.
         packages = [
           "jj-vfs"
-          "jj-views"
         ];
         # jj writes its `[workspace.lints.clippy]` at `warn` and its CI runs
         # `cargo clippy --all-features --workspace --all-targets -- -D warnings`
@@ -121,7 +115,7 @@ in
         inherit workspace;
         # `ciChecks` enumerates `passthru.tests`, and the per-crate gates it
         # picks up on its own are the ROOT package's -- jj-cli, which we do not
-        # own and do not gate. The jj-vfs and jj-views gates are reachable only
+        # own and do not gate. The jj-vfs gate is reachable only
         # from here, so without this the flags above build nothing and the gate
         # passes by never running. Wiring the whole map is safe precisely
         # because `policy.clippy.packages` already narrowed it to our crates,
@@ -140,7 +134,7 @@ in
     meta =
       (old.meta or {})
       // {
-        description = "Jujutsu with index's submodule and view workflows";
+        description = "Jujutsu with index's submodule workflows";
         homepage = "https://github.com/jj-vcs/jj";
         license = lib.licenses.asl20;
         mainProgram = "jj";

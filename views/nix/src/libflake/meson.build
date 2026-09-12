@@ -29,6 +29,7 @@ nlohmann_json = dependency('nlohmann_json', version : '>= 3.9')
 deps_public += nlohmann_json
 
 subdir('nix-meson-build-support/common')
+subdir('nix-meson-build-support/rust-runtime')
 
 subdir('nix-meson-build-support/generate-header')
 
@@ -41,7 +42,6 @@ endforeach
 
 sources = files(
   'config.cc',
-  'flake-primops.cc',
   'flake.cc',
   'flakeref.cc',
   'lockfile.cc',
@@ -62,12 +62,18 @@ this_library = library(
   dependencies : deps_public + deps_private + deps_other,
   include_directories : include_dirs,
   link_args : linker_export_flags,
+  build_rpath : rust_runtime_build_rpath,
+  install_rpath : rust_runtime_install_rpath,
   prelink : true, # For C++ static initializers
   install : true,
 )
 
 install_headers(headers, subdir : 'nix/flake', preserve_path : true)
 
-libraries_private = []
+libraries_private = rust_runtime_libraries_private
+extra_pkg_config_variables = {
+  'rust_runtime_libdir' : rust_runtime_install_rpath,
+  'rust_runtime_includedir' : rust_runtime_install_includedir,
+}
 
 subdir('nix-meson-build-support/export')

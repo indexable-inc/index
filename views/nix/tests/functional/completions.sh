@@ -4,33 +4,39 @@ source common.sh
 
 cd "$TEST_ROOT"
 
-mkdir -p dep
+# Every one of these four directories is fetched as a flake -- `dep` as a
+# declared input, the other three by the completion machinery, which has to
+# read a flake to know what its inputs are called. `path:` serves store objects
+# only (src/libfetchers/path.cc), so each needs an identity of its own. `err`
+# included: its subject is a flake whose evaluation throws, and a fetch that
+# refused first would produce the same empty completion for the wrong reason.
+jjFlakeDir "$TEST_ROOT/dep"
 cat <<EOF > dep/flake.nix
 {
     outputs = i: { };
 }
 EOF
-mkdir -p foo
+jjFlakeDir "$TEST_ROOT/foo"
 cat <<EOF > foo/flake.nix
 {
-    inputs.a.url = "path:$(realpath dep)";
+    inputs.a.url = "jj+file://$(realpath dep)";
 
     outputs = i: {
         sampleOutput = 1;
     };
 }
 EOF
-mkdir -p bar
+jjFlakeDir "$TEST_ROOT/bar"
 cat <<EOF > bar/flake.nix
 {
-    inputs.b.url = "path:$(realpath dep)";
+    inputs.b.url = "jj+file://$(realpath dep)";
 
     outputs = i: {
         sampleOutput = 1;
     };
 }
 EOF
-mkdir -p err
+jjFlakeDir "$TEST_ROOT/err"
 cat <<EOF > err/flake.nix
 throw "error"
 EOF

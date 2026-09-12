@@ -8,6 +8,7 @@ clearStore
 rm -rf "$TEST_HOME"/.cache "$TEST_HOME"/.config "$TEST_HOME"/.local
 
 cp ../shell-hello.nix "${config_nix}" "$TEST_HOME"
+jjFlakeDir "$TEST_HOME"
 cd "$TEST_HOME"
 
 cat <<EOF > flake.nix

@@ -1,9 +1,12 @@
 #include "nix/cmd/command.hh"
 #include "nix/main/common-args.hh"
 #include "nix/store/store-api.hh"
+#include "nix/store/local-fs-store.hh"
 #include "nix/util/archive.hh"
 #include "nix/util/git.hh"
 #include "nix/util/posix-source-accessor.hh"
+#include "nix/util/environment-variables.hh"
+#include "nix/util/file-system.hh"
 #include "nix/cmd/misc-store-flags.hh"
 
 using namespace nix;
@@ -12,6 +15,7 @@ struct CmdAddToStore : MixDryRun, StoreCommand
 {
     std::filesystem::path path;
     std::optional<std::string> namePart;
+    std::optional<std::filesystem::path> outLink;
     ContentAddressMethod caMethod = ContentAddressMethod::Raw::NixArchive;
     HashAlgorithm hashAlgo = HashAlgorithm::SHA256;
 
@@ -28,6 +32,14 @@ struct CmdAddToStore : MixDryRun, StoreCommand
             .handler = {&namePart},
         });
 
+        addFlag({
+            .longName = "out-link",
+            .shortName = 'o',
+            .description = "Create a symlink at *path* and register it as a garbage collector root before returning.",
+            .labels = {"path"},
+            .handler = {&outLink},
+        });
+
         addFlag(flag::contentAddressMethod(&caMethod));
 
         addFlag(flag::hashAlgo(&hashAlgo));
@@ -35,13 +47,41 @@ struct CmdAddToStore : MixDryRun, StoreCommand
 
     void run(ref<Store> store) override
     {
+        auto localStore = store.dynamic_pointer_cast<LocalFSStore>();
+        if (outLink) {
+            if (dryRun)
+                throw UsageError("--out-link cannot be combined with --dry-run");
+            if (outLink->empty())
+                throw UsageError("--out-link requires a non-empty path");
+            if (!localStore)
+                throw UsageError("--out-link requires a store that supports local garbage collector roots");
+        }
+
         if (!namePart)
             namePart = path.filename().string();
 
         auto sourcePath = PosixSourceAccessor::createAtRoot(makeParentCanonical(path));
 
+        std::optional<Hash> expectedHash;
+        if (outLink) {
+            auto [expectedPath, hash] = store->computeStorePath(*namePart, sourcePath, caMethod, hashAlgo, {});
+            // Root even an already-valid path before addToStoreSlow checks it.
+            localStore->addTempRoot(expectedPath);
+            expectedHash = hash;
+        }
+
         auto storePath = dryRun ? store->computeStorePath(*namePart, sourcePath, caMethod, hashAlgo, {}).first
-                                : store->addToStoreSlow(*namePart, sourcePath, caMethod, hashAlgo, {}).path;
+                                : store->addToStoreSlow(*namePart, sourcePath, caMethod, hashAlgo, {}, expectedHash).path;
+
+        // Publish the permanent root before releasing the temporary root or
+        // reporting success. The expected hash refuses mutation during ingestion.
+        if (outLink) {
+            // Functional GC handoff test: pause after ingestion, before the
+            // permanent root exists. The temporary root must already protect it.
+            if (auto sync = getEnv("_NIX_TEST_STORE_ADD_ROOT_SYNC"))
+                readFile(*sync);
+            localStore->addPermRoot(storePath, absPath(*outLink));
+        }
 
         logger->cout("%s", store->printStorePath(storePath));
     }

@@ -114,6 +114,10 @@ Args::Flag contentAddressMethod(ContentAddressMethod * method)
       [`builtins.toFile`](@docroot@/language/builtins.html#builtins-toFile).
       For advanced use-cases only;
       for regular usage prefer `nar` and `flat`.
+
+    [`jj-tree`](@docroot@/store/store-object/content-address.md#method-jj-tree)
+    is recognised but refused: Nix cannot compute a Jujutsu tree id, only read
+    one from a jj object store.
         )",
         .labels = {"content-address-method"},
         .handler = {[method](std::string s) { *method = ContentAddressMethod::parse(s); }},

@@ -3,10 +3,23 @@
   "definitions": {
     "McpAuthStatus": {
       "enum": [
+        "unknown",
         "unsupported",
         "notLoggedIn",
         "bearerToken",
         "oAuth"
+      ],
+      "type": "string"
+    },
+    "McpServerConnectionStatus": {
+      "enum": [
+        "notStarted",
+        "starting",
+        "connected",
+        "authenticationRequired",
+        "failed",
+        "cancelled",
+        "disabled"
       ],
       "type": "string"
     },
@@ -59,6 +72,12 @@
         "name": {
           "type": "string"
         },
+        "pluginId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "resourceTemplates": {
           "items": {
             "$ref": "#/definitions/ResourceTemplate"
@@ -70,6 +89,17 @@
             "$ref": "#/definitions/Resource"
           },
           "type": "array"
+        },
+        "runtimeStatus": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/McpServerConnectionStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Current thread-runtime connection state; null when unavailable or the configuration changed."
         },
         "serverInfo": {
           "anyOf": [
@@ -86,6 +116,13 @@
             "$ref": "#/definitions/Tool"
           },
           "type": "object"
+        },
+        "toolsError": {
+          "description": "Tool discovery failed and no catalog was returned. Null when a catalog is returned, including cached or empty catalogs.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

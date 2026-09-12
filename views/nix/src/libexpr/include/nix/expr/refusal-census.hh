@@ -31,7 +31,7 @@ namespace nix {
  *
  * # Why process-wide rather than per-`EvalState`
  *
- * `nrCppEvals` and `nrRustEvals` are `EvalState` members and this deliberately
+ * `nrRustEvals` is `EvalState` members and this deliberately
  * is not. Four of the command layer's refusal sites throw before
  * `getEvalState()` is ever reached, so a per-`EvalState` counter cannot see
  * them at all. The invariant worth keeping from that mechanism is *one
@@ -81,8 +81,8 @@ struct RefusalCensus
      * here, because the vocabulary is defined in
      * `rust/nix-eval-rs/src/refusal.rs` and enumerable over that ABI, and a
      * second hand-written copy in libexpr would drift the moment either side
-     * gained a token. libexpr cannot include `ixe.h`; `src/nix` can, and
-     * does it once at load.
+     * gained a token. libexpr cannot include `ixe.h`; libcmd can (it links
+     * the archive), and does it once at load.
      */
     static void setVocabulary(std::vector<std::string> tokens);
 

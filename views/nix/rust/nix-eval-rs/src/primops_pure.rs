@@ -26,7 +26,7 @@
 use crate::builtins::{ArgType, Kind, TABLE};
 use crate::refusal::{Refusal, RefusalToken};
 use crate::task::{NeedPath, Task, Yield};
-use crate::value2::{Attrs, ContextElem, NixStr, Slot, Sym, Value, type_name};
+use crate::value2::{AttrMap, AttrOrigin, Attrs, ContextElem, NixStr, Slot, Sym, Value, type_name};
 use crate::vm::{Result, Vm, VmError, forced};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque, btree_map};
@@ -139,6 +139,7 @@ pub enum Cont {
         items: Rc<Vec<Slot>>,
         i: usize,
         out: BTreeMap<Sym, Slot>,
+        origins: Vec<(Sym, AttrOrigin)>,
         cur: Option<Rc<crate::value2::Attrs>>,
         name_sym: Sym,
         value_sym: Sym,
@@ -191,7 +192,7 @@ pub enum Cont {
     /// [`PathPhase`].
     Path {
         phase: PathPhase,
-        mk: fn(String) -> NeedPath,
+        mk: fn(Rc<crate::value2::PathValue>) -> NeedPath,
     },
     /// `toPath`'s coercion: the front half of [`Cont::Path`] -- coerce the
     /// argument to an absolute path -- and then stop, because the coerced
@@ -242,7 +243,7 @@ pub enum PathPhase {
     Coerce(PathStage),
     /// A [`NeedPath::Realise`] is out; this is the path the rewrites coming
     /// back get applied to.
-    Realising(String),
+    Realising(Rc<crate::value2::PathValue>),
     /// The question itself is out; the next value is its answer.
     Asked,
 }
@@ -267,11 +268,12 @@ pub enum ImportStage {
     /// A [`NeedPath::Realise`] is out. Held separately from
     /// [`PathPhase::Realising`] rather than reusing it, because `import` has
     /// two more states after the read that the plain family does not.
-    Realising(String),
+    Realising(Rc<crate::value2::PathValue>),
     /// The scheduler's answer, to be compiled.
     Answer,
-    /// The compiled module's forced entry value.
-    Value,
+    /// The compiled module's forced entry value and optional closed-result key.
+    Value(Option<crate::import_cache::ImportKey>),
+    Derivation(Slot),
 }
 
 pub type Finish = fn(&mut Vm, &[Value], &[Slot]) -> Result<Value>;
@@ -322,7 +324,7 @@ pub fn drive(
                     if !matches!(v, Value::Str(_)) {
                         let slot = arg(args, pos)?.clone();
                         *cont = Cont::CoerceArg { k: *k, pos };
-                        return Ok(Yield::Sub(Task::coerce_as_primop(slot, flags)));
+                        return Ok(Yield::sub(Task::coerce_as_primop(slot, flags)));
                     }
                 } else {
                     ty.check(vm, &argv(args, pos)?)?;
@@ -355,7 +357,7 @@ pub fn drive(
                     }
                     Begin::Sub(t) => {
                         *cont = Cont::Result;
-                        return Ok(Yield::Sub(t));
+                        return Ok(Yield::sub(t));
                     }
                     Begin::Cont(c) => {
                         *cont = c;
@@ -393,7 +395,7 @@ fn step_cont(
         } => {
             if !*started {
                 *started = true;
-                return Ok(Yield::Sub(Task::coerce_as_primop(slot.clone(), *flags)));
+                return Ok(Yield::sub(Task::coerce_as_primop(slot.clone(), *flags)));
             }
             let coerced =
                 incoming.ok_or_else(|| VmError::eval("internal: body coercion lost its result"))?;
@@ -409,7 +411,7 @@ fn step_cont(
                 *i += 1;
             }
             if *i >= items.len() {
-                return Ok(Yield::Done(Value::List(Rc::new(std::mem::take(out)))));
+                return Ok(Yield::Done(Value::list(std::mem::take(out))));
             }
             Ok(Yield::Apply(f.clone(), nth(items, *i)?))
         }
@@ -431,7 +433,7 @@ fn step_cont(
                 *i += 1;
             }
             if *i >= items.len() {
-                return Ok(Yield::Done(Value::List(Rc::new(std::mem::take(out)))));
+                return Ok(Yield::Done(Value::list(std::mem::take(out))));
             }
             Ok(Yield::Apply(f.clone(), nth(items, *i)?))
         }
@@ -496,7 +498,7 @@ fn step_cont(
             }
             loop {
                 if *next >= items.len() {
-                    return Ok(Yield::Done(Value::List(Rc::new(std::mem::take(sorted)))));
+                    return Ok(Yield::Done(Value::list(std::mem::take(sorted))));
                 }
                 if *probe >= sorted.len() {
                     let item = nth(items, *next)?;
@@ -522,7 +524,7 @@ fn step_cont(
             if *i >= items.len() {
                 let map: BTreeMap<Sym, Slot> = std::mem::take(out)
                     .into_iter()
-                    .map(|(k, v)| (k, Slot::value(Value::List(Rc::new(v)))))
+                    .map(|(k, v)| (k, Slot::value(Value::list(v))))
                     .collect();
                 return Ok(Yield::Done(Value::Attrs(Rc::new(Attrs::new(map)))));
             }
@@ -546,9 +548,9 @@ fn step_cont(
             if *i >= items.len() {
                 let mut map = BTreeMap::new();
                 let r = vm.intern("right");
-                map.insert(r, Slot::value(Value::List(Rc::new(std::mem::take(right)))));
+                map.insert(r, Slot::value(Value::list(std::mem::take(right))));
                 let w = vm.intern("wrong");
-                map.insert(w, Slot::value(Value::List(Rc::new(std::mem::take(wrong)))));
+                map.insert(w, Slot::value(Value::list(std::mem::take(wrong))));
                 return Ok(Yield::Done(Value::Attrs(Rc::new(Attrs::new(map)))));
             }
             Ok(Yield::Apply(f.clone(), nth(items, *i)?))
@@ -563,7 +565,7 @@ fn step_cont(
             if *i >= items.len() {
                 return Ok(Yield::Done(Value::Bool(false)));
             }
-            Ok(Yield::Sub(Task::deep_eq_slots(x.clone(), nth(items, *i)?)))
+            Ok(Yield::sub(Task::deep_eq_slots(x.clone(), nth(items, *i)?)))
         }
         Cont::ForceEach {
             items,
@@ -585,6 +587,7 @@ fn step_cont(
             items,
             i,
             out,
+            origins,
             cur,
             name_sym,
             value_sym,
@@ -608,6 +611,9 @@ fn step_cont(
                             .get(value_sym)
                             .cloned()
                             .ok_or_else(|| VmError::eval("attribute 'value' missing"))?;
+                        if let Some(origin) = &m.origin {
+                            origins.push((sym, origin.clone()));
+                        }
                         slot.insert(val);
                     }
                     *i += 1;
@@ -615,9 +621,18 @@ fn step_cont(
                 (None, _) => {}
             }
             if *i >= items.len() {
-                return Ok(Yield::Done(Value::Attrs(Rc::new(Attrs::new(
-                    std::mem::take(out),
-                )))));
+                let map = std::mem::take(out);
+                let attrs = if origins.is_empty() {
+                    Attrs::new(map)
+                } else {
+                    let origin = AttrOrigin::list_to_attrs(
+                        std::mem::take(origins).into_boxed_slice(),
+                        *value_sym,
+                    )
+                    .ok_or_else(|| VmError::eval("too many live listToAttrs origins"))?;
+                    Attrs::at(map, origin)
+                };
+                return Ok(Yield::Done(Value::Attrs(Rc::new(attrs))));
             }
             Ok(Yield::Force(nth(items, *i)?))
         }
@@ -740,7 +755,7 @@ fn step_cont(
                 }
             },
             PathPhase::Realising(path) => {
-                let p = apply_rewrites(core::mem::take(path), incoming)?;
+                let p = apply_rewrites(Rc::clone(path), incoming)?;
                 *phase = PathPhase::Asked;
                 Ok(Yield::Need(mk(p)))
             }
@@ -762,7 +777,7 @@ fn step_cont(
                 // `builtins.toPath "/a/./b//c/../d"` is `"/a/b/d"` -- string
                 // inputs are canonicalized, not just path values.
                 Coerced::Done(p) => Ok(Yield::Done(Value::Str(NixStr::with_context(
-                    crate::value2::normalize_path(&p).into_bytes(),
+                    crate::value2::normalize_path(p.as_ref()).into_bytes(),
                     context,
                 )))),
             }
@@ -782,18 +797,29 @@ fn step_cont(
                 };
             }
             if let ImportStage::Realising(path) = stage {
-                let p = apply_rewrites(core::mem::take(path), incoming)?;
+                let p = apply_rewrites(Rc::clone(path), incoming)?;
                 *stage = ImportStage::Answer;
                 return Ok(Yield::Need(NeedPath::Import(p)));
             }
-            if matches!(stage, ImportStage::Value) {
-                return incoming
-                    .map(Yield::Done)
-                    .ok_or_else(|| VmError::eval("internal: import value lost"));
+            if let ImportStage::Value(key) = stage {
+                let value = incoming.ok_or_else(|| VmError::eval("internal: import value lost"))?;
+                if let Some(key) = key.take() {
+                    vm.complete_import(&key, &value);
+                }
+                return Ok(Yield::Done(value));
             }
-            *stage = ImportStage::Value;
+            if let ImportStage::Derivation(argument) = stage {
+                let argument = argument.clone();
+                let wrapper = incoming.ok_or_else(|| VmError::eval("internal: import wrapper lost"))?;
+                *stage = ImportStage::Value(None);
+                return Ok(Yield::Apply(wrapper, argument));
+            }
             let answer = incoming.ok_or_else(|| VmError::eval("internal: import answer lost"))?;
             let m = want_attrs(&answer)?;
+            if let Some(argument) = m.get(&vm.intern("derivation")) {
+                *stage = ImportStage::Derivation(argument.clone());
+                return Ok(Yield::Force(crate::imported_drv::wrapper(vm)?));
+            }
             let key = |vm: &mut Vm, name: &str| -> Result<String> {
                 let sym = vm.intern(name);
                 let slot = m
@@ -804,7 +830,10 @@ fn step_cont(
                 want_text(&forced(slot)?)
             };
             let path = key(vm, "path")?;
+            let root =
+                crate::value2::Root::from_wire_name(&key(vm, "root")?).map_err(VmError::eval)?;
             let text = key(vm, "text")?;
+            let path = crate::value2::PathValue::new(root, path);
             // The imported file's own directory is what its relative paths
             // resolve against, and it is the RESOLVED path's parent: a
             // directory import reads default.nix, so using the argument here
@@ -814,7 +843,12 @@ fn step_cont(
                 Some(i) => path.get(..i).unwrap_or("/").to_owned(),
                 None => ".".to_owned(),
             };
-            let module = vm.import_module(&path, &text, &base)?;
+            let (module, key) = match vm.import_entry(&path, &text, &base)? {
+                crate::vm::ImportEntry::Cached(value) => return Ok(Yield::Done(value)),
+                crate::vm::ImportEntry::Evaluate { module, key } => (module, key),
+            };
+            *stage = ImportStage::Value(key);
+            crate::perf::note_import_entry_force();
             let entry = module.entry;
             Ok(Yield::Force(Slot::thunk(
                 module,
@@ -1013,7 +1047,7 @@ pub fn bi_tail(_vm: &mut Vm, args: &[Slot]) -> Result<Value> {
     if l.is_empty() {
         return Err(VmError::eval("'tail' called on an empty list"));
     }
-    Ok(Value::List(Rc::new(l.iter().skip(1).cloned().collect())))
+    Ok(Value::list(l.iter().skip(1).cloned().collect()))
 }
 
 pub fn bi_elem_at(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
@@ -1045,7 +1079,7 @@ pub fn bi_map(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
         .iter()
         .map(|s| Slot::pending(f.clone(), vec![s.clone()]))
         .collect();
-    Ok(Begin::Done(Value::List(Rc::new(out))))
+    Ok(Begin::Done(Value::list(out)))
 }
 
 pub fn bi_filter(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
@@ -1093,7 +1127,7 @@ fn finish_concat_lists(_vm: &mut Vm, vals: &[Value], _args: &[Slot]) -> Result<V
     for v in vals {
         out.extend(want_list(v)?.iter().cloned());
     }
-    Ok(Value::List(Rc::new(out)))
+    Ok(Value::list(out))
 }
 
 pub fn bi_concat_map(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
@@ -1115,7 +1149,7 @@ pub fn bi_gen_list(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
     let out: Vec<Slot> = (0..n)
         .map(|i| Slot::pending(f.clone(), vec![Slot::value(Value::Int(i as i64))]))
         .collect();
-    Ok(Begin::Done(Value::List(Rc::new(out))))
+    Ok(Begin::Done(Value::list(out)))
 }
 
 /// cppnix's foldl' is strict in the accumulator it PRODUCES, not in the one
@@ -1363,9 +1397,7 @@ impl Generic {
                 self.stage = Stage::Elem;
                 Ok(Yield::Force(s))
             }
-            None => Ok(Yield::Done(Value::List(Rc::new(std::mem::take(
-                &mut self.res,
-            ))))),
+            None => Ok(Yield::Done(Value::list(std::mem::take(&mut self.res)))),
         }
     }
 
@@ -1409,12 +1441,12 @@ pub fn bi_attr_names(vm: &mut Vm, args: &[Slot]) -> Result<Value> {
     let m = want_attrs(&argv(args, 0)?)?;
     let mut names: Vec<String> = m.keys().map(|k| vm.sym_name(*k).to_owned()).collect();
     names.sort();
-    Ok(Value::List(Rc::new(
+    Ok(Value::list(
         names
             .into_iter()
             .map(|n| Slot::value(Value::Str(n.into())))
             .collect(),
-    )))
+    ))
 }
 
 pub fn bi_attr_values(vm: &mut Vm, args: &[Slot]) -> Result<Value> {
@@ -1424,9 +1456,7 @@ pub fn bi_attr_values(vm: &mut Vm, args: &[Slot]) -> Result<Value> {
         .map(|(k, s)| (vm.sym_name(*k).to_owned(), s.clone()))
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(Value::List(Rc::new(
-        entries.into_iter().map(|(_, s)| s).collect(),
-    )))
+    Ok(Value::list(entries.into_iter().map(|(_, s)| s).collect()))
 }
 
 pub fn bi_get_attr(vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
@@ -1459,12 +1489,21 @@ pub fn bi_remove_attrs(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
 
 fn finish_remove_attrs(vm: &mut Vm, vals: &[Value], args: &[Slot]) -> Result<Value> {
     let m = want_attrs(&argv(args, 0)?)?;
-    let mut out = (*m).clone();
+    let mut gone: Vec<Sym> = Vec::with_capacity(vals.len());
     for v in vals {
         let name = want_text_no_ctx(v)?;
-        let sym = vm.intern(&name);
-        out.remove(&sym);
+        gone.push(vm.intern(&name));
     }
+    gone.sort_unstable();
+    gone.dedup();
+    // `retain` visits names in ascending order and `gone` is sorted, so one
+    // cursor over the removal list walks both in a single pass.
+    let mut gone = gone.iter().peekable();
+    let mut out = (*m).clone();
+    out.retain(|k, _| {
+        while gone.next_if(|g| *g < k).is_some() {}
+        gone.next_if_eq(&k).is_none()
+    });
     // The origin travels with the clone, and that is right rather than
     // merely convenient: every attribute still in `out` came from the set
     // this was derived from, so the position it reports is that attribute's
@@ -1524,7 +1563,7 @@ fn finish_cat_attrs(vm: &mut Vm, vals: &[Value], args: &[Slot]) -> Result<Value>
             out.push(s.clone());
         }
     }
-    Ok(Value::List(Rc::new(out)))
+    Ok(Value::list(out))
 }
 
 pub fn bi_list_to_attrs(vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
@@ -1535,6 +1574,7 @@ pub fn bi_list_to_attrs(vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
         items,
         i: 0,
         out: BTreeMap::new(),
+        origins: Vec::new(),
         cur: None,
         name_sym,
         value_sym,
@@ -1548,12 +1588,15 @@ pub fn bi_map_attrs(vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
     // table just dropped (ENG-13124).
     let f = arg(args, 0)?.clone();
     let m = want_attrs(&argv(args, 1)?)?;
-    let mut out = BTreeMap::new();
+    // `m` iterates in `Sym` order, so the result is born sorted.
+    let mut out = Vec::with_capacity(m.len());
     for (k, s) in m.iter() {
         let name = Slot::value(Value::Str(vm.sym_name(*k).into()));
-        out.insert(*k, Slot::pending(f.clone(), vec![name, s.clone()]));
+        out.push((*k, Slot::pending(f.clone(), vec![name, s.clone()])));
     }
-    Ok(Begin::Done(Value::Attrs(Rc::new(Attrs::new(out)))))
+    Ok(Begin::Done(Value::Attrs(Rc::new(Attrs::new(
+        AttrMap::from_sorted(out),
+    )))))
 }
 
 pub fn bi_group_by(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
@@ -1610,21 +1653,22 @@ fn zip_finish(vm: &mut Vm, vals: &[Value], args: &[Slot]) -> Result<Value> {
             seen.entry(*k).or_default().push(s.clone());
         }
     }
-    let mut out: BTreeMap<Sym, Slot> = BTreeMap::new();
+    // `seen` iterates in `Sym` order, so the result is born sorted.
+    let mut out: Vec<(Sym, Slot)> = Vec::with_capacity(seen.len());
     for (sym, items) in seen {
         let name: Rc<str> = vm.sym_name(sym).into();
-        out.insert(
+        out.push((
             sym,
             Slot::pending(
                 f.clone(),
                 vec![
                     Slot::value(Value::Str(name.into())),
-                    Slot::value(Value::List(Rc::new(items))),
+                    Slot::value(Value::list(items)),
                 ],
             ),
-        );
+        ));
     }
-    Ok(Value::Attrs(Rc::new(Attrs::new(out))))
+    Ok(Value::Attrs(Rc::new(Attrs::new(AttrMap::from_sorted(out)))))
 }
 
 // -- unsafeGetAttrPos -------------------------------------------------------
@@ -1639,10 +1683,10 @@ fn zip_finish(vm: &mut Vm, vals: &[Value], args: &[Slot]) -> Result<Value> {
 ///
 /// The set has to know where it came from, which is [`AttrOrigin`]: a set
 /// written as a literal does, and a set built by a builtin does not. What
-/// each case answers is spelled out on `AttrOrigin` itself; the short version
-/// is that a derived set either carries the origin of the operand its values
-/// came from or carries none, so this never reports a position belonging to a
-/// different attribute.
+/// each case answers is spelled out on `AttrOrigin` itself. Sets assembled
+/// from several origins carry a flat per-name projection, and a name with no
+/// selected position stays absent from that projection. This never reports a
+/// position belonging to a different attribute.
 ///
 /// The forcing is cppnix's and is where the type errors come from: the name
 /// goes through `forceStringNoCtx` and the set through `forceAttrs`, so
@@ -1661,17 +1705,17 @@ pub fn bi_unsafe_get_attr_pos(vm: &mut Vm, args: &[Slot]) -> Result<Value> {
     let Some(origin) = &attrs.origin else {
         return Ok(Value::Null);
     };
-    let Some(offset) = origin.offset_of(&name) else {
+    let Some(position) = vm.attr_origin_position(origin, &name, sym) else {
         return Ok(Value::Null);
     };
-    let Some((line, column)) = origin.module.line_col(offset) else {
+    let Some((line, column)) = position.module.line_col(position.offset) else {
         return Ok(Value::Null);
     };
     // `null` for text with no file behind it, which is not a shortcut: cppnix
     // builds the record only for a `SourcePath` origin (`eval.cc`'s `mkPos`),
     // so `nix-instantiate --eval -E 'builtins.unsafeGetAttrPos "a" { a = 1; }'`
     // answers `null` on both arms. Verified against the system nix, 2026-08-06.
-    let crate::ir::SrcOrigin::File(file) = &origin.module.origin else {
+    let crate::ir::SrcOrigin::File(file) = &position.module.origin else {
         return Ok(Value::Null);
     };
     // cppnix's `file` is a string and not a path, which is visible: it prints
@@ -1825,12 +1869,12 @@ fn distinct_uses(plan: &[Piece]) -> Vec<usize> {
 
 pub fn bi_split_version(_vm: &mut Vm, args: &[Slot]) -> Result<Value> {
     let s = want_bytes_no_ctx(&argv(args, 0)?)?;
-    Ok(Value::List(Rc::new(
+    Ok(Value::list(
         version_parts(&s)
             .into_iter()
             .map(|p| Slot::value(Value::Str(p.into())))
             .collect(),
-    )))
+    ))
 }
 
 // -- hashString -------------------------------------------------------------
@@ -1849,9 +1893,9 @@ fn hex_of(bytes: &[u8]) -> String {
     out
 }
 
-/// The four algorithms cppnix's `parseHashAlgo` accepts, rendered base-16
+/// The five algorithms cppnix's `parseHashAlgo` accepts, rendered base-16
 /// without the `sha256:` prefix (`to_string(HashFormat::Base16, false)`).
-pub fn bi_hash_string(_vm: &mut Vm, args: &[Slot]) -> Result<Value> {
+pub fn bi_hash_string(vm: &mut Vm, args: &[Slot]) -> Result<Value> {
     // Both arguments are forceStringNoCtx in cppnix: a hash of a string that
     // referred to a store path would be a dependency the integer result
     // cannot record, so the refusal is the correct answer, not a limitation.
@@ -1859,7 +1903,7 @@ pub fn bi_hash_string(_vm: &mut Vm, args: &[Slot]) -> Result<Value> {
     // The subject is BYTES: cppnix hashes `s->data()` whatever it holds, so
     // `hashString "sha256" (substring 0 1 "ä")` digests the lone 0xC3.
     let s = want_bytes_no_ctx(&argv(args, 1)?)?;
-    let hex = hash_hex(parse_algo_name(&algo)?, &s);
+    let hex = hash_hex(parse_algo_name(&algo, vm.settings().blake3_hashes)?, &s);
     Ok(Value::Str(hex.as_str().into()))
 }
 
@@ -1868,8 +1912,9 @@ pub fn bi_hash_string(_vm: &mut Vm, args: &[Slot]) -> Result<Value> {
 /// "expect ..." wording, and the experimentally-gated `blake3` is a refusal
 /// because cppnix with the feature on answers fine (the same split
 /// `drvstrict::hash_parse_error` makes).
-pub(crate) fn parse_algo_name(algo: &str) -> Result<crate::nixhash::HashAlgo> {
-    match crate::nixhash::parse_algo(algo) {
+pub(crate) fn parse_algo_name(algo: &str, blake3_hashes: bool) -> Result<crate::nixhash::HashAlgo> {
+    match crate::nixhash::parse_algo(algo).and_then(|parsed| parsed.require_enabled(blake3_hashes))
+    {
         Ok(a) => Ok(a),
         Err(e @ crate::nixhash::HashError::Unsupported(_)) => {
             Err(VmError::Unimplemented(crate::refusal::Refusal::new(
@@ -1887,6 +1932,11 @@ pub(crate) fn hash_hex(algo: crate::nixhash::HashAlgo, bytes: &[u8]) -> String {
     use crate::nixhash::HashAlgo;
     use sha2::Digest;
     match algo {
+        // cppnix switches to a TBB update at 128,000 bytes. This stays on
+        // Blake3's single-threaded convenience call: the digest is identical,
+        // and a threading dependency is not justified for a performance-only
+        // difference at this evaluator boundary.
+        HashAlgo::Blake3 => hex_of(blake3::hash(bytes).as_bytes()),
         HashAlgo::Md5 => hex_of(&md5::Md5::digest(bytes)),
         HashAlgo::Sha1 => hex_of(&sha1::Sha1::digest(bytes)),
         HashAlgo::Sha256 => hex_of(&sha2::Sha256::digest(bytes)),
@@ -1920,12 +1970,17 @@ pub(crate) fn hash_hex(algo: crate::nixhash::HashAlgo, bytes: &[u8]) -> String {
 /// pattern bytes are rewritten to `\xHH` by [`posix_brackets`] so the
 /// translated pattern is pure ASCII and means the same byte sequence in both
 /// dialects, inside and outside bracket expressions.
-fn compile_re(re: &[u8]) -> Result<regex::bytes::Regex> {
-    let lossy = || String::from_utf8_lossy(re).into_owned();
-    regex::bytes::RegexBuilder::new(&format!("(?s){}", posix_brackets(re)))
-        .unicode(false)
-        .build()
-        .map_err(|_| VmError::eval(format!("invalid regular expression '{}'", lossy())))
+///
+/// Served from the VM's regex table ([`Vm::regex`]) so a pattern is compiled
+/// once per evaluation however many subjects it is matched against.
+fn compile_re(vm: &mut Vm, re: &[u8]) -> Result<regex::bytes::Regex> {
+    vm.regex(re, |re| {
+        let lossy = || String::from_utf8_lossy(re).into_owned();
+        regex::bytes::RegexBuilder::new(&format!("(?s){}", posix_brackets(re)))
+            .unicode(false)
+            .build()
+            .map_err(|_| VmError::eval(format!("invalid regular expression '{}'", lossy())))
+    })
 }
 
 /// Rewrite POSIX bracket expressions into this crate's class syntax.
@@ -2063,12 +2118,12 @@ fn group_list(caps: &regex::bytes::Captures<'_>) -> Value {
             })
         })
         .collect();
-    Value::List(Rc::new(items))
+    Value::list(items)
 }
 
 /// `std::regex_match`: the pattern must cover the whole subject, so the
 /// pattern is anchored rather than searched for.
-pub fn bi_match(_vm: &mut Vm, args: &[Slot]) -> Result<Value> {
+pub fn bi_match(vm: &mut Vm, args: &[Slot]) -> Result<Value> {
     // The pattern is forceStringNoCtx; the subject is not, and the captures
     // cppnix returns carry no context either.
     let re = want_bytes_no_ctx(&argv(args, 0)?)?;
@@ -2079,7 +2134,7 @@ pub fn bi_match(_vm: &mut Vm, args: &[Slot]) -> Result<Value> {
     anchored.extend_from_slice(br")\z");
     // Re-mapped so the message quotes the pattern as written, not the
     // anchored wrapper around it.
-    let compiled = compile_re(&anchored).map_err(|_| {
+    let compiled = compile_re(vm, &anchored).map_err(|_| {
         VmError::eval(format!(
             "invalid regular expression '{}'",
             String::from_utf8_lossy(&re)
@@ -2094,10 +2149,10 @@ pub fn bi_match(_vm: &mut Vm, args: &[Slot]) -> Result<Value> {
 /// Non-matching runs interleaved with one group list per match, starting and
 /// ending with a (possibly empty) run: `2 * matches + 1` elements. A pattern
 /// that matches nothing hands the subject back as a one-element list.
-pub fn bi_split(_vm: &mut Vm, args: &[Slot]) -> Result<Value> {
+pub fn bi_split(vm: &mut Vm, args: &[Slot]) -> Result<Value> {
     let re = want_bytes_no_ctx(&argv(args, 0)?)?;
     let s = want_bytes(&argv(args, 1)?)?;
-    let rx = compile_re(&re)?;
+    let rx = compile_re(vm, &re)?;
     let mut out: Vec<Slot> = Vec::new();
     let mut last = 0usize;
     for caps in rx.captures_iter(&s) {
@@ -2110,15 +2165,15 @@ pub fn bi_split(_vm: &mut Vm, args: &[Slot]) -> Result<Value> {
         last = whole.end();
     }
     if out.is_empty() {
-        return Ok(Value::List(Rc::new(vec![Slot::value(Value::Str(
-            NixStr::from(Rc::clone(&s)),
-        ))])));
+        return Ok(Value::list(vec![Slot::value(Value::Str(NixStr::from(
+            Rc::clone(&s),
+        )))]));
     }
     let suffix = s
         .get(last..)
         .ok_or_else(|| VmError::eval("internal: split lost its place"))?;
     out.push(Slot::value(Value::Str(suffix.into())));
-    Ok(Value::List(Rc::new(out)))
+    Ok(Value::list(out))
 }
 
 // -- placeholder ------------------------------------------------------------
@@ -2197,12 +2252,12 @@ pub fn bi_get_context(vm: &mut Vm, args: &[Slot]) -> Result<Value> {
             let k = vm.intern("outputs");
             entry.insert(
                 k,
-                Slot::value(Value::List(std::rc::Rc::new(
+                Slot::value(Value::list(
                     names
                         .into_iter()
                         .map(|n| Slot::value(Value::Str(n.into())))
                         .collect(),
-                ))),
+                )),
             );
         }
         let k = vm.intern(&path);
@@ -2249,7 +2304,7 @@ pub(crate) fn json_to_value(vm: &mut Vm, j: &serde_json::Value) -> Result<Value>
             for it in items {
                 out.push(Slot::value(json_to_value(vm, it)?));
             }
-            Value::List(Rc::new(out))
+            Value::list(out)
         }
         serde_json::Value::Object(map) => {
             let mut out = BTreeMap::new();
@@ -2308,7 +2363,7 @@ fn toml_to_value(vm: &mut Vm, t: &toml::Value) -> Result<Value> {
             for it in items {
                 out.push(Slot::value(toml_to_value(vm, it)?));
             }
-            Value::List(Rc::new(out))
+            Value::list(out)
         }
         toml::Value::Table(map) => {
             let mut out = BTreeMap::new();
@@ -2505,7 +2560,7 @@ pub fn bi_add_error_context(_vm: &mut Vm, args: &[Slot]) -> Result<Begin> {
 /// One step of cppnix's `EvalState::coerceToPath`.
 pub(crate) enum Coerced {
     /// The argument is an absolute path, and this is it.
-    Done(String),
+    Done(Rc<crate::value2::PathValue>),
     /// The machine has to run this first; the value it produces arrives at
     /// [`PathStage::Coerced`].
     Run(Yield),
@@ -2554,11 +2609,11 @@ pub(crate) fn coerce_to_path(v: &Value, stage: &mut PathStage) -> Result<Coerced
     // cppnix returns a path value directly (case 1), before any coercion, so
     // this arm holds whatever the stage is.
     if let Value::Path(p) = v {
-        return Ok(Coerced::Done(p.to_string()));
+        return Ok(Coerced::Done(Rc::clone(p)));
     }
     if let (Value::Attrs(_), PathStage::Value) = (v, *stage) {
         *stage = PathStage::Coerced;
-        return Ok(Coerced::Run(Yield::Sub(Task::coerce_to_path(Slot::value(
+        return Ok(Coerced::Run(Yield::sub(Task::coerce_to_path(Slot::value(
             v.clone(),
         )))));
     }
@@ -2578,7 +2633,14 @@ pub(crate) fn coerce_to_path(v: &Value, stage: &mut PathStage) -> Result<Coerced
             "string '{s}' doesn't represent an absolute path"
         )));
     }
-    Ok(Coerced::Done(s))
+    // `CanonPath(path)` in cppnix's `coerceToPath`: the text is normalised
+    // lexically, so `"/x/Cargo.toml/../."` is the path `/x`. Handing the
+    // spelling on unnormalised would make an embedder's accessor refuse it
+    // as non-canonical where cppnix reads it (the one home-configuration
+    // divergence of 2026-09-01).
+    Ok(Coerced::Done(Rc::new(
+        crate::value2::PathValue::normalized(crate::value2::Root::Ambient, &s),
+    )))
 }
 
 /// What coercing a path-family argument produced: cppnix's `coerceToPath`
@@ -2590,10 +2652,13 @@ pub(crate) enum PathReady {
     /// An absolute path, and a context cppnix realises before using it. The
     /// elements are in `BTreeSet` order, which is what
     /// [`NeedPath::Realise`] promises.
-    Realise(String, Vec<crate::value2::ContextElem>),
+    Realise(
+        Rc<crate::value2::PathValue>,
+        Vec<crate::value2::ContextElem>,
+    ),
     /// An absolute path with nothing to realise, which is every path read in
     /// an evaluation that never touched a store.
-    Ready(String),
+    Ready(Rc<crate::value2::PathValue>),
 }
 
 /// [`coerce_to_path`] plus cppnix's "is there a context to realise" test, for
@@ -2609,6 +2674,29 @@ pub(crate) fn coerce_for_read(
     stage: &mut PathStage,
     incoming: Option<Value>,
 ) -> Result<PathReady> {
+    let (coerced, context) = coerce_path_with_context(args, at, stage, incoming)?;
+    Ok(match coerced {
+        Coerced::Run(y) => PathReady::Run(y),
+        Coerced::Done(p) if context.is_empty() => PathReady::Ready(p),
+        Coerced::Done(p) => PathReady::Realise(p, context.into_iter().collect()),
+    })
+}
+
+/// Coerce one path-family argument while retaining the context accumulated by
+/// the value that supplied its spelling.
+///
+/// Most path consumers pass the result to [`coerce_for_read`], which realises
+/// the context before reading. `builtins.storePath` is the deliberate
+/// exception: cppnix validates the store object without realising the input
+/// context, then copies that context onto its result. Keeping coercion and
+/// context capture here makes those two policies share the mechanism without
+/// making either policy a special case inside the other.
+pub(crate) fn coerce_path_with_context(
+    args: &[Slot],
+    at: usize,
+    stage: &mut PathStage,
+    incoming: Option<Value>,
+) -> Result<(Coerced, BTreeSet<ContextElem>)> {
     let v = path_arg(args, at, *stage, incoming)?;
     // Read before the coercion runs, and off whatever value this stage is
     // looking at. A string carries its own context; a set arrives here a
@@ -2616,11 +2704,7 @@ pub(crate) fn coerce_for_read(
     // carries the accumulated one; a path value carries none, which is right,
     // because a path literal depends on nothing.
     let context = crate::value2::context_of(&v);
-    Ok(match coerce_to_path(&v, stage)? {
-        Coerced::Run(y) => PathReady::Run(y),
-        Coerced::Done(p) if context.is_empty() => PathReady::Ready(p),
-        Coerced::Done(p) => PathReady::Realise(p, context.into_iter().collect()),
-    })
+    Ok((coerce_to_path(&v, stage)?, context))
 }
 
 /// cppnix's `rewriteStrings(path, rewrites)` over the answer to a
@@ -2631,7 +2715,18 @@ pub(crate) fn coerce_for_read(
 /// identity. It is not skipped on that account: under `ca-derivations` the
 /// path is a downstream placeholder and reading it unrewritten is reading a
 /// path that never exists.
-pub(crate) fn apply_rewrites(path: String, answer: Option<Value>) -> Result<String> {
+pub(crate) fn apply_rewrites(
+    path: Rc<crate::value2::PathValue>,
+    answer: Option<Value>,
+) -> Result<Rc<crate::value2::PathValue>> {
+    let out = rewrite_spelling(path.to_string(), answer)?;
+    Ok(Rc::new(path.with_path(out)))
+}
+
+/// The string half of [`apply_rewrites`]: cppnix's `rewriteStrings` over one
+/// spelling. `findFile` entries are spellings and not path values, which is
+/// why this is a function of its own rather than a body inside the other.
+pub(crate) fn rewrite_spelling(mut out: String, answer: Option<Value>) -> Result<String> {
     let list =
         want_list(&answer.ok_or_else(|| VmError::eval("internal: realised context answer lost"))?)?;
     if list.len() % 2 != 0 {
@@ -2639,7 +2734,6 @@ pub(crate) fn apply_rewrites(path: String, answer: Option<Value>) -> Result<Stri
             "internal: realised context has a half rewrite",
         ));
     }
-    let mut out = path;
     for pair in list.chunks_exact(2) {
         let (Some(from), Some(to)) = (pair.first(), pair.get(1)) else {
             return Err(VmError::eval(
@@ -2674,7 +2768,7 @@ pub(crate) fn coerce_in_body(
     }))
 }
 
-pub(crate) fn ask(mk: fn(String) -> NeedPath) -> Result<Begin> {
+pub(crate) fn ask(mk: fn(Rc<crate::value2::PathValue>) -> NeedPath) -> Result<Begin> {
     Ok(Begin::Cont(Cont::Path {
         phase: PathPhase::Coerce(PathStage::Value),
         mk,
@@ -2723,14 +2817,10 @@ pub fn bi_function_args(vm: &mut Vm, args: &[Slot]) -> Result<Value> {
             // `AttrOrigin::FORMALS` stands for.
             Ok(Value::Attrs(Rc::new(crate::value2::Attrs::at(
                 out,
-                crate::value2::AttrOrigin {
-                    module: Rc::clone(&c.module),
-                    unit: c.unit,
-                    ip: crate::value2::AttrOrigin::FORMALS,
-                },
+                vm.static_attr_origin(&c.module, c.unit, crate::value2::AttrOrigin::FORMALS),
             ))))
         }
-        Value::Builtin(_) => Ok(Value::Attrs(Rc::new(Attrs::new(BTreeMap::new())))),
+        Value::Builtin(_) => Ok(Value::Attrs(Rc::new(Attrs::default()))),
         other => Err(VmError::eval(format!(
             "'functionArgs' requires a function, got {}",
             type_name(other)
@@ -2890,27 +2980,13 @@ pub fn bi_compare_versions(_vm: &mut Vm, args: &[Slot]) -> Result<Value> {
 ///   * `isalpha` in the C locale is ASCII-only, so a dash before any byte
 ///     above 0x7f separates. Bytes, not `char`s, for that reason.
 ///
-/// Splitting on byte indices cannot land inside a UTF-8 sequence: the cut is
-/// at an ASCII `-`, so both halves start and end on a boundary.
-fn split_drv_name(s: &[u8]) -> (&[u8], &[u8]) {
-    for i in 0..s.len() {
-        if s.get(i) == Some(&b'-')
-            && let Some(next) = s.get(i + 1)
-            && !next.is_ascii_alphabetic()
-        {
-            return (s.get(..i).unwrap_or(b""), s.get(i + 1..).unwrap_or(b""));
-        }
-    }
-    (s, b"")
-}
-
 /// The two attributes go in a `BTreeMap<Sym, _>`, whose keys are interner
 /// indices rather than names, so this map's own order is the order the two
 /// names happened to be interned in. Nothing observes it: `print`, `attrNames`
 /// and `attrValues` all sort by the name string, which is cppnix's order.
 pub fn bi_parse_drv_name(vm: &mut Vm, args: &[Slot]) -> Result<Value> {
     let s = want_bytes_no_ctx(&argv(args, 0)?)?;
-    let (name, version) = split_drv_name(&s);
+    let crate::drv_name::DrvName { name, version } = crate::drv_name::split(&s);
     let mut out: BTreeMap<Sym, Slot> = BTreeMap::new();
     let name_key = vm.intern("name");
     out.insert(name_key, Slot::value(Value::Str(name.into())));
@@ -3016,7 +3092,7 @@ pub(crate) fn json_value_with_store_paths(vm: &mut Vm, j: &serde_json::Value) ->
             for item in items {
                 out.push(Slot::value(json_value_with_store_paths(vm, item)?));
             }
-            Ok(Value::List(std::rc::Rc::new(out)))
+            Ok(Value::list(out))
         }
         serde_json::Value::Object(map) => {
             if let Some(escaped) = map.get(STORE_PATH_ESCAPE) {
@@ -3049,7 +3125,34 @@ pub(crate) fn json_value_with_store_paths(vm: &mut Vm, j: &serde_json::Value) ->
 
 #[cfg(test)]
 mod tests {
-    use super::posix_brackets;
+    use super::{Coerced, PathStage, coerce_to_path, posix_brackets};
+
+    /// cppnix's `coerceToPath` goes through `CanonPath`, so the text is
+    /// normalised: an embedder's accessor refuses a non-canonical spelling
+    /// where cppnix reads the path it means.
+    #[test]
+    fn a_string_coerced_to_a_path_is_normalised_like_canon_path() {
+        let mut stage = PathStage::Value;
+        let value = crate::value2::Value::Str("/x/crates/Cargo.toml/../.".into());
+        let result = coerce_to_path(&value, &mut stage);
+        assert!(matches!(
+            result,
+            Ok(Coerced::Done(path))
+                if path.root == crate::value2::Root::Ambient && path.as_ref().as_ref() == "/x/crates"
+        ));
+    }
+
+    #[test]
+    fn a_string_coerced_to_a_path_uses_the_ambient_root() {
+        let mut stage = PathStage::Value;
+        let value = crate::value2::Value::Str("/tmp/a".into());
+        let result = coerce_to_path(&value, &mut stage);
+        assert!(matches!(
+            result,
+            Ok(Coerced::Done(path))
+                if path.root == crate::value2::Root::Ambient && path.as_ref().as_ref() == "/tmp/a"
+        ));
+    }
 
     fn matched(src: &str) -> String {
         crate::eval::render_str_with(&crate::eval::Settings::default(), src)
@@ -3148,11 +3251,8 @@ mod tests {
         }
 
         let mut vm = crate::vm::Vm::with_settings(crate::eval::Settings::default());
-        let origin = AttrOrigin {
-            module: Rc::new(crate::ir::Module::default()),
-            unit: 0,
-            ip: 0,
-        };
+        let module = Rc::new(crate::ir::Module::default());
+        let origin = vm.static_attr_origin(&module, 0, 0);
 
         // (a, b): overlapping, disjoint, both directions of empty, and both
         // directions of superset.

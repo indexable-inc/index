@@ -111,11 +111,10 @@ struct GitRepo
            in the repo yet. */
         std::optional<Hash> headRev;
 
-        /* All files in the working directory that are unchanged,
-           modified or added, but excluding deleted files. */
-        std::set<CanonPath> files;
-
-        /* All modified or added files. */
+        /* All modified or added tracked files. Untracked files are not
+           listed: they belong to no commit, so they are neither a change
+           to the checked-out tree nor visible in what the fetcher
+           serves. */
         std::set<CanonPath> dirtyFiles;
 
         /* The deleted files. */
@@ -157,11 +156,14 @@ struct GitRepo
 
     virtual bool hasObject(const Hash & oid) = 0;
 
+    /**
+     * Serve the tree of the object `rev` (a commit or a tree) out of the
+     * object store. This is the only accessor over a Git repository: a
+     * working directory is not served, because it has no identity to
+     * address the result by (`git.cc`, `pinCheckedOutCommit`).
+     */
     virtual ref<SourceAccessor>
     getAccessor(const Hash & rev, const GitAccessorOptions & options, std::string displayPrefix) = 0;
-
-    virtual ref<SourceAccessor> getAccessor(
-        const WorkdirInfo & wd, const GitAccessorOptions & options, MakeNotAllowedError makeNotAllowedError) = 0;
 
     virtual ref<GitFileSystemObjectSink> getFileSystemObjectSink() = 0;
 

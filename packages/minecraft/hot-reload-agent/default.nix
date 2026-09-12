@@ -10,12 +10,10 @@ in
     version = "0.1.0";
     src = fs.toSource {
       root = ./.;
-      fileset = fs.intersection (fs.gitTracked ./.) (
-        fs.unions [
-          ./MANIFEST.MF
-          ./src
-        ]
-      );
+      fileset = fs.unions [
+        ./MANIFEST.MF
+        ./src
+      ];
     };
 
     strictDeps = true;

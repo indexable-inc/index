@@ -39,3 +39,17 @@ option(
   type : 'feature',
   description : 'build support for AWS authentication with S3',
 )
+
+option(
+  'rust-host-prefix',
+  type : 'string',
+  value : '',
+  description : 'exact prefix of the evaluator-independent nix-host-rs runtime',
+)
+
+option(
+  'rust-host-cargo-features',
+  type : 'string',
+  value : '',
+  description : 'Cargo feature flags for the standalone host runtime build',
+)

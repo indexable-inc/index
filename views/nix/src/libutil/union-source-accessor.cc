@@ -63,7 +63,13 @@ struct UnionSourceAccessor : SourceAccessor
         for (auto & accessor : accessors)
             if (accessor->maybeLstat(path))
                 return accessor->identityClass(path);
-        return "";
+        /* Nothing has the path, and "absent" is still an answer the trace
+           records; the read belongs to the union as a whole, which has no name
+           of its own. The first member stands for it: membership order is fixed
+           at construction, so the name is the same in every run. Returning ""
+           here left the pure-eval `HOME=""` probes of `/.config/nixpkgs/*`
+           anonymous and the compare refusing every trace of a flake. */
+        return accessors.empty() ? "" : accessors.front()->identityClass(path);
     }
 
     std::string readLink(const CanonPath & path) override
@@ -103,6 +109,33 @@ struct UnionSourceAccessor : SourceAccessor
                 return {subpath, fingerprint};
         }
         return {path, std::nullopt};
+    }
+
+    /* A subtree accessor is one object with one id. The union's view of a
+       directory that two layers have is not one: `readDirectory` merges
+       their entries, so no layer's object is what reads of `path` see, and
+       such a path names no subtree. When exactly one layer has the path its
+       answer stands, `nullptr` included (a layer that has the path but
+       cannot name subtrees hides nothing, there is nothing beneath it to
+       hide). The rule is what keeps the answer a function of the trees and
+       not of the store's state: the impure evaluator's root filesystem is
+       this union of the real filesystem over the store mounts, and a lazily
+       mounted store path that later got materialized is in both layers. A
+       first-hit answer there would name the subtree object until the copy
+       and a plain directory after it. */
+    std::shared_ptr<SourceAccessor> getSubtree(const CanonPath & path) override
+    {
+        SourceAccessor * only = nullptr;
+        for (auto & accessor : accessors) {
+            if (!accessor->maybeLstat(path))
+                continue;
+            if (only)
+                return nullptr;
+            only = &*accessor;
+        }
+        if (!only)
+            throw FileNotFound("path '%s' does not exist", showPath(path));
+        return only->getSubtree(path);
     }
 
     void invalidateCache(const CanonPath & path) override

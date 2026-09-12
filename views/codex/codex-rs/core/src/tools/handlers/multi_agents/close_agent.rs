@@ -1,6 +1,6 @@
 use super::*;
 use crate::tools::handlers::multi_agents_spec::create_close_agent_tool_v1;
-use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_tools::ToolSpec;
 
 pub(crate) struct Handler;
@@ -21,7 +21,10 @@ impl ToolExecutor<ToolInvocation> for Handler {
         )
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move { handle_close_agent(invocation).await.map(boxed_tool_output) })
     }
 }
@@ -66,7 +69,9 @@ async fn handle_close_agent(
         .await
     {
         Ok(mut status_rx) => status_rx.borrow_and_update().clone(),
-        Err(CodexErr::ThreadNotFound(_)) if known_agent => {
+        Err(err)
+            if known_agent && matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)) =>
+        {
             session.services.agent_control.get_status(agent_id).await
         }
         Err(err) => {
@@ -139,7 +144,7 @@ pub(crate) struct CloseAgentResult {
 }
 
 impl ToolOutput for CloseAgentResult {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         tool_output_json_text(self, "close_agent")
     }
 

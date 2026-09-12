@@ -7,9 +7,8 @@ option(
 )
 
 option(
-  'readline-flavor',
-  type : 'combo',
-  choices : [ 'editline', 'readline' ],
-  value : 'editline',
-  description : 'Which library to use for nice line editing with the Nix language REPL',
+  'rust-eval-prefix',
+  type : 'string',
+  value : '',
+  description : 'prefix of the shared nix-eval-rs runtime; empty discovers the dependency provided by libflake',
 )

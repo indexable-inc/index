@@ -4,10 +4,12 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use axum::extract::ws::Message as AxumWebSocketMessage;
 use axum::extract::ws::WebSocket as AxumWebSocket;
 use codex_exec_server_protocol::JSONRPCMessage;
+use codex_exec_server_protocol::JSONRPCRequest;
 use futures::Sink;
 use futures::SinkExt;
 use futures::Stream;
@@ -18,17 +20,22 @@ use tokio::process::Child;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::time::timeout;
+#[cfg(test)]
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
 use tracing::warn;
 
 use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::io::BufWriter;
 
 pub(crate) const CHANNEL_CAPACITY: usize = 128;
+// Match the existing serialized JSON-RPC message ceiling used by Noise and
+// WebSocket transports so stdio has the same per-message bound.
+const MAX_STDIO_JSONRPC_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 const STDIO_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(2);
 #[cfg(test)]
 pub(crate) const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(25);
@@ -38,8 +45,48 @@ pub(crate) const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30
 #[derive(Debug)]
 pub(crate) enum JsonRpcConnectionEvent {
     Message(JSONRPCMessage),
-    MalformedMessage { reason: String },
-    Disconnected { reason: Option<String> },
+    QueuedRequest {
+        request: JSONRPCRequest,
+        request_span: tracing::Span,
+        queued_at: Instant,
+    },
+    MalformedMessage {
+        reason: String,
+    },
+    Disconnected {
+        reason: Option<String>,
+    },
+}
+
+impl JsonRpcConnectionEvent {
+    pub(crate) fn message(message: JSONRPCMessage) -> Self {
+        let JSONRPCMessage::Request(request) = message else {
+            return Self::Message(message);
+        };
+
+        let queued_at = Instant::now();
+        let request_span = tracing::info_span!(
+            "codex.exec_server.request",
+            otel.kind = "server",
+            otel.name = "unknown",
+            method = request.method.as_str(),
+            result = tracing::field::Empty,
+        );
+        if let Some(trace) = &request.trace
+            && !codex_otel::set_parent_from_w3c_trace_context(&request_span, trace)
+        {
+            warn!(
+                method = request.method.as_str(),
+                "ignoring invalid inbound exec-server trace carrier"
+            );
+        }
+
+        Self::QueuedRequest {
+            request,
+            request_span,
+            queued_at,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -234,6 +281,24 @@ impl JsonRpcConnection {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        Self::from_stdio_with_max_message_len(
+            reader,
+            writer,
+            connection_label,
+            MAX_STDIO_JSONRPC_MESSAGE_LEN,
+        )
+    }
+
+    fn from_stdio_with_max_message_len<R, W>(
+        reader: R,
+        writer: W,
+        connection_label: String,
+        max_message_len: usize,
+    ) -> Self
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (incoming_tx, incoming_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (disconnected_tx, disconnected_rx) = watch::channel(false);
@@ -241,18 +306,70 @@ impl JsonRpcConnection {
         let reader_label = connection_label.clone();
         let incoming_tx_for_reader = incoming_tx.clone();
         let disconnected_tx_for_reader = disconnected_tx.clone();
+        // Read one byte past the payload limit so an unterminated oversized
+        // message fails promptly. A trailing CR gets one more byte of lookahead
+        // because it may be the first half of a valid CRLF terminator.
+        let read_limit = u64::try_from(max_message_len.saturating_add(1)).unwrap_or(u64::MAX);
         let reader_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(reader).lines();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
             loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
+                line.clear();
+                let read_result = (&mut reader).take(read_limit).read_line(&mut line).await;
+                match read_result {
+                    Ok(0) => {
+                        send_disconnected(
+                            &incoming_tx_for_reader,
+                            &disconnected_tx_for_reader,
+                            /*reason*/ None,
+                        )
+                        .await;
+                        break;
+                    }
+                    Ok(_) => {
+                        if line.ends_with('\n') {
+                            line.pop();
+                            if line.ends_with('\r') {
+                                line.pop();
+                            }
+                        } else if line.len() > max_message_len && line.ends_with('\r') {
+                            match reader.read_u8().await {
+                                Ok(b'\n') => {
+                                    line.pop();
+                                }
+                                Ok(_) => {}
+                                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                                Err(err) => {
+                                    send_disconnected(
+                                        &incoming_tx_for_reader,
+                                        &disconnected_tx_for_reader,
+                                        Some(format!(
+                                            "failed to read JSON-RPC message from {reader_label}: {err}"
+                                        )),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                            }
+                        }
+                        if line.len() > max_message_len {
+                            send_disconnected(
+                                &incoming_tx_for_reader,
+                                &disconnected_tx_for_reader,
+                                Some(format!(
+                                    "JSON-RPC message from {reader_label} exceeds maximum length of {max_message_len} bytes"
+                                )),
+                            )
+                            .await;
+                            break;
+                        }
                         if line.trim().is_empty() {
                             continue;
                         }
                         match serde_json::from_str::<JSONRPCMessage>(&line) {
                             Ok(message) => {
                                 if incoming_tx_for_reader
-                                    .send(JsonRpcConnectionEvent::Message(message))
+                                    .send(JsonRpcConnectionEvent::message(message))
                                     .await
                                     .is_err()
                                 {
@@ -269,15 +386,6 @@ impl JsonRpcConnection {
                                 .await;
                             }
                         }
-                    }
-                    Ok(None) => {
-                        send_disconnected(
-                            &incoming_tx_for_reader,
-                            &disconnected_tx_for_reader,
-                            /*reason*/ None,
-                        )
-                        .await;
-                        break;
                     }
                     Err(err) => {
                         send_disconnected(
@@ -320,9 +428,10 @@ impl JsonRpcConnection {
         }
     }
 
-    pub(crate) fn from_websocket<S>(stream: WebSocketStream<S>, connection_label: String) -> Self
+    pub(crate) fn from_websocket<T, E>(stream: T, connection_label: String) -> Self
     where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        T: Sink<Message, Error = E> + Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
+        E: std::fmt::Display + Send + 'static,
     {
         Self::from_websocket_stream(stream, connection_label, /*ping_interval*/ None)
     }
@@ -395,7 +504,7 @@ impl JsonRpcConnection {
                             Some(Ok(message)) => match message.parse_jsonrpc_frame() {
                                 Ok(JsonRpcWebSocketFrame::Message(message)) => {
                                     if incoming_tx
-                                        .send(JsonRpcConnectionEvent::Message(message))
+                                        .send(JsonRpcConnectionEvent::message(message))
                                         .await
                                         .is_err()
                                     {
@@ -601,12 +710,80 @@ mod tests {
     use codex_exec_server_protocol::RequestId;
     use futures::channel::mpsc as futures_mpsc;
     use futures::task::AtomicWaker;
+    use pretty_assertions::assert_eq;
     use tokio::net::TcpListener;
     use tokio::time::timeout;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::connect_async;
 
     use super::*;
+
+    #[tokio::test]
+    async fn stdio_connection_accepts_message_at_size_limit() -> anyhow::Result<()> {
+        let message = test_jsonrpc_message();
+        let encoded = serde_json::to_string(&message)?;
+        let max_message_len = encoded.len();
+
+        for line_ending in [b"\n".as_slice(), b"\r\n".as_slice()] {
+            let (reader, mut peer) =
+                tokio::io::duplex(max_message_len.saturating_add(line_ending.len()));
+            let mut connection = JsonRpcConnection::from_stdio_with_max_message_len(
+                reader,
+                tokio::io::sink(),
+                "test stdio peer".to_string(),
+                max_message_len,
+            );
+
+            peer.write_all(encoded.as_bytes()).await?;
+            peer.write_all(line_ending).await?;
+            let event = timeout(Duration::from_secs(1), connection.incoming_rx.recv())
+                .await?
+                .expect("stdio connection should report the message");
+            match event {
+                JsonRpcConnectionEvent::QueuedRequest { request, .. } => {
+                    assert_eq!(JSONRPCMessage::Request(request), message)
+                }
+                event => anyhow::bail!("expected JSON-RPC message, got {event:?}"),
+            }
+
+            drop(peer);
+            drop(connection);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stdio_connection_rejects_overlong_unterminated_message() -> anyhow::Result<()> {
+        let max_message_len: usize = 32;
+        let (reader, mut peer) = tokio::io::duplex(max_message_len.saturating_add(1));
+        let mut connection = JsonRpcConnection::from_stdio_with_max_message_len(
+            reader,
+            tokio::io::sink(),
+            "hostile stdio peer".to_string(),
+            max_message_len,
+        );
+        let overlong_message = vec![b'x'; max_message_len + 1];
+
+        peer.write_all(&overlong_message).await?;
+        let event = timeout(Duration::from_secs(1), connection.incoming_rx.recv())
+            .await?
+            .expect("stdio connection should report the framing violation");
+        match event {
+            JsonRpcConnectionEvent::Disconnected { reason } => assert_eq!(
+                reason,
+                Some(
+                    "JSON-RPC message from hostile stdio peer exceeds maximum length of 32 bytes"
+                        .to_string()
+                )
+            ),
+            event => anyhow::bail!("expected stdio disconnect, got {event:?}"),
+        }
+
+        drop(peer);
+        drop(connection);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn websocket_connection_sends_configured_ping() -> anyhow::Result<()> {
@@ -673,10 +850,12 @@ mod tests {
         server_websocket
             .send(Message::Binary(serde_json::to_vec(&message)?.into()))
             .await?;
-        assert!(matches!(
-            timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?,
-            Some(JsonRpcConnectionEvent::Message(actual)) if actual == message
-        ));
+        let Some(JsonRpcConnectionEvent::QueuedRequest { request, .. }) =
+            timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?
+        else {
+            anyhow::bail!("expected a queued JSON-RPC request");
+        };
+        assert_eq!(JSONRPCMessage::Request(request), message);
 
         drop(connection);
         Ok(())

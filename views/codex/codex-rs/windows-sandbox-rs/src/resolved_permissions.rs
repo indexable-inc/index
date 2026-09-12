@@ -4,6 +4,7 @@ use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath::Root;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
@@ -106,6 +107,16 @@ impl ResolvedWindowsSandboxPermissions {
         self.file_system.has_full_disk_read_access()
     }
 
+    pub(crate) fn has_symbolic_root_read_access(&self, cwd: &Path) -> bool {
+        self.file_system.entries.iter().any(|entry| {
+            matches!(&entry.path, FileSystemPath::Special { value: Root })
+                && entry.access.can_read()
+        }) && cwd
+            .ancestors()
+            .last()
+            .is_some_and(|root| self.file_system.can_read_local_path_with_cwd(root, cwd))
+    }
+
     pub(crate) fn include_platform_defaults(&self) -> bool {
         self.file_system.include_platform_defaults()
     }
@@ -173,7 +184,7 @@ impl ResolvedWindowsSandboxPermissions {
         self.file_system
             .entries
             .iter()
-            .any(|FileSystemSandboxEntry { path, access }| {
+            .any(|FileSystemSandboxEntry { path, access, .. }| {
                 matches!(
                     path,
                     FileSystemPath::Special {
@@ -258,6 +269,7 @@ mod tests {
                         value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                     },
                     access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 }],
                 glob_scan_max_depth: None,
             },
@@ -298,18 +310,21 @@ mod tests {
                             value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                         },
                         access: FileSystemAccessMode::Write,
+                        missing_path_behavior: None,
                     },
                     FileSystemSandboxEntry {
                         path: FileSystemPath::Special {
                             value: FileSystemSpecialPath::project_roots(Some(".git".into())),
                         },
                         access: FileSystemAccessMode::Deny,
+                        missing_path_behavior: None,
                     },
                     FileSystemSandboxEntry {
                         path: FileSystemPath::GlobPattern {
                             pattern: project_roots_glob_pattern(Path::new("**/*.env")),
                         },
                         access: FileSystemAccessMode::Deny,
+                        missing_path_behavior: None,
                     },
                 ],
                 glob_scan_max_depth: None,
@@ -329,27 +344,31 @@ mod tests {
             FileSystemSandboxPolicy::restricted(vec![
                 FileSystemSandboxEntry {
                     path: FileSystemPath::Path {
-                        path: first.clone(),
+                        path: first.clone().into(),
                     },
                     access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::Path {
-                        path: second.clone(),
+                        path: second.clone().into(),
                     },
                     access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::Path {
-                        path: first.join(".git"),
+                        path: first.join(".git").into(),
                     },
                     access: FileSystemAccessMode::Deny,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::Path {
-                        path: second.join(".git"),
+                        path: second.join(".git").into(),
                     },
                     access: FileSystemAccessMode::Deny,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::GlobPattern {
@@ -361,6 +380,7 @@ mod tests {
                         .into_owned(),
                     },
                     access: FileSystemAccessMode::Deny,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::GlobPattern {
@@ -372,6 +392,7 @@ mod tests {
                         .into_owned(),
                     },
                     access: FileSystemAccessMode::Deny,
+                    missing_path_behavior: None,
                 },
             ])
         );
@@ -455,6 +476,7 @@ mod tests {
                         value: FileSystemSpecialPath::Root,
                     },
                     access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 }],
                 glob_scan_max_depth: None,
             },

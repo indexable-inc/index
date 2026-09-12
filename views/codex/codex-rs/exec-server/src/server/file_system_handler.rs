@@ -3,14 +3,21 @@ use std::io;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use codex_exec_server_protocol::JSONRPCErrorError;
+use codex_protocol::config_types::WindowsSandboxLevel;
 
+use crate::CapabilityRootsDiscoverParams;
+use crate::CapabilityRootsDiscoverResponse;
 use crate::CopyOptions;
 use crate::CreateDirectoryOptions;
 use crate::ExecServerRuntimePaths;
 use crate::ExecutorFileSystem;
+use crate::GetMetadataOptions;
+use crate::ReadFileOptions;
 use crate::RemoveOptions;
+use crate::WriteFileOptions;
 use crate::file_read::FileReadHandleManager;
 use crate::local_file_system::LocalFileSystem;
+use crate::protocol::FS_READ_DIRECTORY_METHOD;
 use crate::protocol::FS_WRITE_FILE_METHOD;
 use crate::protocol::FsCanonicalizeParams;
 use crate::protocol::FsCanonicalizeResponse;
@@ -42,6 +49,9 @@ use crate::rpc::invalid_request;
 use crate::rpc::not_found;
 
 const MAX_FILE_READ_HANDLE_ID_BYTES: usize = 32;
+// Each read-directory entry needs four JSON values. Keep same-version
+// producers comfortably below the shared 256K-value decoder budget.
+const MAX_READ_DIRECTORY_ENTRIES: usize = 50_000;
 
 #[derive(Clone)]
 pub(crate) struct FileSystemHandler {
@@ -59,6 +69,51 @@ impl FileSystemHandler {
 
     pub(crate) async fn shutdown(&self) {
         self.file_reads.close_all().await;
+    }
+
+    pub(crate) async fn discover_capability_roots(
+        &self,
+        params: CapabilityRootsDiscoverParams,
+    ) -> Result<CapabilityRootsDiscoverResponse, JSONRPCErrorError> {
+        let sandbox = params
+            .roots
+            .first()
+            .and_then(|root| root.sandbox.as_ref())
+            .filter(|sandbox| {
+                sandbox.should_run_in_sandbox()
+                    && (!cfg!(target_os = "windows")
+                        || sandbox.windows_sandbox_level != WindowsSandboxLevel::Disabled)
+                    && params
+                        .roots
+                        .iter()
+                        .all(|root| root.sandbox.as_ref() == Some(*sandbox))
+            })
+            .cloned();
+
+        if let Some(sandbox) = sandbox {
+            let mut batched_params = params.clone();
+            for root in &mut batched_params.roots {
+                root.sandbox = None;
+            }
+            let result = match self.file_system.sandboxed() {
+                Ok(file_system) => {
+                    file_system
+                        .discover_capability_roots(batched_params, &sandbox)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    tracing::warn!(%error, "batched capability discovery failed; retrying roots separately");
+                }
+            }
+        }
+
+        crate::discover_capability_roots(&self.file_system, params)
+            .await
+            .map_err(|error| invalid_request(error.to_string()))
     }
 
     pub(crate) async fn open(
@@ -110,7 +165,13 @@ impl FileSystemHandler {
     ) -> Result<FsReadFileResponse, JSONRPCErrorError> {
         let bytes = self
             .file_system
-            .read_file(&params.path, params.sandbox.as_ref())
+            .read_file(
+                &params.path,
+                ReadFileOptions {
+                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                },
+                params.sandbox.as_ref(),
+            )
             .await
             .map_err(map_fs_error)?;
         Ok(FsReadFileResponse {
@@ -128,7 +189,14 @@ impl FileSystemHandler {
             ))
         })?;
         self.file_system
-            .write_file(&params.path, bytes, params.sandbox.as_ref())
+            .write_file(
+                &params.path,
+                bytes,
+                WriteFileOptions {
+                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                },
+                params.sandbox.as_ref(),
+            )
             .await
             .map_err(map_fs_error)?;
         Ok(FsWriteFileResponse {})
@@ -142,7 +210,10 @@ impl FileSystemHandler {
         self.file_system
             .create_directory(
                 &params.path,
-                CreateDirectoryOptions { recursive },
+                CreateDirectoryOptions {
+                    recursive,
+                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                },
                 params.sandbox.as_ref(),
             )
             .await
@@ -156,7 +227,13 @@ impl FileSystemHandler {
     ) -> Result<FsGetMetadataResponse, JSONRPCErrorError> {
         let metadata = self
             .file_system
-            .get_metadata(&params.path, params.sandbox.as_ref())
+            .get_metadata(
+                &params.path,
+                GetMetadataOptions {
+                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                },
+                params.sandbox.as_ref(),
+            )
             .await
             .map_err(map_fs_error)?;
         Ok(FsGetMetadataResponse {
@@ -189,7 +266,14 @@ impl FileSystemHandler {
             .file_system
             .read_directory(&params.path, params.sandbox.as_ref())
             .await
-            .map_err(map_fs_error)?
+            .map_err(map_fs_error)?;
+        let entry_count = entries.len();
+        if entry_count > MAX_READ_DIRECTORY_ENTRIES {
+            return Err(internal_error(format!(
+                "{FS_READ_DIRECTORY_METHOD} returned {entry_count} entries; limit is {MAX_READ_DIRECTORY_ENTRIES}"
+            )));
+        }
+        let entries = entries
             .into_iter()
             .map(|entry| FsReadDirectoryEntry {
                 file_name: entry.file_name,
@@ -219,7 +303,11 @@ impl FileSystemHandler {
         self.file_system
             .remove(
                 &params.path,
-                RemoveOptions { recursive, force },
+                RemoveOptions {
+                    recursive,
+                    force,
+                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                },
                 params.sandbox.as_ref(),
             )
             .await
@@ -310,6 +398,7 @@ mod tests {
             handler
                 .write_file(FsWriteFileParams {
                     path: path.clone(),
+                    follow_symlinks: None,
                     data_base64: STANDARD.encode("ok"),
                     sandbox: Some(sandbox_context(sandbox_policy.clone())),
                 })
@@ -334,6 +423,7 @@ mod tests {
             let response = handler
                 .read_file(FsReadFileParams {
                     path,
+                    follow_symlinks: None,
                     sandbox: Some(sandbox_context(sandbox_policy)),
                 })
                 .await

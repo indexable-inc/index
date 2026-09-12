@@ -58,9 +58,22 @@ pub struct PartialNetworkProxyConfig {
 }
 
 pub fn build_config_state(
-    config: NetworkProxyConfig,
+    mut config: NetworkProxyConfig,
     constraints: NetworkProxyConstraints,
 ) -> anyhow::Result<ConfigState> {
+    if constraints.enabled == Some(false) {
+        config.credential_broker = false;
+    }
+    let brokerage_created_proxy = config.credential_broker && !config.enabled;
+    let brokerage_created_default_allowlist = brokerage_created_proxy
+        && config.allowed_domains().is_none()
+        && constraints.allowed_domains.is_none();
+    if brokerage_created_proxy {
+        config.enabled = true;
+    }
+    if brokerage_created_default_allowlist {
+        config.set_allowed_domains(vec!["*".to_string()]);
+    }
     crate::config::validate_unix_socket_allowlist_paths(&config)?;
     anyhow::ensure!(
         !config.credential_broker || config.mitm,
@@ -76,13 +89,13 @@ pub fn build_config_state(
     let mitm = if config.mitm {
         Some(Arc::new(MitmState::new(MitmUpstreamConfig {
             allow_upstream_proxy: config.allow_upstream_proxy,
-            allow_local_binding: config.allow_local_binding,
         })?))
     } else {
         None
     };
     Ok(ConfigState {
         config,
+        brokerage_created_default_allowlist,
         allow_set,
         deny_set,
         mitm,

@@ -30,7 +30,6 @@ use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::models::PermissionProfile;
-use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -45,10 +44,14 @@ use codex_sandboxing::WindowsSandboxFilesystemOverrides;
 pub(crate) use codex_sandboxing::is_likely_sandbox_denied;
 #[cfg(test)]
 use codex_sandboxing::permission_profile_supports_windows_restricted_token_sandbox;
+use codex_sandboxing::record_filesystem_sandbox_violation;
+#[cfg(test)]
 use codex_sandboxing::resolve_windows_elevated_filesystem_overrides;
+#[cfg(test)]
 use codex_sandboxing::resolve_windows_restricted_token_filesystem_overrides;
 #[cfg(test)]
 use codex_sandboxing::unsupported_windows_restricted_token_sandbox_reason;
+#[cfg(any(test, target_os = "windows"))]
 use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -98,6 +101,8 @@ pub struct ExecParams {
     pub network: Option<NetworkProxy>,
     pub network_environment_id: Option<String>,
     pub sandbox_permissions: SandboxPermissions,
+    // TODO(anp): Reconcile these launch settings with TurnEnvironment::sandbox_context
+    // so turn-scoped execution uses the selected environment's backend.
     pub windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
     pub justification: Option<String>,
@@ -115,14 +120,12 @@ pub enum ExecCapturePolicy {
 }
 
 fn select_process_exec_tool_sandbox_type(
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    network_sandbox_policy: NetworkSandboxPolicy,
+    permission_profile: &PermissionProfile,
     windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
     enforce_managed_network: bool,
 ) -> SandboxType {
     SandboxManager::new().select_initial(
-        file_system_sandbox_policy,
-        network_sandbox_policy,
+        permission_profile,
         SandboxablePreference::Auto,
         windows_sandbox_level,
         enforce_managed_network,
@@ -158,14 +161,6 @@ pub enum ExecExpirationOutcome {
     TimedOut,
     /// The cancellation token was cancelled.
     Cancelled,
-}
-
-impl From<Option<u64>> for ExecExpiration {
-    fn from(timeout_ms: Option<u64>) -> Self {
-        timeout_ms.map_or(ExecExpiration::DefaultTimeout, |timeout_ms| {
-            ExecExpiration::Timeout(Duration::from_millis(timeout_ms))
-        })
-    }
 }
 
 impl From<u64> for ExecExpiration {
@@ -204,6 +199,7 @@ impl ExecExpiration {
     }
 
     /// If ExecExpiration is a timeout, returns the timeout in milliseconds.
+    #[cfg(target_os = "windows")]
     pub(crate) fn timeout_ms(&self) -> Option<u64> {
         match self {
             ExecExpiration::Timeout(duration) => Some(duration.as_millis() as u64),
@@ -345,11 +341,8 @@ pub fn build_exec_request(
     } = params;
 
     let enforce_managed_network = network.is_some();
-    let (file_system_sandbox_policy, network_sandbox_policy) =
-        permission_profile.to_runtime_permissions();
     let sandbox_type = select_process_exec_tool_sandbox_type(
-        &file_system_sandbox_policy,
-        network_sandbox_policy,
+        permission_profile,
         windows_sandbox_level,
         enforce_managed_network,
     );
@@ -384,7 +377,7 @@ pub fn build_exec_request(
         expiration,
         capture_policy,
     };
-    let mut exec_req = manager
+    let request = manager
         .transform(SandboxTransformRequest {
             command,
             permissions: permission_profile,
@@ -398,40 +391,13 @@ pub fn build_exec_request(
             windows_sandbox_level,
             windows_sandbox_private_desktop,
         })
-        .map(|request| {
-            let windows_sandbox_workspace_roots = if windows_sandbox_workspace_roots.is_empty() {
-                vec![sandbox_cwd.clone()]
-            } else {
-                windows_sandbox_workspace_roots.to_vec()
-            };
-            ExecRequest::from_sandbox_exec_request(
-                request,
-                options,
-                windows_sandbox_workspace_roots,
-            )
-        })
         .map_err(CodexErr::from)?;
-    let use_windows_elevated_backend = windows_sandbox_uses_elevated_backend(
-        exec_req.windows_sandbox_level,
-        exec_req.network.is_some(),
-    );
-    exec_req.windows_sandbox_filesystem_overrides = if use_windows_elevated_backend {
-        resolve_windows_elevated_filesystem_overrides(
-            exec_req.sandbox,
-            &exec_req.permission_profile,
-            sandbox_cwd,
-            use_windows_elevated_backend,
-        )
+    let windows_sandbox_workspace_roots = if windows_sandbox_workspace_roots.is_empty() {
+        vec![sandbox_cwd.clone()]
     } else {
-        resolve_windows_restricted_token_filesystem_overrides(
-            exec_req.sandbox,
-            &exec_req.permission_profile,
-            sandbox_cwd,
-            exec_req.windows_sandbox_level,
-        )
-    }
-    .map_err(CodexErr::UnsupportedOperation)?;
-    Ok(exec_req)
+        windows_sandbox_workspace_roots.to_vec()
+    };
+    ExecRequest::from_sandbox_exec_request(request, options, windows_sandbox_workspace_roots)
 }
 
 pub(crate) async fn execute_exec_request(
@@ -444,6 +410,7 @@ pub(crate) async fn execute_exec_request(
         cwd,
         env,
         exec_server_env_config: _,
+        exec_server_shell_snapshot: _,
         network,
         expiration,
         capture_policy,
@@ -453,15 +420,15 @@ pub(crate) async fn execute_exec_request(
         windows_sandbox_level,
         windows_sandbox_private_desktop,
         permission_profile,
-        file_system_sandbox_policy: _,
-        network_sandbox_policy,
         windows_sandbox_filesystem_overrides,
         network_environment_id,
         arg0,
         exec_server_sandbox: _,
         exec_server_enforce_managed_network: _,
         exec_server_managed_network: _,
+        exec_server_network_proxy: _,
     } = exec_request;
+    let network_sandbox_policy = permission_profile.network_sandbox_policy();
 
     // TODO(anp): Keep PathUri through the local process launch boundary.
     let cwd = cwd
@@ -631,6 +598,18 @@ async fn exec_windows_sandbox(
                 network_proxy_environment_error(network_environment_id.as_deref(), err)
             })?;
     }
+    let network_proxy_restricting_sid = network
+        .as_ref()
+        .map(|network| {
+            network
+                .network_proxy_restricting_sid(network_environment_id.as_deref())
+                .ok_or_else(|| {
+                    CodexErr::Io(io::Error::other(
+                        "managed Windows proxy route is missing its restricting SID",
+                    ))
+                })
+        })
+        .transpose()?;
 
     // Windows sandbox capture still receives timeout and cancellation separately.
     let (cancellation, timeout_ms) = if capture_policy.uses_expiration() {
@@ -658,7 +637,7 @@ async fn exec_windows_sandbox(
     let command_path = command.first().cloned();
     let sandbox_level = windows_sandbox_level;
     let proxy_enforced = network.is_some();
-    let use_elevated = windows_sandbox_uses_elevated_backend(sandbox_level, proxy_enforced);
+    let use_elevated = windows_sandbox_uses_elevated_backend(sandbox_level);
     let additional_deny_write_paths = windows_sandbox_filesystem_overrides
         .map(|overrides| overrides.additional_deny_write_paths.clone())
         .unwrap_or_default();
@@ -685,6 +664,7 @@ async fn exec_windows_sandbox(
                     cancellation,
                     use_private_desktop: windows_sandbox_private_desktop,
                     proxy_enforced,
+                    network_proxy_restricting_sid,
                     read_roots_override: elevated_read_roots_override.as_deref(),
                     read_roots_include_platform_defaults:
                         elevated_read_roots_include_platform_defaults,
@@ -807,6 +787,7 @@ fn finalize_exec_result(
             }
 
             if is_likely_sandbox_denied(sandbox_type, &exec_output) {
+                record_filesystem_sandbox_violation(sandbox_type, &exec_output);
                 return Err(CodexErr::Sandbox(SandboxErr::Denied {
                     output: Box::new(exec_output),
                     network_policy_decision: None,

@@ -9,10 +9,11 @@
 //! path, so being one byte or one branch off is a wrong path that looks
 //! exactly like a right one.
 
-/// The four algorithms this backend accepts. cppnix's `parseHashAlgoOpt` also
-/// knows `blake3`, behind an experimental feature; see [`parse_algo_opt`].
+/// The five algorithms cppnix's `parseHashAlgoOpt` accepts
+/// (`libutil/hash.cc:22,468-481`).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum HashAlgo {
+    Blake3,
     Md5,
     Sha1,
     Sha256,
@@ -24,6 +25,7 @@ impl HashAlgo {
     #[must_use]
     pub fn size(self) -> usize {
         match self {
+            HashAlgo::Blake3 => 32,
             HashAlgo::Md5 => 16,
             HashAlgo::Sha1 => 20,
             HashAlgo::Sha256 => 32,
@@ -35,10 +37,31 @@ impl HashAlgo {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
+            HashAlgo::Blake3 => "blake3",
             HashAlgo::Md5 => "md5",
             HashAlgo::Sha1 => "sha1",
             HashAlgo::Sha256 => "sha256",
             HashAlgo::Sha512 => "sha512",
+        }
+    }
+
+    /// Apply cppnix's `blake3-hashes` feature gate.
+    ///
+    /// Recognition and permission are separate: `parseHashAlgoOpt` knows the
+    /// name, then both it and `Hash::Hash` require the feature
+    /// (`libutil/hash.cc:25-29,468-473`). Keeping the check here gives every
+    /// evaluator entry point the same disabled-feature text without making an
+    /// unknown algorithm look like a disabled known one.
+    pub fn require_enabled(self, blake3_hashes: bool) -> Result<Self> {
+        match self {
+            HashAlgo::Blake3 if !blake3_hashes => Err(HashError::Unsupported(
+                "blake3 hashes (cppnix gates these behind the blake3-hashes experimental feature)",
+            )),
+            HashAlgo::Blake3
+            | HashAlgo::Md5
+            | HashAlgo::Sha1
+            | HashAlgo::Sha256
+            | HashAlgo::Sha512 => Ok(self),
         }
     }
 }
@@ -67,9 +90,9 @@ pub enum HashError {
     },
     /// `newHashAllowEmpty` with neither a hash nor an algorithm.
     EmptyWithoutAlgo,
-    /// Recognised by cppnix, gated behind an experimental feature this
-    /// backend does not implement. Reported as a refusal, never as a Nix
-    /// error, because cppnix with the feature on answers fine.
+    /// Recognised by cppnix, but disabled by an experimental feature setting.
+    /// Callers preserve the error class their builtin already assigns to a
+    /// missing feature.
     Unsupported(&'static str),
     /// cppnix's `parseHashFormat` on a name that is none of the five.
     UnknownFormat(String),
@@ -201,18 +224,15 @@ pub fn parse_hash_format(name: &str) -> Result<(HashFormat, Option<String>)> {
 
 /// `parseHashAlgoOpt`: an unrecognised name is **not** an error, it is
 /// `None`, and the caller then needs the algorithm from the hash string
-/// itself. Only `blake3` is special, because cppnix recognises it and then
-/// requires an experimental feature; refusing by name keeps that a refusal
-/// rather than a wrong answer.
+/// itself. The caller applies [`HashAlgo::require_enabled`] because the
+/// feature setting belongs to the evaluation, not to hash syntax.
 pub fn parse_algo_opt(s: &str) -> Result<Option<HashAlgo>> {
     match s {
+        "blake3" => Ok(Some(HashAlgo::Blake3)),
         "md5" => Ok(Some(HashAlgo::Md5)),
         "sha1" => Ok(Some(HashAlgo::Sha1)),
         "sha256" => Ok(Some(HashAlgo::Sha256)),
         "sha512" => Ok(Some(HashAlgo::Sha512)),
-        "blake3" => Err(HashError::Unsupported(
-            "blake3 hashes (cppnix gates these behind the blake3-hashes experimental feature)",
-        )),
         _ => Ok(None),
     }
 }
@@ -223,14 +243,26 @@ pub(crate) fn parse_algo(s: &str) -> Result<HashAlgo> {
     parse_algo_opt(s)?.ok_or_else(|| HashError::UnknownAlgo(s.to_owned()))
 }
 
-/// `Hash::parseAny`. `opt_algo` is what `outputHashAlgo` said, if anything.
-pub fn parse_any(original: &str, opt_algo: Option<HashAlgo>) -> Result<Hash> {
+/// `Hash::parseAny`. `opt_algo` is what `outputHashAlgo` said, if anything;
+/// `blake3_hashes` is cppnix's experimental-feature setting.
+pub fn parse_any(original: &str, opt_algo: Option<HashAlgo>, blake3_hashes: bool) -> Result<Hash> {
+    let opt_algo = opt_algo
+        .map(|algo| algo.require_enabled(blake3_hashes))
+        .transpose()?;
     // `splitPrefixTo(rest, ':')`, then `'-'` for SRI. A `:` anywhere wins over
     // a `-`, which is why these are tried in this order and not by shape.
     let (parsed, rest, is_sri) = if let Some((prefix, rest)) = original.split_once(':') {
-        (Some(parse_algo(prefix)?), rest, false)
+        (
+            Some(parse_algo(prefix)?.require_enabled(blake3_hashes)?),
+            rest,
+            false,
+        )
     } else if let Some((prefix, rest)) = original.split_once('-') {
-        (Some(parse_algo(prefix)?), rest, true)
+        (
+            Some(parse_algo(prefix)?.require_enabled(blake3_hashes)?),
+            rest,
+            true,
+        )
     } else {
         (None, original, false)
     };
@@ -283,14 +315,17 @@ pub fn parse_any(original: &str, opt_algo: Option<HashAlgo>) -> Result<Hash> {
 pub fn new_hash_allow_empty(
     hash: &str,
     opt_algo: Option<HashAlgo>,
+    blake3_hashes: bool,
 ) -> Result<(Hash, Option<String>)> {
     if hash.is_empty() {
-        let algo = opt_algo.ok_or(HashError::EmptyWithoutAlgo)?;
+        let algo = opt_algo
+            .ok_or(HashError::EmptyWithoutAlgo)?
+            .require_enabled(blake3_hashes)?;
         let h = Hash::zero(algo);
         let warning = format!("found empty hash, assuming '{}'", h.to_sri());
         return Ok((h, Some(warning)));
     }
-    Ok((parse_any(hash, opt_algo)?, None))
+    Ok((parse_any(hash, opt_algo, blake3_hashes)?, None))
 }
 
 /// `BaseNix32::encodedLength`.
@@ -431,13 +466,15 @@ fn base64_decode(s: &str) -> Result<Vec<u8>> {
 
 /// This module had no test of its own until mutation testing was run over it
 /// (ENG-13020). It was not uncovered -- `drvstrict`'s fixed-output tests parse
-/// hashes through it and killed 152 of its 155 mutants -- but what they reach
-/// is the sha256 path, because that is what every fixed-output fixture in this
-/// crate declares. The tests below are the cases that indirect coverage cannot
-/// reach.
+/// hashes through it and killed 152 of its 155 mutants -- but what they
+/// reached then was the sha256 path, because every fixed-output fixture
+/// declared sha256. The tests below pin the algorithm-specific cases that
+/// indirect coverage did not reach.
 #[cfg(test)]
 mod tests {
-    use super::{HashAlgo, HashError, base64_len, nix32_len, parse_algo_opt, parse_any};
+    use super::{
+        Hash, HashAlgo, HashError, HashFormat, base64_len, nix32_len, parse_algo_opt, parse_any,
+    };
 
     /// The encoded length of a nix32 digest, for each algorithm this accepts.
     ///
@@ -451,6 +488,7 @@ mod tests {
     /// 32 characters for a sha1 digest.
     #[test]
     fn the_nix32_length_of_every_algorithm_is_cppnixs() {
+        assert_eq!(nix32_len(HashAlgo::Blake3.size()), 52);
         assert_eq!(nix32_len(HashAlgo::Md5.size()), 26);
         assert_eq!(nix32_len(HashAlgo::Sha1.size()), 32);
         assert_eq!(nix32_len(HashAlgo::Sha256.size()), 52);
@@ -473,7 +511,11 @@ mod tests {
             0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50,
             0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d,
         ];
-        let got = parse_any("kpcd173cq987hw957sx6m0868wv3x6d9", Some(HashAlgo::Sha1));
+        let got = parse_any(
+            "kpcd173cq987hw957sx6m0868wv3x6d9",
+            Some(HashAlgo::Sha1),
+            false,
+        );
         assert_eq!(got.as_ref().map(|h| h.algo), Ok(HashAlgo::Sha1));
         assert_eq!(got.map(|h| h.bytes), Ok(expected.clone()));
 
@@ -484,15 +526,17 @@ mod tests {
         let base16 = parse_any(
             "a9993e364706816aba3e25717850c26c9cd0d89d",
             Some(HashAlgo::Sha1),
+            false,
         );
         assert_eq!(base16.map(|h| h.bytes), Ok(expected.clone()));
-        let sri = parse_any("sha1-qZk+NkcGgWq6PiVxeFDCbJzQ2J0=", None);
+        let sri = parse_any("sha1-qZk+NkcGgWq6PiVxeFDCbJzQ2J0=", None, false);
         assert_eq!(sri.map(|h| h.bytes), Ok(expected));
     }
 
     /// The base64 encoded length, which is the third arm of the same choice.
     #[test]
     fn the_base64_length_of_every_algorithm_is_cppnixs() {
+        assert_eq!(base64_len(HashAlgo::Blake3.size()), 44);
         assert_eq!(base64_len(HashAlgo::Md5.size()), 24);
         assert_eq!(base64_len(HashAlgo::Sha1.size()), 28);
         assert_eq!(base64_len(HashAlgo::Sha256.size()), 44);
@@ -507,7 +551,7 @@ mod tests {
     /// a mistyped hash report something a user can act on.
     #[test]
     fn an_unrecognised_length_is_a_length_error_not_a_character_error() {
-        let got = parse_any("abc", Some(HashAlgo::Sha256));
+        let got = parse_any("abc", Some(HashAlgo::Sha256), false);
         assert_eq!(
             got,
             Err(HashError::WrongLength {
@@ -517,24 +561,77 @@ mod tests {
         );
     }
 
-    /// `parseHashAlgoOpt`: an unrecognised name is `None`, not an error, and
-    /// `blake3` is a refusal rather than either.
-    ///
-    /// The three outcomes are genuinely different downstream: `None` sends the
-    /// caller to the hash string for the algorithm, an error refuses the
-    /// derivation, and the refusal carries a token. cppnix accepts `blake3`
-    /// behind an experimental feature, so answering `None` for it would make
-    /// this backend compute a path where cppnix computes a different one.
+    /// `parseHashAlgoOpt`: every name cppnix knows is `Some`, while an
+    /// unrecognised name is `None`, not an error. The Blake3 feature gate is
+    /// applied after this syntax decision by `HashAlgo::require_enabled`.
     #[test]
-    fn an_unknown_algorithm_name_is_none_and_blake3_is_a_refusal() {
+    fn known_algorithm_names_parse_and_an_unknown_name_is_none() {
+        assert_eq!(parse_algo_opt("blake3"), Ok(Some(HashAlgo::Blake3)));
         assert_eq!(parse_algo_opt("sha256"), Ok(Some(HashAlgo::Sha256)));
         assert_eq!(parse_algo_opt("md5"), Ok(Some(HashAlgo::Md5)));
         assert_eq!(parse_algo_opt("sha1"), Ok(Some(HashAlgo::Sha1)));
         assert_eq!(parse_algo_opt("sha512"), Ok(Some(HashAlgo::Sha512)));
         assert_eq!(parse_algo_opt("not-a-hash"), Ok(None));
-        assert!(matches!(
-            parse_algo_opt("blake3"),
-            Err(HashError::Unsupported(_))
-        ));
+    }
+
+    /// cppnix's first Blake3 known-answer vector
+    /// (`libutil-tests/hash.cc:40-49`), pinned literally in every encoding
+    /// `Hash::parseAny` accepts. Literal outputs matter here: round-tripping
+    /// through this module's paired encoder and decoder would let the same
+    /// mistake on both sides pass.
+    ///
+    /// The SRI row supplies its algorithm in-band; the bare encodings take it
+    /// from `outputHashAlgo`, which exercises both resolution paths.
+    #[test]
+    fn a_blake3_hash_matches_cppnixs_literal_encodings() {
+        let hash = Hash {
+            algo: HashAlgo::Blake3,
+            bytes: vec![
+                0x64, 0x37, 0xb3, 0xac, 0x38, 0x46, 0x51, 0x33, 0xff, 0xb6, 0x3b, 0x75, 0x27, 0x3a,
+                0x8d, 0xb5, 0x48, 0xc5, 0x58, 0x46, 0x5d, 0x79, 0xdb, 0x03, 0xfd, 0x35, 0x9c, 0x6c,
+                0xd5, 0xbd, 0x9d, 0x85,
+            ],
+        };
+
+        for (format, encoded) in [
+            (
+                HashFormat::Base16,
+                "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+            ),
+            (
+                HashFormat::Nix32,
+                "11cxppanr71mzl1xnyax8rccaj5milx2fx9vnvzk6la672nb6dv4",
+            ),
+            (
+                HashFormat::Base64,
+                "ZDezrDhGUTP/tjt1JzqNtUjFWEZdedsD/TWcbNW9nYU=",
+            ),
+        ] {
+            assert_eq!(hash.to_format(format, false), encoded);
+            assert_eq!(
+                parse_any(encoded, Some(HashAlgo::Blake3), true),
+                Ok(hash.clone())
+            );
+        }
+        let sri = "blake3-ZDezrDhGUTP/tjt1JzqNtUjFWEZdedsD/TWcbNW9nYU=";
+        assert_eq!(hash.to_sri(), sri);
+        assert_eq!(parse_any(sri, None, true), Ok(hash));
+    }
+
+    /// The algorithm prefix is a second route to Blake3, independent of the
+    /// `outputHashAlgo` argument. It must apply the same experimental-feature
+    /// gate rather than letting a disabled Blake3 hash through in-band.
+    #[test]
+    fn an_in_band_blake3_prefix_requires_the_feature() {
+        assert_eq!(
+            parse_any(
+                "blake3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+                None,
+                false,
+            ),
+            Err(HashError::Unsupported(
+                "blake3 hashes (cppnix gates these behind the blake3-hashes experimental feature)",
+            ))
+        );
     }
 }

@@ -12,6 +12,8 @@
 #include "nix/store/names.hh"
 #include "nix/util/url.hh"
 #include "nix/flake/url-name.hh"
+#include "nix/expr/eval-settings.hh"
+#include "nix/expr/rust-eval-refusal.hh"
 
 #include <nlohmann/json.hpp>
 #include <regex>
@@ -357,6 +359,27 @@ struct CmdProfileAdd : InstallablesCommand, MixDefaultProfile
         return
 #include "profile-add.md"
             ;
+    }
+
+    using InstallablesCommand::run;
+
+    /* Before the installables are parsed: a command that fails closed on this
+       backend should construct nothing it will not use, and the refusal is
+       the same whether or not the arguments would have parsed. */
+    void run(ref<Store> store, std::vector<std::string> && rawInstallables) override
+    {
+        /* A profile element records the flake it came from (`ExtraPathInfoFlake`,
+           below), which is what `nix profile upgrade` later re-evaluates. The
+           Rust route hands back derivations without that record
+           (`rustParseInstallables`), so serving this command would install
+           elements the profile can never upgrade -- a success that reads as
+           one. Refuse under the command's own name instead, in the catch-all's
+           vocabulary, until the route carries the flake origin. */
+        refuseWithAdvice(
+            refusalTokens::unsupported,
+            RefusingCommand::get(),
+            "'nix profile' needs flake provenance for derivations, "
+            "which the evaluator does not supply yet.");
     }
 
     void run(ref<Store> store, Installables && installables) override

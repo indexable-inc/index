@@ -65,6 +65,10 @@ pub enum RefusalToken {
     /// the one refusal raised before anything is compiled, and a census that
     /// could not name it had one bucket it could not explain.
     NonUtf8Source,
+    /// `nix-instantiate --eval` without `--strict` on a value with
+    /// children: cppnix prints `<CODE>` for the children still unevaluated,
+    /// and which those are is evaluator-internal. Scalars are served.
+    LazyPrint,
     /// A byte string reached a boundary that is text-only in this backend:
     /// an attribute name headed for the `str`-keyed interner, a string
     /// coerced to a path, a URL, an ABI leg that carries text. String
@@ -97,19 +101,14 @@ pub enum RefusalToken {
     // hand-maintained vocabularies would drift the moment one side gained a
     // kind. `RefusalToken::raised_by` records which side raises each, so the
     // split stays visible instead of being folded away.
-    /// `--apply`, which needs a function applied to the result.
-    CommandApply,
     /// `--write-to`, which writes a tree rather than printing.
     CommandWriteTo,
     /// `--xml`, an output format this backend does not render.
     CommandXmlOutput,
-    /// Lazy top-level printing; the backend needs `--strict`.
-    CommandLazyPrint,
     /// The expression came from stdin rather than a file or `--expr`.
     CommandStdin,
-    /// `--arg` / `--argstr`, which bind free variables before evaluation.
-    CommandArgs,
-    /// A flake or store-path installable rather than a plain path.
+    /// A store-path installable, which names an already-built object rather
+    /// than an expression to evaluate. (Flake installables are served.)
     CommandInstallable,
     /// An output selection (`^out`) on the installable.
     CommandOutputSelection,
@@ -123,6 +122,10 @@ pub enum RefusalToken {
     /// A `meta.outputsToInstall` or `outputSpecified` shape whose reduction
     /// of the output set this backend does not reproduce.
     CommandOutputsToInstall,
+    /// An installable `nix run` was given that is not an app the backend
+    /// can read: an `apps.*` set whose fields are not the strings cppnix's
+    /// `toApp` reads, so cppnix's own diagnostic stands.
+    CommandNotAnApp,
 
     /// A refusal that crossed a boundary carrying no token: a cache row
     /// written before tokens existed, or a producer that does not set one. A
@@ -148,23 +151,22 @@ impl RefusalToken {
             RefusalToken::UnreadableInput => "unreadable-input",
             RefusalToken::UnimplementedBuiltin => "unimplemented-builtin",
             RefusalToken::NonUtf8Source => "non-utf8-source",
+            RefusalToken::LazyPrint => "lazy-print",
             RefusalToken::NonUtf8Boundary => "non-utf8-boundary",
             RefusalToken::AddPath => "add-path",
             RefusalToken::UnorderedComparison => "unordered-comparison",
             RefusalToken::UnsupportedRender => "unsupported-render",
             RefusalToken::UnsupportedOp => "unsupported-op",
-            RefusalToken::CommandApply => "command-apply",
             RefusalToken::CommandWriteTo => "command-write-to",
             RefusalToken::CommandXmlOutput => "command-xml-output",
-            RefusalToken::CommandLazyPrint => "command-lazy-print",
             RefusalToken::CommandStdin => "command-stdin",
-            RefusalToken::CommandArgs => "command-args",
             RefusalToken::CommandInstallable => "command-installable",
             RefusalToken::CommandOutputSelection => "command-output-selection",
             RefusalToken::CommandFile => "command-file",
             RefusalToken::CommandUnsupported => "command-unsupported",
             RefusalToken::CommandNotADerivation => "command-not-a-derivation",
             RefusalToken::CommandOutputsToInstall => "command-outputs-to-install",
+            RefusalToken::CommandNotAnApp => "command-not-an-app",
             RefusalToken::Unrecorded => "unrecorded",
         }
     }
@@ -183,23 +185,22 @@ impl RefusalToken {
         RefusalToken::UnreadableInput,
         RefusalToken::UnimplementedBuiltin,
         RefusalToken::NonUtf8Source,
+        RefusalToken::LazyPrint,
         RefusalToken::NonUtf8Boundary,
         RefusalToken::AddPath,
         RefusalToken::UnorderedComparison,
         RefusalToken::UnsupportedRender,
         RefusalToken::UnsupportedOp,
-        RefusalToken::CommandApply,
         RefusalToken::CommandWriteTo,
         RefusalToken::CommandXmlOutput,
-        RefusalToken::CommandLazyPrint,
         RefusalToken::CommandStdin,
-        RefusalToken::CommandArgs,
         RefusalToken::CommandInstallable,
         RefusalToken::CommandOutputSelection,
         RefusalToken::CommandFile,
         RefusalToken::CommandUnsupported,
         RefusalToken::CommandNotADerivation,
         RefusalToken::CommandOutputsToInstall,
+        RefusalToken::CommandNotAnApp,
         RefusalToken::Unrecorded,
     ];
 
@@ -212,18 +213,16 @@ impl RefusalToken {
     #[must_use]
     pub fn raised_by(self) -> RaisedBy {
         match self {
-            RefusalToken::CommandApply
-            | RefusalToken::CommandWriteTo
+            RefusalToken::CommandWriteTo
             | RefusalToken::CommandXmlOutput
-            | RefusalToken::CommandLazyPrint
             | RefusalToken::CommandStdin
-            | RefusalToken::CommandArgs
             | RefusalToken::CommandInstallable
             | RefusalToken::CommandOutputSelection
             | RefusalToken::CommandFile
             | RefusalToken::CommandUnsupported
             | RefusalToken::CommandNotADerivation
-            | RefusalToken::CommandOutputsToInstall => RaisedBy::CommandLayer,
+            | RefusalToken::CommandOutputsToInstall
+            | RefusalToken::CommandNotAnApp => RaisedBy::CommandLayer,
             RefusalToken::Unrecorded => RaisedBy::Sentinel,
             _ => RaisedBy::Evaluator,
         }
@@ -325,7 +324,7 @@ mod tests {
         // with no name; this is the count that the compiler cannot check.
         assert_eq!(
             RefusalToken::ALL.len(),
-            28,
+            27,
             "a token was added or removed; update this count deliberately, and \
              check whatever reads the histogram still has a row for it"
         );

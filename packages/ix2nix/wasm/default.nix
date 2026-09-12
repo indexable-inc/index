@@ -6,7 +6,6 @@
 {
   ix,
   lib,
-  repoPackages,
   ...
 }: let
   inherit (ix) pkgs;
@@ -64,7 +63,8 @@
     '';
 
   # End-to-end over every boundary this package exists for: the patched
-  # nix-ix evaluator loads the plugin (`wasm-builtin`), the shim's calling
+  # nix-ix evaluator runs the guest (`builtins.wasm` lives in the Rust
+  # evaluator, hence `eval-backend rust` below), the shim's calling
   # convention matches the renderer's `{ __dir, __importIx, __ixTy }:`
   # wrapper, a relative `.ix` import recurses through the shim, a conversion
   # error surfaces its positioned diagnostic as a Nix eval error, type
@@ -84,7 +84,11 @@
     pkgs.runCommand "ix2nix-wasm-e2e"
     {
       strictDeps = true;
-      nativeBuildInputs = [repoPackages.nix-ix];
+      # The assembled fork client, not `repoPackages.nix-ix` (that recipe
+      # throws un-overridden: its jjTree archive lives in ix). Only this e2e
+      # is guest-Nix-dependent; the converter build above is not, which keeps
+      # `.ix` example discovery evaluable on the standalone flake.
+      nativeBuildInputs = [(ix.nixPackageFor "packages/ix2nix/wasm: e2e test")];
     }
     ''
       export HOME="$TMPDIR/home"
@@ -93,7 +97,8 @@
 
       evalIx() {
         nix eval \
-          --extra-experimental-features 'nix-command wasm-builtin' \
+          --extra-experimental-features 'nix-command wasm-builtin rust-eval' \
+          --option eval-backend rust \
           --impure \
           --expr "let importIx = import ${crateDir}/import-ix.nix { converter = ${package}/lib/ix2nix.wasm; typeMode = \"$2\"; }; in importIx $1"
       }
@@ -130,7 +135,8 @@
       # converter through `builtins.wasm` and a caller reaching it through the
       # library cannot be told different things about one module's types.
       nix eval --raw \
-        --extra-experimental-features 'nix-command wasm-builtin' \
+        --extra-experimental-features 'nix-command wasm-builtin rust-eval' \
+        --option eval-backend rust \
         --impure \
         --expr "(builtins.wasm { path = ${package}/lib/ix2nix.wasm; function = \"schema\"; }) (builtins.readFile ${crateDir + "/tests/golden"}/typed-surface.ix)" \
         > schema.json

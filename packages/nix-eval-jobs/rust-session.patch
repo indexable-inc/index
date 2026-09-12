@@ -1,0 +1,1027 @@
+--- a/meson.build
++++ b/meson.build
+@@ -29,6 +29,7 @@
+ nix_flake_dep = dependency('nix-flake', required: true)
+ nix_main_dep = dependency('nix-main', required: true)
+ nix_cmd_dep = dependency('nix-cmd', required: true)
++nix_eval_rs_dep = cpp.find_library('nix_eval_rs', required: true)
+ 
+ subdir('src')
+ 
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -21,6 +21,7 @@
+   nix_flake_dep,
+   nix_main_dep,
+   nix_cmd_dep,
++  nix_eval_rs_dep,
+ ]
+ 
+ nix_eval_jobs_lib = static_library(
+--- a/src/drv.cc
++++ b/src/drv.cc
+@@ -285,6 +285,29 @@
+     return result;
+ }
+ 
++auto Drv::fromTypedValues(nix::EvalState &state, MyArgs &args,
++    std::string name, std::string system, nix::StorePath drvPath,
++    std::map<std::string, std::optional<nix::StorePath>> outputs,
++    std::optional<nlohmann::json> meta, Constituents constituents) -> Drv {
++    auto store=state.store;
++    Drv result{.name=std::move(name), .storeDir=store->storeDir,
++        .system=std::move(system), .drvPath=std::move(drvPath),
++        .outputs=std::move(outputs), .neededBuilds={}, .neededSubstitutes={},
++        .unknownPaths={}, .meta=std::move(meta), .constituents=std::move(constituents)};
++    auto local=store.dynamic_pointer_cast<nix::LocalFSStore>();
++    if (local && !nix::settings.readOnlyMode) {
++        auto drv=local->readDerivation(result.drvPath);
++        result.system=drv.platform;
++        if (args.checkCacheStatus)
++            result.cacheStatus=queryCacheStatus(*store,result.outputs,result.neededBuilds,
++                result.neededSubstitutes,result.unknownPaths,drv);
++        if (args.showInputDrvs) result.inputDrvs=queryInputDrvs(drv);
++        auto options=derivationOptionsFromStructuredAttrs(*store,drv.env,get(drv.structuredAttrs));
++        result.requiredSystemFeatures=options.getRequiredSystemFeatures(drv);
++    }
++    return result;
++}
++
+ namespace nlohmann {
+ 
+ using nix::get;
+--- a/src/drv.hh
++++ b/src/drv.hh
+@@ -39,6 +39,11 @@
+     static Drv fromPackageInfo(std::string &attrPath, nix::EvalState &state,
+                                nix::PackageInfo &packageInfo, MyArgs &args,
+                                Constituents constituents = {});
++
++    static Drv fromTypedValues(nix::EvalState &state, MyArgs &args,
++        std::string name, std::string system, nix::StorePath drvPath,
++        std::map<std::string, std::optional<nix::StorePath>> outputs,
++        std::optional<nlohmann::json> meta, Constituents constituents);
+ 
+     std::string name;
+     std::string storeDir;
+--- a/src/nix-eval-jobs.cc
++++ b/src/nix-eval-jobs.cc
+@@ -531,7 +531,6 @@
+         nix_eval_jobs::registerDaemonSettings();
+         nix::initNix();
+         nix::initGC();
+-        nix::flakeSettings.configureEvalSettings(nix::evalSettings);
+ 
+ #ifdef __linux__
+         /* Mirrors src/nix/main.cc: prevent LocalStore::makeStoreWritable
+--- a/src/worker.cc
++++ b/src/worker.cc
+@@ -1,40 +1,41 @@
+ // doesn't exist on macOS
+ // IWYU pragma: no_include <bits/types/struct_rusage.h>
+ 
++#include <cstdio>
++#include <iostream>
++#include <nix/cmd/installable-flake.hh>
++#include <nix/expr/attr-path.hh>
+ #include <nix/expr/eval-error.hh>
++#include <nix/expr/value-to-json.hh>
++#include <nix/store/globals.hh>
++#include <nix/store/local-fs-store.hh>
+ #include <nix/util/pos-idx.hh>
+ #include <nix/util/terminal.hh>
+-#include <nix/expr/attr-path.hh>
+-#include <nix/store/local-fs-store.hh>
+-#include <nix/store/globals.hh>
+-#include <nix/cmd/installable-flake.hh>
+-#include <nix/expr/value-to-json.hh>
++#include <nlohmann/json.hpp>
+ #include <sys/resource.h>
+-#include <nlohmann/json.hpp>
+-#include <cstdio>
+-#include <iostream>
+ // NOLINTBEGIN(modernize-deprecated-headers)
+ // misc-include-cleaner wants this header rather than the C++ version
+ #include <stdlib.h>
+ // NOLINTEND(modernize-deprecated-headers)
+ #include <exception>
+ #include <filesystem>
++#include <nix/cmd/common-eval-args.hh>
+ #include <nix/expr/attr-set.hh>
+-#include <nix/cmd/common-eval-args.hh>
++#include <nix/expr/eval-inline.hh>
++#include <nix/expr/eval.hh>
++#include <nix/expr/get-drvs.hh>
++#include <nix/expr/symbol-table.hh>
++#include <nix/expr/value.hh>
++#include <nix/expr/value/context.hh>
++#include <nix/flake/flake.hh>
++#include <nix/flake/flakeref.hh>
++#include <nix/store/outputs-spec.hh>
+ #include <nix/util/error.hh>
+-#include <nix/expr/eval.hh>
+ #include <nix/util/file-system.hh>
+-#include <nix/flake/flakeref.hh>
+-#include <nix/flake/flake.hh>
+-#include <nix/expr/get-drvs.hh>
+ #include <nix/util/logging.hh>
+-#include <nix/store/outputs-spec.hh>
+ #include <nix/util/ref.hh>
+-#include <nix/expr/symbol-table.hh>
+ #include <nix/util/types.hh>
+ #include <nix/util/util.hh>
+-#include <nix/expr/value.hh>
+-#include <nix/expr/value/context.hh>
+ #include <nlohmann/json_fwd.hpp>
+ #include <numeric>
+ #include <optional>
+@@ -45,267 +46,212 @@
+ #include <variant>
+ #include <vector>
+ 
++#include "buffered-io.hh"
++#include "drv.hh"
++#include "eval-args.hh"
++#include "response.hh"
++#include "rust-worker.hh"
++#include "store.hh"
+ #include "worker.hh"
+-#include "drv.hh"
+-#include "response.hh"
+-#include "buffered-io.hh"
+-#include "eval-args.hh"
+-#include "store.hh"
++#include <nix/util/experimental-features.hh>
+ 
+ namespace nix {
+ struct Expr;
+ } // namespace nix
+ 
+ namespace {
+-auto releaseExprTopLevelValue(nix::EvalState &state, nix::Bindings &autoArgs,
+-                              MyArgs &args) -> nix::Value * {
+-    nix::Value vTop;
+-
+-    if (args.fromArgs) {
+-        nix::Expr *expr =
+-            state.parseExprFromString(args.releaseExpr, state.rootPath("."));
+-        state.eval(expr, vTop);
+-    } else {
+-        state.evalFile(lookupFileArg(state, args.releaseExpr), vTop);
+-    }
+-
+-    auto *vRoot = state.allocValue();
+-
+-    state.autoCallFunction(autoArgs, vTop, *vRoot);
+-
+-    return vRoot;
+-}
+-
+-auto evaluateFlake(const nix::ref<nix::EvalState> &state,
+-                   const std::string &releaseExpr,
+-                   const nix::flake::LockFlags &lockFlags) -> nix::Value * {
+-    auto [flakeRef, fragment, outputSpec] =
+-        nix::parseFlakeRefWithFragmentAndExtendedOutputsSpec(
+-            nix::fetchSettings, releaseExpr,
+-            nix::absPath(std::filesystem::path(".")));
+-
+-    nix::InstallableFlake flake{{},       state,      std::move(flakeRef),
+-                                fragment, outputSpec, {},
+-                                {},       lockFlags};
+-
+-    // If no fragment specified, use callFlake to get the full flake structure
+-    // (just like :lf in the REPL)
+-    if (fragment.empty()) {
+-        auto *value = state->allocValue();
+-        nix::flake::callFlake(*state, *flake.getLockedFlake(), *value);
+-        return value;
+-    }
+-    // Fragment specified, use normal evaluation
+-    return flake.toValue(*state).first;
+-}
+-
+-auto attrPathJoin(nlohmann::json input) -> std::string {
+-    return std::accumulate(
+-        input.begin(), input.end(), std::string(),
+-        [](const std::string &acc, std::string str) -> std::basic_string<char> {
+-            // Escape token if containing dots
+-            if (str.find('.') != std::string::npos) {
+-                str = "\"" + str + "\"";
+-            }
+-            return acc.empty() ? str : acc + "." + str;
+-        });
+-}
+-
+-auto extractConstituents(nix::EvalState &state, nix::Value *value,
+-                         const MyArgs &args) -> Constituents {
+-    if (!args.constituents) {
++using nix_eval_jobs::Session;
++using nix_eval_jobs::Value;
++
++auto rootEvaluand(const nix::ref<nix::EvalState> &state, MyArgs &args)
++    -> nix::RustEvaluand {
++    if (args.flake) {
++        auto [reference, fragment, outputs] =
++            nix::parseFlakeRefWithFragmentAndExtendedOutputsSpec(
++                nix::fetchSettings, args.releaseExpr,
++                nix::absPath(std::filesystem::path(".")));
++        nix::InstallableFlake flake{
++            {}, state, std::move(reference), fragment, outputs,
++            {}, {},    args.lockFlags};
++        return fragment.empty() ? nix::rustEvaluandOfLockedFlake(
++                                      *state, *flake.getLockedFlake())
++                                : nix::rustEvaluandOfInstallable(*state, flake);
++    }
++    nix::RustEvaluand input;
++    if (args.fromArgs)
++        input.src = {args.releaseExpr,
++                     nix::absPath(std::filesystem::path(".")).string(), "", ""};
++    else {
++        auto path =
++            nix::resolveExprPath(lookupFileArg(*state, args.releaseExpr));
++        input.src = {path.readFile(), path.parent().to_string(),
++                     path.to_string(), ""};
++    }
++    input.attrPaths = {""};
++    return input;
++}
++
++auto attrPathJoin(const nlohmann::json &input) -> std::string {
++    return nix::showAttrPath(input.get<std::vector<std::string>>());
++}
++
++auto validMeta(nix::EvalState &state, Session &session, IxeHandle value)
++    -> bool {
++    auto depth = state.addCallDepth(nix::noPos);
++    auto type = session.type(value);
++    if (type == IXE_TYPE_LIST) {
++        for (const auto &item : session.list(value))
++            if (!validMeta(state, session, item.handle))
++                return false;
++        return true;
++    }
++    if (type == IXE_TYPE_ATTRS) {
++        if (session.optional(value, "outPath"))
++            return false;
++        for (const auto &name : session.names(value))
++            if (!validMeta(state, session, session.select(value, name).handle))
++                return false;
++        return true;
++    }
++    return type == IXE_TYPE_INT || type == IXE_TYPE_BOOL ||
++           type == IXE_TYPE_STRING || type == IXE_TYPE_FLOAT;
++}
++
++auto metadata(nix::EvalState &state, Session &session, IxeHandle value)
++    -> nlohmann::json {
++    nlohmann::json result;
++    auto meta = session.optional(value, "meta");
++    if (!meta)
++        return result;
++    if (session.type(meta->handle) != IXE_TYPE_ATTRS)
++        throw nix::TypeError(state, "derivation meta is not an attribute set");
++    for (const auto &name : session.names(meta->handle)) {
++        auto item = session.select(meta->handle, name);
++        if (validMeta(state, session, item.handle))
++            result[name] = session.json(item.handle);
++    }
++    return result;
++}
++
++auto constituents(nix::EvalState &state, Session &session, IxeHandle value,
++                  const MyArgs &args) -> Constituents {
++    if (!args.constituents)
+         return {};
+-    }
+-
+-    std::vector<std::string> constituents;
+-    std::vector<std::string> namedConstituents;
+-    bool globConstituents = false;
+-
+-    const auto *aggregateAttr =
+-        value->attrs()->get(state.symbols.create("_hydraAggregate"));
+-
+-    if (aggregateAttr != nullptr &&
+-        state.forceBool(*aggregateAttr->value, aggregateAttr->pos,
+-                        "while evaluating the `_hydraAggregate` attribute")) {
+-
+-        const auto *constituentsAttr =
+-            value->attrs()->get(state.symbols.create("constituents"));
+-
+-        if (constituentsAttr == nullptr) {
+-            state
+-                .error<nix::EvalError>(
+-                    "derivation must have a 'constituents' attribute")
+-                .debugThrow();
++    auto aggregate = session.optional(value, "_hydraAggregate");
++    if (!aggregate || !session.boolean(aggregate->handle))
++        return {};
++    auto items = session.select(value, "constituents");
++    nix::NixStringContext context;
++    for (const auto &text : session.context(items.handle))
++        context.insert(nix::NixStringContextElem::parse(text));
++    Constituents result;
++    for (const auto &item : context)
++        if (const auto *built =
++                std::get_if<nix::NixStringContextElem::Built>(&item.raw))
++            result.constituents.push_back(
++                built->drvPath->to_string(*state.store));
++    for (const auto &item : session.list(items.handle))
++        if (session.type(item.handle) == IXE_TYPE_STRING)
++            result.namedConstituents.push_back(
++                session.string(item.handle, true));
++    if (auto glob = session.optional(value, "_hydraGlobConstituents"))
++        result.globConstituents = session.boolean(glob->handle);
++    return result;
++}
++
++auto outputPaths(nix::EvalState &state, Session &session, IxeHandle value)
++    -> std::map<std::string, std::optional<nix::StorePath>> {
++    std::vector<std::string> names;
++    auto declared = session.optional(value, "outputs");
++    if (declared)
++        for (const auto &item : session.list(declared->handle))
++            names.push_back(session.string(item.handle));
++    else
++        names.push_back("out");
++    std::map<std::string, std::optional<nix::StorePath>> result;
++    try {
++        for (const auto &name : names) {
++            if (declared) {
++                auto output = session.optional(value, name);
++                if (!output)
++                    continue;
++                if (session.type(output->handle) != IXE_TYPE_ATTRS)
++                    throw nix::TypeError(state,
++                        "derivation output is not an attribute set");
++                auto path = session.optional(output->handle, "outPath");
++                if (!path)
++                    continue;
++                result.emplace(name, state.store->parseStorePath(
++                                         session.storePath(path->handle)));
++            } else
++                result.emplace(
++                    name, state.store->parseStorePath(session.storePath(
++                              session.select(value, "outPath").handle)));
+         }
+-
+-        // Extract constituent paths from context
+-        nix::NixStringContext context;
+-        state.coerceToString(
+-            constituentsAttr->pos, *constituentsAttr->value, context,
+-            "while evaluating the `constituents` attribute", true, false);
+-
+-        for (const auto &ctx : context) {
+-            std::visit(
+-                nix::overloaded{
+-                    [&](const nix::NixStringContextElem::Built &built) -> void {
+-                        constituents.push_back(
+-                            built.drvPath->to_string(*state.store));
+-                    },
+-                    [&](const nix::NixStringContextElem::Opaque &opaque
+-                        [[maybe_unused]]) -> void {},
+-                    [&](const nix::NixStringContextElem::DrvDeep &drvDeep
+-                        [[maybe_unused]]) -> void {},
+-                },
+-                ctx.raw);
+-        }
+-
+-        // Extract named constituents
+-        state.forceList(*constituentsAttr->value, constituentsAttr->pos,
+-                        "while evaluating the `constituents` attribute");
+-        auto constituentsList = constituentsAttr->value->listView();
+-
+-        for (const auto &val : constituentsList) {
+-            state.forceValue(*val, nix::noPos);
+-            if (val->type() == nix::nString) {
+-                namedConstituents.emplace_back(val->c_str());
+-            }
+-        }
+-
+-        // Check for glob constituents
+-        const auto *glob =
+-            value->attrs()->get(state.symbols.create("_hydraGlobConstituents"));
+-        globConstituents =
+-            glob != nullptr &&
+-            state.forceBool(
+-                *glob->value, glob->pos,
+-                "while evaluating the `_hydraGlobConstituents` attribute");
+-    }
+-
+-    return Constituents{
+-        .constituents = std::move(constituents),
+-        .namedConstituents = std::move(namedConstituents),
+-        .globConstituents = globConstituents,
+-    };
+-}
+-
+-auto applyExprToValue(nix::EvalState &state, nix::Value *value,
+-                      const std::string &applyExpr) -> nlohmann::json {
+-    if (applyExpr.empty()) {
+-        return nlohmann::json{};
+-    }
+-
+-    auto *expr = state.parseExprFromString(applyExpr, state.rootPath("."));
+-
+-    nix::Value vApply;
+-    nix::Value vRes;
+-
+-    state.eval(expr, vApply);
+-    state.callFunction(vApply, *value, vRes, nix::noPos);
+-    state.forceAttrs(vRes, nix::noPos, "apply needs to evaluate to an attrset");
+-
+-    nix::NixStringContext context;
+-    std::stringstream stream;
+-    nix::printValueAsJSON(state, true, vRes, nix::noPos, stream, context);
+-
+-    return nlohmann::json::parse(stream.str());
++    } catch (const nix::Error &) {
++        if (!nix::experimentalFeatureSettings.isEnabled(nix::Xp::CaDerivations))
++            throw;
++        // Same fallback as upstream queryOutputs(false): floating CA output
++        // paths are unknown, not fabricated store paths or omitted fields.
++        result.clear();
++        for (const auto &name : names)
++            result.emplace(name, std::nullopt);
++    }
++    return result;
+ }
+ 
+ auto registerGCRoot(nix::EvalState &state, const Drv &drv, const MyArgs &args)
+     -> void {
+-    if (args.gcRootsDir.empty() || nix::settings.readOnlyMode) {
++    if (args.gcRootsDir.empty() || nix::settings.readOnlyMode)
+         return;
+-    }
+-
+-    const std::filesystem::path root =
+-        args.gcRootsDir / std::string(drv.drvPath.to_string());
+-
+-    if (!nix::pathExists(root)) {
+-        auto localStore = state.store.dynamic_pointer_cast<nix::LocalFSStore>();
+-        if (localStore) {
+-            localStore->addPermRoot(drv.drvPath, root);
+-        }
+-        // If not a local store, we can't create GC roots
+-    }
+-}
+-
+-auto collectAttrsForRecursion(nix::EvalState &state, nix::Value *value,
+-                              const nlohmann::json &path, const MyArgs &args)
+-    -> std::vector<std::string> {
+-    std::vector<std::string> attrs;
+-    bool recurse =
+-        args.forceRecurse ||
+-        path.empty(); // Don't require recurseForDerivations for top-level
+-
+-    for (auto &attr : value->attrs()->lexicographicOrder(state.symbols)) {
+-        const std::string_view &name = state.symbols[attr->name];
+-        attrs.emplace_back(name);
+-
+-        if (!args.forceRecurse && name == "recurseForDerivations") {
+-            const auto *attrv =
+-                value->attrs()->get(nix::EvalState::s.recurseForDerivations);
+-            recurse = state.forceBool(*attrv->value, attrv->pos,
+-                                      "while evaluating recurseForDerivations");
+-        }
+-    }
+-
+-    return recurse ? attrs : std::vector<std::string>{};
+-}
+-
+-auto processDerivation(nix::EvalState &state, nix::Value *value,
+-                       std::string &attrPathS, const nlohmann::json &path,
+-                       MyArgs &args) -> Response::Payload {
+-    auto packageInfo = nix::getDerivation(state, *value, false);
+-    if (!packageInfo) {
+-        auto attrs = collectAttrsForRecursion(state, value, path, args);
+-        return Response::Attrs{std::move(attrs)};
+-    }
+-
+-    // Extract constituents if enabled
+-    auto constituents = extractConstituents(state, value, args);
+-
+-    // Apply expression if provided
+-    std::optional<nlohmann::json> extraValue;
+-    if (!args.applyExpr.empty()) {
+-        extraValue = applyExprToValue(state, value, args.applyExpr);
+-    }
+-
+-    // Create derivation info
+-    auto drv = Drv::fromPackageInfo(attrPathS, state, *packageInfo, args,
+-                                    std::move(constituents));
+-
+-    // Register GC root
++    const auto root = args.gcRootsDir / std::string(drv.drvPath.to_string());
++    if (!nix::pathExists(root))
++        if (auto local = state.store.dynamic_pointer_cast<nix::LocalFSStore>())
++            local->addPermRoot(drv.drvPath, root);
++}
++
++auto processDerivation(nix::EvalState &state, Session &session, IxeHandle value,
++                       const nlohmann::json &path, MyArgs &args,
++                       const std::optional<Value> &apply) -> Response::Payload {
++    auto type = session.optional(value, "type");
++    bool derivation = type && session.type(type->handle) == IXE_TYPE_STRING &&
++                      session.string(type->handle, true) == "derivation";
++    if (!derivation) {
++        auto names = session.names(value);
++        bool recurse = args.forceRecurse || path.empty();
++        if (!args.forceRecurse)
++            if (auto flag = session.optional(value, "recurseForDerivations"))
++                recurse = session.boolean(flag->handle);
++        return Response::Attrs{recurse ? std::move(names)
++                                       : std::vector<std::string>{}};
++    }
++    auto name = session.string(session.select(value, "name").handle);
++    auto aggregate = constituents(state, session, value, args);
++    std::optional<nlohmann::json> extra;
++    if (apply) {
++        auto applied = session.apply(*apply, value);
++        if (session.type(applied.handle) != IXE_TYPE_ATTRS)
++            throw nix::TypeError(state, "apply needs to evaluate to an attrset");
++        extra = session.json(applied.handle);
++    }
++    auto drvPath = state.store->parseStorePath(
++        session.storePath(session.select(value, "drvPath").handle));
++    drvPath.requireDerivation();
++    auto outputs = outputPaths(state, session, value);
++    std::string system = "unknown";
++    if (!state.store.dynamic_pointer_cast<nix::LocalFSStore>() ||
++        nix::settings.readOnlyMode)
++        if (auto attr = session.optional(value, "system"))
++            system = session.string(attr->handle);
++    std::optional<nlohmann::json> meta;
++    if (args.meta)
++        meta = metadata(state, session, value);
++    auto drv = Drv::fromTypedValues(
++        state, args, std::move(name), std::move(system), std::move(drvPath),
++        std::move(outputs), std::move(meta), std::move(aggregate));
+     registerGCRoot(state, drv, args);
+-
+-    return Response::Job{std::move(drv), std::move(extraValue)};
+-}
+-
+-auto initializeRootValue(const nix::ref<nix::EvalState> &state,
+-                         nix::Bindings &autoArgs, MyArgs &args)
+-    -> nix::Value * {
+-    nix::Value *vEvaluated =
+-        args.flake ? evaluateFlake(state, args.releaseExpr, args.lockFlags)
+-                   : releaseExprTopLevelValue(*state, autoArgs, args);
+-
+-    if (args.selectExpr.empty()) {
+-        return vEvaluated;
+-    }
+-
+-    // Apply the provided select function
+-    auto *selectExpr =
+-        state->parseExprFromString(args.selectExpr, state->rootPath("."));
+-
+-    nix::Value vSelect;
+-    state->eval(selectExpr, vSelect);
+-
+-    nix::Value *vSelected = state->allocValue();
+-    state->callFunction(vSelect, *vEvaluated, *vSelected, nix::noPos);
+-    state->forceAttrs(
+-        *vSelected, nix::noPos,
+-        "'--select' must evaluate to an attrset (the traversal root)");
+-
+-    return vSelected;
+-}
+-
++    return Response::Job{std::move(drv), std::move(extra)};
++}
+ auto shouldRestart(const MyArgs &args) -> bool {
+     struct rusage resourceUsage = {}; // NOLINT(misc-include-cleaner)
+     getrusage(RUSAGE_SELF, &resourceUsage);
+@@ -317,8 +263,9 @@
+ }
+ 
+ auto processJobRequest(nix::EvalState &state, LineReader &fromReader,
+-                       nix::AutoCloseFD &toParent, nix::Bindings &autoArgs,
+-                       nix::Value *vRoot, MyArgs &args) -> bool {
++                       nix::AutoCloseFD &toParent, Session &session,
++                       IxeHandle vRoot, MyArgs &args,
++                       const std::optional<Value> &apply) -> bool {
+     /* Wait for the collector to send us a job name. */
+     if (tryWriteLine(toParent.get(), "next") < 0) {
+         return false; // main process died
+@@ -341,16 +288,14 @@
+     /* Evaluate it and send info back to the collector. */
+     Response::Payload payload = [&]() -> Response::Payload {
+         try {
+-            auto *vTmp =
+-                nix::findAlongAttrPath(state, attrPathS, autoArgs, *vRoot)
+-                    .first;
+-
+-            auto *value = state.allocValue();
+-            state.autoCallFunction(autoArgs, *vTmp, *value);
+-
+-            if (value->type() == nix::nAttrs) {
+-                return processDerivation(state, value, attrPathS, path, args);
+-            }
++            // Start a fresh unfiled question after any prior job failure. The
++            // retained session and root handles remain alive across questions.
++            session.jobsQuestion();
++            auto value =
++                session.walk(vRoot, path.get<std::vector<std::string>>());
++            if (session.type(value.handle) == IXE_TYPE_ATTRS)
++                return processDerivation(state, session, value.handle, path,
++                                         args, apply);
+             // We ignore everything that cannot be built
+             return Response::Attrs{{}};
+         } catch (nix::EvalError &e) {
+@@ -396,26 +341,30 @@
+ 
+ } // namespace
+ 
+-void worker(
+-    MyArgs &args,
+-    nix::AutoCloseFD &toParent, // NOLINT(bugprone-easily-swappable-parameters)
+-    nix::AutoCloseFD &fromParent) {
+-
+-    auto evalStore = nix_eval_jobs::openStore(args.evalStoreUrl);
++void worker(MyArgs &args, nix::AutoCloseFD &toParent,
++            nix::AutoCloseFD &fromParent) {
++    auto store = nix_eval_jobs::openStore(args.evalStoreUrl);
+     auto state = nix::make_ref<nix::EvalState>(
+-        args.lookupPath, evalStore, nix::fetchSettings, nix::evalSettings);
+-    nix::Bindings &autoArgs = *args.getAutoArgs(*state);
+-
+-    nix::Value *vRoot = initializeRootValue(state, autoArgs, args);
+-
+-    LineReader fromReader(fromParent.release());
+-
+-    while (processJobRequest(*state, fromReader, toParent, autoArgs, vRoot,
+-                             args)) {
+-        // Continue processing jobs until we need to exit
+-    }
+-
+-    if (tryWriteLine(toParent.get(), "restart") < 0) {
+-        return; // main process died
+-    };
+-}
++        args.lookupPath, store, nix::fetchSettings, nix::evalSettings);
++    auto input = rootEvaluand(state, args);
++    Session session(*state, args);
++    auto root = session.initialize(input, !args.flake);
++    std::optional<Value> apply;
++    if (!args.applyExpr.empty())
++        apply = session.expression(args.applyExpr);
++    if (!args.selectExpr.empty()) {
++        auto select = session.expression(args.selectExpr);
++        root = session.apply(select, root.handle);
++        if (session.type(root.handle) != IXE_TYPE_ATTRS)
++            throw nix::TypeError(*state,
++                "'--select' must evaluate to an attrset (the traversal root)");
++        session.closeQuestion();
++    }
++    session.jobsQuestion();
++    LineReader reader(fromParent.release());
++    while (processJobRequest(*state, reader, toParent, session, root.handle,
++                             args, apply)) {
++    }
++    if (tryWriteLine(toParent.get(), "restart") < 0)
++        return;
++}
+--- /dev/null
++++ b/src/rust-worker.hh
+@@ -0,0 +1,338 @@
++#pragma once
++
++#include "ixe.h"
++#include <cstring>
++#include <filesystem>
++#include <functional>
++#include <memory>
++#include <nix/cmd/rust-eval-session.hh>
++#include <nix/expr/attr-path.hh>
++#include <nix/expr/eval-settings.hh>
++#include <nix/util/strings.hh>
++#include <nlohmann/json.hpp>
++#include <optional>
++#include <utility>
++#include <vector>
++
++namespace nix_eval_jobs {
++
++struct Value {
++    IxeSession *session = nullptr;
++    IxeHandle handle = 0;
++    Value() = default;
++    Value(IxeSession *session_, IxeHandle handle_)
++        : session(session_), handle(handle_) {}
++    Value(const Value &) = delete;
++    Value &operator=(const Value &) = delete;
++    Value(Value &&other) noexcept
++        : session(other.session), handle(std::exchange(other.handle, 0)) {}
++    Value &operator=(Value &&other) noexcept {
++        if (this != &other) {
++            if (handle)
++                ixe_handle_free(session, handle);
++            session = other.session;
++            handle = std::exchange(other.handle, 0);
++        }
++        return *this;
++    }
++    ~Value() {
++        if (handle)
++            ixe_handle_free(session, handle);
++    }
++};
++
++struct Text {
++    char *data = nullptr;
++    Text() = default;
++    Text(const Text &) = delete;
++    ~Text() { ixe_string_free(data); }
++    std::string str() const { return data ? data : ""; }
++};
++
++// One host and VM per child worker, created after fork and kept until the
++// existing memory-limit restart. Values never cross the parent/worker pipe.
++class Session {
++    nix::EvalState &state;
++    nix::RustEvalSetup setup;
++    std::unique_ptr<IxeSession, decltype(&ixe_session_free)> session;
++    std::vector<nix::RustAutoArg> autoArgs;
++    std::string originalSource;
++    std::string sourceRoot;
++    Value coercer;
++    Value storeCoercer;
++
++    static IxeBytes bytes(const std::string &s) {
++        return {reinterpret_cast<const unsigned char *>(s.data()), s.size()};
++    }
++
++    Value question(const nix::RustEvaluand &input) {
++        std::vector<IxeArgument> arguments;
++        for (const auto &a : input.args)
++            arguments.push_back({a.kind == nix::RustArgument::Kind::Json
++                                     ? IXE_ARG_JSON
++                                     : IXE_ARG_INTERNAL_PRIMOP,
++                                 bytes(a.text)});
++        std::vector<IxeAutoArg> supplied;
++        for (const auto &a : autoArgs)
++            supplied.push_back({bytes(a.name),
++                                a.kind == nix::RustAutoArg::Kind::Expr
++                                    ? IXE_AUTO_ARG_EXPR
++                                    : IXE_AUTO_ARG_STRING,
++                                bytes(a.text)});
++        const std::string empty;
++        const IxeBytes rootPath = bytes(empty);
++        IxeHandle root = 0;
++        Text answer;
++        int mode = -1;
++        // Root configuration must follow abandonment of the previous job.
++        // eval_question also abandons, but that is too late for this setter.
++        closeQuestion();
++        checked(ixe_session_set_source_root(
++            session.get(), bytes(input.src.root).text, input.src.root.size()));
++        checked(ixe_session_eval_question(
++            session.get(), bytes(input.src.source).text,
++            input.src.source.size(), bytes(input.src.baseDir).text,
++            input.src.baseDir.size(),
++            input.src.file.empty() ? nullptr : bytes(input.src.file).text,
++            input.src.file.size(), arguments.data(), arguments.size(),
++            IXE_QUESTION_SELECT, &rootPath, 1, 1, nullptr, 0, supplied.data(),
++            supplied.size(), 0, IXE_RENDER_JSON, &mode, &root, &answer.data));
++        // This worker's streaming replies are not a nix eval memo answer.
++        // The result cache is disabled in this dedicated child, so no foreign
++        // answer shape is read, removed or filed under SELECT's cache kind.
++        Value owned(session.get(), root);
++        if (mode != IXE_SERVE_EVALUATE || answer.data)
++            throw nix::Error(
++                "nix-eval-jobs unexpectedly received a memoized answer");
++        return owned;
++    }
++
++  public:
++    Session(nix::EvalState &state_, const nix::MixEvalArgs &args)
++        : state(state_), setup(state_), session(nullptr, &ixe_session_free),
++          autoArgs(nix::rustAutoArgsOf(args)) {
++        // In-memory compiled modules and graph cells remain resident for this
++        // worker. Do not impersonate the nix executable's persistent cache
++        // identity.
++        ixe_set_eval_cache_dir(nullptr, 0);
++        session.reset(ixe_session_new(setup.host()));
++        if (!session) {
++            Text error;
++            error.data = ixe_take_setting_conflict();
++            throw nix::Error("cannot create nix-eval-jobs Rust session: %s",
++                             error.str());
++        }
++        coercer = expression("x: builtins.toString x");
++        // coerceToStorePath uses coerceMore=false and copyToStore=false.
++        // Generic toString would also accept lists, numbers and booleans.
++        storeCoercer = expression(R"nix(
++          let coerce = value:
++            let kind = builtins.typeOf value; in
++            if kind == "string" then value
++            else if kind == "path" then builtins.toString value
++            else if kind == "set" && value ? __toString then coerce (value.__toString value)
++            else if kind == "set" && value ? outPath then coerce value.outPath
++            else throw "cannot coerce ${kind} to a store path";
++          in coerce
++        )nix");
++    }
++    ~Session() { closeQuestion(); }
++    Session(const Session &) = delete;
++
++    void checked(int status) {
++        if (!status)
++            return;
++        IxePos at{nullptr, 0, 0};
++        Text error;
++        error.data = ixe_session_take_error(session.get(), &at);
++        Text file;
++        file.data = at.file;
++        auto pos = nix::rustEvalPos(state, originalSource, file.data, at.line,
++                                    at.column);
++        const char *token = ixe_session_refusal_token(session.get());
++        nix::rustEvalThrow(state, status, error.str(),
++                           token ? token : "unrecorded", pos);
++    }
++    void closeQuestion() noexcept {
++        if (session)
++            // Any nonzero status abandons without filing (public ixe.h contract).
++            ixe_session_question_answer(session.get(), 1, nullptr, 0);
++    }
++    void jobsQuestion() {
++        nix::RustEvaluand dummy;
++        dummy.src = {.source = "null",
++                     .baseDir =
++                         nix::absPath(std::filesystem::path(".")).string(),
++                     .file = "",
++                     .root = sourceRoot};
++        auto unused = question(dummy);
++    }
++    Value expression(const std::string &source) {
++        IxeHandle value = 0;
++        const auto base = nix::absPath(std::filesystem::path(".")).string();
++        checked(ixe_session_eval(session.get(), bytes(source).text,
++                                 source.size(), bytes(base).text, base.size(),
++                                 nullptr, 0, &value));
++        return {session.get(), value};
++    }
++    Value initialize(const nix::RustEvaluand &input, bool autoCallRoot) {
++        originalSource = input.src.source;
++        sourceRoot = input.src.root;
++        auto root = question(input);
++        if (autoCallRoot)
++            root = autoCall(root.handle);
++        // Resolve the normal flake constructor's quoted candidate paths without
++        // auto-calling flake attributes. Non-flake roots are auto-called above.
++        for (const auto &path : input.attrPaths) {
++            if (path.empty()) {
++                closeQuestion();
++                return root;
++            }
++            try {
++                Value selected;
++                IxeHandle current = root.handle;
++                for (const auto &part : nix::parseAttrPath(path)) {
++                    type(current);
++                    selected = select(current, part);
++                    current = selected.handle;
++                }
++                closeQuestion();
++                return selected;
++            } catch (nix::AttrPathNotFound &) {
++                if (path == input.attrPaths.back())
++                    throw;
++            }
++        }
++        closeQuestion();
++        return root;
++    }
++    Value autoCall(IxeHandle value) {
++        IxeHandle result = 0;
++        checked(ixe_auto_call(session.get(), value, &result));
++        return {session.get(), result};
++    }
++    int type(IxeHandle value) {
++        checked(ixe_force(session.get(), value));
++        return ixe_value_type(session.get(), value);
++    }
++    Value select(IxeHandle value, const std::string &name) {
++        IxeHandle result = 0;
++        int rc = ixe_attrs_select(session.get(), value, bytes(name).text,
++                                  name.size(), &result);
++        if (rc == IXE_ERR_MISSING) {
++            Text discarded;
++            discarded.data = ixe_session_take_error(session.get(), nullptr);
++            throw nix::AttrPathNotFound("attribute '%s' not found", name);
++        }
++        checked(rc);
++        return {session.get(), result};
++    }
++    std::optional<Value> optional(IxeHandle value, const std::string &name) {
++        try {
++            return select(value, name);
++        } catch (nix::AttrPathNotFound &) {
++            return std::nullopt;
++        }
++    }
++    std::vector<std::string> names(IxeHandle value) {
++        char *data = nullptr;
++        size_t size = 0;
++        checked(ixe_attrs_names(session.get(), value, &data, &size));
++        std::unique_ptr<char, std::function<void(char *)>> owner(
++            data, [size](char *p) { ixe_names_free(p, size); });
++        std::vector<std::string> result;
++        for (size_t i = 0; i < size;) {
++            size_t n = strnlen(data + i, size - i);
++            result.emplace_back(data + i, n);
++            i += n + 1;
++        }
++        return result;
++    }
++    Value walk(IxeHandle value, const std::vector<std::string> &path,
++               bool indexLists = true) {
++        auto current = autoCall(value);
++        for (const auto &name : path) {
++            type(current.handle);
++            const auto index =
++                indexLists ? nix::string2Int<unsigned int>(name) : std::nullopt;
++            if (index) {
++                IxeHandle next = 0;
++                checked(
++                    ixe_list_at(session.get(), current.handle, *index, &next));
++                current = Value(session.get(), next);
++            } else {
++                if (name.empty())
++                    throw nix::AttrPathNotFound(
++                        "empty attribute name in selection path");
++                current = select(current.handle, name);
++            }
++            current = autoCall(current.handle);
++        }
++        type(current.handle);
++        return current;
++    }
++    std::string string(IxeHandle value, bool allowContext = false) {
++        Text result;
++        if (allowContext)
++            checked(
++                ixe_render(session.get(), value, IXE_RENDER_RAW, &result.data));
++        else {
++            if (type(value) != IXE_TYPE_STRING)
++                throw nix::TypeError(state, "expected a string without context");
++            checked(ixe_get_string(session.get(), value, &result.data));
++        }
++        return result.str();
++    }
++    std::string storePath(IxeHandle value) {
++        auto coerced = apply(storeCoercer, value);
++        return string(coerced.handle, true);
++    }
++    bool boolean(IxeHandle value) {
++        int result = 0;
++        checked(ixe_get_bool(session.get(), value, &result));
++        return result != 0;
++    }
++    nlohmann::json json(IxeHandle value) {
++        Text result;
++        checked(
++            ixe_render(session.get(), value, IXE_RENDER_JSON, &result.data));
++        return nlohmann::json::parse(result.str());
++    }
++    std::vector<Value> list(IxeHandle value) {
++        size_t n = 0;
++        checked(ixe_list_len(session.get(), value, &n));
++        std::vector<Value> result;
++        for (size_t i = 0; i < n; ++i) {
++            IxeHandle item = 0;
++            checked(ixe_list_at(session.get(), value, i, &item));
++            result.emplace_back(session.get(), item);
++        }
++        return result;
++    }
++    Value apply(const Value &function, IxeHandle argument) {
++        closeQuestion();
++        IxeHandle result = 0;
++        checked(ixe_apply(session.get(), function.handle, argument, &result));
++        Value owned(session.get(), result);
++        jobsQuestion();
++        return owned;
++    }
++    std::vector<std::string> context(IxeHandle value) {
++        auto coerced = apply(coercer, value);
++        type(coerced.handle);
++        char *data = nullptr;
++        size_t size = 0;
++        checked(ixe_get_string_context(session.get(), coerced.handle, &data,
++                                       &size));
++        std::unique_ptr<char, std::function<void(char *)>> owner(
++            data, [size](char *p) { ixe_names_free(p, size); });
++        std::vector<std::string> result;
++        for (size_t i = 0; i < size;) {
++            size_t n = strnlen(data + i, size - i);
++            result.emplace_back(data + i, n);
++            i += n + 1;
++        }
++        return result;
++    }
++};
++} // namespace nix_eval_jobs

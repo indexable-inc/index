@@ -1,0 +1,11 @@
+# The index monorepo's test allowances (ix/clippy.toml), mirrored here the way
+# `[workspace.lints.clippy]` in Cargo.toml mirrors its denies: the four denied
+# lints exist so a production failure becomes a typed error, and a test's job
+# is to abort loudly on an unexpected value. Without this file the crate gate
+# (maintainers/ix/rust-crate-gate.sh, `--all-targets`) reported every
+# `expect`, index and `panic!` in a `#[cfg(test)]` module as an error.
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+allow-unwrap-in-tests = true

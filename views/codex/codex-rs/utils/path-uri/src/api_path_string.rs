@@ -1,5 +1,6 @@
 use crate::PathConvention;
 use crate::PathUri;
+use crate::PathUriParseError;
 use crate::is_windows_separator_byte;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
@@ -24,18 +25,30 @@ use ts_rs::TS;
 /// boundary. Non-UTF-8 paths are converted to UTF-8 lossily because this API
 /// value is serialized as a JSON string.
 ///
-/// Deserialization accepts any UTF-8 string without interpreting or validating
-/// it. That unrestricted construction path is intentionally available only to
-/// serde: Codex-internal code cannot construct this type directly from a raw
-/// `String` and is instead encouraged to convert through [`PathUri`] or
-/// [`AbsolutePathBuf`]. Relative path text remains valid until an operation
-/// such as [`Self::to_path_uri`] requires an absolute path.
+/// Deserialization and [`Self::from_string`] accept any UTF-8 string without
+/// interpreting or validating it. Use [`Self::from_string`] when a caller
+/// already owns legacy app-server path text and needs to preserve its wire
+/// spelling; use [`Self::from_path`], [`Self::from_abs_path`], or
+/// [`Self::from_path_uri`] when converting an actual path value. Relative
+/// path text remains valid until an operation such as [`Self::to_path_uri`]
+/// requires an absolute path.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize, TS)]
 #[serde(transparent)]
 #[ts(type = "string")]
 pub struct LegacyAppPathString(String);
 
 impl LegacyAppPathString {
+    /// Preserves already-legacy app-server path text without interpreting it
+    /// using the current host.
+    ///
+    /// This is for API-boundary values that are already strings, including
+    /// relative or foreign-platform spellings. Callers with a local
+    /// [`Path`], [`AbsolutePathBuf`], or [`PathUri`] should use the
+    /// corresponding typed constructor instead.
+    pub fn from_string(path: impl Into<String>) -> Self {
+        Self(path.into())
+    }
+
     /// Preserves path text without interpreting it using the current host.
     pub fn from_path(path: &Path) -> Self {
         Self(path.to_string_lossy().into_owned())
@@ -79,6 +92,54 @@ impl LegacyAppPathString {
                 convention: Some(convention),
             }
         })
+    }
+
+    /// Resolves this raw API path spelling against an executor cwd.
+    ///
+    /// Relative paths use the cwd's inferred convention. Home-relative paths
+    /// use the supplied executor home, and clearly foreign absolute paths are
+    /// rejected rather than reinterpreted as relative path text.
+    pub fn resolve_against(
+        &self,
+        cwd: &PathUri,
+        user_home_dir: Option<&PathUri>,
+    ) -> Result<PathUri, LegacyAppPathStringError> {
+        let convention = cwd.infer_path_convention().ok_or_else(|| {
+            LegacyAppPathStringError::MissingBaseConvention {
+                cwd: cwd.to_string(),
+            }
+        })?;
+        let is_windows = convention == PathConvention::Windows;
+        let path = self.as_str();
+        let home_relative = path
+            .strip_prefix("~/")
+            .or_else(|| (path == "~").then_some(""))
+            .or_else(|| is_windows.then(|| path.strip_prefix(r"~\")).flatten());
+        if let Some(suffix) = home_relative {
+            let home =
+                user_home_dir.ok_or_else(|| LegacyAppPathStringError::MissingHomeDirectory {
+                    path: path.to_string(),
+                })?;
+            return Ok(home.join(suffix.trim_start_matches(|separator| {
+                separator == '/' || is_windows && separator == '\\'
+            }))?);
+        }
+
+        if is_windows && (path.starts_with("//") || path.starts_with(r"\\")) {
+            return self.to_path_uri(PathConvention::Windows);
+        }
+
+        match self.infer_absolute_path_convention() {
+            Some(path_convention) if path_convention == convention => self.to_path_uri(convention),
+            Some(PathConvention::Posix) if is_windows => Ok(cwd.join(path)?),
+            Some(path_convention) => Err(LegacyAppPathStringError::MismatchedConvention {
+                path: path.to_string(),
+                path_convention,
+                cwd: cwd.to_string(),
+                convention,
+            }),
+            None => Ok(cwd.join(path)?),
+        }
     }
 
     /// Parses this API string as an absolute path using the convention inferred from its spelling.
@@ -352,6 +413,21 @@ pub enum LegacyAppPathStringError {
         path: String,
         convention: Option<PathConvention>,
     },
+    #[error("path URI `{cwd}` has no path convention")]
+    MissingBaseConvention { cwd: String },
+    #[error("cannot resolve home-relative path `{path}` without an executor home")]
+    MissingHomeDirectory { path: String },
+    #[error(
+        "path {path} uses {path_convention} paths, but executor cwd {cwd} uses {convention} paths"
+    )]
+    MismatchedConvention {
+        path: String,
+        path_convention: PathConvention,
+        cwd: String,
+        convention: PathConvention,
+    },
+    #[error(transparent)]
+    PathUri(#[from] PathUriParseError),
 }
 
 #[cfg(test)]

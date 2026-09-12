@@ -9,23 +9,18 @@ WebAssembly modules can interact with Nix values through a host interface that p
 The `builtins.wasm` builtin takes two arguments:
 1. A configuration attribute set with the following attributes:
    - `path` - Path to the WebAssembly module (required)
-   - `function` - Name of the Wasm function to call (required for non-WASI modules, not allowed for WASI modules)
+   - `function` - Name of the exported function to call (required)
 2. The argument value to pass to the function
 
-WASI mode is automatically detected by checking if the module imports from `wasi_snapshot_preview1`. There are two calling conventions:
+The export named by `function` is called with the argument's `ValueId` and returns the `ValueId` of the result. A module may import only the `env` host interface below; a module importing anything else (in particular WASI) is rejected by name before it is linked.
 
-- **Non-WASI mode** (no WASI imports) calls the Wasm export specified by `function` directly. The function receives its input as a `ValueId` parameter and returns a `ValueId`.
-- **WASI mode** (when the module imports from `wasi_snapshot_preview1`) runs the WASI module's `_start` entry point. The input `ValueId` is passed as a command-line argument (`argv[1]`), and the result is returned by calling the `return_to_nix` host function.
+An error raised while the evaluator services a host call -- a `throw` inside a function the module applies, a file that is not there -- is an ordinary evaluation error, so `builtins.tryEval` catches it exactly as it would outside the module. Names that cross the boundary (`get_attr`, `make_attrset`, `make_path`) must be valid UTF-8.
 
 ## Value IDs
 
 Nix values are represented in Wasm code as a `u32` referred to below as a `ValueId`. These are opaque handles that reference values managed by the Nix evaluator. Value ID 0 is reserved to represent a missing attribute lookup result.
 
-## Entry Points
-
-### Non-WASI Mode
-
-Non-WASI mode is used when the module does **not** import from `wasi_snapshot_preview1`.
+## Entry Point
 
 Usage:
 ```nix
@@ -35,31 +30,10 @@ builtins.wasm {
 } <arg>
 ```
 
-Every Wasm module used in non-WASI mode must export:
+Every Wasm module must export:
 - A `memory` object that the host can use to read/write data.
 - `nix_wasm_init_v1()`, a function that is called once when the module is instantiated.
 - The entry point function, whose name is specified by the `function` attribute. It takes a single `ValueId` and returns a single `ValueId` (i.e. it has type `fn(arg: u32) -> u32`).
-
-### WASI Mode
-
-WASI mode is automatically used when the module imports a `wasi_snapshot_preview1` function.
-
-Usage:
-```nix
-builtins.wasm {
-  path = <module>;
-} <arg>
-```
-
-Every WASI module must export:
-- A `memory` object that the host can use to read/write data.
-- `_start()`, the standard WASI entry point. This function takes no parameters.
-
-The input value is passed as a command-line argument: `argv[1]` is set to the decimal representation of the `ValueId` of the input value.
-
-To return a result to Nix, the module must call the `return_to_nix` host function (see below) with the `ValueId` of the result. If `_start` finishes without calling `return_to_nix`, an error is raised.
-
-Standard output and standard error from the WASI module are captured and emitted as Nix warnings (one warning per line).
 
 ## Host Functions
 
@@ -138,7 +112,7 @@ Creates a Nix float value.
 
 #### `get_float(value: ValueId) -> f64`
 
-Extracts a float from a Nix value. Throws an error if the value is not a float.
+Extracts a float from a Nix value. An integer is accepted and widened; any other type is an error.
 
 **Parameters:**
 - `value` - ID of a Nix float value
@@ -213,11 +187,11 @@ Creates a Nix path value relative to a base path.
 
 **Returns:** ID of a new path value
 
-**Note:** The path string is interpreted relative to the base path. The resulting path is in the same source tree ("source accessor") as the original path.
+**Note:** A relative string hangs off the base path; a string starting with `/` starts at the root of the base's source tree instead. The result is in the same source tree ("source accessor") as the base, `..` cannot climb above that tree's root, and a string containing a NUL byte is an error.
 
 #### `copy_path(value: ValueId, ptr: u32, max_len: u32) -> u32`
 
-Copies a Nix path value into Wasm memory as an absolute path string.
+Copies a Nix path value into Wasm memory as an absolute path string within its source tree ("source accessor"): for a path inside a mounted tree this is the path below the mount point, which is also what `make_path` accepts back.
 
 **Parameters:**
 - `value` - ID of a path value
@@ -253,7 +227,7 @@ Copies a Nix list into Wasm memory as an array of value IDs.
 
 **Returns:** The actual number of elements in the list
 
-**Note:** If the returned length is greater than `max_len`, no data is copied. Each element is written as a `ValueId` (4 bytes). The buffer must be `max_len * 4` bytes large.
+**Note:** If the returned length is greater than `max_len`, no data is copied and no handles are created. Each element is written as a `ValueId` (4 bytes); the elements are not forced. The buffer must be `max_len * 4` bytes large.
 
 ### Attribute Set Operations
 
@@ -289,7 +263,7 @@ Copies a Nix attribute set into Wasm memory as an array of attribute structures.
 
 **Returns:** The actual number of attributes in the set
 
-**Note:** If the returned length is greater than `max_len`, no data is copied.
+**Note:** If the returned length is greater than `max_len`, no data is copied and no handles are created. Attributes are enumerated in name order, the same order `copy_attrname` indexes, and their values are not forced.
 
 **Output structure format:**
 ```c
@@ -348,17 +322,6 @@ Creates a lazy or partially applied function application.
 
 **Returns:** Value ID of the unevaluated application
 
-### Returning Results (WASI mode only)
-
-#### `return_to_nix(value: ValueId)`
-
-Returns a result value to the Nix evaluator from a WASI module. This function is only available in WASI mode.
-
-**Parameters:**
-- `value` - ID of the Nix value to return as the result of the `builtins.wasm` call
-
-**Note:** Calling this function immediately terminates the WASI module's execution. The module must call `return_to_nix` before finishing; otherwise, an error is raised.
-
 ### File I/O
 
 #### `read_file(path: ValueId, ptr: u32, len: u32) -> u32`
@@ -372,7 +335,7 @@ Reads a file into Wasm memory.
 
 **Returns:** The actual file size in bytes
 
-**Note:** Similar to `builtins.readFile`, but can handle files that cannot be represented as Nix strings (in particular, files containing NUL bytes). If the returned size is greater than `len`, no data is copied.
+**Note:** Similar to `builtins.readFile`, and like it accepts anything coercible to a path (a string with context is realised first), but can handle files that cannot be represented as Nix strings (in particular, files containing NUL bytes). If the returned size is greater than `len`, no data is copied.
 
 ## Example Usage
 

@@ -53,22 +53,6 @@ EvalErrorBuilder<T> & EvalErrorBuilder<T>::withSuggestions(Suggestions & s)
 }
 
 template<class T>
-EvalErrorBuilder<T> & EvalErrorBuilder<T>::withFrame(const Env & env, const Expr & expr)
-{
-    // NOTE: This is abusing side-effects.
-    // TODO: check compatibility with nested debugger calls.
-    // TODO: What side-effects??
-    error.state.debugTraces.push_front(
-        DebugTrace{
-            .pos = expr.getPos(),
-            .expr = expr,
-            .env = env,
-            .hint = HintFmt("Fake frame for debugging purposes"),
-            .isError = true});
-    return *this;
-}
-
-template<class T>
 EvalErrorBuilder<T> & EvalErrorBuilder<T>::addTrace(PosIdx pos, HintFmt hint)
 {
     error.addTrace(error.state.positions[pos], hint);
@@ -95,8 +79,6 @@ EvalErrorBuilder<T> & EvalErrorBuilder<T>::setIsFromExpr()
 template<class T>
 void EvalErrorBuilder<T>::debugThrow()
 {
-    error.state.runDebugRepl(&error);
-
     // `EvalState` is the only class that can construct an `EvalErrorBuilder`,
     // and it does so in dynamic storage. This is the final method called on
     // any such instance and must delete itself before throwing the underlying

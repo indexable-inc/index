@@ -93,13 +93,17 @@ impl Emit {
     /// Record where the attributes of the `MkAttrs` about to be pushed were
     /// written. Called immediately before pushing it, so the site's `ip` is
     /// the index that op will take.
-    fn attr_site(&mut self, names: Vec<(u32, u32)>) {
-        if names.is_empty() {
+    fn attr_site(&mut self, mut names: Vec<(u32, u32)>, mut dynamic_names: Vec<(u32, u32)>) {
+        if names.is_empty() && dynamic_names.is_empty() {
             return;
         }
+        let static_count = u32::try_from(names.len()).unwrap_or(u32::MAX);
+        names.append(&mut dynamic_names);
         self.attr_sites.push(AttrSite {
             ip: u32::try_from(self.ops.len()).unwrap_or(NO_POS),
             names,
+            static_count,
+            by_name: Box::default(),
         });
     }
 
@@ -178,7 +182,7 @@ pub struct Compiler<'src> {
     /// The settings this compilation resolves bare globals under.
     ///
     /// Compilation is settings-dependent and it is easy to miss why:
-    /// `is_cpp_global` consults `pure-eval` (an impure-only constant is not a
+    /// `is_global` consults `pure-eval` (an impure-only constant is not a
     /// global when it is on) and `cpp-builtin-names` (a gated name is a global
     /// only if cppnix registered it), so the same text compiles to different
     /// ops under different settings. Carried as a value rather than read from
@@ -205,6 +209,25 @@ pub enum Origin<'a> {
     /// all, and a `realpath` on this side would answer a different string for
     /// the same file.
     File(&'a str),
+    /// A file read through a lazily mounted input. `mount_point` is the exact
+    /// logical store path used as the key in cppnix's `storeFS`.
+    MountedFile { path: &'a str, mount_point: &'a str },
+}
+
+impl<'a> Origin<'a> {
+    pub(crate) fn root(self) -> crate::value2::Root {
+        match self {
+            Origin::String | Origin::File(_) => crate::value2::Root::Ambient,
+            Origin::MountedFile { mount_point, .. } => crate::value2::Root::mounted(mount_point),
+        }
+    }
+
+    pub(crate) fn source_path(self) -> Option<&'a str> {
+        match self {
+            Origin::String => None,
+            Origin::File(path) | Origin::MountedFile { path, .. } => Some(path),
+        }
+    }
 }
 
 pub fn compile_source(
@@ -213,13 +236,37 @@ pub fn compile_source(
     origin: Origin<'_>,
     settings: &crate::eval::Settings,
 ) -> Result<Module> {
+    compile_source_with_hook(src, base_dir, origin, settings, || {})
+}
+
+fn compile_source_with_hook(
+    src: &str,
+    base_dir: &str,
+    origin: Origin<'_>,
+    settings: &crate::eval::Settings,
+    during_compile: impl FnOnce(),
+) -> Result<Module> {
     // The parse is inside the measured phase deliberately: cppnix's
     // comparable number is `parseExprFrom`, and a compile timer that started
     // after the parse would be measuring a different thing than the arm it
     // gets compared against.
-    let (out, nanos) = crate::perf::timed(|| compile_source_inner(src, base_dir, origin, settings));
+    let (out, nanos) = crate::perf::timed(|| {
+        during_compile();
+        compile_source_inner(src, base_dir, origin, settings)
+    });
     crate::perf::note_compile(src.len(), nanos);
     out
+}
+
+#[cfg(test)]
+pub(crate) fn compile_source_with_test_hook(
+    src: &str,
+    base_dir: &str,
+    origin: Origin<'_>,
+    settings: &crate::eval::Settings,
+    during_compile: impl FnOnce(),
+) -> Result<Module> {
+    compile_source_with_hook(src, base_dir, origin, settings, during_compile)
 }
 
 fn compile_source_inner(
@@ -237,7 +284,10 @@ fn compile_source_inner(
         .expr()
         .ok_or_else(|| CompileError::Parse("empty expression".into()))?;
     let mut c = Compiler {
-        module: Module::default(),
+        module: Module {
+            root: origin.root(),
+            ..Module::default()
+        },
         konst_idx: HashMap::new(),
         sym_idx: HashMap::new(),
         scopes: Vec::new(),
@@ -249,23 +299,57 @@ fn compile_source_inner(
     // over the file; the alternative is keeping the source itself on the
     // module, which is far larger and would only ever be used to count these
     // same newlines.
-    c.module.origin = match origin {
-        Origin::String => SrcOrigin::String,
-        Origin::File(path) => SrcOrigin::File(path.to_owned()),
-    };
+    c.module.origin = origin
+        .source_path()
+        .map_or(SrcOrigin::String, |path| SrcOrigin::File(path.to_owned()));
     c.module.line_starts = Module::line_starts_of(src);
     let mut ops = Emit::new();
     c.compile(&expr, &mut ops)?;
     ops.push(Op::Ret);
-    let entry = c.push_unit(ops.into_unit(None));
+    let unit = ops.into_unit(None);
+
+    let entry = c.push_unit(unit)?;
     c.module.entry = entry;
+    // Symbols are complete only now, so the sites' text index is built here,
+    // once per unit, and the compiler<->VM contract is checked on every
+    // module rather than only on the test corpus.
+    let Module { units, symbols, .. } = &mut c.module;
+    for unit in units.iter_mut() {
+        unit.link_attr_sites(symbols).map_err(|detail| {
+            CompileError::Parse(format!("internal: attr site contract: {detail}"))
+        })?;
+    }
     Ok(c.module)
 }
 
+/// The expressions cppnix's `maybeThunk` never thunks: an integer, float or
+/// URI literal, a string or path with no interpolation (`<x>` is an
+/// application, see `compile_path`), the empty list. Parentheses are looked
+/// through, as cppnix's parser has no node for them.
+fn is_constant(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(p) => p.expr().is_some_and(|inner| is_constant(&inner)),
+        Expr::Literal(_) => true,
+        Expr::Str(s) => !s
+            .normalized_parts()
+            .iter()
+            .any(|part| matches!(part, ast::InterpolPart::Interpolation(_))),
+        Expr::Path(p) => {
+            !p.parts()
+                .any(|part| matches!(part, ast::InterpolPart::Interpolation(_)))
+                && !p.syntax().text().to_string().starts_with('<')
+        }
+        Expr::List(l) => l.items().next().is_none(),
+        _ => false,
+    }
+}
+
 impl<'src> Compiler<'src> {
-    fn push_unit(&mut self, u: CodeUnit) -> u32 {
+    fn push_unit(&mut self, u: CodeUnit) -> Result<u32> {
+        let index = checked_unit_index(self.module.units.len())?;
+        checked_op_count(u.ops.len())?;
         self.module.units.push(u);
-        (self.module.units.len() - 1) as u32
+        Ok(index)
     }
 
     fn intern(&mut self, s: &str) -> u32 {
@@ -339,12 +423,16 @@ impl<'src> Compiler<'src> {
     }
 
     /// Compile `expr` as a fresh thunk unit capturing the current scope.
-    /// Trivial expressions (constants) skip the thunk.
+    ///
+    /// A constant never comes here: `value_or_thunk` pushes it as its value
+    /// first, in every lazy position, as cppnix's `maybeThunk` does.
     fn compile_thunk(&mut self, expr: &Expr) -> Result<Op> {
         let mut ops = Emit::new();
         self.compile(expr, &mut ops)?;
         ops.push(Op::Ret);
-        let unit = self.push_unit(ops.into_unit(None));
+        let unit = ops.into_unit(None);
+
+        let unit = self.push_unit(unit)?;
         Ok(Op::Thunk { unit })
     }
 
@@ -360,6 +448,11 @@ impl<'src> Compiler<'src> {
     /// frame does not exist until PushEnv), so those keep `compile_thunk`,
     /// whose captured env PushEnv repoints.
     fn compile_lazy(&mut self, expr: &Expr) -> Result<Op> {
+        if let Expr::Paren(paren) = expr
+            && let Some(inner) = paren.expr()
+        {
+            return self.compile_lazy(&inner);
+        }
         if let Expr::Ident(id) = expr
             && let Some(tok) = id.ident_token()
             // `__curPos` is not a variable at all, so a binding of that name
@@ -371,13 +464,66 @@ impl<'src> Compiler<'src> {
             && tok.text() != CUR_POS
         {
             let mut probe = Emit::new();
-            if self.compile_var(tok.text(), &mut probe).is_ok()
-                && let [Op::GetLocal { depth, slot }] = probe.ops.as_slice()
+            if self.compile_var(tok.text(), &mut probe).is_ok() {
+                match probe.ops.as_slice() {
+                    [Op::GetLocal { depth, slot }] => {
+                        return Ok(Op::GetLocalLazy {
+                            depth: *depth,
+                            slot: *slot,
+                        });
+                    }
+                    // A global that already is a value -- `true`, `false`,
+                    // `null`, `builtins`, a bare primop -- is pushed as that
+                    // value: cppnix's `ExprVar::maybeThunk` hands back the
+                    // base environment's cell rather than allocating a thunk,
+                    // which is why `flake = false` is forceable under the
+                    // trivial rule there. Not `derivation`, `__nixPath` or an
+                    // unimplemented global: those ops run code when executed
+                    // and stay deferred.
+                    [op @ (Op::Const(_) | Op::BuiltinsSet | Op::Builtin { .. })] => return Ok(*op),
+                    _ => {}
+                }
+            }
+        }
+        self.value_or_thunk(expr)
+    }
+
+    /// The rest of cppnix's `maybeThunk`: `ExprInt`, `ExprFloat`,
+    /// `ExprString` and `ExprPath` return their value and `ExprList` returns
+    /// `vEmptyList` for `[ ]`, so a constant is never a thunk there, which is
+    /// why `nixConfig.x = [ "s" ]` holds a string `readFlake` reads without
+    /// forcing. Here each of those compiles to exactly one op that reads no
+    /// environment (`Const`, `MkList { n: 0 }`), pushed in place of a thunk.
+    /// Valid in every lazy position, the let/rec fill ops included: those run
+    /// one frame out from their own scope, and a constant consults no frame.
+    ///
+    /// The probe compiles only `is_constant` shapes, which push no units, so a
+    /// miss costs a constant-pool lookup and nothing is emitted twice.
+    fn value_or_thunk(&mut self, expr: &Expr) -> Result<Op> {
+        if let Expr::Paren(paren) = expr
+            && let Some(inner) = paren.expr()
+        {
+            return self.value_or_thunk(&inner);
+        }
+        // Resolve in the actual scope: a binding named `false` must retain
+        // its cell, while the builtin Boolean needs no recursive frame.
+        if let Expr::Ident(id) = expr
+            && let Some(tok) = id.ident_token()
+            && tok.text() != CUR_POS
+        {
+            let mut probe = Emit::new();
+            self.compile_var(tok.text(), &mut probe)?;
+            if let [op @ (Op::Const(_) | Op::BuiltinsSet | Op::Builtin { .. })] =
+                probe.ops.as_slice()
             {
-                return Ok(Op::GetLocalLazy {
-                    depth: *depth,
-                    slot: *slot,
-                });
+                return Ok(*op);
+            }
+        }
+        if is_constant(expr) {
+            let mut probe = Emit::new();
+            self.compile(expr, &mut probe)?;
+            if let [op @ (Op::Const(_) | Op::MkList { n: 0 })] = probe.ops.as_slice() {
+                return Ok(*op);
             }
         }
         self.compile_thunk(expr)
@@ -579,16 +725,19 @@ impl<'src> Compiler<'src> {
             ops.push(Op::Apply);
             return Ok(());
         }
-        let abs = if text.starts_with('/') {
+        let rooted = if text.starts_with('/') {
             self.lint_absolute_path(&text)?;
-            normalize_path(&text)
+            crate::value2::PathValue::ambient(normalize_path(&text))
         } else if text.starts_with('~') {
-            self.home_path(&text)?
+            crate::value2::PathValue::ambient(self.home_path(&text)?)
         } else {
             self.lint_short_path(&text)?;
-            normalize_path(&format!("{}/{}", self.base_dir, text))
+            crate::value2::PathValue::normalized(
+                self.module.root.clone(),
+                &format!("{}/{}", self.base_dir, text),
+            )
         };
-        let idx = self.konst(Const::Path(abs));
+        let idx = self.konst(Const::Path(rooted));
         ops.push(Op::Const(idx));
         Ok(())
     }
@@ -633,14 +782,20 @@ impl<'src> Compiler<'src> {
         // The lints fire here too: cppnix's `path_start` production is
         // shared between the plain and interpolated forms, so `/x/${v}`
         // lints exactly as `/x/y` does.
-        let mut prefix = if literal.starts_with('~') {
-            self.home_path(&literal)?
+        let (root, mut prefix) = if literal.starts_with('~') {
+            (crate::value2::Root::Ambient, self.home_path(&literal)?)
         } else if literal.starts_with('/') {
             self.lint_absolute_path(&literal)?;
-            normalize_path(&literal)
+            (crate::value2::Root::Ambient, normalize_path(&literal))
         } else {
             self.lint_short_path(&literal)?;
-            normalize_path(&format!("{}/{}", self.base_dir, literal))
+            {
+                let rooted = crate::value2::PathValue::normalized(
+                    self.module.root.clone(),
+                    &format!("{}/{}", self.base_dir, literal),
+                );
+                (rooted.root, rooted.path.to_string())
+            }
         };
         // cppnix's `if (literal.size() > 1 && literal.back() == '/')`, read
         // off the literal and not off the normalized result: `/` alone
@@ -648,7 +803,7 @@ impl<'src> Compiler<'src> {
         if literal.len() > 1 && literal.ends_with('/') && !prefix.ends_with('/') {
             prefix.push('/');
         }
-        let idx = self.konst(Const::Path(prefix));
+        let idx = self.konst(Const::Path(crate::value2::PathValue::new(root, prefix)));
         ops.push(Op::Const(idx));
 
         let mut n: u16 = 1;
@@ -720,34 +875,38 @@ impl<'src> Compiler<'src> {
         let offset = u32::try_from(offset).unwrap_or(NO_POS);
         let (line, column) = self.module.line_col(offset).unwrap_or((0, 0));
         let (line, column) = (i64::from(line), i64::from(column));
-        // Pushed as name/value pairs for `MkAttrs`, which is how every other
-        // attrset literal is built; nothing here is a new kind of value.
+        // Built by `MkAttrs` like every other attrset literal: the values on
+        // the stack, the names in the op's attr site (with no position of
+        // their own, which is what `unsafeGetAttrPos` answers `null` for).
+        let mut sites = Vec::new();
         for (name, value) in [
             ("column", Const::Int(column)),
             ("file", Const::Str(file)),
             ("line", Const::Int(line)),
         ] {
-            let name_idx = self.konst(Const::Str(name.to_owned()));
-            ops.push(Op::Const(name_idx));
             let value_idx = self.konst(value);
             ops.push(Op::Const(value_idx));
+            sites.push((self.intern(name), NO_POS));
         }
-        ops.push(Op::MkAttrs { n: 3, rec: false });
+        self.record_attr_site(ops, sites, Vec::new());
+        ops.push(Op::MkAttrs {
+            statics: 3,
+            dynamics: 0,
+        });
         Ok(())
     }
 
     fn compile_var(&mut self, name: &str, ops: &mut Emit) -> Result<()> {
-        // Static scopes, innermost first.
+        // Static scopes, innermost first. A static binding wins over any
+        // inner `with`, and `depth` counts every environment node between
+        // here and it, `with` scopes included: `lookup_local` steps through
+        // an `EnvNode::With` the same as a frame.
         let mut depth: u16 = 0;
         let mut crossed_with = false;
         for frame in self.scopes.iter().rev() {
             match frame {
                 ScopeFrame::Bindings(names) => {
                     if let Some(slot) = names.iter().position(|n| n == name) {
-                        if crossed_with {
-                            // Static binding still wins over any inner with;
-                            // depth counts only binding frames at runtime.
-                        }
                         ops.push(Op::GetLocal {
                             depth,
                             slot: slot as u16,
@@ -793,10 +952,8 @@ impl<'src> Compiler<'src> {
         // mentions a derivation never compiles the wrapper.
         //
         // Placed after the local scopes above, so a binding named
-        // `derivation` still shadows it, and before `is_cpp_global`, which
-        // would otherwise route it to `UnimplementedGlobal`: the name is in
-        // the cpp globals list but has no entry in the primop table, since it
-        // is not one.
+        // `derivation` still shadows it. This dedicated opcode retains the
+        // lazy wrapper, while ordinary function globals use builtin indices.
         if name == "derivation" {
             ops.push(Op::DerivationGlobal);
             return Ok(());
@@ -811,19 +968,13 @@ impl<'src> Compiler<'src> {
             ops.push(Op::NixPathGlobal);
             return Ok(());
         }
-        // Bare-global resolution mirrors cppnix registration spelling: a
-        // primop registered as "__length" is global ONLY as __length (bare
-        // `length` is an undefined variable), one registered as "map" is
-        // global as map. Implemented names bind; known-but-unimplemented
-        // ones compile to a runtime unimplemented report.
-        if builtins::is_cpp_global(self.settings, name) {
-            let impl_name = name.strip_prefix("__").unwrap_or(name);
-            if let Some(idx) = builtins::global_index(impl_name) {
-                ops.push(Op::Builtin { idx });
-            } else {
-                let sym = self.intern(name);
-                ops.push(Op::UnimplementedGlobal { sym });
-            }
+        // Global spellings and feature availability come from the owned catalogue.
+        // The catalogue contains only implemented functions; unknown names remain
+        // undefined rather than compiling to a placeholder opcode.
+        if builtins::is_global(self.settings, name)
+            && let Some(idx) = builtins::global_index(name.strip_prefix("__").unwrap_or(name))
+        {
+            ops.push(Op::Builtin { idx });
             return Ok(());
         }
         if crossed_with {
@@ -1031,7 +1182,8 @@ impl<'src> Compiler<'src> {
         ops.at = b.pos;
         self.emit_set_build(b, &mut ops)?;
         ops.push(Op::Ret);
-        Ok(self.push_unit(ops.into_unit(None)))
+        let unit = ops.into_unit(None);
+        self.push_unit(unit)
     }
 
     /// Emit the ops that leave one assembled set on the stack.
@@ -1039,28 +1191,33 @@ impl<'src> Compiler<'src> {
         if b.rec {
             return self.emit_rec_set_build(b, ops);
         }
-        let mut n: u16 = 0;
+        // Static values first, then the dynamic (name, value) pairs: the
+        // static names are not on the stack at all, they are the attr site's
+        // static half, in this same emission order (every `inherit` first,
+        // then the bindings, each in source order).
         let mut sites: Vec<(u32, u32)> = Vec::new();
+        let mut dynamic_sites: Vec<(u32, u32)> = Vec::new();
         for inh in &b.inherits {
-            n += self.emit_inherit_group(inh, ops, &mut sites)?;
+            self.emit_inherit_group(inh, ops, &mut sites)?;
         }
         for (name, pos, t) in &b.kids {
-            let k = self.konst(Const::Str(name.clone()));
-            ops.push(Op::Const(k));
             let op = self.bind_value_op(t)?;
             ops.push(op);
-            let sym = self.intern(name);
-            sites.push((sym, *pos));
-            n += 1;
+            sites.push((self.intern(name), *pos));
         }
-        for (attr, t) in &b.dynamic {
+        for (attr, pos, t) in &b.dynamic {
+            dynamic_sites.push((attr_count(dynamic_sites.len())?.into(), *pos));
             self.compile_attr_dynamic(attr, ops)?;
             let op = self.bind_value_op(t)?;
             ops.push(op);
-            n += 1;
         }
-        self.record_attr_site(ops, sites);
-        ops.push(Op::MkAttrs { n, rec: false });
+        // Counts come from the tables the op is zipped with, never from a
+        // running counter: a counter that wrapped at 65_536 emitted
+        // `MkAttrs { 0, 0 }` over a full site and a full stack.
+        let statics = attr_count(sites.len())?;
+        let dynamics = attr_count(dynamic_sites.len())?;
+        self.record_attr_site(ops, sites, dynamic_sites);
+        ops.push(Op::MkAttrs { statics, dynamics });
         Ok(())
     }
 
@@ -1118,10 +1275,11 @@ impl<'src> Compiler<'src> {
                 self.rec_inherit_fill_ops(inh, &mut fill)?;
             }
             for (_, _, t) in &b.kids {
-                // Thunks, never GetLocalLazy: a fill op runs before PushEnv,
-                // one frame out from the scope it was compiled against.
+                // Thunks or constants, never GetLocalLazy: a fill op runs
+                // before PushEnv, one frame out from the scope it was
+                // compiled against, and only a constant reads no frame.
                 fill.push(match t {
-                    BindTree::Leaf(e) => self.compile_thunk(e)?,
+                    BindTree::Leaf(e) => self.value_or_thunk(e)?,
                     BindTree::Node(sub) => {
                         let unit = self.set_build_unit(sub)?;
                         Op::Thunk { unit }
@@ -1163,11 +1321,8 @@ impl<'src> Compiler<'src> {
                 .map_err(|_| CompileError::Parse("too many rec bindings".into()))?;
             ops.extend(fill);
             ops.push(Op::PushEnv { n });
-            let mut m: u16 = 0;
             let mut sites: Vec<(u32, u32)> = Vec::new();
             for (slot, name) in names.iter().enumerate() {
-                let k = self.konst(Const::Str(name.clone()));
-                ops.push(Op::Const(k));
                 ops.push(Op::GetLocalLazy {
                     depth: 0,
                     slot: u16::try_from(slot)
@@ -1175,17 +1330,19 @@ impl<'src> Compiler<'src> {
                 });
                 let sym = self.intern(name);
                 sites.push((sym, where_written.get(slot).copied().unwrap_or(NO_POS)));
-                m += 1;
             }
             // With overrides the set is closed here and the appended names
             // arrive through `Update`; the dynamic attributes then land on
             // the result, which is cppnix's order and cppnix's duplicate
             // check. Without overrides the whole thing is one `MkAttrs`, as
             // it always was.
-            let mut dyn_n: u16 = 0;
             if overrides_at.is_some() {
-                self.record_attr_site(ops, core::mem::take(&mut sites));
-                ops.push(Op::MkAttrs { n: m, rec: false });
+                let statics = attr_count(sites.len())?;
+                self.record_attr_site(ops, core::mem::take(&mut sites), Vec::new());
+                ops.push(Op::MkAttrs {
+                    statics,
+                    dynamics: 0,
+                });
                 ops.push(Op::GetLocalLazy {
                     depth: 0,
                     slot: names
@@ -1194,22 +1351,24 @@ impl<'src> Compiler<'src> {
                         .map_err(|_| CompileError::Parse("too many rec bindings".into()))?,
                 });
                 ops.push(Op::Update);
-                m = 0;
             }
-            for (attr, t) in &b.dynamic {
+            let mut dynamic_sites: Vec<(u32, u32)> = Vec::new();
+            for (attr, pos, t) in &b.dynamic {
+                dynamic_sites.push((attr_count(dynamic_sites.len())?.into(), *pos));
                 self.compile_attr_dynamic(attr, ops)?;
                 let op = self.bind_value_op(t)?;
                 ops.push(op);
-                m += 1;
-                dyn_n += 1;
             }
+            let dynamics = attr_count(dynamic_sites.len())?;
             if overrides_at.is_some() {
-                if dyn_n > 0 {
-                    ops.push(Op::MkAttrsOnto { n: dyn_n });
+                if dynamics > 0 {
+                    self.record_attr_site(ops, Vec::new(), dynamic_sites);
+                    ops.push(Op::MkAttrsOnto { n: dynamics });
                 }
             } else {
-                self.record_attr_site(ops, sites);
-                ops.push(Op::MkAttrs { n: m, rec: false });
+                let statics = attr_count(sites.len())?;
+                self.record_attr_site(ops, sites, dynamic_sites);
+                ops.push(Op::MkAttrs { statics, dynamics });
             }
             ops.push(Op::PopEnv);
             Ok(())
@@ -1218,23 +1377,23 @@ impl<'src> Compiler<'src> {
         result
     }
 
-    /// File the attribute positions of the `MkAttrs` about to be emitted.
+    /// File the attribute names and positions of the `MkAttrs` about to be
+    /// emitted.
     ///
-    /// Sorted by the symbol's TEXT and not by its index, because the index is
-    /// assignment order (`intern`) and a lookup arrives with a name.
-    fn record_attr_site(&mut self, ops: &mut Emit, mut names: Vec<(u32, u32)>) {
-        names.sort_by(|a, b| {
-            let (x, y) = (self.symbol_text(a.0), self.symbol_text(b.0));
-            x.cmp(y)
-        });
-        ops.attr_site(names);
-    }
-
-    fn symbol_text(&self, sym: u32) -> &str {
-        self.module
-            .symbols
-            .get(sym as usize)
-            .map_or("", String::as_str)
+    /// Static entries are `(module symbol, position)` in the order the op
+    /// pops the static values (emission order: every `inherit` first, then
+    /// the bindings), because the site IS where the VM takes those names
+    /// from; the order is load-bearing, never sorted. Dynamic entries are
+    /// `(index among the op's dynamic pairs, position)`, joined to the names
+    /// the VM resolves on each execution. `CodeUnit::check_attr_sites` is the
+    /// contract this has to meet.
+    fn record_attr_site(
+        &mut self,
+        ops: &mut Emit,
+        static_names: Vec<(u32, u32)>,
+        dynamic_names: Vec<(u32, u32)>,
+    ) {
+        ops.attr_site(static_names, dynamic_names);
     }
 
     /// `<overrides>.<name> or <fallback>`, as one thunk for a rec slot.
@@ -1270,7 +1429,7 @@ impl<'src> Compiler<'src> {
             param: None,
             spans,
             attr_sites: Vec::new(),
-        });
+        })?;
         Ok(Op::Thunk { unit })
     }
 
@@ -1297,20 +1456,15 @@ impl<'src> Compiler<'src> {
         inh: &ast::Inherit,
         ops: &mut Emit,
         sites: &mut Vec<(u32, u32)>,
-    ) -> Result<u16> {
-        let mut n: u16 = 0;
+    ) -> Result<()> {
         let mut fill = Vec::new();
         self.inherit_fill_ops(inh, &mut fill)?;
         for (attr, op) in inh.attrs().zip(fill) {
             let name = static_attr_name(&attr)?.ok_or_else(no_dynamic_in_inherit)?;
-            let k = self.konst(Const::Str(name.clone()));
-            ops.push(Op::Const(k));
             ops.push(op);
-            let sym = self.intern(&name);
-            sites.push((sym, attr_offset(&attr)));
-            n += 1;
+            sites.push((self.intern(&name), attr_offset(&attr)));
         }
-        Ok(n)
+        Ok(())
     }
 
     /// `inherit x;` inside a rec scope resolves x in the ENCLOSING scope, so
@@ -1370,7 +1524,7 @@ impl<'src> Compiler<'src> {
                 None => self.compile_var(&name, &mut tops)?,
             }
             tops.push(Op::Ret);
-            let unit = self.push_unit(tops.into_unit(None));
+            let unit = self.push_unit(tops.into_unit(None))?;
             fill.push(Op::Thunk { unit });
         }
         Ok(())
@@ -1399,8 +1553,10 @@ impl<'src> Compiler<'src> {
                 self.rec_inherit_fill_ops(inh, &mut fill)?;
             }
             for (_, _, t) in &b.kids {
+                // As in `emit_rec_set_build`: thunks or constants, never
+                // GetLocalLazy, since the fill runs before PushEnv.
                 fill.push(match t {
-                    BindTree::Leaf(e) => self.compile_thunk(e)?,
+                    BindTree::Leaf(e) => self.value_or_thunk(e)?,
                     BindTree::Node(sub) => {
                         let unit = self.set_build_unit(sub)?;
                         Op::Thunk { unit }
@@ -1485,7 +1641,7 @@ impl<'src> Compiler<'src> {
                                 let mut dops = Emit::new();
                                 self.compile(&d, &mut dops)?;
                                 dops.push(Op::Ret);
-                                Some(self.push_unit(dops.into_unit(None)))
+                                Some(self.push_unit(dops.into_unit(None))?)
                             }
                             None => None,
                         };
@@ -1522,7 +1678,7 @@ impl<'src> Compiler<'src> {
             let mut bops = Emit::new();
             self.compile(&body, &mut bops)?;
             bops.push(Op::Ret);
-            Ok(self.push_unit(bops.into_unit(Some(param_ir))))
+            self.push_unit(bops.into_unit(Some(param_ir)))
         })();
         self.scopes.pop();
         let unit = result?;
@@ -1737,6 +1893,71 @@ impl<'src> Compiler<'src> {
     }
 }
 
+/// Turn the next `Module::units` offset into an IR index without entering the
+/// `AttrOrigin` tag range. Those values are interpreted as slab coordinates by
+/// `Clone` and `Drop`, so compiling a real unit with one would corrupt origin
+/// ownership rather than merely make an oversized module.
+fn checked_unit_index(index: usize) -> Result<u32> {
+    let index = u32::try_from(index)
+        .map_err(|_| CompileError::Eval("module has too many code units".to_owned()))?;
+    if index >= crate::value2::AttrOrigin::PROJECTED_UNIT {
+        return Err(CompileError::Eval(
+            "module has too many code units for attribute provenance".to_owned(),
+        ));
+    }
+    Ok(index)
+}
+
+/// A real instruction index must stay below `AttrOrigin::FORMALS`, which uses
+/// `u32::MAX` in the `ip` word for a non-instruction source site.
+fn checked_op_count(count: usize) -> Result<()> {
+    let first_invalid = usize::try_from(crate::value2::AttrOrigin::FORMALS).unwrap_or(usize::MAX);
+    if count > first_invalid {
+        return Err(CompileError::Eval(
+            "code unit has too many instructions for attribute provenance".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod origin_index_tests {
+    use super::{checked_op_count, checked_unit_index};
+    use crate::value2::AttrOrigin;
+
+    /// Exercise the numeric boundary directly. Allocating four billion units
+    /// would hide this invariant behind the allocator and never reach the cast
+    /// whose collision this test exists to prevent.
+    #[test]
+    fn compiled_indices_stop_before_attribute_origin_sentinels() {
+        let first_reserved = usize::try_from(AttrOrigin::PROJECTED_UNIT)
+            .expect("u32 fits usize on supported targets");
+        let Ok(last_real) = checked_unit_index(first_reserved - 1) else {
+            unreachable!("the unit below the reserved range was rejected")
+        };
+        assert_eq!(last_real, AttrOrigin::PROJECTED_UNIT - 1);
+        for reserved in [
+            AttrOrigin::PROJECTED_UNIT,
+            AttrOrigin::LIST_TO_ATTRS_UNIT,
+            AttrOrigin::DYNAMIC_UNIT,
+        ] {
+            assert!(
+                checked_unit_index(reserved as usize).is_err(),
+                "reserved unit tag {reserved} compiled as a real unit"
+            );
+        }
+
+        let formals =
+            usize::try_from(AttrOrigin::FORMALS).expect("u32 fits usize on supported targets");
+        assert!(checked_op_count(formals).is_ok());
+        #[cfg(target_pointer_width = "64")]
+        assert!(
+            checked_op_count(formals + 1).is_err(),
+            "a real instruction index can alias the FORMALS sentinel"
+        );
+    }
+}
+
 /// What one binding name is bound to. A `Node` is an attribute set under
 /// construction: `a.b = 1; a.c = 2;` is one `a`, and so is
 /// `a = { b = 1; }; a = { c = 2; };`, because cppnix's parser merges two
@@ -1767,7 +1988,7 @@ struct SetBuild {
     /// more path after it: `{ ${a}.b = 1; }` binds one run-time name to a set
     /// that this compiler builds, and there is no source expression for that
     /// set to point at.
-    dynamic: Vec<(ast::Attr, BindTree)>,
+    dynamic: Vec<(ast::Attr, u32, BindTree)>,
     inherits: Vec<ast::Inherit>,
 }
 
@@ -1845,14 +2066,16 @@ fn tree_insert(b: &mut SetBuild, path: &[ast::Attr], value: Expr, root_pos: u32)
         Some(name) => name,
         None => {
             if rest.is_empty() {
-                b.dynamic.push((head_attr.clone(), BindTree::Leaf(value)));
+                b.dynamic
+                    .push((head_attr.clone(), root_pos, BindTree::Leaf(value)));
             } else {
                 let mut sub = SetBuild {
                     pos: attr_offset(head_attr),
                     ..SetBuild::default()
                 };
                 tree_insert(&mut sub, rest, value, root_pos)?;
-                b.dynamic.push((head_attr.clone(), BindTree::Node(sub)));
+                b.dynamic
+                    .push((head_attr.clone(), root_pos, BindTree::Node(sub)));
             }
             return Ok(());
         }
@@ -1971,6 +2194,13 @@ fn no_dynamic_in_inherit() -> CompileError {
     CompileError::Parse("dynamic attributes not allowed in inherit".into())
 }
 
+/// The `u16` a set-building op carries for one of its attribute tables, from
+/// the table's actual length, or a compile error: `MkAttrs` is zipped with
+/// its attr site by position, so the count and the table must not disagree.
+fn attr_count(len: usize) -> Result<u16> {
+    u16::try_from(len).map_err(|_| CompileError::Parse("too many attributes in one set".into()))
+}
+
 fn node_name(e: &Expr) -> &'static str {
     match e {
         Expr::Apply(_) => "function application",
@@ -2000,7 +2230,7 @@ fn node_name(e: &Expr) -> &'static str {
 mod span_tests {
     use super::compile_source;
     use crate::compile::Origin;
-    use crate::ir::{Module, NO_POS};
+    use crate::ir::{AttrSite, Module, NO_POS};
 
     /// Enough of the language that a construct emitting unattributed ops is
     /// likely to be in here somewhere.
@@ -2121,28 +2351,146 @@ mod span_tests {
         assert!(total > 250, "the corpus shrank to {total} ops");
     }
 
-    /// `attr_sites` is binary-searched by `ip` and its `names` by symbol
-    /// text, so an unsorted table finds the wrong attribute or none.
+    /// The compiler<->VM contract on attribute sites is one function,
+    /// `CodeUnit::check_attr_sites` (the module-cache decoder runs the same
+    /// one on every cached unit), so the corpus is checked against it rather
+    /// than against a second transcription of the rules.
     #[test]
-    fn the_attr_site_table_is_sorted() {
+    fn the_attr_site_table_matches_its_ops() {
         for (src, m) in modules() {
             for unit in &m.units {
-                let ips: Vec<u32> = unit.attr_sites.iter().map(|s| s.ip).collect();
-                let mut sorted = ips.clone();
-                sorted.sort_unstable();
-                assert_eq!(ips, sorted, "attr sites of `{src}` are out of ip order");
-                for site in &unit.attr_sites {
-                    let names: Vec<&str> = site
-                        .names
-                        .iter()
-                        .map(|&(sym, _)| m.symbols.get(sym as usize).map_or("", String::as_str))
-                        .collect();
-                    let mut sorted = names.clone();
-                    sorted.sort_unstable();
-                    assert_eq!(names, sorted, "attr site names of `{src}` are unsorted");
+                if let Err(detail) = unit.check_attr_sites(&m.symbols) {
+                    panic!("attr sites of `{src}`: {detail}");
                 }
             }
         }
+    }
+
+    /// Static names sit in the site in emission order: every `inherit`
+    /// first, then the bindings, each in source order. The VM pairs them with
+    /// the popped values by position, so this order IS the meaning of the
+    /// op; a sorted table would name every attribute wrong.
+    #[test]
+    fn static_attr_names_are_recorded_in_emission_order() {
+        let module = five_name_module();
+        let site = five_name_site(&module);
+        let want = FIVE_NAMES_IN_EMISSION_ORDER;
+        assert_eq!(site.static_names().len(), want.len());
+        for (i, (&(sym, _), name)) in site.static_names().iter().zip(want).enumerate() {
+            assert!(
+                module.symbol_is(sym, name),
+                "static name {i} of the fixture is not `{name}`"
+            );
+        }
+    }
+
+    /// A position lookup arrives with text and goes through the site's text
+    /// index, not a scan of the emission-ordered table: every static name
+    /// resolves to its own position and an absent name to `None`.
+    #[test]
+    fn static_attr_positions_resolve_through_the_text_index() {
+        let module = five_name_module();
+        let site = five_name_site(&module);
+        for (i, name) in FIVE_NAMES_IN_EMISSION_ORDER.iter().enumerate() {
+            let (_, offset) = site.static_names()[i];
+            assert_ne!(offset, NO_POS, "`{name}` has a position");
+            assert_eq!(
+                site.static_offset(name, &module.symbols),
+                Some(offset),
+                "`{name}` resolves to its own position"
+            );
+        }
+        assert_eq!(site.static_offset("absent", &module.symbols), None);
+        assert_eq!(site.static_offset("", &module.symbols), None);
+    }
+
+    /// `{ z = 3; inherit (e) q p; a = 4; m = 5; }`: the static names in the
+    /// order the op pops them (inherits first, then bindings, source order).
+    const FIVE_NAMES_IN_EMISSION_ORDER: [&str; 5] = ["q", "p", "z", "a", "m"];
+
+    fn five_name_module() -> Module {
+        let src = "let e = { p = 1; q = 2; }; in { z = 3; inherit (e) q p; a = 4; m = 5; }";
+        compile_source(src, "/", Origin::String, &crate::eval::Settings::default())
+            .expect("fixture compiles")
+    }
+
+    fn five_name_site(module: &Module) -> &AttrSite {
+        module
+            .units
+            .iter()
+            .flat_map(|unit| {
+                unit.attr_sites.iter().filter(move |site| {
+                    unit.ops.get(site.ip as usize).is_some_and(|op| {
+                        matches!(
+                            op,
+                            crate::ir::Op::MkAttrs {
+                                statics: 5,
+                                dynamics: 0
+                            }
+                        )
+                    })
+                })
+            })
+            .next()
+            .expect("fixture emitted the five-name MkAttrs site")
+    }
+
+    /// A runtime-name site keeps static symbols in the compiled table and
+    /// records pair indices only for runtime-computed names. This is what
+    /// keeps one dynamic binding from becoming per-execution work for every
+    /// static binding in the same set.
+    #[test]
+    fn a_dynamic_attr_site_separates_static_and_runtime_names() {
+        let src = r#"let k = "b"; in { a = 1; ${k} = 2; }"#;
+        let pos = |needle: &str| {
+            u32::try_from(src.find(needle).expect("the fixture moved"))
+                .expect("the fixture exceeds u32")
+        };
+        let module = compile_source(src, "/", Origin::String, &crate::eval::Settings::default())
+            .expect("fixture compiles");
+        let site = module
+            .units
+            .iter()
+            .flat_map(|unit| {
+                unit.attr_sites.iter().filter(move |site| {
+                    unit.ops.get(site.ip as usize).is_some_and(
+                        |op| matches!(op, crate::ir::Op::MkAttrs { dynamics, .. } if *dynamics > 0),
+                    )
+                })
+            })
+            .next()
+            .expect("fixture emitted a dynamic MkAttrs site");
+        assert_eq!(site.static_names(), [(0, pos("a = 1"))]);
+        assert_eq!(site.dynamic_names(), [(0, pos("${k}"))]);
+    }
+
+    #[test]
+    fn one_dynamic_binding_does_not_make_static_bindings_runtime_entries() {
+        use std::fmt::Write as _;
+
+        let mut src = "let k = \"dynamic\"; in {".to_owned();
+        for i in 0..1_000 {
+            write!(&mut src, " static{i:04} = {i};").expect("writing to a string succeeds");
+        }
+        src.push_str(" ${k} = 1; }");
+        let module = compile_source(&src, "/", Origin::String, &crate::eval::Settings::default())
+            .expect("fixture compiles");
+        let site = module
+            .units
+            .iter()
+            .flat_map(|unit| {
+                unit.attr_sites.iter().filter(move |site| {
+                    unit.ops.get(site.ip as usize).is_some_and(
+                        |op| matches!(op, crate::ir::Op::MkAttrs { dynamics, .. } if *dynamics > 0),
+                    )
+                })
+            })
+            .next()
+            .expect("fixture emitted a dynamic MkAttrs site");
+
+        assert_eq!(site.static_names().len(), 1_000);
+        assert_eq!(site.dynamic_names().len(), 1);
+        assert_eq!(site.dynamic_names()[0].0, 0);
     }
 }
 
@@ -2295,7 +2643,7 @@ mod pool_index_tests {
     fn count_path(m: &Module, want: &str) -> usize {
         m.consts
             .iter()
-            .filter(|c| matches!(c, Const::Path(p) if p == want))
+            .filter(|c| matches!(c, Const::Path(p) if p.path.as_ref() == want))
             .count()
     }
 
@@ -2313,6 +2661,28 @@ mod pool_index_tests {
             "pool: {:?}",
             m.consts
         );
+    }
+
+    #[test]
+    fn a_relative_literal_keeps_the_imported_modules_mount() {
+        let mount = "/nix/store/00000000000000000000000000000000-source";
+        let file = format!("{mount}/sub/module.nix");
+        let module = compile_source(
+            "./a",
+            &format!("{mount}/sub"),
+            Origin::MountedFile {
+                path: &file,
+                mount_point: mount,
+            },
+            &crate::eval::Settings::default(),
+        )
+        .unwrap_or_default();
+        assert!(module.consts.iter().any(|constant| matches!(
+            constant,
+            Const::Path(p)
+                if matches!(&p.root, crate::value2::Root::Mounted(root) if root.as_ref() == mount)
+                    && p.path.as_ref() == format!("{mount}/sub/a")
+        )));
     }
 
     /// Deduplication is what the index replaced, so it has to still happen.
@@ -2393,6 +2763,73 @@ mod pool_index_tests {
                 "symbol {s:?} appears twice in {:?}",
                 m.symbols
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod immediate_value_tests {
+    use super::compile_source;
+    use crate::compile::Origin;
+    use crate::ir::{Module, Op};
+
+    fn module_of(src: &str) -> Module {
+        let m = compile_source(src, "/", Origin::String, &crate::eval::Settings::default());
+        assert!(m.is_ok(), "{src} did not compile: {m:?}");
+        m.unwrap_or_default()
+    }
+
+    fn deferred_in_entry(m: &Module) -> usize {
+        m.units[m.entry as usize]
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::Thunk { .. } | Op::Closure { .. }))
+            .count()
+    }
+
+    /// `{ a = false; }`, `{ a = "s"; }`, `{ a = [ ]; }`: cppnix's `maybeThunk`
+    /// returns the base environment's cell for a global and the value itself
+    /// for a constant (`ExprVar`, `ExprInt`, `ExprFloat`, `ExprString`,
+    /// `ExprPath`, `ExprList` when empty), so `a` is a value, not a thunk,
+    /// and a reader that looks without forcing sees it. The entry then
+    /// defers nothing.
+    #[test]
+    fn values_are_values_not_thunks() {
+        for value in [
+            "false",
+            "true",
+            "null",
+            "builtins",
+            "map",
+            "\"s\"",
+            "''s''",
+            "1",
+            "1.5",
+            "./p",
+            "[ ]",
+            "(\"s\")",
+            "(false)",
+            "((true))",
+            "(builtins)",
+        ] {
+            let m = module_of(&format!("{{ a = {value}; }}"));
+            let deferred = deferred_in_entry(&m);
+            assert_eq!(deferred, 0, "{value}: the entry deferred {deferred} cells");
+        }
+        // The let/rec fill ops push a constant the same way (cppnix's
+        // `ExprLet::eval` and `ExprAttrs::eval` call `maybeThunk` on each
+        // binding); a binding that runs code is still a thunk there.
+        for (source, deferred) in [
+            ("let z = \"x\"; in z", 0),
+            ("let z = [ ]; in z", 0),
+            ("let z = 1; y = ./p; in z", 0),
+            ("let z = false; in z", 0),
+            ("rec { flake = (false); }", 0),
+            ("let false = (x: x) true; z = false; in z", 2),
+            ("let z = (x: x) 1; in z", 1),
+        ] {
+            let m = module_of(source);
+            assert_eq!(deferred_in_entry(&m), deferred, "{source}");
         }
     }
 }

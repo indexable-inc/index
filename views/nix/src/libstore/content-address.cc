@@ -1,9 +1,37 @@
 #include "nix/util/args.hh"
+#include "nix/util/archive.hh"
+#include "nix/util/git.hh"
+#include "nix/util/source-path.hh"
+#include "nix/store/references.hh"
 #include "nix/store/content-address.hh"
 #include "nix/util/split.hh"
 #include "nix/util/json-utils.hh"
 
 namespace nix {
+
+ContentAddressHashResult hashContentAddress(const SourcePath & path, const ContentAddressHashRequest & request)
+{
+    auto method = request.method.getFileIngestionMethod();
+    switch (method) {
+    case FileIngestionMethod::Flat:
+    case FileIngestionMethod::NixArchive: {
+        HashModuloSink contentSink{request.algorithm, request.selfReference};
+        if (method == FileIngestionMethod::NixArchive) {
+            HashSink narSink{HashAlgorithm::SHA256};
+            TeeSink sink{contentSink, narSink};
+            dumpPath(path, sink, FileSerialisationMethod::NixArchive);
+            return {.hash = contentSink.finish().hash, .narHashAndSize = narSink.finish()};
+        }
+        dumpPath(path, contentSink, FileSerialisationMethod::Flat);
+        return {.hash = contentSink.finish().hash, .narHashAndSize = std::nullopt};
+    }
+    case FileIngestionMethod::Git:
+        return {.hash = git::dumpHash(request.algorithm, path).hash, .narHashAndSize = std::nullopt};
+    case FileIngestionMethod::JjTree:
+        throw TreeIdNotComputable("a jj tree content address must be authenticated by its object store");
+    }
+    throw Error("unsupported content-address ingestion method");
+}
 
 std::string_view makeFileIngestionPrefix(FileIngestionMethod m)
 {
@@ -16,6 +44,8 @@ std::string_view makeFileIngestionPrefix(FileIngestionMethod m)
     case FileIngestionMethod::Git:
         experimentalFeatureSettings.require(Xp::GitHashing);
         return "git:";
+    case FileIngestionMethod::JjTree:
+        return "jj-tree:";
     default:
         assert(false);
     }
@@ -29,6 +59,7 @@ std::string_view ContentAddressMethod::render() const
     case ContentAddressMethod::Raw::Flat:
     case ContentAddressMethod::Raw::NixArchive:
     case ContentAddressMethod::Raw::Git:
+    case ContentAddressMethod::Raw::JjTree:
         return renderFileIngestionMethod(getFileIngestionMethod());
     default:
         assert(false);
@@ -53,6 +84,8 @@ static ContentAddressMethod fileIngestionMethodToContentAddressMethod(FileIngest
         return ContentAddressMethod::Raw::NixArchive;
     case FileIngestionMethod::Git:
         return ContentAddressMethod::Raw::Git;
+    case FileIngestionMethod::JjTree:
+        return ContentAddressMethod::Raw::JjTree;
     default:
         assert(false);
     }
@@ -74,6 +107,7 @@ std::string_view ContentAddressMethod::renderPrefix() const
     case ContentAddressMethod::Raw::Flat:
     case ContentAddressMethod::Raw::NixArchive:
     case ContentAddressMethod::Raw::Git:
+    case ContentAddressMethod::Raw::JjTree:
         return makeFileIngestionPrefix(getFileIngestionMethod());
     default:
         assert(false);
@@ -87,6 +121,8 @@ ContentAddressMethod ContentAddressMethod::parsePrefix(std::string_view & m)
     } else if (splitPrefix(m, "git:")) {
         experimentalFeatureSettings.require(Xp::GitHashing);
         return ContentAddressMethod::Raw::Git;
+    } else if (splitPrefix(m, "jj-tree:")) {
+        return ContentAddressMethod::Raw::JjTree;
     } else if (splitPrefix(m, "text:")) {
         return ContentAddressMethod::Raw::Text;
     }
@@ -106,6 +142,7 @@ static std::string renderPrefixModern(const ContentAddressMethod & ca)
     case ContentAddressMethod::Raw::Flat:
     case ContentAddressMethod::Raw::NixArchive:
     case ContentAddressMethod::Raw::Git:
+    case ContentAddressMethod::Raw::JjTree:
         return "fixed:" + makeFileIngestionPrefix(ca.getFileIngestionMethod());
     default:
         assert(false);
@@ -126,6 +163,8 @@ FileIngestionMethod ContentAddressMethod::getFileIngestionMethod() const
         return FileIngestionMethod::NixArchive;
     case ContentAddressMethod::Raw::Git:
         return FileIngestionMethod::Git;
+    case ContentAddressMethod::Raw::JjTree:
+        return FileIngestionMethod::JjTree;
     case ContentAddressMethod::Raw::Text:
         return FileIngestionMethod::Flat;
     default:
@@ -153,11 +192,11 @@ static std::pair<ContentAddressMethod, HashAlgorithm> parseContentAddressMethodP
         prefix = *optPrefix;
     }
 
-    auto parseHashAlgorithm_ = [&]() {
+    auto parseHashAlgorithm_ = [&](const ExperimentalFeatureSettings & xpSettings = experimentalFeatureSettings) {
         auto hashAlgoRaw = splitPrefixTo(rest, ':');
         if (!hashAlgoRaw)
             throw UsageError("content address hash must be in form '<algo>:<hash>', but found: %s", wholeInput);
-        HashAlgorithm hashAlgo = parseHashAlgo(*hashAlgoRaw);
+        HashAlgorithm hashAlgo = parseHashAlgo(*hashAlgoRaw, xpSettings);
         return hashAlgo;
     };
 
@@ -177,6 +216,21 @@ static std::pair<ContentAddressMethod, HashAlgorithm> parseContentAddressMethodP
         else if (splitPrefix(rest, "git:")) {
             experimentalFeatureSettings.require(Xp::GitHashing);
             method = ContentAddressMethod::Raw::Git;
+        } else if (splitPrefix(rest, "jj-tree:")) {
+            /* The algorithm is the method's, not the user's choice: read it
+               past the `blake3-hashes` gate (see `nativeIdXpSettings`),
+               then hold it to the one value the method allows. */
+            HashAlgorithm hashAlgo = parseHashAlgorithm_(nativeIdXpSettings());
+            if (hashAlgo != HashAlgorithm::BLAKE3)
+                throw UsageError(
+                    "content address '%s' uses method 'jj-tree' with hash algorithm '%s', but a Jujutsu tree id is "
+                    "always BLAKE3",
+                    wholeInput,
+                    printHashAlgo(hashAlgo));
+            return {
+                ContentAddressMethod::Raw::JjTree,
+                hashAlgo,
+            };
         }
         HashAlgorithm hashAlgo = parseHashAlgorithm_();
         return {
@@ -194,9 +248,14 @@ ContentAddress ContentAddress::parse(std::string_view rawCa)
 
     auto [caMethod, hashAlgo] = parseContentAddressMethodPrefix(rest);
 
+    /* A jj tree id is BLAKE3 by construction, never by a user choosing the
+       algorithm, so it reads past the `blake3-hashes` gate. */
+    auto & xpSettings =
+        caMethod == ContentAddressMethod::Raw::JjTree ? nativeIdXpSettings() : experimentalFeatureSettings;
+
     return ContentAddress{
         .method = std::move(caMethod),
-        .hash = Hash::parseNonSRIUnprefixed(rest, hashAlgo),
+        .hash = Hash::parseNonSRIUnprefixed(rest, hashAlgo, xpSettings),
     };
 }
 
@@ -244,6 +303,7 @@ ContentAddressWithReferences ContentAddressWithReferences::withoutRefs(const Con
     case ContentAddressMethod::Raw::Flat:
     case ContentAddressMethod::Raw::NixArchive:
     case ContentAddressMethod::Raw::Git:
+    case ContentAddressMethod::Raw::JjTree:
         return FixedOutputInfo{
             .method = ca.method.getFileIngestionMethod(),
             .hash = ca.hash,
@@ -265,6 +325,12 @@ ContentAddressWithReferences::fromParts(ContentAddressMethod method, Hash hash, 
             .hash = std::move(hash),
             .references = std::move(refs.others),
         };
+    case ContentAddressMethod::Raw::JjTree:
+        /* The id covers the tree's bytes and nothing else; a reference
+           would be a claim the id does not certify. */
+        if (!refs.empty())
+            throw Error("a Jujutsu tree object cannot refer to other store paths");
+        [[fallthrough]];
     case ContentAddressMethod::Raw::Flat:
     case ContentAddressMethod::Raw::NixArchive:
     case ContentAddressMethod::Raw::Git:
@@ -319,9 +385,20 @@ void adl_serializer<ContentAddressMethod>::to_json(json & json, const ContentAdd
 ContentAddress adl_serializer<ContentAddress>::from_json(const json & json)
 {
     auto obj = getObject(json);
+    auto method = adl_serializer<ContentAddressMethod>::from_json(valueAt(obj, "method"));
+    /* See `ContentAddress::parse`: the algorithm of a jj tree id is the
+       method's, not a user's choice, so it reads past the `blake3-hashes`
+       gate; the method then holds it to BLAKE3. */
+    auto hash = method == ContentAddressMethod::Raw::JjTree
+                    ? adl_serializer<Hash>::from_json(valueAt(obj, "hash"), nativeIdXpSettings())
+                    : adl_serializer<Hash>::from_json(valueAt(obj, "hash"));
+    if (method == ContentAddressMethod::Raw::JjTree && hash.algo != HashAlgorithm::BLAKE3)
+        throw UsageError(
+            "content address uses method 'jj-tree' with hash algorithm '%s', but a Jujutsu tree id is always BLAKE3",
+            printHashAlgo(hash.algo));
     return {
-        .method = adl_serializer<ContentAddressMethod>::from_json(valueAt(obj, "method")),
-        .hash = valueAt(obj, "hash"),
+        .method = std::move(method),
+        .hash = std::move(hash),
     };
 }
 

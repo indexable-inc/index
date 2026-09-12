@@ -23,14 +23,13 @@
 //! are compared against: a retained process agreeing with itself proves
 //! nothing.
 
-use ix_kernel::cas::{Cas, DirCas, MemoryCas};
-use ix_kernel::rows::DirRows;
+use ix_kernel::cas::{Cas, MemoryCas};
 use nix_eval_rs::host::{Host, RealFs};
 use nix_eval_rs::modcache::ModuleCache;
 use nix_eval_rs::modcache::compile_domain;
-use nix_eval_rs::readset::{DirWitness, EvalResult, ResultCache, eval_domain};
+use nix_eval_rs::readset::{EvalResult, ResultCache, eval_domain};
 use nix_eval_rs::session;
-use nix_eval_rs::store::{Store, unreferenced_object_names};
+use nix_eval_rs::store::Store;
 use nix_eval_rs::vm::Vm;
 use std::io::{BufRead, Write};
 
@@ -67,12 +66,7 @@ struct Answer {
 /// `session::evaluate`, which is the same function the C ABI calls. Path
 /// resolution is the server's business; evaluation is not, and having two
 /// copies of it was how the two embedders would drift.
-fn evaluate(
-    vm: &mut Vm,
-    cache: &mut ModuleCache<'_, dyn Cas>,
-    results: Option<&mut ResultCache<'_, dyn Cas>>,
-    path: &str,
-) -> Answer {
+fn evaluate(vm: &mut Vm, results: Option<&mut ResultCache<'_, dyn Cas>>, path: &str) -> Answer {
     let real = RealFs;
     let fail = |message: String| Answer {
         result: EvalResult {
@@ -86,10 +80,11 @@ fn evaluate(
         memo: false,
     };
 
-    let resolved = match real.resolve_import(path) {
+    let resolved = match real.resolve_import(&nix_eval_rs::value2::ambient_path(path)) {
         Ok(resolved) => resolved,
         Err(error) => return fail(error),
     };
+    let resolved_text = resolved.to_string();
     // Re-read every time. The caches are keyed on this text, so reading it is
     // what lets them be trusted; skipping the read is what would make them
     // stale.
@@ -97,19 +92,18 @@ fn evaluate(
         Ok(source) => source,
         Err(error) => return fail(error),
     };
-    let base = match resolved.rsplit_once('/') {
+    let base = match resolved_text.rsplit_once('/') {
         Some((dir, _)) if !dir.is_empty() => dir.to_owned(),
         _ => ".".to_owned(),
     };
 
     let (result, reuse) = session::evaluate(
         vm,
-        cache,
         results,
         &real,
         &source,
         &base,
-        nix_eval_rs::compile::Origin::File(&resolved),
+        nix_eval_rs::compile::Origin::File(&resolved_text),
     );
     Answer {
         result,
@@ -159,33 +153,25 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
     }
 
     let memory = MemoryCas::new();
-    let directory;
     let cas: &dyn Cas = match &disk {
-        Some(disk) => {
-            directory = DirCas::open(disk.objects_dir())?;
-            &directory
-        }
+        Some(disk) => disk.cas(),
         None => &memory,
     };
 
-    let rows;
-    let witness;
-    let (mut cache, mut results) = match &disk {
-        Some(disk) => {
-            rows = DirRows::open(disk.index_dir())?;
-            witness = DirWitness::open(disk.witness_dir())?;
-            // Nothing is read here: rows arrive one key at a time, as
-            // requests ask for them. Whatever is refused is reported per
-            // request through take_corruption below.
-            (
-                ModuleCache::persistent(cas, &rows),
-                ResultCache::persistent(cas, &rows, &witness),
-            )
-        }
-        None => (ModuleCache::new(cas), ResultCache::new(cas)),
+    // Nothing is read here: rows arrive one key at a time, as requests ask
+    // for them. Whatever is refused is reported per request through
+    // take_corruption below. The compile cache is the machine's own.
+    let mut results = match &disk {
+        Some(disk) => ResultCache::persistent(disk),
+        None => ResultCache::new(cas),
     };
-
-    let mut vm = Vm::from_process_settings();
+    let mut vm = Vm::with_modules(
+        nix_eval_rs::eval::Settings::current(),
+        match &disk {
+            Some(disk) => ModuleCache::persistent(disk.clone()),
+            None => ModuleCache::in_memory(),
+        },
+    );
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut n = 0u64;
@@ -200,22 +186,15 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
             // A fresh process in everything but the process. The gate also
             // compares against genuinely separate processes; this arm exists
             // so a difference can be localised to the caches.
-            let scratch = MemoryCas::new();
-            let mut scratch_cache = ModuleCache::new(&scratch as &dyn Cas);
-            evaluate(
-                &mut Vm::from_process_settings(),
-                &mut scratch_cache,
-                None,
-                path,
-            )
+            evaluate(&mut Vm::from_process_settings(), None, path)
         } else if memo {
-            evaluate(&mut vm, &mut cache, Some(&mut results), path)
+            evaluate(&mut vm, Some(&mut results), path)
         } else {
-            evaluate(&mut vm, &mut cache, None, path)
+            evaluate(&mut vm, None, path)
         };
         // A damaged store entry is a miss, and a miss nobody reports looks
         // exactly like a cold cache. Say it, at the priority it earns.
-        for reason in cache.take_corruption() {
+        for reason in vm.modules_mut().take_corruption() {
             eprintln!("eval-server: warning: compile cache: {reason}");
         }
         for reason in results.take_corruption() {
@@ -247,7 +226,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
     // so it belongs after the work rather than in front of it, and a failure
     // here must not fail a run whose answers were already correct.
     if let (Some(disk), Some(cap)) = (&disk, cap) {
-        match disk.sweep(cap, &[compile_domain(), eval_domain()]) {
+        match disk.sweep(cap) {
             Ok(report) => {
                 // A sweep that emptied the witness directory is not a tidy
                 // sweep, it is a cache that will serve nothing next time, and
@@ -262,21 +241,20 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
                         report.witnesses_removed, report.witnesses_unreadable
                     );
                 }
-                if report.rows_removed + report.objects_removed + report.witnesses_removed > 0
-                    || report.still_over_cap
+                if report.rows_removed
+                    + report.objects_removed
+                    + report.witnesses_removed
+                    + report.leftovers_removed
+                    > 0
                 {
                     eprintln!(
-                        "eval-server: swept {} rows, {} objects, {} witnesses; {} -> {} bytes (cap {cap}){}",
+                        "eval-server: swept {} rows, {} objects, {} witnesses, {} leftovers; {} -> {} bytes (cap {cap})",
                         report.rows_removed,
                         report.objects_removed,
                         report.witnesses_removed,
+                        report.leftovers_removed,
                         report.bytes_before,
                         report.bytes_after,
-                        if report.still_over_cap {
-                            "; STILL OVER CAP"
-                        } else {
-                            ""
-                        }
                     );
                 }
             }
@@ -288,8 +266,8 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
 
 /// Report what an offline scan finds wrong with a store, and change nothing.
 fn scrub_store(disk: &Store) -> Result<(), Box<dyn core::error::Error>> {
-    let rows = DirRows::open(disk.index_dir())?;
-    let cas = DirCas::open(disk.objects_dir())?;
+    let rows = disk.rows();
+    let cas = disk.cas();
     let domains = [("compile", compile_domain()), ("eval", eval_domain())];
     let mut problems = 0usize;
     let mut checked = 0usize;
@@ -311,51 +289,26 @@ fn scrub_store(disk: &Store) -> Result<(), Box<dyn core::error::Error>> {
         );
     }
 
-    let orphaned_objects = unreferenced_object_names(disk, &[compile_domain(), eval_domain()]);
+    // What the sweep would remove, from the sweep's own census, so this
+    // report cannot drift from the rule (`Store::census`). ENG-12884 was the
+    // drift: the sweep was fixed and this diagnostic kept the old filename
+    // rule, calling every witness orphaned at exit 0.
+    let census = disk.census()?;
+    let orphaned_objects = census.unreferenced_objects();
     for name in &orphaned_objects {
-        println!("objects: {name} is referenced by no row");
+        println!("objects: {name} is referenced by no row and no live witness");
     }
-    // A witness is dead when the module it names is gone, and the module it
-    // names is a field inside it. Reading the *filename* instead is the
-    // pre-ENG-12601 rule, from when witnesses happened to be named by their
-    // module's object address; they are named by the evaluation identity now,
-    // no object is ever named after one, so that rule called every witness
-    // orphaned. It did it at exit 0, in the one diagnostic whose job is to
-    // spot exactly the failure ENG-12601 was -- a sweep reclaiming live
-    // witnesses -- so the real signal would have arrived as one more line in
-    // a report that always had them. `Store::sweep` was fixed when the
-    // renaming landed and this copy was not. ENG-12884.
-    let mut orphaned_witnesses = 0usize;
-    if let Ok(read) = std::fs::read_dir(disk.witness_dir()) {
-        for entry in read.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with(".tmp-") {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(entry.path()) else {
-                orphaned_witnesses += 1;
-                println!("witness: {name} cannot be read");
-                continue;
-            };
-            let Some(module) = nix_eval_rs::readset::witness_module(&bytes) else {
-                orphaned_witnesses += 1;
-                println!("witness: {name} does not say which module it belongs to");
-                continue;
-            };
-            if !disk.objects_dir().join(module.to_hex()).exists() {
-                orphaned_witnesses += 1;
-                println!(
-                    "witness: {name} names module object {} which is gone",
-                    module.to_hex()
-                );
-            }
-        }
+    let dead_witnesses = census.dead_witnesses();
+    for (name, why) in &dead_witnesses {
+        println!("witness: {name} {why}");
     }
 
     println!(
-        "scrub: {checked} rows checked, {problems} refused,          {} unreferenced objects, {orphaned_witnesses} orphaned witnesses, {} bytes",
+        "scrub: {checked} rows checked, {problems} refused, {} unreferenced objects, {} dead witnesses, {} leftovers, {} bytes",
         orphaned_objects.len(),
-        disk.size()
+        dead_witnesses.len(),
+        census.leftovers(),
+        census.total()
     );
     // Orphans are normal after a sweep and are not failures; a refused row is.
     if problems > 0 {

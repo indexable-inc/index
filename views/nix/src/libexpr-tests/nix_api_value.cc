@@ -13,6 +13,39 @@
 
 namespace nixC {
 
+static void initTestPrimop(nix_c_context * ctx, nix_value * value, PrimOpFun function)
+{
+    auto primop = nix_alloc_primop(ctx, function, 1, "testValueFunction", nullptr, "test callback", nullptr);
+    nix_init_primop(ctx, value, primop);
+    nix_gc_decref(ctx, primop);
+}
+
+static void throwingPrimop(void *, nix_c_context * ctx, EvalState *, nix_value **, nix_value *)
+{
+    nix_set_err_msg(ctx, NIX_ERR_NIX_ERROR, "This should not be evaluated by the lazy accessor");
+}
+
+static void incrementPrimop(void *, nix_c_context * ctx, EvalState * state, nix_value ** args, nix_value * ret)
+{
+    nix_value_force(ctx, state, args[0]);
+    nix_init_int(ctx, ret, nix_get_int(ctx, args[0]) + 1);
+}
+
+static void squarePrimop(void *, nix_c_context * ctx, EvalState * state, nix_value ** args, nix_value * ret)
+{
+    nix_value_force(ctx, state, args[0]);
+    auto value = nix_get_int(ctx, args[0]);
+    nix_init_int(ctx, ret, value * value);
+}
+
+static void attrPrimop(void *, nix_c_context * ctx, EvalState * state, nix_value ** args, nix_value * ret)
+{
+    auto builder = nix_make_bindings_builder(ctx, state, 1);
+    nix_bindings_builder_insert(ctx, builder, "foo", args[0]);
+    nix_make_attrs(ctx, ret, builder);
+    nix_bindings_builder_free(builder);
+}
+
 TEST_F(nix_api_expr_test, nix_value_get_int_invalid)
 {
     ASSERT_EQ(0, nix_get_int(ctx, nullptr));
@@ -193,14 +226,7 @@ TEST_F(nix_api_expr_test, nix_get_list_byidx_lazy)
     nix_value * throwingFn = nix_alloc_value(ctx, state);
     nix_value * throwingValue = nix_alloc_value(ctx, state);
 
-    nix_expr_eval_from_string(
-        ctx,
-        state,
-        R"(
-        _: throw "This should not be evaluated by the lazy accessor"
-    )",
-        "<test>",
-        throwingFn);
+    initTestPrimop(ctx, throwingFn, throwingPrimop);
     assert_ctx_ok();
 
     nix_init_apply(ctx, throwingValue, throwingFn, throwingFn);
@@ -216,7 +242,7 @@ TEST_F(nix_api_expr_test, nix_get_list_byidx_lazy)
     nix_value * incrementFn = nix_alloc_value(ctx, state);
     nix_value * argFive = nix_alloc_value(ctx, state);
 
-    nix_expr_eval_from_string(ctx, state, "x: x + 1", "<test>", incrementFn);
+    initTestPrimop(ctx, incrementFn, incrementPrimop);
     assert_ctx_ok();
     nix_init_int(ctx, argFive, 5);
 
@@ -392,14 +418,7 @@ TEST_F(nix_api_expr_test, nix_get_attr_byname_lazy)
     nix_value * throwingFn = nix_alloc_value(ctx, state);
     nix_value * throwingValue = nix_alloc_value(ctx, state);
 
-    nix_expr_eval_from_string(
-        ctx,
-        state,
-        R"(
-        _: throw "This should not be evaluated by the lazy accessor"
-    )",
-        "<test>",
-        throwingFn);
+    initTestPrimop(ctx, throwingFn, throwingPrimop);
     assert_ctx_ok();
 
     nix_init_apply(ctx, throwingValue, throwingFn, throwingFn);
@@ -415,7 +434,7 @@ TEST_F(nix_api_expr_test, nix_get_attr_byname_lazy)
     nix_value * incrementFn = nix_alloc_value(ctx, state);
     nix_value * argSeven = nix_alloc_value(ctx, state);
 
-    nix_expr_eval_from_string(ctx, state, "x: x + 1", "<test>", incrementFn);
+    initTestPrimop(ctx, incrementFn, incrementPrimop);
     assert_ctx_ok();
     nix_init_int(ctx, argSeven, 7);
 
@@ -482,14 +501,7 @@ TEST_F(nix_api_expr_test, nix_get_attr_byidx_lazy)
     nix_value * throwingFn = nix_alloc_value(ctx, state);
     nix_value * throwingValue = nix_alloc_value(ctx, state);
 
-    nix_expr_eval_from_string(
-        ctx,
-        state,
-        R"(
-        _: throw "This should not be evaluated by the lazy accessor"
-    )",
-        "<test>",
-        throwingFn);
+    initTestPrimop(ctx, throwingFn, throwingPrimop);
     assert_ctx_ok();
 
     nix_init_apply(ctx, throwingValue, throwingFn, throwingFn);
@@ -505,7 +517,7 @@ TEST_F(nix_api_expr_test, nix_get_attr_byidx_lazy)
     nix_value * incrementFn = nix_alloc_value(ctx, state);
     nix_value * argTen = nix_alloc_value(ctx, state);
 
-    nix_expr_eval_from_string(ctx, state, "x: x + 1", "<test>", incrementFn);
+    initTestPrimop(ctx, incrementFn, incrementPrimop);
     assert_ctx_ok();
     nix_init_int(ctx, argTen, 10);
 
@@ -582,14 +594,7 @@ TEST_F(nix_api_expr_test, nix_value_init)
     nix_init_int(ctx, two, 2);
 
     nix_value * f = nix_alloc_value(ctx, state);
-    nix_expr_eval_from_string(
-        ctx,
-        state,
-        R"(
-        a: a * a
-    )",
-        "<test>",
-        f);
+    initTestPrimop(ctx, f, squarePrimop);
 
     // Test
 
@@ -656,27 +661,13 @@ TEST_F(nix_api_expr_test, nix_value_init_apply_lazy_arg)
     // r should not throw an exception, because e is not evaluated
 
     nix_value * f = nix_alloc_value(ctx, state);
-    nix_expr_eval_from_string(
-        ctx,
-        state,
-        R"(
-        a: { foo = a; }
-    )",
-        "<test>",
-        f);
+    initTestPrimop(ctx, f, attrPrimop);
     assert_ctx_ok();
 
     nix_value * e = nix_alloc_value(ctx, state);
     {
         nix_value * g = nix_alloc_value(ctx, state);
-        nix_expr_eval_from_string(
-            ctx,
-            state,
-            R"(
-            _ignore: throw "error message for test case nix_value_init_apply_lazy_arg"
-        )",
-            "<test>",
-            g);
+        initTestPrimop(ctx, g, throwingPrimop);
         assert_ctx_ok();
 
         nix_init_apply(ctx, e, g, g);
@@ -699,8 +690,7 @@ TEST_F(nix_api_expr_test, nix_value_init_apply_lazy_arg)
     nix_value * foo = nix_get_attr_byname(ctx, r, state, "foo");
     ASSERT_EQ(nullptr, foo);
     ASSERT_THAT(
-        nix_err_msg(nullptr, ctx, nullptr),
-        testing::HasSubstr("error message for test case nix_value_init_apply_lazy_arg"));
+        nix_err_msg(nullptr, ctx, nullptr), testing::HasSubstr("This should not be evaluated by the lazy accessor"));
 
     // Clean up
     nix_gc_decref(ctx, f);

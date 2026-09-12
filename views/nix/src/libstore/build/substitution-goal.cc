@@ -26,14 +26,44 @@ PathSubstitutionGoal::~PathSubstitutionGoal()
     cleanup();
 }
 
+/* Expand available references through their registered metadata, but only
+   await absent objects. Awaiting available intermediate paths would create
+   goal cycles when their closures refer back to the path being substituted. */
+static Goals realiseReferenceGoals(Worker & worker, const StorePathSet & references, const StorePath & self)
+{
+    StorePathSet paths;
+    for (auto & path : references) {
+        worker.store.addTempRoot(path);
+        if (worker.store.isValidPath(path))
+            worker.store.computeFSClosure(path, paths);
+        else
+            paths.insert(path);
+    }
+    Goals goals;
+    for (auto & path : paths) {
+        worker.store.addTempRoot(path);
+        if (path != self && !worker.store.isValidPath(path))
+            goals.insert(worker.makePathSubstitutionGoal(path));
+    }
+    return goals;
+}
+
 Goal::Co PathSubstitutionGoal::init()
 {
     trace("init");
 
     worker.store.addTempRoot(storePath);
 
-    /* If the path already exists we're done. */
+    /* An available root can still have missing transitive references. */
     if (!repair && worker.store.isValidPath(storePath)) {
+        co_await await(realiseReferenceGoals(worker, StorePathSet{storePath}, storePath));
+        if (nrFailed != 0)
+            co_return doneFailure(
+                nrNoSubstituters > 0 ? ecNoSubstituters : ecFailed,
+                BuildResult::Failure{{
+                    .status = BuildResult::Failure::DependencyFailed,
+                    .msg = HintFmt("references of path '%s' could not be realised", worker.store.printStorePath(storePath)),
+                }});
         co_return doneSuccess(BuildResult::Success{.status = BuildResult::Success::AlreadyValid});
     }
 
@@ -121,15 +151,9 @@ Goal::Co PathSubstitutionGoal::init()
             continue;
         }
 
-        Goals waitees;
-
-        /* To maintain the closure invariant, we first have to realise the
-           paths referenced by this one. */
-        for (auto & i : info->references)
-            if (i != storePath) /* ignore self-references */
-                waitees.insert(worker.makePathSubstitutionGoal(i));
-
-        co_await await(std::move(waitees));
+        /* Restore the complete reference closure, including missing objects
+           below references that are themselves already available. */
+        co_await await(realiseReferenceGoals(worker, info->references, storePath));
 
         // FIXME: consider returning boolean instead of passing in reference
         bool out = false; // is mutated by tryToRun
@@ -194,10 +218,7 @@ Goal::Co PathSubstitutionGoal::tryToRun(
 
     trace("trying to run");
 
-    /* Make sure that we are allowed to start a substitution.  Note that even
-       if maxSubstitutionJobs == 0, we still allow a substituter to run. This
-       prevents infinite waiting. */
-    while (worker.getNrSubstitutions() >= std::max(1U, (unsigned int) worker.settings.maxSubstitutionJobs)) {
+    while (!worker.buildSlotAvailable(JobCategory::Substitution)) {
         co_await waitForBuildSlot();
     }
 
@@ -315,7 +336,7 @@ void PathSubstitutionGoal::cleanup()
         if (thr.joinable()) {
             // FIXME: signal worker thread to quit.
             thr.join();
-            worker.childTerminated(this, JobCategory::Substitution);
+            worker.childTerminated(this);
         }
 
         outPipe.close();

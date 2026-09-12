@@ -37,4 +37,14 @@ std::pair<StorePath, Hash> fetchToStore2(
 fetchers::Cache::Key
 makeSourcePathToHashCacheKey(std::string_view fingerprint, ContentAddressMethod method, const CanonPath & path);
 
+/**
+ * The tree object at `path`, with `filter` applied when one is given, as
+ * an accessor announcing its id (`SourceAccessor::knownTreeRoot`): the
+ * thing `ContentAddressMethod::Raw::JjTree` can address. `nullptr` when
+ * `path` is not a directory or its accessor cannot name the object
+ * (`getSubtree` / `getFilteredTree` say when). The root of an accessor
+ * unfiltered is the accessor itself, with no call made.
+ */
+std::shared_ptr<SourceAccessor> treeObjectAt(const SourcePath & path, PathFilter * filter);
+
 } // namespace nix

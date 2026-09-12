@@ -13,6 +13,7 @@
 #endif
 #include "nix/util/signals.hh"
 #include "nix/store/globals.hh"
+#include "ixe-build-scheduler.h"
 
 #ifndef _WIN32
 #  include <fcntl.h>
@@ -21,8 +22,44 @@
 
 namespace nix {
 
-Worker::Worker(Store & store, Store & evalStore)
-    : act(*logger, actRealise)
+namespace {
+
+template<typename F>
+void schedulerCall(F && call)
+{
+    char * message = nullptr;
+    auto status = call(&message);
+    std::unique_ptr<char, void (*)(char *)> error(message, ixe_build_scheduler_error_free);
+    if (status != 0)
+        throw Error("build scheduler: %s", message ? message : "missing failure diagnostic");
+}
+
+template<typename T, typename F>
+T schedulerResult(F && call)
+{
+    T result{};
+    schedulerCall([&](char ** error) { return call(&result, error); });
+    return result;
+}
+
+unsigned int schedulerCategory(JobCategory category)
+{
+    switch (category) {
+    case JobCategory::Build:
+        return IXE_BUILD_JOB_BUILD;
+    case JobCategory::Substitution:
+        return IXE_BUILD_JOB_SUBSTITUTION;
+    case JobCategory::Administration:
+        return IXE_BUILD_JOB_ADMINISTRATION;
+    }
+    unreachable();
+}
+
+} // namespace
+
+Worker::Worker(Store & store, Store & evalStore, BuildFailureMode failureMode)
+    : childScheduler(nullptr, ixe_build_scheduler_free)
+    , act(*logger, actRealise)
     , actDerivations(*logger, actBuilds)
     , actSubstitutions(*logger, actCopyPaths)
 #ifdef _WIN32
@@ -31,6 +68,8 @@ Worker::Worker(Store & store, Store & evalStore)
     , store(store)
     , evalStore(evalStore)
     , settings(nix::settings.getWorkerSettings())
+    , keepGoing(failureMode == BuildFailureMode::KeepGoing || settings.keepGoing)
+    , independentRequests(failureMode == BuildFailureMode::KeepGoing)
     , getSubstituters{[] {
         return nix::settings.getWorkerSettings().useSubstitutes ? getDefaultSubstituters() : std::list<ref<Store>>{};
     }}
@@ -39,9 +78,17 @@ Worker::Worker(Store & store, Store & evalStore)
     if (!ioport)
         throw windows::WinError("CreateIoCompletionPort");
 #endif
-    nrLocalBuilds = 0;
-    nrSubstitutions = 0;
-    lastWokenUp = steady_time_point::min();
+    IxeBuildSchedulerConfig config{
+        .max_builds = settings.maxBuildJobs,
+        .max_substitutions = settings.maxSubstitutionJobs,
+        .silent_seconds = settings.maxSilentTime,
+        .build_seconds = settings.buildTimeout,
+        .poll_seconds = settings.pollInterval,
+        .monitor_progress = settings.maxNoProgressTime != 0,
+    };
+    childScheduler.reset(schedulerResult<IxeBuildScheduler *>([&](auto out, char ** error) {
+        return ixe_build_scheduler_new(&config, out, error);
+    }));
 
 #ifndef _WIN32
     /* See the field doc in worker.hh: level-triggered interrupt wakeup for
@@ -217,7 +264,7 @@ void Worker::removeGoal(GoalPtr goal)
         topGoals.erase(goal);
         /* If a top-level goal failed, then kill all other goals
            (unless keepGoing was set). */
-        if (goal->exitCode == Goal::ecFailed && !settings.keepGoing)
+        if (goal->exitCode == Goal::ecFailed && !keepGoing)
             topGoals.clear();
     }
 
@@ -239,74 +286,78 @@ void Worker::wakeUp(GoalPtr goal)
 
 size_t Worker::getNrLocalBuilds()
 {
-    return nrLocalBuilds;
+    return schedulerResult<uint64_t>([&](auto out, char ** error) {
+        return ixe_build_scheduler_running(childScheduler.get(), IXE_BUILD_JOB_BUILD, out, error);
+    });
 }
 
 size_t Worker::getNrSubstitutions()
 {
-    return nrSubstitutions;
+    return schedulerResult<uint64_t>([&](auto out, char ** error) {
+        return ixe_build_scheduler_running(childScheduler.get(), IXE_BUILD_JOB_SUBSTITUTION, out, error);
+    });
+}
+
+bool Worker::buildSlotAvailable(JobCategory category)
+{
+    return schedulerResult<unsigned int>([&](auto out, char ** error) {
+               return ixe_build_scheduler_slot_available(childScheduler.get(), schedulerCategory(category), out, error);
+           })
+           != 0;
+}
+
+uint64_t Worker::schedulerTime(steady_time_point now) const
+{
+    auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now - schedulerEpoch).count();
+    if (milliseconds < 0)
+        throw Error("build scheduler monotonic clock precedes worker creation");
+    return static_cast<uint64_t>(milliseconds);
 }
 
 void Worker::childStarted(
     GoalPtr goal, const std::set<MuxablePipePollState::CommChannel> & channels, bool inBuildSlot, bool respectTimeouts)
 {
-    Child child;
-    child.goal = goal;
-    child.goal2 = goal.get();
-    child.channels = channels;
-    child.timeStarted = child.lastOutput = steady_time_point::clock::now();
-    child.inBuildSlot = inBuildSlot;
-    child.respectTimeouts = respectTimeouts;
-    children.emplace_back(child);
-    if (inBuildSlot) {
-        switch (goal->jobCategory()) {
-        case JobCategory::Substitution:
-            nrSubstitutions++;
-            break;
-        case JobCategory::Build:
-            nrLocalBuilds++;
-            break;
-        case JobCategory::Administration:
-            /* Intentionally not limited, see docs */
-            break;
-        default:
-            unreachable();
-        }
+    if (std::ranges::any_of(children, [&](const Child & child) { return child.identity == goal.get(); }))
+        throw Error("build goal already has a registered child");
+    Child child{
+        .goal = goal,
+        .identity = goal.get(),
+        .schedulerId = 0,
+        .channels = channels,
+    };
+    child.schedulerId = schedulerResult<uint64_t>([&](auto out, char ** error) {
+        return ixe_build_scheduler_start(
+            childScheduler.get(),
+            schedulerCategory(goal->jobCategory()),
+            inBuildSlot,
+            respectTimeouts,
+            schedulerTime(steady_time_point::clock::now()),
+            out,
+            error);
+    });
+    try {
+        children.emplace_back(std::move(child));
+    } catch (...) {
+        schedulerResult<unsigned int>([&](auto out, char ** error) {
+            return ixe_build_scheduler_stop(childScheduler.get(), child.schedulerId, false, out, error);
+        });
+        throw;
     }
 }
 
 void Worker::childTerminated(Goal * goal, bool wakeSleepers)
 {
-    childTerminated(goal, goal->jobCategory(), wakeSleepers);
-}
-
-void Worker::childTerminated(Goal * goal, JobCategory jobCategory, bool wakeSleepers)
-{
-    auto i = std::find_if(children.begin(), children.end(), [&](const Child & child) { return child.goal2 == goal; });
+    auto i =
+        std::find_if(children.begin(), children.end(), [&](const Child & child) { return child.identity == goal; });
     if (i == children.end())
         return;
 
-    if (i->inBuildSlot) {
-        switch (jobCategory) {
-        case JobCategory::Substitution:
-            assert(nrSubstitutions > 0);
-            nrSubstitutions--;
-            break;
-        case JobCategory::Build:
-            assert(nrLocalBuilds > 0);
-            nrLocalBuilds--;
-            break;
-        case JobCategory::Administration:
-            /* Intentionally not limited, see docs */
-            break;
-        default:
-            unreachable();
-        }
-    }
-
+    auto wake = schedulerResult<unsigned int>([&](auto out, char ** error) {
+        return ixe_build_scheduler_stop(childScheduler.get(), i->schedulerId, wakeSleepers, out, error);
+    });
     children.erase(i);
 
-    if (wakeSleepers) {
+    if (wake) {
 
         /* Wake up goals waiting for a build slot. */
         for (auto & j : wantingToBuild) {
@@ -322,9 +373,7 @@ void Worker::childTerminated(Goal * goal, JobCategory jobCategory, bool wakeSlee
 void Worker::waitForBuildSlot(GoalPtr goal)
 {
     goal->trace("wait for build slot");
-    bool isSubstitutionGoal = goal->jobCategory() == JobCategory::Substitution;
-    if ((!isSubstitutionGoal && getNrLocalBuilds() < settings.maxBuildJobs)
-        || (isSubstitutionGoal && getNrSubstitutions() < settings.maxSubstitutionJobs))
+    if (buildSlotAvailable(goal->jobCategory()))
         wakeUp(goal); /* we can do it right away */
     else
         addToWeakGoals(wantingToBuild, goal);
@@ -360,7 +409,11 @@ void Worker::run(const Goals & _topGoals)
     }
 
     /* Call queryMissing() to efficiently query substitutes. */
-    store.queryMissing(topPaths);
+    // Independent requests must report malformed derivations against their
+    // own goals. This batch prefetch can throw before any goal runs; the
+    // goals perform the same lookups themselves when it is omitted.
+    if (!independentRequests)
+        store.queryMissing(topPaths);
 
     debug("entered goal loop");
 
@@ -384,7 +437,16 @@ void Worker::run(const Goals & _topGoals)
             awake.clear();
             for (auto & goal : awake2) {
                 checkInterrupt();
+                // Polling between steps can wake a goal that is already in
+                // this batch. This step consumes that wake too; keep only
+                // wakes produced during or after work for the next batch.
+                awake.erase(goal);
                 goal->work();
+                // A new hook can negotiate synchronously. Drain accepted hooks
+                // between goal steps so their diagnostics cannot block uploads
+                // while the remaining ready goals compete for remote slots.
+                if (!topGoals.empty() && !children.empty())
+                    waitForInput(false);
                 if (topGoals.empty())
                     break; // stuff may have been cancelled
             }
@@ -414,12 +476,12 @@ void Worker::run(const Goals & _topGoals)
     /* If --keep-going is not set, it's possible that the main goal
        exited while some of its subgoals were still active.  But if
        --keep-going *is* set, then they must all be finished now. */
-    assert(!settings.keepGoing || awake.empty());
-    assert(!settings.keepGoing || wantingToBuild.empty());
-    assert(!settings.keepGoing || children.empty());
+    assert(!keepGoing || awake.empty());
+    assert(!keepGoing || wantingToBuild.empty());
+    assert(!keepGoing || children.empty());
 }
 
-void Worker::waitForInput()
+void Worker::waitForInput(bool block)
 {
     printMsg(lvlVomit, "waiting for children");
 
@@ -429,52 +491,20 @@ void Worker::waitForInput()
        the logger pipe of a build, we assume that the builder has
        terminated. */
 
-    bool useTimeout = false;
-    long timeout = 0;
     auto before = steady_time_point::clock::now();
-
-    /* If we're monitoring for silence on stdout/stderr, or if there
-       is a build timeout, then wait for input until the first
-       deadline for any child. */
-    auto nearest = steady_time_point::max(); // nearest deadline
-
     auto localStore = dynamic_cast<LocalStore *>(&store);
-    if (localStore && localStore->config->getLocalSettings().getGCSettings().minFree.get() != 0)
-        // If we have a local store (and thus are capable of automatically collecting garbage) and configured to do so,
-        // periodically wake up to see if we need to run the garbage collector. (See the `autoGC` call site above in
-        // this file, also gated on having a local store. when we wake up, we intended to reach that call site.)
-        nearest = before + std::chrono::seconds(10);
-    for (auto & i : children) {
-        if (!i.respectTimeouts)
-            continue;
-        if (0 != settings.maxSilentTime)
-            nearest = std::min(nearest, i.lastOutput + std::chrono::seconds(settings.maxSilentTime));
-        if (0 != settings.buildTimeout)
-            nearest = std::min(nearest, i.timeStarted + std::chrono::seconds(settings.buildTimeout));
-        if (0 != settings.maxNoProgressTime)
-            nearest = std::min(nearest, before + std::chrono::seconds(1));
-    }
-    if (nearest != steady_time_point::max()) {
-        timeout = std::max(1L, (long) std::chrono::duration_cast<std::chrono::seconds>(nearest - before).count());
-        useTimeout = true;
-    }
+    auto plan = schedulerResult<IxeBuildWaitPlan>([&](auto out, char ** error) {
+        return ixe_build_scheduler_wait_plan(
+            childScheduler.get(),
+            schedulerTime(before),
+            !waitingForAWhile.empty(),
+            localStore && localStore->config->getLocalSettings().getGCSettings().minFree.get() != 0,
+            out,
+            error);
+    });
 
-    /* If we are polling goals that are waiting for a lock, then wake
-       up after a few seconds at most. */
-    if (!waitingForAWhile.empty()) {
-        useTimeout = true;
-        if (lastWokenUp == steady_time_point::min() || lastWokenUp > before)
-            lastWokenUp = before;
-        timeout = std::max(
-            1L,
-            (long) std::chrono::duration_cast<std::chrono::seconds>(
-                lastWokenUp + std::chrono::seconds(settings.pollInterval) - before)
-                .count());
-    } else
-        lastWokenUp = steady_time_point::min();
-
-    if (useTimeout)
-        vomit("sleeping %d seconds", timeout);
+    if (plan.has_timeout)
+        vomit("sleeping %d milliseconds", plan.timeout_ms);
 
     MuxablePipePollState state;
 
@@ -502,7 +532,7 @@ void Worker::waitForInput()
 #ifdef _WIN32
         ioport.get(),
 #endif
-        useTimeout ? (std::optional{timeout * 1000}) : std::nullopt);
+        !block || plan.has_timeout ? std::optional{block ? plan.timeout_ms : 0U} : std::nullopt);
 
 #ifndef _WIN32
     /* Drain pending wakeup bytes and act on the interrupt now: with no
@@ -517,6 +547,7 @@ void Worker::waitForInput()
 #endif
 
     auto after = steady_time_point::clock::now();
+    auto afterMs = schedulerTime(after);
 
     /* Process all available file descriptors. FIXME: this is
        O(children * fds). */
@@ -533,7 +564,9 @@ void Worker::waitForInput()
             j->channels,
             [&](Descriptor k, std::string_view data) {
                 printMsg(lvlVomit, "%1%: read %2% bytes", goal->getName(), data.size());
-                j->lastOutput = after;
+                schedulerCall([&](char ** error) {
+                    return ixe_build_scheduler_note_output(childScheduler.get(), j->schedulerId, afterMs, error);
+                });
                 goal->handleChildOutput(k, data);
             },
             [&](Descriptor k) {
@@ -541,25 +574,28 @@ void Worker::waitForInput()
                 goal->handleEOF(k);
             });
 
-        auto noProgressTimeout = j->respectTimeouts ? goal->noProgressTimeout(after) : std::nullopt;
-
-        if (goal->exitCode == Goal::ecBusy && 0 != settings.maxSilentTime && j->respectTimeouts
-            && after - j->lastOutput >= std::chrono::seconds(settings.maxSilentTime)) {
-            goal->timedOut(TimedOut(settings.maxSilentTime));
-        }
-
-        else if (goal->exitCode == Goal::ecBusy && noProgressTimeout)
-            goal->timedOut(TimedOut(*noProgressTimeout));
-
-        else if (
-            goal->exitCode == Goal::ecBusy && 0 != settings.buildTimeout && j->respectTimeouts
-            && after - j->timeStarted >= std::chrono::seconds(settings.buildTimeout)) {
-            goal->timedOut(TimedOut(settings.buildTimeout));
-        }
+        auto monitorProgress = schedulerResult<unsigned int>([&](auto out, char ** error) {
+            return ixe_build_scheduler_monitors_progress(childScheduler.get(), j->schedulerId, out, error);
+        });
+        auto noProgressTimeout = monitorProgress ? goal->noProgressTimeout(after) : std::nullopt;
+        auto decision = schedulerResult<IxeBuildChildDecision>([&](auto out, char ** error) {
+            return ixe_build_scheduler_inspect_child(
+                childScheduler.get(),
+                j->schedulerId,
+                afterMs,
+                goal->exitCode == Goal::ecBusy,
+                noProgressTimeout.value_or(0),
+                out,
+                error);
+        });
+        if (decision.timeout_kind != IXE_BUILD_TIMEOUT_NONE)
+            goal->timedOut(TimedOut(static_cast<time_t>(decision.timeout_seconds)));
     }
 
-    if (!waitingForAWhile.empty() && lastWokenUp + std::chrono::seconds(settings.pollInterval) <= after) {
-        lastWokenUp = after;
+    auto wakeLocks = schedulerResult<unsigned int>([&](auto out, char ** error) {
+        return ixe_build_scheduler_finish_poll(childScheduler.get(), afterMs, !waitingForAWhile.empty(), out, error);
+    });
+    if (wakeLocks) {
         for (auto & i : waitingForAWhile) {
             GoalPtr goal = i.lock();
             if (goal)
@@ -569,28 +605,39 @@ void Worker::waitForInput()
     }
 }
 
-bool Worker::pathContentsGood(const StorePath & path)
+PathContentStatus Worker::checkPathContents(const StorePath & path)
 {
-    auto i = pathContentsGoodCache.find(path);
-    if (i != pathContentsGoodCache.end())
+    auto i = pathContentsCache.find(path);
+    if (i != pathContentsCache.end())
         return i->second;
     printInfo("checking path '%s'...", store.printStorePath(path));
     auto info = store.queryPathInfo(path);
-    bool res = false;
+    auto res = PathContentStatus::InvalidArchive;
     if (auto accessor = store.getFSAccessor(path, /*requireValidPath=*/false)) {
-        auto current = hashPath({ref{accessor}}, FileIngestionMethod::NixArchive, info->narHash.algo).first;
+        std::optional<ContentAddressHashResult> contentHash;
+        if (info->ca && info->ca->method.raw != ContentAddressMethod::Raw::JjTree)
+            contentHash = hashContentAddress(
+                {ref{accessor}},
+                {.method = info->ca->method,
+                 .algorithm = info->ca->hash.algo,
+                 .selfReference = std::string{path.hashPart()}});
+        auto current = contentHash && contentHash->narHashAndSize
+                           ? contentHash->narHashAndSize->hash
+                           : hashPath({ref{accessor}}, FileIngestionMethod::NixArchive, info->narHash.algo).first;
         Hash nullHash(HashAlgorithm::SHA256);
-        res = info->narHash == nullHash || info->narHash == current;
+        res = info->narHash != nullHash && info->narHash != current ? PathContentStatus::InvalidArchive
+              : contentHash && contentHash->hash != info->ca->hash  ? PathContentStatus::InvalidContentAddress
+                                                                    : PathContentStatus::Valid;
     }
-    pathContentsGoodCache.insert_or_assign(path, res);
-    if (!res)
+    pathContentsCache.insert_or_assign(path, res);
+    if (res != PathContentStatus::Valid)
         printError("path '%s' is corrupted or missing!", store.printStorePath(path));
     return res;
 }
 
 void Worker::markContentsGood(const StorePath & path)
 {
-    pathContentsGoodCache.insert_or_assign(path, true);
+    pathContentsCache.insert_or_assign(path, PathContentStatus::Valid);
 }
 
 GoalPtr upcast_goal(std::shared_ptr<PathSubstitutionGoal> subGoal)

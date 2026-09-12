@@ -7,7 +7,6 @@ use codex_protocol::capabilities::SelectedCapabilityRoot;
 
 use crate::Environment;
 use crate::EnvironmentManager;
-use crate::ExecutorFileSystem;
 
 /// A selected capability root paired with its currently ready environment handle.
 ///
@@ -36,10 +35,6 @@ impl ResolvedSelectedCapabilityRoot {
 
     pub fn environment(&self) -> &Arc<Environment> {
         &self.environment
-    }
-
-    pub fn file_system(&self) -> Arc<dyn ExecutorFileSystem> {
-        self.environment.get_filesystem()
     }
 }
 
@@ -118,6 +113,7 @@ impl EnvironmentManager {
     /// environment captured for the step carries its exact process-local handle so readiness and
     /// execution cannot come from different registry snapshots. Missing, starting, or failed
     /// environments are omitted. A lazy environment is started for a later step.
+    #[tracing::instrument(name = "capability_roots.resolve", skip_all)]
     pub async fn resolve_selected_capability_roots(
         &self,
         selected_roots: &[SelectedCapabilityRoot],
