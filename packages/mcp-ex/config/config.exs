@@ -25,6 +25,9 @@ if config_env() == :test do
   # Flush output to the durable table quickly so tests can read a dead job's
   # output without long waits (#3839).
   config :ix_mcp, output_flush_interval_ms: 20
+  # A tiny output cap so the over-cap truncation-notice test does not have to
+  # produce 8 MiB to reach it.
+  config :ix_mcp, output_cap: 2_048
   # Short coalesce/poll windows so the notification tests observe scoped
   # delivery, suppression, and digests without real waits (#3934). The
   # coalesce window still has to outlast the exec reply path's ack under CI

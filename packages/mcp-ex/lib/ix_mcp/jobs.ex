@@ -220,15 +220,54 @@ defmodule IxMcp.Jobs do
     end
   end
 
-  @doc "Full captured output -- from the live buffer, or the durable table if the job is gone."
+  @doc """
+  Full captured output -- from the live buffer, or the durable table if the job
+  is gone.
+
+  When the job hit `Job.output_cap/0` this ends with a truncation notice, so
+  every derived read (`tail/head/lines/slice/grep`) carries it too. Without it
+  they answer confidently about output that is not there: what the buffer holds
+  is the HEAD, so `tail` returns lines from the middle of the run and `grep`
+  answers "" for a pattern the cell really did print (#4306).
+  """
   @spec output(String.t()) :: String.t()
   def output(id) do
     # Snapshot first (#4082), same reasoning as `get/1`: the hot buffer is
     # public ETS, so reading it must not queue behind a parked control
     # process.
-    case Job.read_output(id) do
-      nil -> live_or_ledger(id, &Job.output/1, &output_from_ledger/1)
-      output -> output
+    body =
+      case Job.read_output(id) do
+        nil -> live_or_ledger(id, &Job.output/1, &output_from_ledger/1)
+        output -> output
+      end
+
+    body <> truncation_notice(id, body)
+  end
+
+  # The drop count lives beside the output on both paths: counter 2 of the
+  # live snapshot, `output_dropped` in the ledger once the job is gone.
+  defp truncation_notice(id, body) do
+    case dropped_bytes(id) do
+      dropped when is_integer(dropped) and dropped > 0 ->
+        "\n[output truncated at the #{Job.output_cap()}-byte per-job cap: " <>
+          "#{byte_size(body)} bytes kept, #{dropped} dropped. This is the HEAD " <>
+          "of the output -- the end of the run is gone, so tail/grep cannot see it.]"
+
+      _none ->
+        ""
+    end
+  end
+
+  defp dropped_bytes(id) do
+    case Job.read_dropped(id) do
+      nil ->
+        case ActionLog.job(id) do
+          %{output_dropped: dropped} -> dropped
+          nil -> nil
+        end
+
+      dropped ->
+        dropped
     end
   end
 
@@ -342,6 +381,7 @@ defmodule IxMcp.Jobs do
           intent: job.intent,
           elapsed_s: (job.elapsed_ms || 0) / 1000,
           output_bytes: job.output_bytes,
+          output_dropped: job.output_dropped,
           diagnostics: [],
           result: job.result
         }

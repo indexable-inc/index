@@ -73,8 +73,13 @@ defmodule IxMcp.Jobs.Job do
 
   # Per-job output cap. Beyond it, output is dropped (head kept) and the drop
   # is recorded, so one runaway cell cannot fill the ledger. 8 MiB is far
-  # above any legitimate cell's output.
-  @output_cap 8 * 1024 * 1024
+  # above any legitimate cell's output. Tests shrink it via app env so the
+  # over-cap read paths can be exercised without producing 8 MiB.
+  @output_cap Application.compile_env(:ix_mcp, :output_cap, 8 * 1024 * 1024)
+
+  @doc "The per-job output cap, in bytes. Output past it is counted, not kept."
+  @spec output_cap() :: pos_integer()
+  def output_cap, do: @output_cap
 
   @enforce_keys [:id, :code]
   defstruct [
@@ -144,6 +149,7 @@ defmodule IxMcp.Jobs.Job do
           intent: String.t() | nil,
           elapsed_s: float(),
           output_bytes: non_neg_integer(),
+          output_dropped: non_neg_integer(),
           diagnostics: [String.t()],
           result: String.t() | nil
         }
@@ -310,6 +316,7 @@ defmodule IxMcp.Jobs.Job do
         intent: snap.intent,
         elapsed_s: (finished - snap.started_mono) / 1000,
         output_bytes: :counters.get(snap.counter, 1),
+        output_dropped: :counters.get(snap.counter, 2),
         diagnostics: snap.diagnostics,
         result: snap.result
       }
@@ -324,6 +331,23 @@ defmodule IxMcp.Jobs.Job do
     with {pid, %{buffer: buffer}} <- lookup_snapshot(id),
          true <- Process.alive?(pid) do
       read_buffer(buffer)
+    else
+      _not_resident -> nil
+    end
+  end
+
+  @doc """
+  Bytes this job discarded at `output_cap/0`, read from the snapshot -- `nil`
+  when the job is not resident, so callers fall back to the ledger's
+  `output_dropped`. Every output read path needs this: the buffer holds the
+  HEAD, so a job over the cap has no tail left to return and `Jobs.grep`
+  cannot see a pattern that was printed past the cap.
+  """
+  @spec read_dropped(String.t()) :: non_neg_integer() | nil
+  def read_dropped(id) do
+    with {pid, %{counter: counter}} <- lookup_snapshot(id),
+         true <- Process.alive?(pid) do
+      :counters.get(counter, 2)
     else
       _not_resident -> nil
     end
@@ -830,6 +854,7 @@ defmodule IxMcp.Jobs.Job do
       intent: state.intent,
       elapsed_s: (finished - state.started_mono) / 1000,
       output_bytes: :counters.get(state.counter, 1),
+      output_dropped: :counters.get(state.counter, 2),
       diagnostics: state.diagnostics,
       result: render_result(state)
     }

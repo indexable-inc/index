@@ -424,4 +424,55 @@ defmodule IxMcp.JobsTest do
       receive_channel_mentioning(id)
     end
   end
+  describe "output past the per-job cap" do
+    # The cap keeps the HEAD, so before #4306 `tail` returned lines from the
+    # middle of the run as if they were the last ones, and `grep` answered ""
+    # about a pattern the cell really did print. Both read as fact.
+    setup do
+      cap = IxMcp.Jobs.Job.output_cap()
+      line = String.duplicate("x", 64)
+      lines = div(cap, 65) * 3
+
+      code =
+        "Enum.each(1..LINES, fn n -> IO.puts(\"L\" <> to_string(n) <> \" LINE\") end); IO.puts(\"SENTINEL\"); :over"
+        |> String.replace("LINES", to_string(lines))
+        |> String.replace("LINE", line)
+
+      {summary, _out} = Jobs.run(code, budget: 30, intent: "over cap")
+      assert summary.status == :done
+      %{summary: summary, cap: cap}
+    end
+
+    test "the summary reports what was dropped, not only what was kept", ctx do
+      assert ctx.summary.output_dropped > 0
+      assert ctx.summary.output_bytes >= ctx.cap
+      assert Jobs.get(ctx.summary.id).output_dropped == ctx.summary.output_dropped
+    end
+
+    test "every derived read carries the notice, so none of them lies", ctx do
+      dropped = ctx.summary.output_dropped
+
+      for {label, text} <- [
+            {"output", Jobs.output(ctx.summary.id)},
+            {"tail", Jobs.tail(ctx.summary.id, 3)},
+            {"grep", Jobs.grep(ctx.summary.id, "truncated")}
+          ] do
+        assert text =~ "output truncated", "#{label} gave no truncation notice"
+        assert text =~ to_string(dropped), "#{label} did not name the dropped byte count"
+      end
+    end
+
+    test "the notice says the tail is what is missing, since that is the wrong guess", ctx do
+      notice = Jobs.tail(ctx.summary.id, 2)
+      assert notice =~ "HEAD"
+      refute Jobs.output(ctx.summary.id) =~ "SENTINEL"
+    end
+  end
+
+  test "a job under the cap gets no truncation notice" do
+    {summary, _out} = Jobs.run(~S|IO.puts("small"); :ok|, intent: "under cap")
+    assert summary.output_dropped == 0
+    refute Jobs.output(summary.id) =~ "output truncated"
+    assert Jobs.tail(summary.id, 1) == "" or Jobs.output(summary.id) =~ "small"
+  end
 end
