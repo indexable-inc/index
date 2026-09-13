@@ -129,6 +129,14 @@ than connecting to a daemon, so it works when the daemon is wedged. Gated on the
 `build-status-dir` experimental feature at both the writer and the reader, so an
 empty array can mean the feature is off rather than idle.
 
+A quiet systemd journal does not prove a build is idle. On dev-compute-6
+(2026-09-13 UTC), native `nix build --store local` compiled Rust while its unit
+journal stayed quiet; `/nix/var/nix/status/*-<nix-pid>.json` exposed the active
+work and disappeared at completion. Keep the command's exit status and final
+JSON result as the completion witness. For a floating content-addressed output,
+`nix build --store local --no-link --json <drv>^out` resolved the finished path
+when legacy `nix-store --query --outputs <drv>` could not.
+
 ## Which .nix file put this here: `whence`
 
 ```
@@ -186,6 +194,23 @@ commit, so 29 of those 34 deploys paid the timer's whole reason for nothing.
 The two findings take different fixes. A semantic change earns its restart. A
 pure path bump means the unit is carrying a store path it does not need to
 carry, and `nix-dag` on the same closure will name the edge that puts it there.
+
+## Verify the effective unit before a handoff
+
+After `daemon-reload`, inspect `systemctl show <unit> -p ExecStart -p DropInPaths`
+before replacing a process. Drop-ins sort lexically: `100-progress.conf` loaded
+before `99-no-autofix.conf` on hil-compute-1 (2026-09-13 UTC), so a restart
+launched the old executable. Confirm the desired wrapper and arguments in the
+effective property, then verify the new PID's `/proc/<pid>/exe` and live output.
+
+A terminal CI progress record can precede landing or recovery. When proving an
+idle boundary without a drain API, use the installed executable's actual caller
+site and empty owned process groups. Linux `clock_nanosleep` can use the same
+pointer for requested and remaining time: a native control changed `[2, 0]` to
+`[1, 810764893]` after `SIGSTOP`. Comparing the stopped request to the original
+duration rejects a valid boundary. Retire each independent resume watchdog
+before another freeze of the same PID; an older watchdog can otherwise resume
+the next attempt. Revalidate caller offsets whenever the executable changes.
 
 ## NAR integrity and content-address identity are separate checks
 

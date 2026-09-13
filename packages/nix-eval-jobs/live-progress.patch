@@ -1,0 +1,77 @@
+--- a/src/nix-eval-jobs.cc
++++ b/src/nix-eval-jobs.cc
+@@ -43,6 +43,9 @@
+ #endif
+ #include <sys/signal.h>
+ #include <variant>
++#include "rust-worker.hh"
++#include <chrono>
++#include <cstdlib>
+ #include <nlohmann/json.hpp>
+ #include <nlohmann/json_fwd.hpp>
+ #include <optional>
+@@ -431,6 +434,18 @@
+ }
+ } // namespace
+ 
++// Opt-in controller events share the JSONL output lock with completed jobs.
++// Only the collector knows both the assigned attribute and its worker process.
++void evaluationProgress(const char *event, int worker, const nlohmann::json &path) {
++    const char *enabled = std::getenv("JJ_EVAL_PROGRESS");
++    if (enabled == nullptr || std::string_view(enabled) != "1") return;
++    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
++        std::chrono::system_clock::now().time_since_epoch()).count();
++    const nlohmann::json record = {{"type", "evaluation-progress"},
++        {"event", event}, {"worker", worker}, {"attrPath", path}, {"at_ms", now}};
++    getCoutLock().lock() << record.dump() << "\n";
++}
++
+ void collector(nix::Sync<State> &state_, std::condition_variable &wakeup) {
+     try {
+         std::optional<std::unique_ptr<Proc>> proc_;
+@@ -468,10 +483,12 @@
+                 handleBrokenWorkerPipe(*proc_.value(), msg);
+             }
+ 
++            evaluationProgress("start", proc_.value()->pid, attrPath);
+             auto newAttrs =
+                 processWorkerResponse(fromReader_.value().get(), attrPath,
+                                       proc_.value().get(), state_);
+ 
++            evaluationProgress("finish", proc_.value()->pid, attrPath);
+             updateJobQueue(state_, wakeup, attrPath, newAttrs);
+         }
+     } catch (...) {
+@@ -598,6 +615,16 @@
+            fail with "unable to open database file". Open it once here. */
+         nix::fetchSettings.getCache();
+ 
++        if (const char *enabled = std::getenv("JJ_EVAL_PROGRESS");
++            enabled != nullptr && std::string_view(enabled) == "1") {
++            auto context = nix_eval_jobs::Session::evaluationCache();
++            std::error_code error;
++            auto executable = std::filesystem::read_symlink("/proc/self/exe", error);
++            context["executable"] = error ? nlohmann::json(nullptr) : nlohmann::json(executable.string());
++            getCoutLock().lock() << nlohmann::json({{"type", "evaluation-context"},
++                {"evaluation_cache", context}}).dump() << "\n";
++        }
++
+         /* Start a collector thread per worker process. */
+         std::vector<Thread> threads;
+         std::condition_variable wakeup;
+--- a/src/rust-worker.hh
++++ b/src/rust-worker.hh
+@@ -108,6 +108,13 @@
+     }
+ 
+   public:
++    // The mode belongs to this streaming adapter, beside its cache setter.
++    static nlohmann::json evaluationCache() {
++        return {{"engine", "nix-eval-rs"}, {"mode", "worker-local"},
++            {"reason", "Persistent result caching is disabled by the streaming worker adapter; compiled modules and graph cells remain resident within each worker."},
++            {"stats", nullptr}};
++    }
++
+     Session(nix::EvalState &state_, const nix::MixEvalArgs &args)
+         : state(state_), setup(state_), session(nullptr, &ixe_session_free),
+           autoArgs(nix::rustAutoArgsOf(args)) {

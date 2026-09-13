@@ -24,7 +24,7 @@
     (pkgs.nix-eval-jobs.override {
       nixComponents = nixPackage.passthru.components;
     }).overrideAttrs (old: {
-      patches = (old.patches or []) ++ [./rust-session.patch];
+      patches = (old.patches or []) ++ [./rust-session.patch ./live-progress.patch];
       # The worker directly calls the public ixe API, not only nix-cmd.
       buildInputs = (old.buildInputs or []) ++ [nixPackage.nixEvalRs];
       # The public handle ABI must come from the same source as the linked fork.
@@ -63,6 +63,7 @@
           exit 1
           ;;
       esac
+      ${pkgs.python3}/bin/python3 ${./live-progress-smoke.py} ${package}/bin/nix-eval-jobs
       mkdir -p "$out"
     '';
 in
