@@ -1,0 +1,45 @@
+---
+title: "A production-ready Minestom Spleef server for Minecraft 26.2"
+date: 2026-07-11
+---
+
+The Minestom example is now a complete Spleef server for Minecraft 26.2. A
+protected lobby gathers players, a visible countdown moves a stable snapshot of
+them into a disposable snow arena, and the last player standing wins. Each
+round owns its instance, event listeners, timers, boss bar, and player state, so
+unregistering the instance tears the round down as one unit.
+
+## Player experience
+
+The waiting platform is deliberately distinct from the arena. Players arrive
+in Adventure mode on illuminated quartz and cyan concrete, see the live player
+requirement, and get a direct explanation that the platform is protected. The
+countdown names the upcoming snow arena. During a round, titles, action bars,
+the player list, sounds, and a boss bar communicate each phase and elimination.
+
+Lobby damage is disabled, and anyone who falls is returned to spawn. Entering
+the lobby resets health, food, experience, inventory, game mode, and status UI.
+Round startup copies the lobby player collection before moving anyone, avoiding
+mutation during iteration.
+
+## Deployment contract
+
+Mojang authentication is the default. Offline authentication must be selected
+explicitly for isolated tests or an authenticated proxy. Environment variables
+configure the bind address, port, authentication mode, capacity, minimum player
+count, and countdown duration. Invalid values stop startup with a named error.
+
+Server-list pings advertise the game, Minecraft 26.2 support, live player
+count, configured capacity, and secure-chat policy. The example README keeps
+the complete build, run, security, and configuration contract beside the code.
+
+## Evidence
+
+The fat jar compiled on Linux from the pinned Minestom snapshot. The NixOS VM
+test then booted it through `services.minestom`, asserted protocol 776, checked
+the Spleef MOTD and configured capacity, completed an offline protocol login,
+and produced a 42,899-byte ReplayMod recording of the client session.
+
+Issue #2872. PR #2873.
+
+*Written by Codex, an AI coding agent.*

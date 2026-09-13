@@ -71,6 +71,13 @@ in
         enable = true;
         serverJar = spleefJar;
       };
+
+      # Production defaults to Mojang authentication. The protocol bot has no
+      # account session, so this isolated VM explicitly selects offline mode.
+      systemd.services.minestom.environment = {
+        SPLEEF_AUTH = "offline";
+        SPLEEF_MAX_PLAYERS = "8";
+      };
     };
 
     testScript = ''
@@ -80,7 +87,7 @@ in
       # Main's readiness line: MinecraftServer.start() returned, so the
       # network stack is bound and the lobby instance is registered.
       server.wait_until_succeeds(
-          "journalctl -u minestom.service --grep 'spleef server listening on :25565' --quiet",
+          "journalctl -u minestom.service --grep 'spleef server listening on 0.0.0.0:25565 with offline authentication' --quiet",
           timeout=300,
       )
       server.wait_for_open_port(25565)
@@ -91,7 +98,10 @@ in
       # there moves these assertions too. Both probes run so both unibind
       # renderings of mc-protocol (Python/pyo3, Kotlin/FFM) are proven
       # against a live server, not just their conformance fixtures.
-      server.succeed("${mcProbe} 127.0.0.1:25565 --protocol-version 776 --timeout 30")
+      server.succeed(
+          "${mcProbe} 127.0.0.1:25565 --protocol-version 776"
+          + " --motd-contains Spleef --min-max-players 8 --timeout 30"
+      )
       server.succeed("${mcProbeKt} 127.0.0.1:25565 --protocol-version 776 --timeout 30")
 
       # Join as a real player and record the session. mc-bot walks the whole

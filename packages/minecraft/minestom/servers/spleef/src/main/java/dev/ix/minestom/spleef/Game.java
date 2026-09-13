@@ -3,7 +3,9 @@ package dev.ix.minestom.spleef;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
+import net.kyori.adventure.bossbar.BossBar;
 import net.kyori.adventure.sound.Sound;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
@@ -61,17 +63,25 @@ final class Game {
     private final Lobby lobby;
     private final InstanceContainer arena;
     private final Set<Player> alive = new HashSet<>();
+    private final int startingPlayers;
+    private final BossBar status;
     private Phase phase = Phase.FREEZE;
     private int freezeLeft = FREEZE_SECONDS;
 
     static void start(Lobby lobby, Collection<Player> players) {
-        new Game(lobby, players);
+        new Game(lobby, List.copyOf(players));
     }
 
     private Game(Lobby lobby, Collection<Player> players) {
         this.lobby = lobby;
         this.arena = createArena();
         this.alive.addAll(players);
+        this.startingPlayers = players.size();
+        this.status = BossBar.bossBar(
+            Component.text("Snow arena: get ready", NamedTextColor.YELLOW),
+            1f,
+            BossBar.Color.YELLOW,
+            BossBar.Overlay.PROGRESS);
 
         var events = arena.eventNode();
         events.addListener(PlayerStartDiggingEvent.class, this::onStartDigging);
@@ -96,8 +106,15 @@ final class Game {
             double z = Math.sin(angle) * SPAWN_RADIUS;
             float yaw = (float) Math.toDegrees(Math.atan2(x, -z));
             Pos spawn = new Pos(x, FLOOR_Y + 1, z, yaw, 0f);
+            player.setGameMode(GameMode.ADVENTURE);
+            player.setInvulnerable(true);
+            player.getInventory().clear();
             player.setRespawnPoint(spawn);
             player.setInstance(arena, spawn);
+            player.showBossBar(status);
+            player.sendPlayerListHeaderAndFooter(
+                Component.text("IX SPLEEF", NamedTextColor.AQUA, TextDecoration.BOLD),
+                Component.text("Snow arena | %d players".formatted(startingPlayers), NamedTextColor.GRAY));
         }
 
         arena.scheduler().submitTask(() -> {
@@ -105,7 +122,7 @@ final class Game {
             if (freezeLeft > 0) {
                 arena.showTitle(Title.title(
                     Component.text(freezeLeft, NamedTextColor.RED),
-                    Component.text("Get ready…", NamedTextColor.GRAY),
+                    Component.text("Snow arena: get ready", NamedTextColor.GRAY),
                     Title.Times.times(Duration.ZERO, Duration.ofMillis(900), Duration.ofMillis(100))));
                 arena.playSound(Sound.sound(SoundEvent.BLOCK_NOTE_BLOCK_PLING, Sound.Source.MASTER, 1f, 1f));
                 freezeLeft--;
@@ -142,14 +159,16 @@ final class Game {
 
     private void release() {
         phase = Phase.RUNNING;
+        status.name(Component.text("Snow arena: %d alive".formatted(alive.size()), NamedTextColor.GREEN));
+        status.color(BossBar.Color.GREEN);
         for (Player player : alive) {
             player.setGameMode(GameMode.SURVIVAL);
             player.getInventory().setItemStack(0, SHOVEL);
             player.setHeldItemSlot((byte) 0);
         }
         arena.showTitle(Title.title(
-            Component.text("DIG!", NamedTextColor.GREEN, TextDecoration.BOLD),
-            Component.empty(),
+            Component.text("DIG THE SNOW!", NamedTextColor.GREEN, TextDecoration.BOLD),
+            Component.text("Last player standing wins", NamedTextColor.GRAY),
             Title.Times.times(Duration.ZERO, Duration.ofMillis(700), Duration.ofMillis(300))));
         arena.playSound(Sound.sound(SoundEvent.BLOCK_NOTE_BLOCK_PLING, Sound.Source.MASTER, 1f, 2f));
     }
@@ -182,6 +201,14 @@ final class Game {
 
     private void eliminate(Player player) {
         if (!alive.remove(player)) return;
+        status.name(Component.text("Snow arena: %d alive".formatted(alive.size()), NamedTextColor.RED));
+        status.progress((float) alive.size() / startingPlayers);
+        for (Player survivor : alive) {
+            survivor.sendActionBar(Component.text(
+                "%s fell | %d player%s left"
+                    .formatted(player.getUsername(), alive.size(), alive.size() == 1 ? "" : "s"),
+                NamedTextColor.YELLOW));
+        }
         if (player.getInstance() == arena) {
             // Still connected: park them as a spectator hovering over the arena.
             player.setGameMode(GameMode.SPECTATOR);
@@ -201,8 +228,13 @@ final class Game {
         phase = Phase.ENDING;
         Player winner = alive.isEmpty() ? null : alive.iterator().next();
         if (winner == null) {
+            status.name(Component.text("Round over: no survivors", NamedTextColor.GRAY));
+            status.color(BossBar.Color.WHITE);
             arena.sendMessage(Component.text("Nobody survived the round.", NamedTextColor.GRAY));
         } else {
+            status.name(Component.text("%s wins!".formatted(winner.getUsername()), NamedTextColor.GOLD));
+            status.color(BossBar.Color.YELLOW);
+            status.progress(1f);
             arena.showTitle(Title.title(
                 Component.text("%s wins!".formatted(winner.getUsername()), NamedTextColor.GOLD, TextDecoration.BOLD),
                 Component.empty(),
@@ -214,6 +246,7 @@ final class Game {
 
     private void close() {
         for (Player player : Set.copyOf(arena.getPlayers())) {
+            player.hideBossBar(status);
             player.setInstance(lobby.instance(), Lobby.SPAWN);
         }
         // Instance switches complete asynchronously; unregister the arena (and
