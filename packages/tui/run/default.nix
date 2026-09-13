@@ -7,6 +7,20 @@
     if pkgs.stdenv.hostPlatform.isLinux
     then lib.getExe' pkgs.util-linux "scriptreplay"
     else "scriptreplay";
+  # #2759: Rust links libiconv through the raw Darwin compiler, which does not
+  # consume NIX_LDFLAGS from the surrounding profile.
+  wrapperArgs =
+    [
+      "--set"
+      "IX_RUN_SCRIPTREPLAY"
+      scriptreplay
+    ]
+    ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+      "--prefix"
+      "LIBRARY_PATH"
+      ":"
+      "${lib.getLib pkgs.libiconv}/lib"
+    ];
   unwrapped = ix.writePythonApplication pkgs {
     name = "run-unwrapped";
     src = ./run.py;
@@ -26,7 +40,7 @@
     ''
       mkdir -p $out/bin
       makeWrapper ${lib.getExe unwrapped} $out/bin/run \
-        --set IX_RUN_SCRIPTREPLAY ${lib.escapeShellArg scriptreplay}
+        ${lib.escapeShellArgs wrapperArgs}
     '';
   recordsSession =
     pkgs.runCommand "run-records-session"
@@ -180,13 +194,55 @@
 
       mkdir -p "$out"
     '';
+  darwinLibiconv =
+    pkgs.runCommand "run-darwin-libiconv"
+    {
+      nativeBuildInputs = [
+        package
+        pkgs.darwin.binutils
+        pkgs.llvmPackages.clang-unwrapped
+      ];
+      strictDeps = true;
+    }
+    ''
+      cat >main.c <<'EOF'
+      extern void *iconv_open(const char *, const char *);
+      void *probe(void) { return iconv_open("UTF-8", "UTF-8"); }
+      EOF
+
+      cat >link-iconv <<'EOF'
+      #!${lib.getExe pkgs.bash}
+      ${lib.getExe' pkgs.coreutils "env"} -i \
+        HOME="$TMPDIR" \
+        LIBRARY_PATH="$LIBRARY_PATH" \
+        PATH="$PATH" \
+        TMPDIR="$TMPDIR" \
+        ${lib.getExe pkgs.llvmPackages.clang-unwrapped} \
+          -shared -nostdlib main.c -liconv -o iconv-smoke.dylib \
+          2>"$TMPDIR/link-iconv.stderr"
+      EOF
+      chmod +x link-iconv
+
+      export IX_RUN_DIR="$TMPDIR/runs"
+      if ! LIBRARY_PATH= run "$PWD/link-iconv"; then
+        cat "$TMPDIR/link-iconv.stderr" >&2
+        exit 1
+      fi
+      ${lib.getExe' pkgs.darwin.cctools "otool"} -L iconv-smoke.dylib \
+        | ${lib.getExe' pkgs.gnugrep "grep"} -F ${lib.escapeShellArg "${lib.getLib pkgs.libiconv}/lib/libiconv.2.dylib"}
+      mkdir -p "$out"
+    '';
 in
   package.overrideAttrs (old: {
     passthru =
       (old.passthru or {})
       // {
-        tests = {
-          inherit recordsSession;
-        };
+        tests =
+          {
+            inherit recordsSession;
+          }
+          // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+            inherit darwinLibiconv;
+          };
       };
   })
