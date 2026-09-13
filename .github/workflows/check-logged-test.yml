@@ -26,7 +26,7 @@ jobs:
     runs-on: ["${{ format('ix-ci-run-{0}-{1}-check-logged-test', github.run_id, github.run_attempt) }}"]
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Both suites build their own stub PATH and run the scripts under
       # `env -i`, so they need almost nothing from the runner. The one

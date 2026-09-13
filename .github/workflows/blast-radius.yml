@@ -67,7 +67,7 @@ jobs:
       # `git merge-base` and the `?rev=<sha>` flake refs resolve. The only token
       # in this job is the read-only one on the timings-fetch step below.
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -148,7 +148,7 @@ jobs:
       # fails on views/nix's dangling-symlink fixtures (see check.yml's
       # flake-check for the full story).
       - name: Checkout the CI actions tree
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github
           persist-credentials: false

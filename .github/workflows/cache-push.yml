@@ -151,7 +151,7 @@ jobs:
     timeout-minutes: 170
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Underscore digit separators: every nix invocation that evaluates this
       # tree must go through the patched client (see the action's description).
@@ -571,7 +571,7 @@ jobs:
       # fails on views/nix's dangling-symlink fixtures (see check.yml's
       # flake-check for the full story).
       - name: Checkout the CI actions tree
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github
           persist-credentials: false
