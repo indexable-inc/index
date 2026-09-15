@@ -29,7 +29,7 @@
   # argument and throws when it is forced without one, so `nix-ix` is
   # assembled by whoever HAS the archive and handed in here. One formal, no
   # default. The flake supplies it: `null` for index's own outputs, the
-  # assembled fork through `index.withNixPackage { nixPackage = ...; }`
+  # assembled fork through `index.withNixPackage { nixPackage = ...; imageShellModule = ...; }`
   # (flake.nix `outputsWith`), which is the only place a consumer hands it
   # in; nothing imports this file with a hand-picked Nix. Its readers, all
   # of them: modules/profiles/base consumes it (`nix.package`, refusing a
@@ -41,6 +41,8 @@
   # binds. No other package path reads it, which is why the standalone
   # surface evaluates everything except images and that consumer class.
   nixPackage,
+  # Shared NixOS shell policy, also delivered by template-profile.
+  imageShellModule,
   # The flake's own source (`self`), carrying `.outPath` (a `-source` store
   # path with string context, so it roots into a closure like `nixpkgs`) and
   # `.narHash`. Only the flake scope sees these, so they are plumbed down to
@@ -844,7 +846,7 @@
   ixSpecialArgs =
     sharedHelpers
     // {
-      inherit buildRustPackage islandsTheme nixPackage nixPackageFor;
+      inherit buildRustPackage islandsTheme nixPackage nixPackageFor imageShellModule;
       packages = packageSetFor pkgs;
       # The flox CLI as built by flox's own flake (own nixpkgs pin, so the
       # derivation is exactly what cache.flox.dev serves). Consumed by
@@ -1006,6 +1008,7 @@
         mkPackageSet
         mkVm
         mkVmFor
+        imageShellModule
         nixPackage
         nixPackageFor
         nixosModules

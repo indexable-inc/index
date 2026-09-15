@@ -364,7 +364,7 @@
     modules/profiles/base). Assembling it needs the jj tree ABI archive from
     the ix repository, outside this flake's source root (lib/default.nix
     documents the formal), so index cannot bind it: this flake's own outputs
-    are `outputsWith null`, and the consumer that holds the archive
+    use `outputsWith` with an absent runtime, and the consumer that holds the archive
     instantiates the same surface through `withNixPackage` below. There is no
     third shape. Every output is one of those two evaluations, `lib`
     included, so a consumer never pairs an image from one instantiation with
@@ -433,7 +433,10 @@
     recipe does not read `nixPackage` back, so the standalone library is the
     right place to assemble the guest Nix from).
     */
-    outputsWith = nixPackage: let
+    outputsWith = {
+      nixPackage,
+      imageShellModule,
+    }: let
       ix = import ./lib {
         # The `.ix` converter, resolved through IFD instead of a committed
         # artifact. A function, not a value, so this stays lazy: `perSystem`
@@ -448,7 +451,7 @@
         # `specialArgs.ix.nixPackage`, and lib/default.nix binds it into
         # `ixSpecialArgs` without forcing it, so a standalone evaluation only
         # meets the refusal where an image is actually forced.
-        inherit nixPackage;
+        inherit nixPackage imageShellModule;
         inherit
           self
           nixpkgs
@@ -560,7 +563,10 @@
       devShells = collected.collect "devShells";
     };
 
-    standalone = outputsWith null;
+    standalone = outputsWith {
+      nixPackage = null;
+      imageShellModule = throw "index: instantiate the image runtime through ix.index";
+    };
 
     # Every image evaluates against ONE pinned system: lib/default.nix binds
     # `system = "x86_64-linux"` for `imagePkgs`, and lib/image/default.nix
@@ -571,6 +577,10 @@
 
     /**
     Instantiate this flake's whole output surface with the guest Nix supplied.
+
+    `imageShellModule` is the shared NixOS shell policy from template-profile.
+    It is injected with the runtime so base images and delivered templates
+    consume the same source file, without an index-to-parent source path.
 
     The only caller today is ix (nix/flake/outputs/workspace.nix `index`),
     which assembles `nix-ix` from `lib.packageSetFor` plus the jj tree ABI
@@ -588,7 +598,10 @@
     host's `packages.<system>.nix-ix`: the image boots, then fails inside the
     guest on an exec-format error).
     */
-    withNixPackage = {nixPackage}:
+    withNixPackage = {
+      nixPackage,
+      imageShellModule,
+    }:
       if !lib.isDerivation nixPackage
       then
         throw ''
@@ -603,7 +616,7 @@
 
           Pass the ${guestSystem} guest Nix, whatever system evaluates the flake.
         ''
-      else withBoundaryCheck (outputsWith nixPackage);
+      else withBoundaryCheck (outputsWith {inherit nixPackage imageShellModule;});
 
     # The boundary above, exercised both ways. `tryEval` catches `throw`, so a
     # refusal that stopped firing turns this check red instead of silently
@@ -622,7 +635,7 @@
         system = guestSystem;
         builder = "/bin/false";
       };
-      refuses = arg: !(builtins.tryEval (withNixPackage arg)).success;
+      refuses = arg: !(builtins.tryEval (withNixPackage (arg // {imageShellModule = {};}))).success;
     in
       assert lib.assertMsg (refuses {nixPackage = null;})
       "index.withNixPackage accepted null; the standalone surface and the injected one would be indistinguishable";
@@ -634,7 +647,11 @@
       "index.withNixPackage accepted a guest Nix built for aarch64-darwin; images evaluate against ${guestSystem}";
       assert lib.assertMsg (refuses {nixPackage = fixture // {system = "x86_64-darwin";};})
       "index.withNixPackage accepted a guest Nix built for x86_64-darwin; images evaluate against ${guestSystem}";
-      assert lib.assertMsg ((withNixPackage {nixPackage = fixture;}).lib.nixPackage == fixture)
+      assert lib.assertMsg ((withNixPackage {
+          nixPackage = fixture;
+          imageShellModule = {};
+        }).lib.nixPackage
+        == fixture)
       "index.withNixPackage bound a different derivation than the one handed in";
         standalone.lib.pkgs.runCommand "with-nix-package-boundary" {} ''
           printf 'index.withNixPackage refuses null, non-derivations and a foreign-system Nix, and binds the one it is given\n' > "$out"

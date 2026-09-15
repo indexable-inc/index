@@ -2887,9 +2887,26 @@
   base = let
     config = evalConfig [];
     imageConfig = evalConfig [(paths.root + "/images/system/base")];
+    vanillaTemplate = lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        {
+          nixpkgs.pkgs = pkgs;
+          system.stateVersion = "26.05";
+        }
+      ];
+    };
+    # Use the same sibling files delivered by the node agent to the wrapper.
+    machineProfile = builtins.dirOf ix.imageShellModule + "/ix-machine-profile.nix";
+    templateShell = vanillaTemplate.extendModules {
+      modules = [machineProfile];
+    };
   in {
-    inherit config imageConfig;
+    inherit config imageConfig templateShell;
     cfg = config.ix.profiles.base;
+    templateShellDisabled = vanillaTemplate.extendModules {
+      modules = [machineProfile {ix.interactiveShell.enable = false;}];
+    };
   };
 
   # Regression fence for the guest-nix-slowness bug family. Do NOT delete as
@@ -4153,7 +4170,7 @@
       }
       {
         assertion = base.config.users.users.root.shell.meta.mainProgram == "zsh";
-        message = "base profile should make root land in zsh (via platform users.defaultUserShell)";
+        message = "base profile should make root land in zsh (via shared users.defaultUserShell)";
       }
       {
         assertion = base.config.environment.localBinInPath;
@@ -4168,8 +4185,69 @@
         message = "base profile should not ALSO wire the prompt through Home Manager: two starship inits would run per shell";
       }
       {
-        assertion = lib.hasInfix "starship" base.config.programs.zsh.promptInit;
-        message = "base profile's system prompt should reach zsh's promptInit, which is what /etc/zshrc runs";
+        assertion =
+          lib.all (
+            config:
+              config.programs.zsh.enable
+              && config.programs.starship.enable
+              && config.users.defaultUserShell == pkgs.zsh
+              # The needle carries the starship store path; `builtins.match` (inside
+              # hasInfix) refuses strings with store-path context, so drop the context
+              # for the comparison only (precedent: packages/jj-ci-gate/module-tests.nix).
+              && lib.hasInfix
+              (builtins.unsafeDiscardStringContext ''eval "$(${config.programs.starship.package}/bin/starship init zsh)"'')
+              config.environment.etc.zshrc.text
+          ) [
+            base.config
+            base.imageConfig
+            base.templateShell.config
+          ];
+        message = "base and template shell defaults must render Starship init into /etc/zshrc and select zsh";
+      }
+      {
+        assertion =
+          base.config.programs.zsh.enableCompletion
+          && lib.hasInfix "bindkey -e" base.config.environment.etc.zshrc.text
+          && lib.hasInfix "HISTFILE=$HOME/.zsh_history" base.config.environment.etc.zshrc.text;
+        message = "the system zshrc must supply completion, emacs keys and persistent history before root's rc";
+      }
+      {
+        assertion = lib.all (config: let
+          rc = config.home-manager.users.root.home.file."./.zshrc".text;
+        in
+          !lib.hasInfix "PS1=" rc
+          && !lib.hasInfix "PROMPT=" rc
+          && !lib.hasInfix "starship init" rc) [base.config base.imageConfig];
+        message = "root's rendered rc must not replace or reinitialize the system prompt";
+      }
+      {
+        assertion = lib.all (template: let
+          inherit (template) config;
+        in
+          lib.all (entry: entry.assertion) config.assertions
+          && builtins.isString config.system.build.toplevel.drvPath
+          && config.boot.isContainer
+          && config.boot.modprobeConfig.enable
+          && !config.networking.useDHCP
+          && !config.networking.resolvconf.enable
+          && config.networking.nftables.enable
+          && builtins.elem 5001 config.networking.firewall.allowedTCPPorts
+          && builtins.elem 8443 config.networking.firewall.allowedUDPPorts
+          && !config.systemd.services."serial-getty@ttyS0".enable
+          && !config.systemd.services."serial-getty@hvc0".enable
+          && config.environment.etc ? "ix/guest-swap.toml") [
+          base.templateShell
+          base.templateShellDisabled
+        ];
+        message = "assembled templates must evaluate a toplevel with valid assertions and retain required machine settings with either shell policy";
+      }
+      {
+        assertion =
+          !base.templateShellDisabled.config.programs.starship.enable
+          && !base.templateShellDisabled.config.programs.zsh.enable
+          && base.templateShellDisabled.config.users.users.root.shell == pkgs.bashInteractive
+          && builtins.elem "${pkgs.bashInteractive}/bin/bash" base.templateShellDisabled.config.environment.shells;
+        message = "templates must be able to explicitly disable the shared shell policy while retaining the stock root shell";
       }
       {
         assertion = base.config.home-manager.users.root.programs.fzf.historyWidget.command == "";
