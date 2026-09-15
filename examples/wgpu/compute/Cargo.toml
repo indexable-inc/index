@@ -1,0 +1,17 @@
+[package]
+name = "wgpu-compute-demo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone crate on purpose: the example carries its own Cargo.lock (read by
+# package.nix via `cargoLock.lockFile`), so its wgpu dependency tree never
+# enters the repo's root workspace lockfile. Same shape as
+# packages/nix/nix-cargo-unit.
+[workspace]
+
+[dependencies]
+# Block the main thread on wgpu's async entry points (adapter/device requests);
+# a full async runtime would be noise for a linear demo.
+pollster = "0.4"
+wgpu = "30"
