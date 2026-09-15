@@ -1,4 +1,4 @@
 # Rust toolchain pin used by repo-owned Rust package builds.
 [toolchain]
-channel = "nightly-2026-05-27"
+channel = "nightly-2026-08-03"
 components = ["rust-src", "rust-analyzer"]
